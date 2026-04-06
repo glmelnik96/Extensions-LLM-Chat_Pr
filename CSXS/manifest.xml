@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<ExtensionManifest xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ExtensionBundleId="com.extensionsllm.chatpr" ExtensionBundleVersion="1.1.0" Version="11.0">
+  <ExtensionList>
+    <Extension Id="com.extensionsllm.chatpr.timecode" Version="1.1" />
+    <Extension Id="com.extensionsllm.chatpr.textmontage" Version="1.1" />
+    <Extension Id="com.extensionsllm.chatpr.markers" Version="1.1" />
+  </ExtensionList>
+  <ExecutionEnvironment>
+    <HostList>
+      <Host Name="PPRO" Version="[24.0,99.9]" />
+    </HostList>
+    <LocaleList>
+      <Locale Code="All" />
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="12.0" />
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+  <DispatchInfoList>
+    <Extension Id="com.extensionsllm.chatpr.timecode">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./client/timecode-edit/index.html</MainPath>
+          <CEFCommandLine>
+            <Parameter>--mixed-context</Parameter>
+            <Parameter>--enable-nodejs</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>ИИ: монтаж по таймкодам</Menu>
+          <Geometry>
+            <Size>
+              <Height>560</Height>
+              <Width>360</Width>
+            </Size>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+    <Extension Id="com.extensionsllm.chatpr.textmontage">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./client/text-montage/index.html</MainPath>
+          <CEFCommandLine>
+            <Parameter>--mixed-context</Parameter>
+            <Parameter>--enable-nodejs</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>ИИ: монтаж по тексту</Menu>
+          <Geometry>
+            <Size>
+              <Height>560</Height>
+              <Width>360</Width>
+            </Size>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+    <Extension Id="com.extensionsllm.chatpr.markers">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./client/markers/index.html</MainPath>
+          <CEFCommandLine>
+            <Parameter>--mixed-context</Parameter>
+            <Parameter>--enable-nodejs</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>ИИ: маркеры по структуре</Menu>
+          <Geometry>
+            <Size>
+              <Height>560</Height>
+              <Width>360</Width>
+            </Size>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

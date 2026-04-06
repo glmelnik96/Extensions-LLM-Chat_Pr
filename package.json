@@ -1,0 +1,12 @@
+{
+  "name": "extensions-llm-chat-pr",
+  "private": true,
+  "description": "CEP panels for Premiere + FM; run npm test from extension root",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

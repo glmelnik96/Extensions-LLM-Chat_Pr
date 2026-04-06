@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Монтаж по таймкодам</title>
+    <link rel="stylesheet" href="../shared/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        ИИ: монтаж по таймкодам
+        <div class="sub">Конфиг: client/shared/fm-defaults.js · ключ: fm-secrets.js</div>
+      </header>
+      <div class="toolbar">
+        <button type="button" id="btn-undo" class="secondary">Откат в Premiere</button>
+        <button type="button" id="btn-clear-chat" class="secondary">Очистить чат</button>
+        <button type="button" id="btn-clear-cache" class="secondary">Очистить кэш</button>
+        <button type="button" id="btn-clear-all" class="danger">Сбросить всё</button>
+      </div>
+      <div class="err" id="err"></div>
+      <div class="status-bar" id="statusBar" hidden>
+        <span class="status-spinner" id="statusSpinner"></span>
+        <span class="status-text" id="statusText"></span>
+      </div>
+      <div class="chat" id="chat"></div>
+      <div class="hint-chips" id="hint-chips"></div>
+      <div class="composer">
+        <textarea id="input" placeholder="Пишите как в разговоре: «покажи клипы», «удали кусок с 3 по 5 секунду», «обрежь начало…»"></textarea>
+        <div class="row">
+          <button type="button" id="send">Отправить</button>
+          <button type="button" id="stop" class="secondary" disabled>Стоп</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      window.__PANEL_ID__ = 'timecode';
+    </script>
+    <script src="../lib/csinterface.js"></script>
+    <script src="../shared/fm-defaults.js"></script>
+    <script src="../shared/fm-secrets.js"></script>
+    <script src="../shared/abort-shim.js"></script>
+    <script src="../shared/context-store.js"></script>
+    <script src="../shared/cloudru-client.js"></script>
+    <script src="../shared/bridge-premiere.js"></script>
+    <script src="../shared/prompts.js"></script>
+    <script src="../shared/tool-validators.js"></script>
+    <script src="../shared/agent-loop.js"></script>
+    <script src="../shared/ui-status.js"></script>
+    <script src="../shared/ui-hints.js"></script>
+    <script src="panel.js"></script>
+  </body>
+</html>

@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Logs
+npm-debug.log*
+*.log
+
+# Локальные секреты — не коммитить реальные ключи (шаблон: fm-secrets.example.js)
+client/shared/fm-secrets.js
