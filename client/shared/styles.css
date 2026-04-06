@@ -73,6 +73,31 @@ button.danger {
 button.danger:hover {
   filter: brightness(1.1);
 }
+.transcript-led-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.transcript-led {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 6px rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(0, 0, 0, 0.35);
+}
+.transcript-led--red {
+  background: #c0392b;
+}
+.transcript-led--yellow {
+  background: #f39c12;
+}
+.transcript-led--green {
+  background: #229954;
+}
+
 .transcribe-bar {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);

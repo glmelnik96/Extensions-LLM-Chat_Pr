@@ -15,3 +15,9 @@ npm-debug.log*
 
 # Локальные секреты — не коммитить реальные ключи (шаблон: fm-secrets.example.js)
 client/shared/fm-secrets.js
+
+# Общий кэш транскриптов между CEP-панелями (создаётся при транскрибации)
+_llm_transcript_cache.json
+_llm_transcript_cache.json.tmp
+host/_llm_transcript_cache.json
+host/_llm_transcript_cache.json.tmp

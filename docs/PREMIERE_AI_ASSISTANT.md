@@ -2,7 +2,7 @@
 
 Конспект референсов, локально установленных решений, границ возможностей Premiere Pro по официальному API и сопоставление с [Evolution Foundation Models на Cloud.ru](https://cloud.ru/products/evolution-foundation-models). Без выдуманных API: то, что не описано в [Premiere Pro Scripting Guide](https://ppro-scripting.docsforadobe.dev/), помечается как практика экосистемы (CEP/QE), а не как гарантия Adobe.
 
-**Архив внешнего исследования (Perplexity и ссылки):** [research-notes-archive.md](research-notes-archive.md). Задачи 1–6; B-roll по смыслу — вне скоупа.
+Задачи 1–6 и исключения по скоупу изложены ниже в этом файле; расширенный список внешних ссылок (MCP, auto-editor и т.д.) — в §2.
 
 ### Что уже есть в репозитории Extensions-LLM-Chat_Pr
 
@@ -52,7 +52,10 @@
 | [Chat Video Pro](https://chatvideopro.com/) | Коммерческий ИИ-панельный ориентир. |
 | [laozuzhen / chatvideo-yucut (V-Editor)](https://github.com/laozuzhen/chatvideo-yucut) | План → исполнение → проверка; транскрипт. |
 | [Evolution Foundation Models (Cloud.ru)](https://cloud.ru/products/evolution-foundation-models) | Каталог моделей и API. |
-| [research-notes-archive.md](research-notes-archive.md) | Архив исследования: GitHub / MCP / ссылки (6 задач в ТЗ). |
+| [playbooks.com — Adobe Premiere Pro MCP](https://playbooks.com/mcp/adobe-premiere-pro) | Каталог инструментов таймлайна (в т.ч. multicam) — ориентир по контрактам, не код этого репо. |
+| [mikechambers/adb-mcp](https://github.com/mikechambers/adb-mcp) | MCP → UXP proxy → Premiere — зрелый пример цепочки. |
+| [WyattBlue/auto-editor](https://github.com/WyattBlue/auto-editor) | CLI: нарезка по тишине, экспорт XML для Premiere. |
+| [barefootford/buttercut](https://github.com/barefootford/buttercut) | Транскрипт + LLM + XML в Premiere (семантический монтаж). |
 
 ---
 
@@ -99,7 +102,7 @@
 3. **Готовые и open-source подходы к вычислению лага**  
    - Вынуть **PCM/WAV** из обеих дорожек (экспорт аудио / ffmpeg в Node из панели) и найти **задержку кросс-корреляцией** (например SciPy/NumPy в sidecar Python, или библиотеки на JS с WASM — по выбору стека).  
    - Для выравнивания **речи по тексту** (если есть расшифровка): класс инструментов **forced alignment** (например [aeneas](https://github.com/readbeyond/aeneas)) — отдельный контур, не Cloud.ru FM.  
-   - **MCP:** в [research-notes-archive.md](research-notes-archive.md) упоминается `create_multicam_sequence` у [Adobe Premiere Pro MCP](https://playbooks.com/mcp/adobe-premiere-pro) — ориентир по контракту операций, не реализовано в этом расширении.
+   - **MCP:** у [Adobe Premiere Pro MCP](https://playbooks.com/mcp/adobe-premiere-pro) есть `create_multicam_sequence` и др. — ориентир по контракту операций, в этом расширении не реализовано.
 
 4. **Роль Cloud.ru FM в задаче 3**  
    Вспомогательная: выбрать **какие клипы** синхронизировать, порог уверенности, fallback; **не** замена математики синхронизации.
@@ -193,4 +196,4 @@ flowchart TB
 
 ---
 
-*При смене каталога моделей на [cloud.ru](https://cloud.ru/products/evolution-foundation-models) обновите §6. Пара документов: этот файл ↔ [research-notes-archive.md](research-notes-archive.md).*
+*При смене каталога моделей на [cloud.ru](https://cloud.ru/products/evolution-foundation-models) обновите §6. См. также [PROJECT.md](PROJECT.md), [premiere-extension-audit.md](premiere-extension-audit.md).*

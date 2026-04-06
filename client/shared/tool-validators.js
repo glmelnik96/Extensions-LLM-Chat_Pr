@@ -49,17 +49,42 @@
         op = plan.operations[j];
         a = op.action;
         if (!a) continue;
-        if (a === 'ripple_delete_range' || a === 'ripple_delete_range_all_tracks') {
+        if (a === 'shift_timeline_ripple') {
+          if (typeof op.fromSec !== 'number' || typeof op.deltaSec !== 'number') {
+            return 'shift_timeline_ripple: нужны числа fromSec и deltaSec';
+          }
+          if (op.deltaSec <= 0) {
+            return 'shift_timeline_ripple: deltaSec должен быть > 0';
+          }
+        }
+        if (
+          a === 'ripple_delete_range' ||
+          a === 'ripple_delete_range_all_tracks' ||
+          a === 'lift_delete_range' ||
+          a === 'lift_delete_range_all_tracks'
+        ) {
           if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number') {
-            return 'ripple_delete_range: нужны числа startSec и endSec';
+            return a + ': нужны числа startSec и endSec';
           }
           if (op.endSec <= op.startSec) {
-            return 'ripple_delete_range: endSec должен быть больше startSec';
+            return a + ': endSec должен быть больше startSec';
+          }
+        }
+        if (a === 'set_clips_enabled_by_name') {
+          if (!String(op.clipName || op.name || '').trim()) {
+            return 'set_clips_enabled_by_name: укажите clipName (имя клипа из снимка)';
           }
         }
         /* Проверка nodeId для действий, требующих клип */
-        var needsNodeId = (a === 'remove_clip' || a === 'set_clip_enabled' || a === 'move_clip' || a === 'set_clip_speed' ||
-          a.indexOf('timeline') >= 0 || a === 'set_timeline_bounds');
+        var needsNodeId =
+          a !== 'set_clips_enabled_by_name' &&
+          a !== 'shift_timeline_ripple' &&
+          (a === 'remove_clip' ||
+            a === 'set_clip_enabled' ||
+            a === 'move_clip' ||
+            a === 'set_clip_speed' ||
+            a.indexOf('timeline') >= 0 ||
+            a === 'set_timeline_bounds');
         if (needsNodeId) {
           if (!op.nodeId) continue;
           if (!ids[String(op.nodeId)]) {

@@ -1,5 +1,11 @@
-(function () {
+PanelBoot.run('ИИ: монтаж по таймкодам', function () {
   var PANEL_ID = window.__PANEL_ID__;
+  var cs = new CSInterface();
+  try {
+    ContextStore.setExtensionRoot((cs.getExtensionPath() || '').replace(/\\/g, '/'));
+    var udTc = cs.getSystemPath('userData');
+    if (udTc) ContextStore.setTranscriptUserDataBase(udTc.replace(/\\/g, '/'));
+  } catch (eRoot) {}
 
   var el = {
     chat: document.getElementById('chat'),
@@ -8,6 +14,10 @@
     stop: document.getElementById('stop'),
     err: document.getElementById('err')
   };
+
+  if (!el.chat || !el.input || !el.send || !el.stop || !el.err) {
+    throw new Error('Не найдены узлы UI (chat, input, send, stop, err).');
+  }
 
   var runAbort = null;
 
@@ -18,7 +28,7 @@
   var tools = [
     {
       type: 'function',
-      function: {
+      'function': {
         name: 'get_timeline_snapshot',
         description:
           'Список клипов активной секвенции: имена, nodeId, startSec/endSec на таймлайне. Вызывай, когда пользователь просит «показать», «что на таймлайне», «найди клип».',
@@ -27,10 +37,10 @@
     },
     {
       type: 'function',
-      function: {
+      'function': {
         name: 'apply_timecode_edits',
         description:
-          'Правки на активной секвенции. Действия: ripple_delete_range(startSec,endSec) — вырезать интервал; remove_clip(nodeId) — удалить клип целиком (видео+аудио); set_timeline_in/out(nodeId,timeSec) — обрезка краёв; move_clip(nodeId,newStartSec) — переместить; set_clip_enabled(nodeId,enabled) — вкл/выкл; set_clip_speed(nodeId,speed) — скорость; set_playhead(timeSec) — курсор; mute_track(trackType,trackIndex,muted) — заглушить дорожку; note — лог.',
+          'Правки на активной секвенции. ripple_delete_range — вырезать и сомкнуть; lift_delete_range — вырезать с дырой; remove_clip; trim; move_clip (по умолчанию автосдвиг всех клипов правее newStartSec); shift_timeline_ripple — явный сдвиг вправо от fromSec; set_clip_enabled; set_clips_enabled_by_name; set_clip_speed; set_playhead; mute_track; note.',
         parameters: {
           type: 'object',
           properties: {
@@ -50,8 +60,12 @@
                       'remove_clip',
                       'ripple_delete_range',
                       'ripple_delete_range_all_tracks',
+                      'lift_delete_range',
+                      'lift_delete_range_all_tracks',
                       'set_clip_enabled',
+                      'set_clips_enabled_by_name',
                       'move_clip',
+                      'shift_timeline_ripple',
                       'set_playhead',
                       'set_clip_speed',
                       'mute_track',
@@ -62,11 +76,25 @@
                   startSec: { type: 'number' },
                   endSec: { type: 'number' },
                   newStartSec: { type: 'number', description: 'Новая позиция начала клипа (move_clip)' },
+                  shiftBlockingClips: {
+                    type: 'boolean',
+                    description:
+                      'По умолчанию true (или не передавать): ripple-сдвиг всех клипов с start >= newStartSec на длительность переносимого, затем установка клипа. false + makeRoom:false — только попытка move без сдвига.'
+                  },
+                  makeRoom: { type: 'boolean', description: 'Синоним автосдвига; false вместе с shiftBlockingClips:false отключает сдвиг.' },
+                  fromSec: { type: 'number', description: 'Начало сдвига на таймлайне (shift_timeline_ripple)' },
+                  deltaSec: { type: 'number', description: 'На сколько секунд сдвинуть вправо (shift_timeline_ripple)' },
+                  excludeNodeIds: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'nodeId, которые не сдвигать (shift_timeline_ripple)'
+                  },
                   enabled: { type: 'boolean', description: 'true=включить, false=выключить клип (set_clip_enabled)' },
                   speed: { type: 'number', description: '1.0=нормальная, 2.0=2x, 0.5=замедление (set_clip_speed)' },
                   trackType: { type: 'string', description: 'video или audio (mute_track)' },
                   trackIndex: { type: 'number', description: 'Индекс дорожки (mute_track)' },
                   muted: { type: 'boolean', description: 'true=заглушить, false=включить (mute_track)' },
+                  clipName: { type: 'string', description: 'Имя клипа как в снимке (set_clips_enabled_by_name)' },
                   note: { type: 'string' }
                 }
               }
@@ -144,11 +172,18 @@
     });
   }
 
-  /** Быстрый путь: «удали между 3 и 5 сек» без LLM. */
-  function parseRippleDeleteRangeSec(text) {
-    var t = String(text || '')
-      .toLowerCase()
-      .replace(/ё/g, 'е');
+  /** Быстрый путь: «удали между 3 и 5 сек» без LLM. ripple=false → lift (дыра остаётся). */
+  function parseTimelineIntervalDeleteSec(text) {
+    var raw = String(text || '');
+    var t = raw.toLowerCase().replace(/ё/g, 'е');
+    var ripple = true;
+    if (
+      /не\s*смыка|без\s*смык|не\s+сомык|остав(ь|ить)\s+дыр|с\s+дыр|lift|без\s+ripple|не\s+сомкн/i.test(
+        raw
+      )
+    ) {
+      ripple = false;
+    }
     if (!/(удал|убер|выреж|вырез|очист|cut|remove|промежут|интервал|дырк|пуст)/i.test(t)) return null;
     var m =
       t.match(/между\s+(\d+)\s*[-]?\s*[йиюяех]?\s+и\s+(\d+)\s*[-]?\s*[йиюяех]?\s*(?:сек|секунд)/i) ||
@@ -161,7 +196,7 @@
     var a = parseFloat(String(m[1]).replace(',', '.'));
     var b = parseFloat(String(m[2]).replace(',', '.'));
     if (isNaN(a) || isNaN(b)) return null;
-    return { startSec: Math.min(a, b), endSec: Math.max(a, b) };
+    return { startSec: Math.min(a, b), endSec: Math.max(a, b), ripple: ripple };
   }
 
   async function onSendFixed() {
@@ -175,7 +210,7 @@
     ContextStore.setMessages(PANEL_ID, stored);
     renderMessages(stored);
 
-    var direct = parseRippleDeleteRangeSec(text);
+    var direct = parseTimelineIntervalDeleteSec(text);
     if (direct && direct.endSec > direct.startSec + 0.02) {
       el.send.disabled = true;
       el.stop.disabled = false;
@@ -186,11 +221,10 @@
         if (ac.aborted) {
           throw new Error('Остановлено');
         }
+        var delAction = direct.ripple ? 'ripple_delete_range' : 'lift_delete_range';
         var plan = {
-          operations: [
-            { action: 'ripple_delete_range', startSec: direct.startSec, endSec: direct.endSec }
-          ],
-          summary: 'Удалён участок ' + direct.startSec + '–' + direct.endSec + ' с'
+          operations: [{ action: delAction, startSec: direct.startSec, endSec: direct.endSec }],
+          summary: 'Удалён участок ' + direct.startSec + '–' + direct.endSec + ' с (' + delAction + ')'
         };
         var fastRes = await new Promise(function (resolve, reject) {
           PremiereBridge.applyTimecodeEdits(plan, function (err, data) {
@@ -209,7 +243,9 @@
             direct.startSec +
             ' по ' +
             direct.endSec +
-            ' с (одна операция ripple_delete_range).'
+            ' с (' +
+            delAction +
+            ').'
         });
         ContextStore.setMessages(PANEL_ID, stored);
         renderMessages(stored);
@@ -274,30 +310,44 @@
     }
   }
 
-  document.getElementById('btn-undo').onclick = function () {
-    PremiereBridge.undoLast(function (err, data) {
-      if (err) showErr(String(err.message || err));
-      else if (data && data.ok) showErr('Откат в Premiere (один шаг).');
-      else showErr((data && data.error) || 'Откат недоступен — сфокусируйте таймлайн и Cmd+Z / Ctrl+Z.');
+  var btnUndoTc = document.getElementById('btn-undo');
+  if (btnUndoTc) {
+    btnUndoTc.onclick = function () {
+      PremiereBridge.undoLast(function (err, data) {
+        if (err) showErr(String(err.message || err));
+        else if (data && data.ok) showErr('Откат в Premiere (один шаг).');
+        else showErr((data && data.error) || 'Откат недоступен — сфокусируйте таймлайн и Cmd+Z / Ctrl+Z.');
+        setTimeout(function () {
+          showErr('');
+        }, 3500);
+      });
+    };
+  }
+
+  var btnClrChatTc = document.getElementById('btn-clear-chat');
+  if (btnClrChatTc) {
+    btnClrChatTc.onclick = function () {
+      ContextStore.clearChat(PANEL_ID);
+      renderMessages([]);
+    };
+  }
+  var btnClrCacheTc = document.getElementById('btn-clear-cache');
+  if (btnClrCacheTc) {
+    btnClrCacheTc.onclick = function () {
+      ContextStore.clearTranscriptCache(PANEL_ID);
+      showErr('Кэш транскриптов очищен (общий файл для всех панелей).');
       setTimeout(function () {
         showErr('');
-      }, 3500);
-    });
-  };
-
-  document.getElementById('btn-clear-chat').onclick = function () {
-    ContextStore.clearChat(PANEL_ID);
-    renderMessages([]);
-  };
-  document.getElementById('btn-clear-cache').onclick = function () {
-    ContextStore.clearTranscriptCache(PANEL_ID);
-    showErr('Кэш транскриптов очищен (для этой панели).');
-    setTimeout(function () { showErr(''); }, 2000);
-  };
-  document.getElementById('btn-clear-all').onclick = function () {
-    ContextStore.clearAllPanelCache(PANEL_ID);
-    renderMessages([]);
-  };
+      }, 2000);
+    };
+  }
+  var btnClrAllTc = document.getElementById('btn-clear-all');
+  if (btnClrAllTc) {
+    btnClrAllTc.onclick = function () {
+      ContextStore.clearAllPanelCache(PANEL_ID);
+      renderMessages([]);
+    };
+  }
 
   el.stop.onclick = function () {
     if (runAbort && typeof runAbort.abort === 'function') runAbort.abort();
@@ -326,4 +376,4 @@
   })();
 
   renderMessages(ContextStore.getMessages(PANEL_ID));
-})();
+});

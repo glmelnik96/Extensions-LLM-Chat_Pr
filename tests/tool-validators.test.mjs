@@ -47,6 +47,31 @@ describe('validateTimecodePlan', () => {
     );
   });
 
+  test('lift_delete_range валиден', () => {
+    assert.equal(
+      TV.validateTimecodePlan(snapOk, {
+        operations: [{ action: 'lift_delete_range', startSec: 2, endSec: 5 }]
+      }),
+      null
+    );
+  });
+
+  test('set_clips_enabled_by_name без clipName — ошибка', () => {
+    const err = TV.validateTimecodePlan(snapOk, {
+      operations: [{ action: 'set_clips_enabled_by_name', enabled: false }]
+    });
+    assert.match(err, /clipName/);
+  });
+
+  test('set_clips_enabled_by_name валиден', () => {
+    assert.equal(
+      TV.validateTimecodePlan(snapOk, {
+        operations: [{ action: 'set_clips_enabled_by_name', clipName: 'Interview.braw', enabled: false }]
+      }),
+      null
+    );
+  });
+
   test('remove_clip: неизвестный nodeId', () => {
     const err = TV.validateTimecodePlan(snapOk, {
       operations: [{ action: 'remove_clip', nodeId: 'ghost' }]
@@ -93,6 +118,48 @@ describe('validateTimecodePlan', () => {
       }),
       null
     );
+  });
+
+  test('move_clip: shiftBlockingClips / makeRoom не ломают валидацию', () => {
+    assert.equal(
+      TV.validateTimecodePlan(snapOk, {
+        operations: [
+          { action: 'move_clip', nodeId: 'clip-b', newStartSec: 0, shiftBlockingClips: true }
+        ]
+      }),
+      null
+    );
+    assert.equal(
+      TV.validateTimecodePlan(snapOk, {
+        operations: [{ action: 'move_clip', nodeId: 'clip-a', newStartSec: 2, makeRoom: true }]
+      }),
+      null
+    );
+  });
+
+  test('lift_delete_range_all_tracks валиден', () => {
+    assert.equal(
+      TV.validateTimecodePlan(snapOk, {
+        operations: [{ action: 'lift_delete_range_all_tracks', startSec: 1, endSec: 3 }]
+      }),
+      null
+    );
+  });
+
+  test('shift_timeline_ripple валиден', () => {
+    assert.equal(
+      TV.validateTimecodePlan(snapOk, {
+        operations: [{ action: 'shift_timeline_ripple', fromSec: 0, deltaSec: 2 }]
+      }),
+      null
+    );
+  });
+
+  test('shift_timeline_ripple: deltaSec <= 0', () => {
+    const err = TV.validateTimecodePlan(snapOk, {
+      operations: [{ action: 'shift_timeline_ripple', fromSec: 0, deltaSec: 0 }]
+    });
+    assert.ok(err);
   });
 
   test('set_clip_speed: speed <= 0', () => {

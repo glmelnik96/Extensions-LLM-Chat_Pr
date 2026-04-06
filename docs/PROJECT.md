@@ -5,10 +5,10 @@
 | Панель | `panel.js` | Инструменты агента | Хост `premiere.jsx` |
 |--------|------------|-------------------|---------------------|
 | Монтаж по таймкодам | `client/timecode-edit/` | `get_timeline_snapshot`, `apply_timecode_edits` | `getTimelineSnapshot`, `applyTimecodeEdits` |
-| Монтаж по тексту | `client/text-montage/` | + `get_transcript_from_cache`, `apply_transcript_cuts` | `applyTranscriptCuts` |
+| Монтаж по тексту | `client/text-montage/` | + `get_transcript_from_cache`, `apply_transcript_cuts`, `apply_timecode_edits` (трим, `move_clip`, `shift_timeline_ripple`) | `applyTimecodeEdits`, `applyTranscriptCuts` |
 | Маркеры | `client/markers/` | + `get_transcript_from_cache`, `add_markers` | `addSequenceMarkers` |
 
-У каждой панели **отдельный** чат и **отдельный** кэш транскриптов (`ContextStore`, ключ по `__PANEL_ID__`).
+У каждой панели **отдельный** чат (`localStorage`, ключ `__PANEL_ID__`). Кэш транскриптов **общий** между Extension Id: запись/чтение в несколько путей с merge; канон для кросс-панели — **`~/.extensions_llm_chat_pr/_llm_transcript_cache.json`** (Node `os.homedir()`), т.к. CEP `userData` часто разный на каждую панель. Дополнительно: корень расширения, `host/`, bundle, опционально `setTranscriptUserDataBase`, fallback — `localStorage`.
 
 ## Поток данных
 
@@ -25,6 +25,7 @@
 - `client/shared/fm-defaults.js` / `fm-secrets.js` — URL, модели, ключ  
 - `client/shared/timeline-transcribe.js` — Whisper → сегменты; `runFromPrep` (чанки, очередь клипов)  
 - `client/shared/abort-shim.js` + `abortCheck` в цикле и в `fetch` — кнопка «Стоп»  
+- `client/shared/panel-bootstrap.js` — `PanelBoot.run`, видимая ошибка при сбое инициализации вместо пустой панели  
 - `CSXS/manifest.xml` — CEP 12, `--enable-nodejs` для чтения файлов транскрибации  
 
 ## Соответствие Premiere API
@@ -39,4 +40,12 @@
 2. Реализовать в `premiere.jsx` (ветка в существующем JSON-хендлере или новая функция).  
 3. При необходимости — правило в `tool-validators.js`.  
 4. Строка в промпте в `prompts.js`.  
-5. Одна строка в [CONTEXT_NEXT_AGENT.md](CONTEXT_NEXT_AGENT.md), если менялось поведение для тестов.
+5. При заметной смене поведения в Premiere — кратко обновить [premiere-extension-audit.md](premiere-extension-audit.md).
+
+---
+
+## Перед правками (быстрый чек)
+
+1. `npm test` — валидаторы аргументов инструментов (`tests/*.test.mjs`).  
+2. После изменений `host/premiere.jsx` — перезагрузка панели в Premiere, проверка на **копии** секвенции.  
+3. Сеть FM: 401 / 413 — сообщения в панели и `client/shared/cloudru-client.js` (413 → уменьшить чанк / In–Out / лимит загрузки).

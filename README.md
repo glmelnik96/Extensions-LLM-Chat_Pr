@@ -5,7 +5,7 @@
 ## Панели (Window > Extensions)
 
 1. **ИИ: монтаж по таймкодам** — снимок секвенции, обрезка/перемещение/скорость клипов, ripple delete, вкл/выкл клипов, управление playhead и дорожками.
-2. **ИИ: монтаж по тексту** — транскрипт в кэш > removeIntervals на таймлайне (все видео- и аудиодорожки).
+2. **ИИ: монтаж по тексту** — транскрипт в кэш > `apply_transcript_cuts` и те же правки, что у таймкодов (`apply_timecode_edits`: трим, перенос блоков).
 3. **ИИ: маркеры по структуре** — маркеры на секвенции (Comment / Chapter).
 
 ## Возможности v2.0.0
@@ -19,7 +19,8 @@
 | `set_timeline_in` | nodeId, timeSec | Обрезать начало клипа |
 | `set_timeline_out` | nodeId, timeSec | Обрезать конец клипа |
 | `set_timeline_bounds` | nodeId, startSec, endSec | Оба конца |
-| `move_clip` | nodeId, newStartSec | Переместить клип |
+| `move_clip` | nodeId, newStartSec, shiftBlockingClips? | Переместить; по умолчанию ripple-сдвиг всех клипов правее цели |
+| `shift_timeline_ripple` | fromSec, deltaSec | Сдвинуть вправо все клипы с start ≥ fromSec |
 | `set_clip_enabled` | nodeId, enabled | Включить/выключить без удаления |
 | `set_clip_speed` | nodeId, speed | Скорость (1.0=норма, 2.0=2x, 0.5=замедление) |
 | `set_playhead` | timeSec | Переместить курсор воспроизведения |
@@ -37,7 +38,7 @@
 
 - **Авто-извлечение аудио через ffmpeg** — если медиафайл слишком большой для API, автоматически извлекается аудио (mono 16kHz WAV). Требует `ffmpeg` в PATH.
 - **Экспорт чанками** — при наличии .epr пресета, область In-Out экспортируется чанками.
-- **Кэш транскриптов** — по имени секвенции, localStorage.
+- **Кэш транскриптов** — по имени секвенции; файловый канон `~/.extensions_llm_chat_pr/_llm_transcript_cache.json` и merge с путями расширения (см. `docs/PROJECT.md`).
 
 ### Улучшения агента
 
@@ -94,16 +95,14 @@ brew install ffmpeg
 ## Тесты
 
 ```bash
-# Автотесты валидаторов (27 тестов):
 npm test
-
-# Мануальные тесты:
-cat tests/MANUAL-TESTS.md
 ```
+
+Автотесты покрывают валидаторы планов (`tests/*.test.mjs`). Интеграция с Premiere — только ручная проверка; итоги и риски — в `docs/premiere-extension-audit.md` и `docs/KNOWN_ISSUES_AND_TEST_GAPS.md`.
 
 ## Хост ExtendScript
 
-Файл `host/premiere.jsx` v2.0.0:
+Файл `host/premiere.jsx` (версия в преамбуле файла):
 
 - Обогащённый снимок (playhead, fps, tracks, disabled, In/Out)
 - Linked A/V: remove/trim/move/enable работают на все связанные дорожки
@@ -114,6 +113,7 @@ cat tests/MANUAL-TESTS.md
 
 ## Документация
 
-- [docs/README.md](docs/README.md) — указатель
-- [docs/PROJECT.md](docs/PROJECT.md) — архитектура
-- [tests/MANUAL-TESTS.md](tests/MANUAL-TESTS.md) — мануальные тесты (24 сценария)
+- [docs/README.md](docs/README.md) — указатель по `docs/`
+- [docs/PROJECT.md](docs/PROJECT.md) — архитектура и чек перед правками
+- [docs/premiere-extension-audit.md](docs/premiere-extension-audit.md) — аудит: работает / не работает, качество STT, скорость
+- [docs/PREMIERE_AI_ASSISTANT.md](docs/PREMIERE_AI_ASSISTANT.md) — продуктовое ТЗ и референсы

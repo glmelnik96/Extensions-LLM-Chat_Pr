@@ -1,7 +1,12 @@
-(function () {
+PanelBoot.run('ИИ: маркеры по структуре', function () {
   var PANEL_ID = window.__PANEL_ID__;
   var lastSnap = null;
   var cs = new CSInterface();
+  try {
+    ContextStore.setExtensionRoot((cs.getExtensionPath() || '').replace(/\\/g, '/'));
+    var udMk = cs.getSystemPath('userData');
+    if (udMk) ContextStore.setTranscriptUserDataBase(udMk.replace(/\\/g, '/'));
+  } catch (eRoot) {}
 
   var el = {
     chat: document.getElementById('chat'),
@@ -12,6 +17,10 @@
     transcribe: document.getElementById('btn-transcribe')
   };
 
+  if (!el.chat || !el.input || !el.send || !el.stop || !el.err || !el.transcribe) {
+    throw new Error('Не найдены узлы UI (chat, input, send, stop, err, btn-transcribe).');
+  }
+
   var runAbort = null;
 
   var statusUi = PanelUIStatus.create('statusBar');
@@ -20,10 +29,21 @@
     return (cs.getExtensionPath() || '').replace(/\\/g, '/');
   }
 
+  function setTranscriptLed(state) {
+    var led = document.getElementById('transcript-led');
+    if (!led) return;
+    var s = state === 'busy' ? 'yellow' : state === 'ok' ? 'green' : 'red';
+    led.className = 'transcript-led transcript-led--' + s;
+    led.setAttribute(
+      'aria-label',
+      state === 'ok' ? 'Транскрипт в кэше' : state === 'busy' ? 'Идёт транскрибация' : 'Нет транскрипта'
+    );
+  }
+
   var tools = [
     {
       type: 'function',
-      function: {
+      'function': {
         name: 'get_timeline_snapshot',
         description: 'Снимок активной секвенции.',
         parameters: { type: 'object', properties: {} }
@@ -31,7 +51,7 @@
     },
     {
       type: 'function',
-      function: {
+      'function': {
         name: 'get_transcript_from_cache',
         description: 'Транскрипт из кэша панели по имени секвенции.',
         parameters: {
@@ -45,7 +65,7 @@
     },
     {
       type: 'function',
-      function: {
+      'function': {
         name: 'add_markers',
         description: 'Создать маркеры на активной секвенции (секунды таймлайна).',
         parameters: {
@@ -110,14 +130,19 @@
       },
       get_transcript_from_cache: function (args) {
         var key = args.sequenceKey || '';
-        var entry = ContextStore.getTranscriptEntry(PANEL_ID, key);
-        if (!entry) {
+        var found = ContextStore.findTranscriptEntry(PANEL_ID, key);
+        if (!found.entry) {
+          var keys = ContextStore.listTranscriptCacheKeys(PANEL_ID);
           return Promise.resolve({
             error:
-              'Нет кэша. Выставьте In/Out и нажмите «Транскрибировать In–Out в кэш».'
+              'Нет кэша для «' +
+              key +
+              '». Проверьте имя секвенции (как в снимке). Кэш общий: ~/.extensions_llm_chat_pr/_llm_transcript_cache.json. Или транскрибируйте In–Out в любой из панелей.',
+            requestedKey: key,
+            availableKeysInCache: keys.slice(0, 32)
           });
         }
-        return Promise.resolve(entry);
+        return Promise.resolve(found.entry);
       },
       add_markers: function (args) {
         return new Promise(function (resolve, reject) {
@@ -203,6 +228,7 @@
     var ac = runAbort;
     var prep = null;
     statusUi.show('Подготовка аудио с таймлайна (In–Out)…', true);
+    setTranscriptLed('busy');
     try {
       prep = await new Promise(function (resolve, reject) {
         PremiereBridge.prepareTranscribeFromTimeline(
@@ -247,6 +273,13 @@
       });
 
       ContextStore.setTranscriptEntry(PANEL_ID, key, norm);
+      var again = ContextStore.findTranscriptEntry(PANEL_ID, key);
+      if (!again.entry) {
+        showErr('Не удалось сохранить или прочитать кэш. Проверьте Node.js в манифесте и права на папку расширения.');
+        setTranscriptLed('red');
+      } else {
+        setTranscriptLed('ok');
+      }
       statusUi.show('Транскрипт в кэше: «' + key + '»', false);
       setTimeout(function () {
         statusUi.hide();
@@ -257,6 +290,7 @@
       }, 5000);
     } catch (e) {
       statusUi.hide();
+      setTranscriptLed('red');
       if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1)) {
         showErr('Транскрибация остановлена.');
       } else {
@@ -274,32 +308,45 @@
     if (runAbort) runAbort.abort();
   };
 
-  document.getElementById('btn-undo').onclick = function () {
-    PremiereBridge.undoLast(function (err, data) {
-      if (err) showErr(String(err.message || err));
-      else if (data && data.ok) showErr('Откат в Premiere (один шаг).');
-      else showErr((data && data.error) || 'Откат недоступен — Cmd+Z / Ctrl+Z в таймлайне.');
+  var btnUndoMk = document.getElementById('btn-undo');
+  if (btnUndoMk) {
+    btnUndoMk.onclick = function () {
+      PremiereBridge.undoLast(function (err, data) {
+        if (err) showErr(String(err.message || err));
+        else if (data && data.ok) showErr('Откат в Premiere (один шаг).');
+        else showErr((data && data.error) || 'Откат недоступен — Cmd+Z / Ctrl+Z в таймлайне.');
+        setTimeout(function () {
+          showErr('');
+        }, 3500);
+      });
+    };
+  }
+
+  var btnClrChatMk = document.getElementById('btn-clear-chat');
+  if (btnClrChatMk) {
+    btnClrChatMk.onclick = function () {
+      ContextStore.clearChat(PANEL_ID);
+      renderMessages([]);
+    };
+  }
+  var btnClrCacheMk = document.getElementById('btn-clear-cache');
+  if (btnClrCacheMk) {
+    btnClrCacheMk.onclick = function () {
+      ContextStore.clearTranscriptCache(PANEL_ID);
+      setTranscriptLed('red');
+      showErr('Кэш транскриптов очищен (общий для панелей маркеров и монтажа по тексту).');
       setTimeout(function () {
         showErr('');
-      }, 3500);
-    });
-  };
-
-  document.getElementById('btn-clear-chat').onclick = function () {
-    ContextStore.clearChat(PANEL_ID);
-    renderMessages([]);
-  };
-  document.getElementById('btn-clear-cache').onclick = function () {
-    ContextStore.clearTranscriptCache(PANEL_ID);
-    showErr('Кэш транскриптов очищен.');
-    setTimeout(function () {
-      showErr('');
-    }, 2000);
-  };
-  document.getElementById('btn-clear-all').onclick = function () {
-    ContextStore.clearAllPanelCache(PANEL_ID);
-    renderMessages([]);
-  };
+      }, 2000);
+    };
+  }
+  var btnClrAllMk = document.getElementById('btn-clear-all');
+  if (btnClrAllMk) {
+    btnClrAllMk.onclick = function () {
+      ContextStore.clearAllPanelCache(PANEL_ID);
+      renderMessages([]);
+    };
+  }
 
   el.send.onclick = onSend;
   el.transcribe.onclick = onTranscribeTimeline;
@@ -327,15 +374,36 @@
 
   renderMessages(ContextStore.getMessages(PANEL_ID));
 
-  /* Показать статус кэша при загрузке панели */
-  (function showCacheStatus() {
-    var cache = ContextStore.getTranscriptCache(PANEL_ID);
-    var keys = Object.keys(cache || {});
-    if (keys.length > 0) {
-      var last = keys[keys.length - 1];
-      var entry = cache[last];
-      var segCount = entry && entry.segments ? entry.segments.length : '?';
-      showErr('Транскрипт в кэше: «' + last + '», сегментов: ' + segCount);
-    }
+  /* Статус кэша для активной секвенции при загрузке */
+  (function refreshTranscriptBannerOnLoad() {
+    PremiereBridge.getTimelineSnapshot(function (err, snap) {
+      var seq = !err && snap && snap.ok && snap.sequenceName ? snap.sequenceName : '';
+      if (seq) {
+        if (ContextStore.hasTranscriptForSequence(PANEL_ID, seq)) {
+          var ent = ContextStore.getTranscriptEntry(PANEL_ID, seq);
+          var sc = ent && ent.segments ? ent.segments.length : 0;
+          setTranscriptLed('ok');
+          showErr('Секвенция «' + seq + '»: транскрипт в кэше (' + sc + ' сегм.). Можно писать в чат.');
+        } else {
+          setTranscriptLed('red');
+          showErr(
+            'Секвенция «' +
+              seq +
+              '»: транскрипта нет — выставьте In/Out и нажмите «Транскрибировать In–Out в кэш».'
+          );
+        }
+      } else {
+        var keys = Object.keys(ContextStore.getTranscriptCache(PANEL_ID) || {});
+        if (keys.length) {
+          setTranscriptLed('red');
+          showErr('В кэше ' + keys.length + ' ключ(ей). Откройте секвенцию — покажу статус по имени.');
+        } else {
+          setTranscriptLed('red');
+        }
+      }
+      setTimeout(function () {
+        showErr('');
+      }, 9000);
+    });
   })();
-})();
+});

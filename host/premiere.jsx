@@ -7,7 +7,8 @@
  * - applyTimecodeEdits: TrackItem.remove(ripple, align) — ripple-delete; in/out через присвоение .seconds
  * - ripple_delete_range: split средней части клипа через Track.insertClip(projectItem, time, …) + подгонка in/out
  * - applyTranscriptCuts: тот же механизм вырезания интервалов
- * - addSequenceMarkers: Sequence.markers.createMarker(timeTicks)
+ * - addSequenceMarkers: createMarker(String(Math.round(sec * timebase))); lift/ripple через remove(0|1,1)
+ * - move_clip: по умолчанию ripple-insert (все start >= newStartSec += dur), затем установка клипа; shift_timeline_ripple
  * - exportInOutAudio: Sequence.exportAsMediaDirect(path, preset, ENCODE_IN_TO_OUT)
  * - undoLast: app.findMenuCommandId + app.executeCommand (локализованные названия меню)
  */
@@ -15,15 +16,23 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.1.0';
+$._EXT_PRM_.version = '2.4.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
-/** Конвертация секунд → тики (для insertClip, который принимает тики). */
-$._EXT_PRM_._ticksStr = function (seq, sec) {
+/**
+ * Тики на секунде для активной секвенции (timebase в тиках/сек, см. getTimelineSnapshot).
+ * Fallback ~25 fps, если timebase недоступен.
+ */
+$._EXT_PRM_._ticksPerSecond = function (seq) {
   var tb = parseFloat(seq.timebase);
-  if (!tb || isNaN(tb)) tb = 254016000000;
-  return String(Math.round(sec * tb));
+  if (!tb || isNaN(tb)) tb = 10160640000;
+  return tb;
+};
+
+/** Конвертация секунд → строка тиков (insertClip и др.). */
+$._EXT_PRM_._ticksStr = function (seq, sec) {
+  return String(Math.round(sec * $._EXT_PRM_._ticksPerSecond(seq)));
 };
 
 $._EXT_PRM_._clipTimes = function (clip) {
@@ -211,10 +220,13 @@ $._EXT_PRM_._secToTimecode = function (sec, fps) {
  * Удаляет содержимое интервала [t0,t1] на всех дорожках.
  *
  * Стратегия (из AutoPod): QE DOM razor() для разрезания, затем clip.remove() для удаления.
- * Если QE DOM недоступен — fallback на trim outPoint/inPoint.
+ * ripple === false → lift (remove(0,1)), дыра на таймлайне остаётся; true → ripple (remove(1,1)).
+ * Если QE DOM недоступен — fallback на trim outPoint/inPoint (lift только для полного удаления клипа в интервале).
  * Никогда не используем insertClip (он создаёт дубликаты).
  */
-$._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log) {
+$._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
+  var doRipple = ripple !== false;
+  var ripFlag = doRipple ? 1 : 0;
   var eps = $._EXT_PRM_._EPS;
 
   /* --- Определяем FPS для таймкода QE --- */
@@ -276,7 +288,7 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log) {
           var ce = c.end.seconds;
           /* Клип целиком внутри [t0, t1] (с допуском eps) */
           if (cs >= t0 - eps && ce <= t1 + eps) {
-            c.remove(1, 1);
+            c.remove(ripFlag, 1);
             removed++;
           }
         } catch (eVC) {}
@@ -291,13 +303,13 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log) {
           var as2 = ac.start.seconds;
           var ae = ac.end.seconds;
           if (as2 >= t0 - eps && ae <= t1 + eps) {
-            ac.remove(1, 1);
+            ac.remove(ripFlag, 1);
             removed++;
           }
         } catch (eAC) {}
       }
     }
-    log.push({ op: 'qe_razor_delete', t0: t0, t1: t1, removed: removed });
+    log.push({ op: doRipple ? 'qe_razor_delete' : 'qe_razor_lift', t0: t0, t1: t1, removed: removed, ripple: doRipple });
     return;
   }
 
@@ -327,10 +339,10 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log) {
     T = $._EXT_PRM_._clipTimes(clip);
     srcIn = T.srcIn;
 
-    /* Case 1: клип целиком внутри [t0,t1] → удалить */
+    /* Case 1: клип целиком внутри [t0,t1] → удалить (ripple или lift) */
     if (i0 <= s + eps && i1 >= e - eps) {
-      try { clip.remove(1, 1); } catch (eR) {}
-      log.push({ op: 'remove_clip_ripple', nodeId: String(clip.nodeId) });
+      try { clip.remove(ripFlag, 1); } catch (eR) {}
+      log.push({ op: doRipple ? 'remove_clip_ripple' : 'remove_clip_lift', nodeId: String(clip.nodeId) });
       continue;
     }
 
@@ -398,6 +410,177 @@ $._EXT_PRM_._findLinkedClips = function (seq, clip) {
     }
   }
   return result;
+};
+
+/**
+ * Все клипы на секвенции с точным совпадением отображаемого имени (все дорожки).
+ */
+$._EXT_PRM_._findClipsByDisplayName = function (seq, clipName) {
+  var want = String(clipName || '');
+  var out = [];
+  var vi, ai, j, tr, it, n;
+  for (vi = 0; vi < seq.videoTracks.numTracks; vi++) {
+    tr = seq.videoTracks[vi];
+    n = tr.clips.numItems;
+    for (j = 0; j < n; j++) {
+      try {
+        it = tr.clips[j];
+        if (it && String(it.name) === want) out.push(it);
+      } catch (e0) {}
+    }
+  }
+  for (ai = 0; ai < seq.audioTracks.numTracks; ai++) {
+    tr = seq.audioTracks[ai];
+    n = tr.clips.numItems;
+    for (j = 0; j < n; j++) {
+      try {
+        it = tr.clips[j];
+        if (it && String(it.name) === want) out.push(it);
+      } catch (e1) {}
+    }
+  }
+  return out;
+};
+
+/**
+ * Сдвинуть вправо на deltaSec все клипы, пересекающие [rangeStart, rangeEnd),
+ * кроме исключённых по nodeId (связка переносимого клипа). Сортировка справа налево.
+ */
+$._EXT_PRM_._shiftClipsOverlappingRangeRight = function (seq, rangeStart, rangeEnd, deltaSec, excludeNodeIdSet) {
+  var eps = $._EXT_PRM_._EPS;
+  var items = [];
+  var vi,
+    ai,
+    j,
+    tr,
+    it,
+    n,
+    s,
+    e;
+  function pushClip(clip) {
+    var id = String(clip.nodeId);
+    if (excludeNodeIdSet[id]) return;
+    try {
+      s = clip.start.seconds;
+      e = clip.end.seconds;
+    } catch (e0) {
+      return;
+    }
+    if (e <= rangeStart + eps || s >= rangeEnd - eps) return;
+    if (s < rangeEnd - eps && e > rangeStart + eps) items.push(clip);
+  }
+  for (vi = 0; vi < seq.videoTracks.numTracks; vi++) {
+    tr = seq.videoTracks[vi];
+    n = tr.clips.numItems;
+    for (j = 0; j < n; j++) {
+      try {
+        it = tr.clips[j];
+        if (it) pushClip(it);
+      } catch (e1) {}
+    }
+  }
+  for (ai = 0; ai < seq.audioTracks.numTracks; ai++) {
+    tr = seq.audioTracks[ai];
+    n = tr.clips.numItems;
+    for (j = 0; j < n; j++) {
+      try {
+        it = tr.clips[j];
+        if (it) pushClip(it);
+      } catch (e2) {}
+    }
+  }
+  var scored = [];
+  for (var k = 0; k < items.length; k++) {
+    try {
+      scored.push({ clip: items[k], s: items[k].start.seconds });
+    } catch (e3) {}
+  }
+  scored.sort(function (a, b) {
+    return b.s - a.s;
+  });
+  var log = [];
+  for (var m = 0; m < scored.length; m++) {
+    var c = scored[m].clip;
+    try {
+      var ns = c.start.seconds + deltaSec;
+      var ne = c.end.seconds + deltaSec;
+      c.start.seconds = ns;
+      c.end.seconds = ne;
+      log.push({ nodeId: String(c.nodeId), newStartSec: ns, newEndSec: ne });
+    } catch (eMv) {}
+  }
+  return log;
+};
+
+/**
+ * Ripple: сдвинуть вправо на deltaSec все клипы с start >= fromSec (кроме exclude по nodeId).
+ * Порядок справа налево. Нужен для move_clip: иначе сдвиг только пересекающих [0,L] заводит длинный клип на соседний.
+ * @returns {Array} лог { nodeId, newStartSec, newEndSec }
+ */
+$._EXT_PRM_._rippleShiftAllClipsFrom = function (seq, fromSec, deltaSec, excludeNodeIdSet) {
+  var eps = $._EXT_PRM_._EPS;
+  if (!seq || typeof fromSec !== 'number' || typeof deltaSec !== 'number' || deltaSec === 0) return [];
+  var ex = excludeNodeIdSet || {};
+  var items = [];
+  var vi,
+    ai,
+    j,
+    tr,
+    it,
+    n,
+    s0;
+  function consider(clip) {
+    var id = String(clip.nodeId);
+    if (ex[id]) return;
+    try {
+      s0 = clip.start.seconds;
+    } catch (e0) {
+      return;
+    }
+    if (s0 < fromSec - eps) return;
+    items.push(clip);
+  }
+  for (vi = 0; vi < seq.videoTracks.numTracks; vi++) {
+    tr = seq.videoTracks[vi];
+    n = tr.clips.numItems;
+    for (j = 0; j < n; j++) {
+      try {
+        it = tr.clips[j];
+        if (it) consider(it);
+      } catch (e1) {}
+    }
+  }
+  for (ai = 0; ai < seq.audioTracks.numTracks; ai++) {
+    tr = seq.audioTracks[ai];
+    n = tr.clips.numItems;
+    for (j = 0; j < n; j++) {
+      try {
+        it = tr.clips[j];
+        if (it) consider(it);
+      } catch (e2) {}
+    }
+  }
+  var scored = [];
+  for (var k = 0; k < items.length; k++) {
+    try {
+      scored.push({ clip: items[k], s: items[k].start.seconds });
+    } catch (e3) {}
+  }
+  scored.sort(function (a, b) {
+    return b.s - a.s;
+  });
+  var log = [];
+  for (var m = 0; m < scored.length; m++) {
+    var c = scored[m].clip;
+    try {
+      var ns = c.start.seconds + deltaSec;
+      var ne = c.end.seconds + deltaSec;
+      c.start.seconds = ns;
+      c.end.seconds = ne;
+      log.push({ nodeId: String(c.nodeId), newStartSec: ns, newEndSec: ne });
+    } catch (eMv) {}
+  }
+  return log;
 };
 
 $._EXT_PRM_._setTimelineIn = function (found, newStartSec) {
@@ -603,15 +786,51 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           results.push({ op: a, ok: false, error: 'endSec должен быть > startSec' });
           continue;
         }
-        var lg = [];
-        $._EXT_PRM_._applyOneTimelineInterval(seq, op.startSec, op.endSec, lg);
-        results.push({ op: a, ok: true, log: lg });
+        var lgR = [];
+        $._EXT_PRM_._applyOneTimelineInterval(seq, op.startSec, op.endSec, lgR, true);
+        results.push({ op: a, ok: true, log: lgR });
+        continue;
+      }
+
+      if (a === 'lift_delete_range' || a === 'lift_delete_range_all_tracks') {
+        if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number') {
+          results.push({ op: a, ok: false, error: 'Нужны startSec и endSec' });
+          continue;
+        }
+        if (op.endSec <= op.startSec) {
+          results.push({ op: a, ok: false, error: 'endSec должен быть > startSec' });
+          continue;
+        }
+        var lgL = [];
+        $._EXT_PRM_._applyOneTimelineInterval(seq, op.startSec, op.endSec, lgL, false);
+        results.push({ op: a, ok: true, log: lgL });
         continue;
       }
 
       if (a === 'remove_clip') {
         var rmResult = $._EXT_PRM_._removeClipAndLinked(seq, op.nodeId);
         results.push({ op: a, ok: rmResult.ok, detail: rmResult });
+        continue;
+      }
+
+      /* --- shift_timeline_ripple: сдвинуть вправо все клипы с start >= fromSec --- */
+      if (a === 'shift_timeline_ripple') {
+        if (typeof op.fromSec !== 'number' || typeof op.deltaSec !== 'number') {
+          results.push({ op: a, ok: false, error: 'Нужны fromSec и deltaSec (числа)' });
+          continue;
+        }
+        if (op.deltaSec <= 0) {
+          results.push({ op: a, ok: false, error: 'deltaSec должен быть > 0 (сдвиг вправо)' });
+          continue;
+        }
+        var exRip = {};
+        if (op.excludeNodeIds && op.excludeNodeIds.length) {
+          for (var xr = 0; xr < op.excludeNodeIds.length; xr++) {
+            exRip[String(op.excludeNodeIds[xr])] = true;
+          }
+        }
+        var ripLog = $._EXT_PRM_._rippleShiftAllClipsFrom(seq, op.fromSec, op.deltaSec, exRip);
+        results.push({ op: a, ok: true, shifted: ripLog, count: ripLog.length });
         continue;
       }
 
@@ -674,7 +893,28 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         continue;
       }
 
-      /* --- move_clip: переместить клип на новую позицию на таймлайне --- */
+      /* --- set_clips_enabled_by_name: все сегменты с данным именем клипа на секвенции --- */
+      if (a === 'set_clips_enabled_by_name') {
+        var nm = String(op.clipName || op.name || '').trim();
+        if (!nm) {
+          results.push({ op: a, ok: false, error: 'Нужен clipName (имя клипа как в снимке)' });
+          continue;
+        }
+        var en = op.enabled !== false;
+        var byName = $._EXT_PRM_._findClipsByDisplayName(seq, nm);
+        var ch,
+          aff = 0;
+        for (ch = 0; ch < byName.length; ch++) {
+          try {
+            byName[ch].disabled = !en;
+            aff++;
+          } catch (eBn) {}
+        }
+        results.push({ op: a, ok: true, clipName: nm, enabled: en, affectedClips: aff });
+        continue;
+      }
+
+      /* --- move_clip: переместить клип; shiftBlockingClips — сдвинуть мешающие клипы вправо на длительность --- */
       if (a === 'move_clip') {
         found = $._EXT_PRM_._findClipByNodeId(seq, op.nodeId);
         if (!found) {
@@ -685,15 +925,58 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           results.push({ op: a, ok: false, error: 'Нужен newStartSec (число)' });
           continue;
         }
+        var nodeRef = String(found.clip.nodeId);
         var linked2 = $._EXT_PRM_._findLinkedClips(seq, found.clip);
         var dur = found.clip.end.seconds - found.clip.start.seconds;
+        /* По умолчанию: ripple-insert — сдвинуть ВСЕ клипы с start >= newStartSec на dur (в т.ч. переносимую
+           связку), затем поставить её на newStartSec. Если исключить связку из сдвига — длинный клип снова
+           наезжает на соседа. Отключение: shiftBlockingClips:false и makeRoom:false. */
+        var useRippleInsert = op.shiftBlockingClips !== false && op.makeRoom !== false;
+        var shiftLog = null;
+        if (useRippleInsert) {
+          shiftLog = $._EXT_PRM_._rippleShiftAllClipsFrom(seq, op.newStartSec, dur, {});
+          found = $._EXT_PRM_._findClipByNodeId(seq, nodeRef);
+          if (!found) {
+            results.push({ op: a, ok: false, error: 'Клип не найден после ripple-сдвига', shiftedBeforeAttempt: shiftLog });
+            continue;
+          }
+          linked2 = $._EXT_PRM_._findLinkedClips(seq, found.clip);
+        }
+        var mvErr = null;
         for (var lm = 0; lm < linked2.length; lm++) {
           try {
             linked2[lm].start.seconds = op.newStartSec;
             linked2[lm].end.seconds = op.newStartSec + dur;
-          } catch (eMv) {}
+          } catch (eMv) {
+            mvErr = String(eMv.message || eMv);
+          }
         }
-        results.push({ op: a, ok: true, newStartSec: op.newStartSec, newEndSec: op.newStartSec + dur });
+        var verify = $._EXT_PRM_._findClipByNodeId(seq, nodeRef);
+        var epsM = $._EXT_PRM_._EPS;
+        var movedOk =
+          verify &&
+          Math.abs(verify.clip.start.seconds - op.newStartSec) < epsM &&
+          Math.abs(verify.clip.end.seconds - (op.newStartSec + dur)) < epsM;
+        if (!movedOk) {
+          results.push({
+            op: a,
+            ok: false,
+            error:
+              'Premiere не переместил клип (коллизия). Проверьте снимок; при необходимости shift_timeline_ripple(fromSec, deltaSec) или move_clip без отключения автосдвига. ' +
+              (mvErr || ''),
+            requestedStartSec: op.newStartSec,
+            actualStartSec: verify ? verify.clip.start.seconds : null,
+            shiftedBeforeAttempt: shiftLog
+          });
+        } else {
+          results.push({
+            op: a,
+            ok: true,
+            newStartSec: op.newStartSec,
+            newEndSec: op.newStartSec + dur,
+            shiftedClips: shiftLog
+          });
+        }
         continue;
       }
 
@@ -798,7 +1081,7 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') continue;
       if (iv.endSec <= iv.startSec) continue;
       lg = [];
-      $._EXT_PRM_._applyOneTimelineInterval(seq, iv.startSec, iv.endSec, lg);
+      $._EXT_PRM_._applyOneTimelineInterval(seq, iv.startSec, iv.endSec, lg, true);
       allLog.push({ interval: iv, log: lg });
     }
     return JSON.stringify({
@@ -833,17 +1116,36 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
     var markers = seq.markers;
     var i,
       m,
-      t,
       mk;
     var created = [];
+    var tps = $._EXT_PRM_._ticksPerSecond(seq);
     for (i = 0; i < list.length; i++) {
       m = list[i];
-      if (typeof m.timeSec !== 'number') continue;
-      t = new Time();
-      t.seconds = m.timeSec;
-      var ticksNum = parseFloat(t.ticks);
-      if (isNaN(ticksNum)) continue;
-      mk = markers.createMarker(ticksNum);
+      if (typeof m.timeSec !== 'number' || isNaN(m.timeSec)) continue;
+      var ticksNum = Math.round(m.timeSec * tps);
+      mk = null;
+      /* В разных сборках PP стабильнее строка тиков от timebase; Time.seconds→ticks иногда даёт неверную позицию. */
+      try {
+        mk = markers.createMarker(String(ticksNum));
+      } catch (eMk0) {
+        mk = null;
+      }
+      if (!mk) {
+        try {
+          var tPlaced = new Time();
+          tPlaced.seconds = m.timeSec;
+          mk = markers.createMarker(tPlaced.ticks);
+        } catch (eMkT) {
+          mk = null;
+        }
+      }
+      if (!mk) {
+        try {
+          mk = markers.createMarker(ticksNum);
+        } catch (eMk1) {
+          mk = null;
+        }
+      }
       if (mk) {
         mk.name = m.name || 'ИИ';
         mk.comments = m.comment || '';
@@ -856,7 +1158,8 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
             mk.setTypeAsComment();
           } catch (e8) {}
         }
-        created.push({ timeSec: m.timeSec, name: mk.name });
+        /* Не читать mk.start.seconds — в части сборок PP даёт мусор; в ответе — запрошенное время. */
+        created.push({ timeSec: m.timeSec, name: mk.name, ticks: ticksNum });
       }
     }
     return JSON.stringify({ ok: true, created: created, count: created.length, hostVersion: $._EXT_PRM_.version });

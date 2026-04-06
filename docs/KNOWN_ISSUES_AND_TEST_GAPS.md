@@ -31,8 +31,8 @@
 
 | Область | Комментарий |
 |---------|-------------|
-| `host/premiere.jsx` целиком | Снимок, `applyTimecodeEdits`, `applyTranscriptCuts`, маркеры, `prepareTranscribeFromTimeline`, `undoLast`, `ripple_delete` / split — ручная проверка на разных секвенциях и версиях PP. |
-| Транскрибация: `export_chunks`, `clip_queue` | Очередь чанков и несколько клипов — нет регрессионного чек-листа в репо. |
+| `host/premiere.jsx` целиком | Снимок, `applyTimecodeEdits`, `applyTranscriptCuts`, маркеры, `prepareTranscribeFromTimeline`, `undoLast`, `ripple_delete` / split — только ручная проверка в Premiere; сценарии не хранятся отдельным чек-листом в репозитории. |
+| Транскрибация: `export_chunks`, `clip_queue` | Очередь чанков и несколько клипов — без формального регрессионного плана в репо. |
 | Whisper / FM | Таймауты, 413, не-JSON ответы, лимиты прокси — зависят от окружения и квот. |
 | Панель таймкодов: быстрый путь по фразе | Регексы для «удали между N и M сек» — не покрыты тестами. |
 | `undoLast` | Зависит от локализации меню и фокуса; не автотестируется. |
@@ -44,4 +44,4 @@
 ## Как использовать этот файл
 
 - Перед релизом или после сессии в Premiere — дополнять таблицу или раздел «Известные ошибки».
-- Дублировать кратко в [CONTEXT_NEXT_AGENT.md](CONTEXT_NEXT_AGENT.md), если нужен хвост для следующего чата.
+- Итоговые выводы по продукту — в [premiere-extension-audit.md](premiere-extension-audit.md).

@@ -18,12 +18,21 @@
         <button type="button" id="btn-clear-all" class="danger">Сбросить всё</button>
       </div>
       <div class="transcribe-bar">
-        <label
-          >На секвенции выставьте <strong>In</strong> и <strong>Out</strong>, затем отправьте аудио этой области в
-          кэш (имя секвенции = ключ).</label
-        >
+        <label>
+          На секвенции выставьте <strong>In</strong> и <strong>Out</strong>, затем кэш по имени секвенции (общий с
+          маркерами: общий файл <code>~/.extensions_llm_chat_pr/_llm_transcript_cache.json</code> и копии в папке расширения / CEP userData).
+        </label>
         <div class="row" style="margin-top: 6px; align-items: center; flex-wrap: wrap; gap: 8px">
           <button type="button" id="btn-transcribe" class="secondary">Транскрибировать In–Out в кэш</button>
+          <span class="transcript-led-wrap" title="Кэш транскрипта для активной секвенции">
+            <span
+              id="transcript-led"
+              class="transcript-led transcript-led--red"
+              role="img"
+              aria-label="Нет транскрипта"
+            ></span>
+            <span class="hint-inline" style="margin: 0">нет / идёт / есть</span>
+          </span>
           <span class="hint-inline">Несколько клипов — очередь по одному; длинный In–Out — чанки через .epr (host/presets/README.txt)</span>
         </div>
       </div>
@@ -48,6 +57,7 @@
     <script>
       window.__PANEL_ID__ = 'textmontage';
     </script>
+    <script src="../shared/panel-bootstrap.js"></script>
     <script src="../lib/csinterface.js"></script>
     <script src="../shared/fm-defaults.js"></script>
     <script src="../shared/fm-secrets.js"></script>
