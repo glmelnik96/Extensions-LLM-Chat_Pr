@@ -34,6 +34,32 @@
     }
   }
 
+  /**
+   * Усечение истории сообщений: оставляем все system-сообщения + последние N не-system,
+   * стараясь не разрывать пары tool_call → tool (иначе 400 от FM).
+   */
+  function trimHistory(messages, maxNonSystem) {
+    if (!Array.isArray(messages) || messages.length === 0) return messages;
+    if (typeof maxNonSystem !== 'number' || maxNonSystem <= 0) return messages;
+    var sys = [];
+    var rest = [];
+    for (var i = 0; i < messages.length; i++) {
+      if (messages[i].role === 'system') sys.push(messages[i]);
+      else rest.push(messages[i]);
+    }
+    if (rest.length <= maxNonSystem) return messages;
+    var keep = rest.slice(-maxNonSystem);
+    /* Не начинаем с tool-сообщения, иначе FM вернёт 400. */
+    while (keep.length > 0 && keep[0].role === 'tool') keep.shift();
+    /* Если первый assistant-сообщение содержит tool_calls, но соответствующих tool-ответов
+       уже нет в keep — отбрасываем его до следующего «чистого» сообщения. */
+    while (keep.length > 0 && keep[0].role === 'assistant' && keep[0].tool_calls) {
+      keep.shift();
+      while (keep.length > 0 && keep[0].role === 'tool') keep.shift();
+    }
+    return sys.concat(keep);
+  }
+
   global.runAgentLoop = async function (opts) {
     var settings = opts.settings;
     var onStatus = typeof opts.onStatus === 'function' ? opts.onStatus : function () {};
@@ -42,7 +68,13 @@
     var messages = opts.messages.slice();
     var tools = opts.tools;
     var toolExecutors = opts.toolExecutors;
-    var maxSteps = opts.maxSteps || 14;
+    var maxSteps =
+      opts.maxSteps ||
+      (settings && typeof settings.maxAgentSteps === 'number' ? settings.maxAgentSteps : 24);
+    var maxHistory =
+      (settings && typeof settings.maxChatHistoryMessages === 'number' && settings.maxChatHistoryMessages > 0)
+        ? settings.maxChatHistoryMessages
+        : 60;
     var step = 0;
     var lastAssistantText = '';
     var model = settings.activeAgentModel || settings.chatModel;
@@ -50,6 +82,7 @@
     while (step < maxSteps) {
       throwIfAborted(signal, abortCheck);
       step++;
+      messages = trimHistory(messages, maxHistory);
       onStatus({
         phase: 'llm',
         step: step,

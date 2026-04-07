@@ -16,7 +16,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.4.0';
+$._EXT_PRM_.version = '2.4.7';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -377,11 +377,41 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
  * Найти все клипы с тем же именем и позицией (linked A/V пара).
  */
 $._EXT_PRM_._findLinkedClips = function (seq, clip) {
+  /* Канонический путь PP: TrackItem.getLinkedItems() — возвращает массив реально
+     связанных клипов (A/V пары), вне зависимости от имени и таймкодов. */
+  var result = [clip];
+  var seen = {};
+  try { seen[String(clip.nodeId)] = true; } catch (eN0) {}
+  try {
+    if (typeof clip.getLinkedItems === 'function') {
+      var linked = clip.getLinkedItems();
+      if (linked && linked.numItems !== undefined) {
+        for (var li = 0; li < linked.numItems; li++) {
+          var lit = linked[li];
+          if (!lit) continue;
+          var lid = String(lit.nodeId);
+          if (!seen[lid]) { seen[lid] = true; result.push(lit); }
+        }
+        if (result.length > 1) return result;
+      } else if (linked && linked.length) {
+        for (var lj = 0; lj < linked.length; lj++) {
+          var lit2 = linked[lj];
+          if (!lit2) continue;
+          var lid2 = String(lit2.nodeId);
+          if (!seen[lid2]) { seen[lid2] = true; result.push(lit2); }
+        }
+        if (result.length > 1) return result;
+      }
+    }
+  } catch (eGL) {}
+
+  /* Fallback (для самых старых сборок без getLinkedItems): эвристика
+     name+start+end. ВНИМАНИЕ: ненадёжно — может включить независимый клип
+     с тем же source media, который случайно стоит на той же позиции. */
   var name = clip.name || '';
-  var s = clip.start.seconds;
-  var e = clip.end.seconds;
+  var s = 0, e = 0;
+  try { s = clip.start.seconds; e = clip.end.seconds; } catch (eSE) { return result; }
   var eps = $._EXT_PRM_._EPS;
-  var result = [];
   var vi, ai, j, tr, it, n;
   for (vi = 0; vi < seq.videoTracks.numTracks; vi++) {
     tr = seq.videoTracks[vi];
@@ -390,7 +420,10 @@ $._EXT_PRM_._findLinkedClips = function (seq, clip) {
       try {
         it = tr.clips[j];
         if (!it) continue;
+        var idV = String(it.nodeId);
+        if (seen[idV]) continue;
         if (it.name === name && Math.abs(it.start.seconds - s) < eps && Math.abs(it.end.seconds - e) < eps) {
+          seen[idV] = true;
           result.push(it);
         }
       } catch (e0) {}
@@ -403,7 +436,10 @@ $._EXT_PRM_._findLinkedClips = function (seq, clip) {
       try {
         it = tr.clips[j];
         if (!it) continue;
+        var idA = String(it.nodeId);
+        if (seen[idA]) continue;
         if (it.name === name && Math.abs(it.start.seconds - s) < eps && Math.abs(it.end.seconds - e) < eps) {
+          seen[idA] = true;
           result.push(it);
         }
       } catch (e1) {}
@@ -928,13 +964,21 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         var nodeRef = String(found.clip.nodeId);
         var linked2 = $._EXT_PRM_._findLinkedClips(seq, found.clip);
         var dur = found.clip.end.seconds - found.clip.start.seconds;
-        /* По умолчанию: ripple-insert — сдвинуть ВСЕ клипы с start >= newStartSec на dur (в т.ч. переносимую
-           связку), затем поставить её на newStartSec. Если исключить связку из сдвига — длинный клип снова
-           наезжает на соседа. Отключение: shiftBlockingClips:false и makeRoom:false. */
+        var oldStartSec = found.clip.start.seconds;
+
+        /* Собираем nodeId связки (переносимый клип + его linked A/V) для исключения из сдвига */
+        var linkedNodeIds = {};
+        for (var ln = 0; ln < linked2.length; ln++) {
+          try { linkedNodeIds[String(linked2[ln].nodeId)] = true; } catch (eLn) {}
+        }
+        linkedNodeIds[nodeRef] = true;
+
         var useRippleInsert = op.shiftBlockingClips !== false && op.makeRoom !== false;
         var shiftLog = null;
         if (useRippleInsert) {
-          shiftLog = $._EXT_PRM_._rippleShiftAllClipsFrom(seq, op.newStartSec, dur, {});
+          /* Сдвигаем ВСЕ клипы КРОМЕ переносимой связки: освобождаем место в [newStartSec, newStartSec+dur] */
+          shiftLog = $._EXT_PRM_._rippleShiftAllClipsFrom(seq, op.newStartSec, dur, linkedNodeIds);
+          /* Перечитываем клип (после сдвига индексы могли измениться, но сам клип НЕ двигался) */
           found = $._EXT_PRM_._findClipByNodeId(seq, nodeRef);
           if (!found) {
             results.push({ op: a, ok: false, error: 'Клип не найден после ripple-сдвига', shiftedBeforeAttempt: shiftLog });
@@ -942,14 +986,185 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           }
           linked2 = $._EXT_PRM_._findLinkedClips(seq, found.clip);
         }
+
+        /* Перемещаем связку на newStartSec.
+         *
+         * В PP 2025 прямое присваивание clip.start.seconds = X часто НЕ работает
+         * (свойство read-only после определённых операций). Канон API — TrackItem.move(timeDelta),
+         * где timeDelta — Time-объект со знаковой дельтой. move() автоматически тащит за собой
+         * linked A/V, поэтому достаточно вызвать на одном клипе связки (берём видео, если есть).
+         *
+         * Стратегии (последовательно, до успеха):
+         *   1) move() с Time-объектом (каноничный путь).
+         *   2) move() с числом тиков (некоторые сборки).
+         *   3) Прямое присваивание start.seconds / end.seconds на всей связке (fallback).
+         */
         var mvErr = null;
-        for (var lm = 0; lm < linked2.length; lm++) {
+        var deltaSec = op.newStartSec - oldStartSec;
+
+        /* Выбираем «ведущий» клип для move(): предпочтительно видео. */
+        var leadClip = found.clip;
+        for (var lv = 0; lv < linked2.length; lv++) {
           try {
-            linked2[lm].start.seconds = op.newStartSec;
-            linked2[lm].end.seconds = op.newStartSec + dur;
-          } catch (eMv) {
-            mvErr = String(eMv.message || eMv);
+            if (linked2[lv] && String(linked2[lv].mediaType || '').toLowerCase() === 'video') {
+              leadClip = linked2[lv];
+              break;
+            }
+          } catch (eLv) {}
+        }
+
+        /* Все nodeId связки для верификации (lead + linked) */
+        var verifyIds = [];
+        for (var lvi = 0; lvi < linked2.length; lvi++) {
+          try { verifyIds.push(String(linked2[lvi].nodeId)); } catch (eVI) {}
+        }
+        function _verifyMove() {
+          /* Все клипы связки должны оказаться на newStartSec. */
+          for (var vi2 = 0; vi2 < verifyIds.length; vi2++) {
+            var vv = $._EXT_PRM_._findClipByNodeId(seq, verifyIds[vi2]);
+            if (!vv) return false;
+            try {
+              if (Math.abs(vv.clip.start.seconds - op.newStartSec) > 0.05) return false;
+            } catch (eV) { return false; }
           }
+          return true;
+        }
+
+        var moved = false;
+
+        /* Стратегия 1: TrackItem.move(Time). */
+        if (!moved && Math.abs(deltaSec) > $._EXT_PRM_._EPS) {
+          try {
+            if (typeof leadClip.move === 'function') {
+              var tDelta = new Time();
+              tDelta.seconds = deltaSec;
+              leadClip.move(tDelta);
+              moved = _verifyMove();
+            }
+          } catch (eM1) { mvErr = 'move(Time): ' + String(eM1.message || eM1); }
+        }
+
+        /* Стратегия 2: TrackItem.move(ticks как число). */
+        if (!moved && Math.abs(deltaSec) > $._EXT_PRM_._EPS) {
+          try {
+            if (typeof leadClip.move === 'function') {
+              var tps2 = $._EXT_PRM_._ticksPerSecond(seq);
+              leadClip.move(Math.round(deltaSec * tps2));
+              moved = _verifyMove();
+            }
+          } catch (eM2) { mvErr = (mvErr ? mvErr + '; ' : '') + 'move(ticks): ' + String(eM2.message || eM2); }
+        }
+
+        /* Стратегия 2.5: QE DOM move(timecodeString).
+         * ВАЖНО: QE.move() НЕ тянет linked-связку — двигает только тот клип, на котором вызвали.
+         * Поэтому вызываем move() для КАЖДОГО клипа связки (видео + аудио) индивидуально с одной и той же дельтой. */
+        if (!moved && Math.abs(deltaSec) > $._EXT_PRM_._EPS) {
+          try {
+            if (typeof app.enableQE === 'function') app.enableQE();
+            var qeSeq = (typeof qe !== 'undefined' && qe.project) ? qe.project.getActiveSequence() : null;
+            if (qeSeq) {
+              /* Сформировать timecode-строку дельты. */
+              var fps = 30;
+              try {
+                var fpsTime = seq.timebase ? Math.round(254016000000 / parseFloat(seq.timebase)) : 30;
+                if (fpsTime > 0 && fpsTime < 1000) fps = fpsTime;
+              } catch (eF) {}
+              var sign = deltaSec < 0 ? '-' : '';
+              var ad = Math.abs(deltaSec);
+              var hh = Math.floor(ad / 3600);
+              var mm = Math.floor((ad - hh * 3600) / 60);
+              var ssF = ad - hh * 3600 - mm * 60;
+              var ss = Math.floor(ssF);
+              var ff = Math.round((ssF - ss) * fps);
+              if (ff >= fps) { ff = 0; ss++; }
+              function pad(n) { return n < 10 ? '0' + n : '' + n; }
+              var tcStr = sign + pad(hh) + ';' + pad(mm) + ';' + pad(ss) + ';' + pad(ff);
+
+              /* Перебор: для каждого linked-клипа найти QE-аналог по (mediaType, start.secs ≈ oldStartSec) и вызвать .move(tcStr).
+                 Порядок R→L при перемещении вправо, L→R при перемещении влево, чтобы не наступать на собственные клипы. */
+              var goingRightQ = op.newStartSec > oldStartSec;
+              var qeMoveLog = [];
+              var qeFails = 0;
+              for (var lk = 0; lk < linked2.length; lk++) {
+                var origClip = linked2[lk];
+                var origStart = oldStartSec;
+                try { origStart = origClip.start.seconds; } catch (eOS) {}
+                var isVideo = false;
+                try { isVideo = String(origClip.mediaType || '').toLowerCase() === 'video'; } catch (eMT) {}
+                /* Иногда mediaType пуст — определяем по тому, на каком треке. */
+
+                var qeClip = null;
+                try {
+                  /* Сначала ищем в видео-треках, потом в аудио. */
+                  var trackLists = [];
+                  var nvT = qeSeq.numVideoTracks ? qeSeq.numVideoTracks : 0;
+                  var naT = qeSeq.numAudioTracks ? qeSeq.numAudioTracks : 0;
+                  for (var qti = 0; qti < nvT; qti++) trackLists.push({ tr: qeSeq.getVideoTrackAt(qti), kind: 'video' });
+                  for (var qti2 = 0; qti2 < naT; qti2++) trackLists.push({ tr: qeSeq.getAudioTrackAt(qti2), kind: 'audio' });
+
+                  for (var qtl = 0; qtl < trackLists.length && !qeClip; qtl++) {
+                    var qvT2 = trackLists[qtl].tr;
+                    if (!qvT2) continue;
+                    var nci2 = qvT2.numItems ? qvT2.numItems : 0;
+                    for (var qci2 = 0; qci2 < nci2; qci2++) {
+                      var cit2 = null;
+                      try { cit2 = qvT2.getItemAt(qci2); } catch (eGI) {}
+                      if (!cit2) continue;
+                      try {
+                        var cs2 = parseFloat(cit2.start.secs || cit2.start.seconds || '0');
+                        if (Math.abs(cs2 - origStart) < 0.06) {
+                          /* Если это видео-клип linked2[lk], предпочесть совпадающий kind. */
+                          if (isVideo && trackLists[qtl].kind === 'video') { qeClip = cit2; break; }
+                          if (!isVideo && trackLists[qtl].kind === 'audio') { qeClip = cit2; break; }
+                          /* Если mediaType неопределён — берём первый совпавший. */
+                          if (!qeClip) qeClip = cit2;
+                        }
+                      } catch (eCs2) {}
+                    }
+                  }
+                } catch (eFindL) {}
+
+                if (qeClip && typeof qeClip.move === 'function') {
+                  try {
+                    qeClip.move(tcStr);
+                    qeMoveLog.push({ ok: true, kind: isVideo ? 'video' : 'audio', from: origStart });
+                  } catch (eQEm) {
+                    qeFails++;
+                    qeMoveLog.push({ ok: false, kind: isVideo ? 'video' : 'audio', from: origStart, error: String(eQEm.message || eQEm) });
+                  }
+                } else {
+                  qeFails++;
+                  qeMoveLog.push({ ok: false, kind: isVideo ? 'video' : 'audio', from: origStart, error: 'qe clip not found' });
+                }
+              }
+              moved = _verifyMove();
+              if (!moved) {
+                mvErr = (mvErr ? mvErr + '; ' : '') + 'qe partial: ' + qeFails + '/' + linked2.length + ' fails';
+              }
+            }
+          } catch (eQE) { mvErr = (mvErr ? mvErr + '; ' : '') + 'qe: ' + String(eQE.message || eQE); }
+        }
+
+        /* Стратегия 3: прямое присваивание по всей связке (порядок R→L или L→R). */
+        if (!moved) {
+          var goingRight = op.newStartSec > oldStartSec;
+          var mvOrder = linked2.slice();
+          mvOrder.sort(function (aa, bb) {
+            try {
+              return goingRight
+                ? bb.start.seconds - aa.start.seconds
+                : aa.start.seconds - bb.start.seconds;
+            } catch (eS) { return 0; }
+          });
+          for (var lm = 0; lm < mvOrder.length; lm++) {
+            try {
+              mvOrder[lm].start.seconds = op.newStartSec;
+              mvOrder[lm].end.seconds = op.newStartSec + dur;
+            } catch (eMv) {
+              mvErr = (mvErr ? mvErr + '; ' : '') + 'start.seconds=: ' + String(eMv.message || eMv);
+            }
+          }
+          moved = _verifyMove();
         }
         var verify = $._EXT_PRM_._findClipByNodeId(seq, nodeRef);
         var epsM = $._EXT_PRM_._EPS;
@@ -962,7 +1177,9 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
             op: a,
             ok: false,
             error:
-              'Premiere не переместил клип (коллизия). Проверьте снимок; при необходимости shift_timeline_ripple(fromSec, deltaSec) или move_clip без отключения автосдвига. ' +
+              'Premiere не переместил клип (коллизия или занято). actualStart=' +
+              (verify ? verify.clip.start.seconds.toFixed(2) : '?') + ', requested=' + op.newStartSec.toFixed(2) +
+              '. Попробуйте: 1) ripple_delete_range + shift_timeline_ripple чтобы освободить место, 2) затем move_clip повторно. ' +
               (mvErr || ''),
             requestedStartSec: op.newStartSec,
             actualStartSec: verify ? verify.clip.start.seconds : null,
@@ -1118,34 +1335,92 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
       m,
       mk;
     var created = [];
+    var failed = [];
     var tps = $._EXT_PRM_._ticksPerSecond(seq);
+    /* Вспом.: проверить, куда встал маркер после создания. */
+    var _mkPos = function (mm) {
+      try {
+        if (mm && mm.start && typeof mm.start.seconds === 'number') return mm.start.seconds;
+      } catch (ePos) {}
+      return null;
+    };
+    /* Вспом.: попытаться создать маркер по стратегии и проверить дрейф; вернёт {mk, verifiedSec, drift}. */
+    var _tryCreate = function (strategyFn, targetSec) {
+      var mmk = null;
+      try { mmk = strategyFn(); } catch (eTC) { mmk = null; }
+      if (!mmk) return { mk: null, verifiedSec: null, drift: null };
+      var vs = _mkPos(mmk);
+      var dr = vs !== null ? Math.abs(vs - targetSec) : null;
+      return { mk: mmk, verifiedSec: vs, drift: dr };
+    };
+    /* Вспом.: удалить маркер (для retry). */
+    var _mkDelete = function (mm) {
+      try { if (mm && typeof markers.deleteMarker === 'function') markers.deleteMarker(mm); } catch (eDel) {}
+    };
+
     for (i = 0; i < list.length; i++) {
       m = list[i];
       if (typeof m.timeSec !== 'number' || isNaN(m.timeSec)) continue;
       var ticksNum = Math.round(m.timeSec * tps);
       mk = null;
-      /* В разных сборках PP стабильнее строка тиков от timebase; Time.seconds→ticks иногда даёт неверную позицию. */
-      try {
-        mk = markers.createMarker(String(ticksNum));
-      } catch (eMk0) {
-        mk = null;
-      }
-      if (!mk) {
-        try {
-          var tPlaced = new Time();
-          tPlaced.seconds = m.timeSec;
-          mk = markers.createMarker(tPlaced.ticks);
-        } catch (eMkT) {
-          mk = null;
+      var lastErr = null;
+      var bestDrift = null;
+      var bestVS = null;
+      var DRIFT_OK = 0.25; /* приемлемо — в пределах четверти секунды */
+      var targetSec = m.timeSec;
+
+      /* Перебор 4 стратегий с верификацией позиции и retry.
+       * В PP 2025 createMarker() может «молча» создать маркер в 0
+       * для одной стратегии и корректно — для другой, в зависимости от сборки. */
+      var strategies = [
+        /* 1) КАНОН docsforadobe: createMarker(seconds as Number). */
+        function () { return markers.createMarker(Number(targetSec)); },
+        /* 2) Time-объект с .seconds. */
+        function () {
+          var tP = new Time();
+          tP.seconds = targetSec;
+          return markers.createMarker(tP);
+        },
+        /* 3) Целое тиков (старые сборки PP ≤ 2020). */
+        function () { return markers.createMarker(ticksNum); },
+        /* 4) Строка тиков (совсем старый формат). */
+        function () { return markers.createMarker(String(ticksNum)); }
+      ];
+
+      for (var si = 0; si < strategies.length; si++) {
+        var res = _tryCreate(strategies[si], targetSec);
+        if (!res.mk) { lastErr = 'strategy ' + (si + 1) + ' returned null'; continue; }
+
+        /* Если встал с дрейфом > DRIFT_OK — пытаемся откорректировать mk.start.seconds. */
+        if (res.drift !== null && res.drift > DRIFT_OK) {
+          try { res.mk.start.seconds = targetSec; } catch (eFix) {}
+          var vs2 = _mkPos(res.mk);
+          if (vs2 !== null) {
+            res.verifiedSec = vs2;
+            res.drift = Math.abs(vs2 - targetSec);
+          }
+        }
+
+        if (res.drift !== null && res.drift <= DRIFT_OK) {
+          /* Успех — принимаем этот маркер. */
+          mk = res.mk;
+          bestVS = res.verifiedSec;
+          bestDrift = res.drift;
+          break;
+        }
+
+        /* Эта стратегия «подвела»: маркер не там. Запомним лучший, удалим плохой, пробуем следующую. */
+        if (bestDrift === null || (res.drift !== null && res.drift < bestDrift)) {
+          /* Сохранить как «лучший» — но если следующая не удастся, мы откатимся к нему. */
+          if (mk) _mkDelete(mk);
+          mk = res.mk;
+          bestVS = res.verifiedSec;
+          bestDrift = res.drift;
+        } else {
+          _mkDelete(res.mk);
         }
       }
-      if (!mk) {
-        try {
-          mk = markers.createMarker(ticksNum);
-        } catch (eMk1) {
-          mk = null;
-        }
-      }
+
       if (mk) {
         mk.name = m.name || 'ИИ';
         mk.comments = m.comment || '';
@@ -1158,11 +1433,111 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
             mk.setTypeAsComment();
           } catch (e8) {}
         }
-        /* Не читать mk.start.seconds — в части сборок PP даёт мусор; в ответе — запрошенное время. */
-        created.push({ timeSec: m.timeSec, name: mk.name, ticks: ticksNum });
+
+        /* Span-маркер: KNOWN BROKEN на PP 2025 (см. docs/premiere-extension-audit.md).
+         *
+         * Эмпирически на сборке пользователя (PP 2025) Marker API:
+         *   - Пробовали 11+ стратегий: прямое mk.end.seconds, get→modify→put,
+         *     new Time() seconds/ticks, setEndTime, mk.duration, QE DOM.
+         *   - Во ВСЕХ случаях mk.end читается обратно равным mk.start → маркер рисуется точкой.
+         *   - `verifiedEndSec === verifiedSec` подтверждено на живом данных пользователя v2.4.6.
+         *
+         * Делаем ОДНУ лучшую попытку (get→modify→put по ticks, абсолют) ради будущих сборок PP,
+         * и если не сработало — возвращаем spanApplied:false + notSupported:true без дальнейшего спама. */
+        var hasSpan = false;
+        var spanEnd = null;
+        var spanRequested = false;
+        if (typeof m.endSec === 'number' && !isNaN(m.endSec) && m.endSec > m.timeSec + 0.001) {
+          spanRequested = true;
+          spanEnd = m.endSec;
+          var spanLen = m.endSec - m.timeSec;
+          var startActualPre = _mkPos(mk);
+          var startActual = (typeof startActualPre === 'number' && startActualPre !== null) ? startActualPre : m.timeSec;
+
+          var endTicksAbs = Math.round(m.endSec * tps);
+          var lenTicks = Math.round(spanLen * tps);
+
+          function _verifySpan() {
+            try {
+              if (mk.end && typeof mk.end.seconds === 'number') {
+                var es = mk.end.seconds;
+                /* Считаем полосу выставленной, если mk.end.seconds либо ≈ abs endSec,
+                 * либо ≈ start+spanLen, либо ≈ сама длительность. */
+                if (Math.abs(es - m.endSec) < 0.1) return true;
+                if (Math.abs(es - (startActual + spanLen)) < 0.1) return true;
+                if (Math.abs(es - spanLen) < 0.1) return true;
+                /* дополнительно, если есть duration.seconds */
+                if (mk.duration && typeof mk.duration.seconds === 'number' &&
+                    Math.abs(mk.duration.seconds - spanLen) < 0.1) return true;
+              }
+            } catch (eVS) {}
+            return false;
+          }
+
+          /* Одна best-effort попытка для будущих сборок PP, которые могут это поддержать.
+             GET→MODIFY→PUT по ticks (абсолют) — самый каноничный путь. */
+          try {
+            var tBest = mk.end;
+            if (tBest) { tBest.ticks = String(endTicksAbs); mk.end = tBest; }
+          } catch (eBest) {}
+          if (_verifySpan()) hasSpan = true;
+
+          /* Встраиваем пояснение в comments маркера, чтобы в Premiere видна была длительность хотя бы текстом. */
+          if (!hasSpan) {
+            try {
+              var hh = function (t) { var a = Math.floor(t / 60), b = Math.round(t - a * 60); return a + ':' + (b < 10 ? '0' : '') + b; };
+              var rangeTxt = '[' + hh(m.timeSec) + '–' + hh(m.endSec) + ', ' + (m.endSec - m.timeSec).toFixed(1) + 'с]';
+              var existing = mk.comments || '';
+              mk.comments = (existing ? existing + ' ' : '') + rangeTxt;
+            } catch (eAug) {}
+          }
+        }
+
+        /* Финальная перепроверка позиции (mk.start мог «уплыть»). */
+        var verifiedSec = _mkPos(mk);
+        if (verifiedSec === null) verifiedSec = bestVS;
+        var drift = verifiedSec !== null ? Math.abs(verifiedSec - m.timeSec) : bestDrift;
+        var verifiedEndSec = null;
+        try {
+          if (mk.end && typeof mk.end.seconds === 'number') verifiedEndSec = mk.end.seconds;
+        } catch (eVE) {}
+        created.push({
+          timeSec: m.timeSec,
+          endSec: spanEnd,
+          name: mk.name,
+          ticks: ticksNum,
+          verifiedSec: verifiedSec,
+          verifiedEndSec: verifiedEndSec,
+          spanApplied: hasSpan,
+          spanRequested: spanRequested,
+          driftSec: drift !== null ? Math.round(drift * 100) / 100 : null
+        });
+      } else {
+        failed.push({ timeSec: m.timeSec, name: m.name || '', error: 'createMarker вернул null (все 4 стратегии). last=' + lastErr });
       }
     }
-    return JSON.stringify({ ok: true, created: created, count: created.length, hostVersion: $._EXT_PRM_.version });
+    var anyDrift = false;
+    var anySpanRequested = false;
+    var anySpanApplied = false;
+    for (var cd = 0; cd < created.length; cd++) {
+      if (created[cd].driftSec !== null && created[cd].driftSec > 1.0) anyDrift = true;
+      if (created[cd].spanRequested) anySpanRequested = true;
+      if (created[cd].spanApplied) anySpanApplied = true;
+    }
+    var spanNotSupported = anySpanRequested && !anySpanApplied;
+    return JSON.stringify({
+      ok: true,
+      created: created,
+      count: created.length,
+      failed: failed,
+      failedCount: failed.length,
+      driftWarning: anyDrift ? 'Некоторые маркеры сместились более чем на 1 с от запрошенной позиции — проверьте визуально' : null,
+      spanNotSupported: spanNotSupported,
+      spanNotice: spanNotSupported
+        ? 'Known-broken на этой сборке PP 2025: API не позволяет создавать span-маркеры (длительность) программно — все маркеры получились точечными, несмотря на endSec. Диапазон добавлен в comments маркера текстом. См. docs/premiere-extension-audit.md.'
+        : null,
+      hostVersion: $._EXT_PRM_.version
+    });
   } catch (e) {
     return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
   } finally {
@@ -1307,6 +1682,10 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
     var outSec = parseFloat(seq.getOutPoint());
     if (isNaN(inSec)) inSec = 0;
     if (isNaN(outSec)) outSec = 0;
+    /* В некоторых сборках PP getInPoint()/getOutPoint() возвращает гигантские
+       отрицательные значения, если In/Out не выставлены или сброшены — clip к 0. */
+    if (inSec < 0 || inSec > 360000) inSec = 0;
+    if (outSec < 0 || outSec > 360000) outSec = 0;
     if (outSec <= inSec + $._EXT_PRM_._EPS) {
       return JSON.stringify({
         ok: false,

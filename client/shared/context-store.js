@@ -237,6 +237,14 @@
         maxTranscribeUploadBytes:
           typeof maxUp === 'number' && !isNaN(maxUp) ? maxUp : 20971520,
         exportChunkExtension: chunkExt,
+        maxChatHistoryMessages:
+          typeof d.maxChatHistoryMessages === 'number' && d.maxChatHistoryMessages > 0
+            ? d.maxChatHistoryMessages
+            : 60,
+        maxAgentSteps:
+          typeof d.maxAgentSteps === 'number' && d.maxAgentSteps > 0
+            ? d.maxAgentSteps
+            : 24,
         chatParams: shallowCopy(d.chatParams || {}),
         transcribeParams: shallowCopy(d.transcribeParams || {})
       };
@@ -297,6 +305,104 @@
       var map = this.getTranscriptCache(panelId);
       map[nk] = value;
       return this.setTranscriptCache(panelId, map);
+    },
+
+    /**
+     * Применить ripple-удаления removeIntervals к кэшированному транскрипту.
+     * Сегменты, полностью попавшие внутрь удаляемого интервала, выбрасываются;
+     * частично пересекающиеся — обрезаются; сегменты правее сдвигаются влево на сумму вырезанных интервалов слева от них.
+     * Добавляет метку editHistory со счётчиком правок и меткой editedAfterTranscribe: true.
+     */
+    applyRippleDeletionsToTranscript: function (panelId, sequenceKey, removeIntervals) {
+      var found = this.findTranscriptEntry(panelId, sequenceKey);
+      if (!found || !found.entry || !Array.isArray(found.entry.segments)) return false;
+      var removes = (removeIntervals || [])
+        .filter(function (iv) {
+          return iv && typeof iv.startSec === 'number' && typeof iv.endSec === 'number' && iv.endSec > iv.startSec;
+        })
+        .map(function (iv) { return { s: iv.startSec, e: iv.endSec }; })
+        .sort(function (a, b) { return a.s - b.s; });
+      if (!removes.length) return false;
+      /* merge overlapping removes */
+      var merged = [];
+      for (var mi = 0; mi < removes.length; mi++) {
+        var cur = removes[mi];
+        if (merged.length && cur.s <= merged[merged.length - 1].e + 0.001) {
+          merged[merged.length - 1].e = Math.max(merged[merged.length - 1].e, cur.e);
+        } else {
+          merged.push({ s: cur.s, e: cur.e });
+        }
+      }
+      function shiftBefore(t) {
+        /* сколько секунд вырезано строго ДО момента t */
+        var acc = 0;
+        for (var i = 0; i < merged.length; i++) {
+          if (merged[i].e <= t) acc += (merged[i].e - merged[i].s);
+          else if (merged[i].s < t && merged[i].e > t) acc += (t - merged[i].s);
+          else break;
+        }
+        return acc;
+      }
+      function insideRemove(t) {
+        for (var i = 0; i < merged.length; i++) {
+          if (merged[i].s <= t && t < merged[i].e) return i;
+        }
+        return -1;
+      }
+      var oldSegs = found.entry.segments;
+      var newSegs = [];
+      for (var si = 0; si < oldSegs.length; si++) {
+        var seg = oldSegs[si];
+        if (!seg || typeof seg.startSec !== 'number' || typeof seg.endSec !== 'number') continue;
+        var s = seg.startSec;
+        var e = seg.endSec;
+        /* если сегмент полностью в удалённом — пропустить */
+        var inStart = insideRemove(s);
+        var inEnd = insideRemove(e - 0.001);
+        if (inStart !== -1 && inStart === inEnd) continue;
+        /* обрезать границы, если пересекает ремов */
+        if (inStart !== -1) s = merged[inStart].e;
+        if (inEnd !== -1) e = merged[inEnd].s;
+        if (e - s < 0.05) continue;
+        var ns = s - shiftBefore(s);
+        var ne = e - shiftBefore(e);
+        if (ne - ns < 0.05) continue;
+        var copy = shallowCopy(seg);
+        copy.startSec = Math.round(ns * 1000) / 1000;
+        copy.endSec = Math.round(ne * 1000) / 1000;
+        newSegs.push(copy);
+      }
+      var entry = shallowCopy(found.entry);
+      entry.segments = newSegs;
+      entry.editHistory = Array.isArray(found.entry.editHistory) ? found.entry.editHistory.slice() : [];
+      entry.editHistory.push({
+        at: Date.now(),
+        kind: 'ripple_delete',
+        intervals: merged.map(function (x) { return { startSec: x.s, endSec: x.e }; })
+      });
+      entry.editedAfterTranscribe = true;
+      var map = this.getTranscriptCache(panelId);
+      map[found.matchedKey] = entry;
+      this.setTranscriptCache(panelId, map);
+      return true;
+    },
+
+    /**
+     * Помечает транскрипт как «возможно устаревший» после общих timecode-правок
+     * (move_clip, set_timeline_bounds и т.п.), когда точная карта сдвигов неизвестна.
+     */
+    markTranscriptStale: function (panelId, sequenceKey, reason) {
+      var found = this.findTranscriptEntry(panelId, sequenceKey);
+      if (!found || !found.entry) return false;
+      var entry = shallowCopy(found.entry);
+      entry.editHistory = Array.isArray(found.entry.editHistory) ? found.entry.editHistory.slice() : [];
+      entry.editHistory.push({ at: Date.now(), kind: 'unknown_shift', reason: String(reason || '') });
+      entry.editedAfterTranscribe = true;
+      entry.possiblyStale = true;
+      var map = this.getTranscriptCache(panelId);
+      map[found.matchedKey] = entry;
+      this.setTranscriptCache(panelId, map);
+      return true;
     },
 
     getTranscriptEntry: function (panelId, cacheKey) {

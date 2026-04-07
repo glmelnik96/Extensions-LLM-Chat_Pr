@@ -4,6 +4,9 @@
 (function (global) {
   function normalizeWhisperExport(data, timelineOffsetSec) {
     var off = typeof timelineOffsetSec === 'number' && !isNaN(timelineOffsetSec) ? timelineOffsetSec : 0;
+    /* Защита от мусорных значений из ExtendScript: getInPoint() в редких случаях
+       возвращает большое отрицательное число (тики, sequence zeroPoint и т.п.). */
+    if (off < 0 || off > 360000) off = 0;
     var segments = [];
     if (data.segments && Array.isArray(data.segments)) {
       data.segments.forEach(function (seg) {

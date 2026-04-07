@@ -22,6 +22,7 @@ PanelBoot.run('ИИ: маркеры по структуре', function () {
   }
 
   var runAbort = null;
+  var _activeSystemAddon = null;
 
   var statusUi = PanelUIStatus.create('statusBar');
 
@@ -67,7 +68,11 @@ PanelBoot.run('ИИ: маркеры по структуре', function () {
       type: 'function',
       'function': {
         name: 'add_markers',
-        description: 'Создать маркеры на активной секвенции (секунды таймлайна).',
+        description:
+          'Создать маркеры на активной секвенции (секунды таймлайна). ' +
+          'Маркер может быть точечным (только timeSec) или span-маркером с длительностью (timeSec + endSec) — ' +
+          'тогда он рисуется на линейке как полоса от start до end. ' +
+          'Для «отмеченных фрагментов» (хайлайт, цитата, эпизод, глава) предпочитай span-маркер.',
         parameters: {
           type: 'object',
           properties: {
@@ -76,7 +81,8 @@ PanelBoot.run('ИИ: маркеры по структуре', function () {
               items: {
                 type: 'object',
                 properties: {
-                  timeSec: { type: 'number' },
+                  timeSec: { type: 'number', description: 'Начало маркера (сек таймлайна)' },
+                  endSec: { type: 'number', description: 'Конец span-маркера (сек таймлайна), > timeSec. Опционально.' },
                   name: { type: 'string' },
                   comment: { type: 'string' },
                   type: { type: 'string', description: 'highlight | intro | topic | chapter | question | other' }
@@ -172,7 +178,12 @@ PanelBoot.run('ИИ: маркеры по структуре', function () {
     ContextStore.setMessages(PANEL_ID, stored);
     renderMessages(stored);
 
-    var apiMessages = [{ role: 'system', content: AgentPrompts.markers }].concat(stored);
+    var sysContent = AgentPrompts.markers;
+    if (_activeSystemAddon) {
+      sysContent += '\n\n' + _activeSystemAddon;
+      _activeSystemAddon = null;
+    }
+    var apiMessages = [{ role: 'system', content: sysContent }].concat(stored);
 
     el.send.disabled = true;
     el.stop.disabled = false;
@@ -185,7 +196,7 @@ PanelBoot.run('ИИ: маркеры по структуре', function () {
         messages: apiMessages,
         tools: tools,
         toolExecutors: buildExecutors(),
-        maxSteps: 10,
+        maxSteps: settings.maxAgentSteps || 24,
         abortSignal: ac.signal,
         abortCheck: function () {
           return ac.aborted;
@@ -373,6 +384,26 @@ PanelBoot.run('ИИ: маркеры по структуре', function () {
   })();
 
   renderMessages(ContextStore.getMessages(PANEL_ID));
+
+  /* ── Conversation Starters ────────────────────────────────────── */
+  (function setupStarters() {
+    var sc = document.getElementById('starters-container');
+    if (!sc || typeof StartersUI === 'undefined') return;
+    StartersUI.init(PANEL_ID, {
+      container: sc,
+      onUse: function (starter) {
+        el.input.value = starter.userPrompt || '';
+        el.input.focus();
+      },
+      onSystemAddon: function (addon) {
+        _activeSystemAddon = addon;
+      },
+      onError: function (msg) {
+        showErr(msg);
+        setTimeout(function () { showErr(''); }, 4000);
+      }
+    });
+  })();
 
   /* Статус кэша для активной секвенции при загрузке */
   (function refreshTranscriptBannerOnLoad() {

@@ -20,6 +20,7 @@ PanelBoot.run('ИИ: монтаж по таймкодам', function () {
   }
 
   var runAbort = null;
+  var _activeSystemAddon = null;
 
   var statusUi = PanelUIStatus.create('statusBar');
 
@@ -268,7 +269,12 @@ PanelBoot.run('ИИ: монтаж по таймкодам', function () {
       return;
     }
 
-    var apiMessages = [{ role: 'system', content: AgentPrompts.timecode }].concat(stored);
+    var sysContent = AgentPrompts.timecode;
+    if (_activeSystemAddon) {
+      sysContent += '\n\n' + _activeSystemAddon;
+      _activeSystemAddon = null;
+    }
+    var apiMessages = [{ role: 'system', content: sysContent }].concat(stored);
 
     el.send.disabled = true;
     el.stop.disabled = false;
@@ -281,7 +287,7 @@ PanelBoot.run('ИИ: монтаж по таймкодам', function () {
         messages: apiMessages,
         tools: tools,
         toolExecutors: buildExecutors(),
-        maxSteps: 12,
+        maxSteps: settings.maxAgentSteps || 24,
         abortSignal: ac.signal,
         abortCheck: function () {
           return ac.aborted;
@@ -376,4 +382,24 @@ PanelBoot.run('ИИ: монтаж по таймкодам', function () {
   })();
 
   renderMessages(ContextStore.getMessages(PANEL_ID));
+
+  /* ── Conversation Starters ────────────────────────────────────── */
+  (function setupStarters() {
+    var sc = document.getElementById('starters-container');
+    if (!sc || typeof StartersUI === 'undefined') return;
+    StartersUI.init(PANEL_ID, {
+      container: sc,
+      onUse: function (starter) {
+        el.input.value = starter.userPrompt || '';
+        el.input.focus();
+      },
+      onSystemAddon: function (addon) {
+        _activeSystemAddon = addon;
+      },
+      onError: function (msg) {
+        showErr(msg);
+        setTimeout(function () { showErr(''); }, 4000);
+      }
+    });
+  })();
 });
