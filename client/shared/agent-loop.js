@@ -37,27 +37,66 @@
   /**
    * Усечение истории сообщений: оставляем все system-сообщения + последние N не-system,
    * стараясь не разрывать пары tool_call → tool (иначе 400 от FM).
+   *
+   * Дополнительно: tool-результаты компрессируем — крупные снимки/транскрипты
+   * (десятки КБ) забивают контекст и приводят к 413 после нескольких шагов.
+   * Свежие N tool-результатов оставляем как есть, более старые усекаем до 600 байт
+   * с пометкой «[truncated, see earlier in context]».
    */
+  var TOOL_KEEP_FULL = 4;
+  var TOOL_TRUNC_BYTES = 600;
+
+  function compressToolHistory(messages) {
+    /* Идём с конца, оставляем последние TOOL_KEEP_FULL tool-сообщений нетронутыми,
+       остальные — урезаем content. Не трогаем оригинальные объекты — клонируем. */
+    var seenTools = 0;
+    var out = new Array(messages.length);
+    for (var i = messages.length - 1; i >= 0; i--) {
+      var m = messages[i];
+      if (m.role !== 'tool') {
+        out[i] = m;
+        continue;
+      }
+      seenTools++;
+      if (seenTools <= TOOL_KEEP_FULL) {
+        out[i] = m;
+        continue;
+      }
+      var c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+      if (c.length > TOOL_TRUNC_BYTES) {
+        c = c.slice(0, TOOL_TRUNC_BYTES) + '… [truncated ' + (c.length - TOOL_TRUNC_BYTES) + ' bytes — данные есть выше в контексте]';
+      }
+      out[i] = { role: 'tool', tool_call_id: m.tool_call_id, content: c };
+    }
+    return out;
+  }
+
   function trimHistory(messages, maxNonSystem) {
     if (!Array.isArray(messages) || messages.length === 0) return messages;
-    if (typeof maxNonSystem !== 'number' || maxNonSystem <= 0) return messages;
+    if (typeof maxNonSystem !== 'number' || maxNonSystem <= 0) {
+      return compressToolHistory(messages);
+    }
     var sys = [];
     var rest = [];
     for (var i = 0; i < messages.length; i++) {
       if (messages[i].role === 'system') sys.push(messages[i]);
       else rest.push(messages[i]);
     }
-    if (rest.length <= maxNonSystem) return messages;
-    var keep = rest.slice(-maxNonSystem);
-    /* Не начинаем с tool-сообщения, иначе FM вернёт 400. */
-    while (keep.length > 0 && keep[0].role === 'tool') keep.shift();
-    /* Если первый assistant-сообщение содержит tool_calls, но соответствующих tool-ответов
-       уже нет в keep — отбрасываем его до следующего «чистого» сообщения. */
-    while (keep.length > 0 && keep[0].role === 'assistant' && keep[0].tool_calls) {
-      keep.shift();
+    var keep;
+    if (rest.length <= maxNonSystem) {
+      keep = rest;
+    } else {
+      keep = rest.slice(-maxNonSystem);
+      /* Не начинаем с tool-сообщения, иначе FM вернёт 400. */
       while (keep.length > 0 && keep[0].role === 'tool') keep.shift();
+      /* Если первый assistant-сообщение содержит tool_calls, но соответствующих tool-ответов
+         уже нет в keep — отбрасываем его до следующего «чистого» сообщения. */
+      while (keep.length > 0 && keep[0].role === 'assistant' && keep[0].tool_calls) {
+        keep.shift();
+        while (keep.length > 0 && keep[0].role === 'tool') keep.shift();
+      }
     }
-    return sys.concat(keep);
+    return sys.concat(compressToolHistory(keep));
   }
 
   global.runAgentLoop = async function (opts) {

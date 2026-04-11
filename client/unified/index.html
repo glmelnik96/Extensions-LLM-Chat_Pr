@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <title>ИИ: монтаж</title>
+    <link rel="stylesheet" href="../shared/styles.css" />
+    <style>
+      /* ── Action bar ─────────────────────────────────────────────── */
+      .action-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+        padding: 8px 10px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+      }
+      .action-bar .grow { flex: 1 1 auto; }
+      .action-bar button {
+        font-size: 11px;
+        padding: 6px 10px;
+        white-space: nowrap;
+      }
+      .action-bar .led-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 10px;
+        color: var(--muted);
+      }
+
+      /* ── Меню «Ещё» ────────────────────────────────────────────── */
+      .more-menu { position: relative; display: inline-block; }
+      .more-menu .more-btn { background: var(--border); color: var(--text); }
+      .more-menu .more-btn:hover { background: #4a4a4a; }
+      .more-menu .more-popover {
+        position: absolute;
+        right: 0; top: calc(100% + 4px);
+        min-width: 180px;
+        background: #2a2a2a;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+        padding: 4px;
+        display: none;
+        z-index: 50;
+      }
+      .more-menu.open .more-popover { display: block; }
+      .more-menu .more-popover button {
+        display: block; width: 100%; text-align: left;
+        background: transparent; color: var(--text);
+        border-radius: 4px; padding: 6px 10px; font-size: 12px;
+      }
+      .more-menu .more-popover button:hover { background: rgba(255,255,255,0.07); }
+      .more-menu .more-popover button.danger:hover { background: rgba(196,43,43,0.18); color: #ff8888; }
+      .more-menu .more-popover hr { border: none; border-top: 1px solid var(--border); margin: 4px 2px; }
+
+      /* ── Starters category tabs ─────────────────────────────────── */
+      .starters-cat-bar {
+        display: flex;
+        gap: 0;
+        background: var(--panel);
+      }
+      .starters-cat-btn {
+        flex: 1;
+        background: transparent;
+        color: var(--muted);
+        border: none;
+        border-bottom: 2px solid transparent;
+        border-radius: 0;
+        padding: 7px 4px;
+        font-size: 10px;
+        font-weight: 600;
+        cursor: pointer;
+        text-transform: uppercase;
+        letter-spacing: 0.2px;
+        white-space: nowrap;
+      }
+      .starters-cat-btn:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+      .starters-cat-btn.active { color: #6cb6ff; border-bottom-color: #6cb6ff; }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header>ИИ: монтаж</header>
+
+      <div class="action-bar">
+        <button type="button" id="btn-transcribe" class="secondary" title="Транскрибировать область In–Out на активной секвенции">Транскрибировать In–Out</button>
+        <span class="led-wrap" title="Кэш транскрипта для активной секвенции">
+          <span id="transcript-led" class="transcript-led transcript-led--red" role="img" aria-label="Нет транскрипта"></span>
+          <span id="transcript-led-text">нет</span>
+        </span>
+        <span class="grow"></span>
+        <button type="button" id="btn-undo" class="secondary">Откат маркеров</button>
+        <div class="more-menu" id="more-menu">
+          <button type="button" class="more-btn" id="more-btn">Ещё ▾</button>
+          <div class="more-popover">
+            <button type="button" id="btn-clear-chat">Очистить чат</button>
+            <button type="button" id="btn-clear-cache">Очистить кэш транскриптов</button>
+            <hr />
+            <button type="button" id="btn-clear-all" class="danger">Сбросить всё</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="err" id="err"></div>
+      <div class="status-bar" id="statusBar" hidden>
+        <span class="status-spinner" id="statusSpinner"></span>
+        <span class="status-text" id="statusText"></span>
+      </div>
+
+      <div class="chat" id="chat"></div>
+
+      <div class="starters-section" id="starters-container"></div>
+      <div class="hint-chips" id="hint-chips"></div>
+
+      <div class="composer">
+        <textarea id="input" placeholder="Опишите задачу обычными словами…"></textarea>
+        <div class="row">
+          <button type="button" id="send">Отправить</button>
+          <button type="button" id="stop" class="secondary" disabled>Стоп</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      window.__PANEL_ID__ = 'unified';
+    </script>
+    <script src="../shared/panel-bootstrap.js"></script>
+    <script src="../lib/csinterface.js"></script>
+    <script src="../shared/fm-defaults.js"></script>
+    <script src="../shared/fm-secrets.js"></script>
+    <script src="../shared/abort-shim.js"></script>
+    <script src="../shared/context-store.js"></script>
+    <script src="../shared/cloudru-client.js"></script>
+    <script src="../shared/whisper-cpp-client.js"></script>
+    <script src="../shared/bridge-premiere.js"></script>
+    <script src="../shared/audio-preprocess.js"></script>
+    <script src="../shared/timeline-transcribe.js"></script>
+    <script src="../shared/transcript-structure.js"></script>
+    <script src="../shared/prompts.js"></script>
+    <script src="../shared/tool-validators.js"></script>
+    <script src="../shared/find-moments.js"></script>
+    <script src="../shared/edit-plan-simulator.js"></script>
+    <script src="../shared/audio-ducking.js"></script>
+    <script src="../shared/audio-render.js"></script>
+    <script src="../shared/agent-loop.js"></script>
+    <script src="../shared/ui-status.js"></script>
+    <script src="../shared/ui-hints.js"></script>
+    <script src="../shared/conversation-starters.js"></script>
+    <script src="../shared/starters-ui.js"></script>
+    <script src="panel.js"></script>
+  </body>
+</html>

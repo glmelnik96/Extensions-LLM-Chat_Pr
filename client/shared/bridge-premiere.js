@@ -84,8 +84,28 @@
       this.evalJson('$._EXT_PRM_.prepareTranscribeFromTimeline("' + json + '")', cb);
     },
 
-    undoLast: function (cb) {
-      this.evalJson('$._EXT_PRM_.undoLast()', cb);
+    /* Откат таймкодов / монтажа по тексту средствами плагина не реализован.
+       Edit→Undo на PP 2025 нестабилен на ripple-cuts; пакетный откат N шагов
+       в реальных монтажах (десятки операций) — нерабочее решение. Пользователь
+       откатывает штатно: Cmd+Z / Ctrl+Z в таймлайне Premiere. Для маркеров
+       откат остаётся через removeMarkersBySeconds. */
+
+    /** Удалить маркеры по списку секунд (откат для add_markers — Edit→Undo не работает по маркерам в PP 2025). */
+    removeMarkersBySeconds: function (secondsArr, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify({ seconds: secondsArr || [] }));
+      this.evalJson('$._EXT_PRM_.removeMarkersBySeconds("' + json + '")', cb);
+    },
+
+    /** Импорт файла в проект (в bin "AI Renders" по умолчанию). */
+    importMediaFile: function (params, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify(params || {}));
+      this.evalJson('$._EXT_PRM_.importMediaFile("' + json + '")', cb);
+    },
+
+    /** Получить mediaPath клипа на таймлайне по nodeId. */
+    getClipMediaPath: function (nodeId, cb) {
+      var s = String(nodeId).replace(/"/g, '\\"');
+      this.evalJson('$._EXT_PRM_.getClipMediaPath("' + s + '")', cb);
     }
   };
 })(window);

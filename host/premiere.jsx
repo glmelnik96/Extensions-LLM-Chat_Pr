@@ -10,15 +10,30 @@
  * - addSequenceMarkers: createMarker(String(Math.round(sec * timebase))); lift/ripple через remove(0|1,1)
  * - move_clip: по умолчанию ripple-insert (все start >= newStartSec += dur), затем установка клипа; shift_timeline_ripple
  * - exportInOutAudio: Sequence.exportAsMediaDirect(path, preset, ENCODE_IN_TO_OUT)
- * - undoLast: app.findMenuCommandId + app.executeCommand (локализованные названия меню)
+ * - откат таймкодов/textmontage: НЕ реализован (Cmd+Z в таймлайне Premiere вручную)
+ * - removeMarkersBySeconds: markers.deleteMarker — единственный механизм отката маркеров
  */
 if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.4.7';
+$._EXT_PRM_.version = '2.6.0';
 
 $._EXT_PRM_._EPS = 0.04;
+
+/**
+ * Счётчик «шагов» Premiere в рамках одной операции applyTimecodeEdits /
+ * applyTranscriptCuts / addSequenceMarkers. Раньше использовался для пакетного
+ * отката Edit→Undo×N — функция удалена как нереализуемая. Сейчас счётчик
+ * остаётся информационным полем `undoSteps` в ответе хоста (для логов/отладки).
+ */
+$._EXT_PRM_._opCounter = 0;
+$._EXT_PRM_._bump = function (n) {
+  $._EXT_PRM_._opCounter += typeof n === 'number' ? n : 1;
+};
+$._EXT_PRM_._resetOps = function () {
+  $._EXT_PRM_._opCounter = 0;
+};
 
 /**
  * Тики на секунде для активной секвенции (timebase в тиках/сек, см. getTimelineSnapshot).
@@ -146,6 +161,7 @@ $._EXT_PRM_._removeClipAndLinked = function (seq, nodeId) {
   for (var k = 0; k < toRemove.length; k++) {
     try {
       toRemove[k].remove(1, 1);
+      $._EXT_PRM_._bump();
       removed.push(String(toRemove[k].nodeId));
     } catch (eR) {}
   }
@@ -263,15 +279,15 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
     for (vi = 0; vi < numV; vi++) {
       try {
         var vt = qeSeq.getVideoTrackAt(vi);
-        vt.razor(tc0, true, true);
-        vt.razor(tc1, true, true);
+        try { vt.razor(tc0, true, true); $._EXT_PRM_._bump(); } catch (eVR0) {}
+        try { vt.razor(tc1, true, true); $._EXT_PRM_._bump(); } catch (eVR1) {}
       } catch (eVR) {}
     }
     for (ai = 0; ai < numA; ai++) {
       try {
         var at = qeSeq.getAudioTrackAt(ai);
-        at.razor(tc0, true, true);
-        at.razor(tc1, true, true);
+        try { at.razor(tc0, true, true); $._EXT_PRM_._bump(); } catch (eAR0) {}
+        try { at.razor(tc1, true, true); $._EXT_PRM_._bump(); } catch (eAR1) {}
       } catch (eAR) {}
     }
 
@@ -289,6 +305,7 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
           /* Клип целиком внутри [t0, t1] (с допуском eps) */
           if (cs >= t0 - eps && ce <= t1 + eps) {
             c.remove(ripFlag, 1);
+            $._EXT_PRM_._bump();
             removed++;
           }
         } catch (eVC) {}
@@ -304,6 +321,7 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
           var ae = ac.end.seconds;
           if (as2 >= t0 - eps && ae <= t1 + eps) {
             ac.remove(ripFlag, 1);
+            $._EXT_PRM_._bump();
             removed++;
           }
         } catch (eAC) {}
@@ -341,31 +359,31 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
 
     /* Case 1: клип целиком внутри [t0,t1] → удалить (ripple или lift) */
     if (i0 <= s + eps && i1 >= e - eps) {
-      try { clip.remove(ripFlag, 1); } catch (eR) {}
+      try { clip.remove(ripFlag, 1); $._EXT_PRM_._bump(); } catch (eR) {}
       log.push({ op: doRipple ? 'remove_clip_ripple' : 'remove_clip_lift', nodeId: String(clip.nodeId) });
       continue;
     }
 
     /* Case 2: отрезает начало клипа */
     if (i0 <= s + eps && i1 < e - eps) {
-      clip.inPoint.seconds = srcIn + (i1 - s);
-      if (Math.abs(clip.start.seconds - i1) > eps) clip.start.seconds = i1;
+      clip.inPoint.seconds = srcIn + (i1 - s); $._EXT_PRM_._bump();
+      if (Math.abs(clip.start.seconds - i1) > eps) { clip.start.seconds = i1; $._EXT_PRM_._bump(); }
       log.push({ op: 'trim_prefix', nodeId: String(clip.nodeId), newStartSec: i1 });
       continue;
     }
 
     /* Case 3: отрезает конец клипа */
     if (i0 > s + eps && i1 >= e - eps) {
-      clip.outPoint.seconds = srcIn + (i0 - s);
-      if (Math.abs(clip.end.seconds - i0) > eps) clip.end.seconds = i0;
+      clip.outPoint.seconds = srcIn + (i0 - s); $._EXT_PRM_._bump();
+      if (Math.abs(clip.end.seconds - i0) > eps) { clip.end.seconds = i0; $._EXT_PRM_._bump(); }
       log.push({ op: 'trim_suffix', nodeId: String(clip.nodeId), newEndSec: i0 });
       continue;
     }
 
     /* Case 4: середина — без QE только обрезка до t0 (правая часть потеряна) */
     if (i0 > s + eps && i1 < e - eps) {
-      clip.outPoint.seconds = srcIn + (i0 - s);
-      if (Math.abs(clip.end.seconds - i0) > eps) clip.end.seconds = i0;
+      clip.outPoint.seconds = srcIn + (i0 - s); $._EXT_PRM_._bump();
+      if (Math.abs(clip.end.seconds - i0) > eps) { clip.end.seconds = i0; $._EXT_PRM_._bump(); }
       log.push({ op: 'trim_suffix_no_split', nodeId: String(clip.nodeId), newEndSec: i0,
         warn: 'QE DOM недоступен — правая часть клипа после ' + i1.toFixed(2) + ' с потеряна. Включите QE DOM.' });
       continue;
@@ -540,8 +558,8 @@ $._EXT_PRM_._shiftClipsOverlappingRangeRight = function (seq, rangeStart, rangeE
     try {
       var ns = c.start.seconds + deltaSec;
       var ne = c.end.seconds + deltaSec;
-      c.start.seconds = ns;
-      c.end.seconds = ne;
+      c.start.seconds = ns; $._EXT_PRM_._bump();
+      c.end.seconds = ne; $._EXT_PRM_._bump();
       log.push({ nodeId: String(c.nodeId), newStartSec: ns, newEndSec: ne });
     } catch (eMv) {}
   }
@@ -611,8 +629,8 @@ $._EXT_PRM_._rippleShiftAllClipsFrom = function (seq, fromSec, deltaSec, exclude
     try {
       var ns = c.start.seconds + deltaSec;
       var ne = c.end.seconds + deltaSec;
-      c.start.seconds = ns;
-      c.end.seconds = ne;
+      c.start.seconds = ns; $._EXT_PRM_._bump();
+      c.end.seconds = ne; $._EXT_PRM_._bump();
       log.push({ nodeId: String(c.nodeId), newStartSec: ns, newEndSec: ne });
     } catch (eMv) {}
   }
@@ -636,11 +654,11 @@ $._EXT_PRM_._setTimelineIn = function (found, newStartSec) {
          Затем двигаем start на новую позицию. */
       var c = linked[k];
       var newIn = c.inPoint.seconds + delta;
-      c.inPoint.seconds = newIn;
+      c.inPoint.seconds = newIn; $._EXT_PRM_._bump();
       /* Premiere может автоматически скорректировать start/end.
          Если start не сместился — двигаем вручную: */
       if (Math.abs(c.start.seconds - newStartSec) > $._EXT_PRM_._EPS) {
-        c.start.seconds = newStartSec;
+        c.start.seconds = newStartSec; $._EXT_PRM_._bump();
       }
     } catch (eL) {}
   }
@@ -662,10 +680,10 @@ $._EXT_PRM_._setTimelineOut = function (found, newEndSec) {
       /* Premiere: end = start + (outPoint - inPoint).
          Для trim-right: уменьшаем outPoint → Premiere сокращает clip с конца. */
       var c = linked[k];
-      c.outPoint.seconds = c.outPoint.seconds - delta;
+      c.outPoint.seconds = c.outPoint.seconds - delta; $._EXT_PRM_._bump();
       /* Если end не скорректировался — поправляем вручную: */
       if (Math.abs(c.end.seconds - newEndSec) > $._EXT_PRM_._EPS) {
-        c.end.seconds = newEndSec;
+        c.end.seconds = newEndSec; $._EXT_PRM_._bump();
       }
     } catch (eL) {}
   }
@@ -751,6 +769,14 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
           if (!item) continue;
           var aDisabled = false;
           try { aDisabled = item.disabled ? true : false; } catch (eD2) {}
+          var aMediaPath = '';
+          try {
+            var aPi = item.projectItem;
+            if (aPi) {
+              if (typeof aPi.getMediaPath === 'function') aMediaPath = String(aPi.getMediaPath() || '');
+              else if (aPi.mediaPath) aMediaPath = String(aPi.mediaPath);
+            }
+          } catch (eMP) {}
           clips.push({
             trackIndex: ti,
             trackType: 'audio',
@@ -761,7 +787,8 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
             durationSec: item.end.seconds - item.start.seconds,
             inPointSec: item.inPoint ? item.inPoint.seconds : null,
             outPointSec: item.outPoint ? item.outPoint.seconds : null,
-            disabled: aDisabled
+            disabled: aDisabled,
+            mediaPath: aMediaPath.replace(/\\/g, '/')
           });
         } catch (e6) {}
       }
@@ -800,6 +827,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
       app.beginUndoGroup('ИИ: таймкоды');
       undoOpened = true;
     }
+    $._EXT_PRM_._resetOps();
     var ops = plan.operations || [];
     var results = [];
     var i,
@@ -923,7 +951,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         var enabled = op.enabled !== false;
         var linked = $._EXT_PRM_._findLinkedClips(seq, found.clip);
         for (var le = 0; le < linked.length; le++) {
-          try { linked[le].disabled = !enabled; } catch (eEn) {}
+          try { linked[le].disabled = !enabled; $._EXT_PRM_._bump(); } catch (eEn) {}
         }
         results.push({ op: a, ok: true, enabled: enabled, affectedClips: linked.length });
         continue;
@@ -943,6 +971,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         for (ch = 0; ch < byName.length; ch++) {
           try {
             byName[ch].disabled = !en;
+            $._EXT_PRM_._bump();
             aff++;
           } catch (eBn) {}
         }
@@ -1038,7 +1067,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
             if (typeof leadClip.move === 'function') {
               var tDelta = new Time();
               tDelta.seconds = deltaSec;
-              leadClip.move(tDelta);
+              leadClip.move(tDelta); $._EXT_PRM_._bump();
               moved = _verifyMove();
             }
           } catch (eM1) { mvErr = 'move(Time): ' + String(eM1.message || eM1); }
@@ -1049,7 +1078,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           try {
             if (typeof leadClip.move === 'function') {
               var tps2 = $._EXT_PRM_._ticksPerSecond(seq);
-              leadClip.move(Math.round(deltaSec * tps2));
+              leadClip.move(Math.round(deltaSec * tps2)); $._EXT_PRM_._bump();
               moved = _verifyMove();
             }
           } catch (eM2) { mvErr = (mvErr ? mvErr + '; ' : '') + 'move(ticks): ' + String(eM2.message || eM2); }
@@ -1126,7 +1155,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
 
                 if (qeClip && typeof qeClip.move === 'function') {
                   try {
-                    qeClip.move(tcStr);
+                    qeClip.move(tcStr); $._EXT_PRM_._bump();
                     qeMoveLog.push({ ok: true, kind: isVideo ? 'video' : 'audio', from: origStart });
                   } catch (eQEm) {
                     qeFails++;
@@ -1158,8 +1187,8 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           });
           for (var lm = 0; lm < mvOrder.length; lm++) {
             try {
-              mvOrder[lm].start.seconds = op.newStartSec;
-              mvOrder[lm].end.seconds = op.newStartSec + dur;
+              mvOrder[lm].start.seconds = op.newStartSec; $._EXT_PRM_._bump();
+              mvOrder[lm].end.seconds = op.newStartSec + dur; $._EXT_PRM_._bump();
             } catch (eMv) {
               mvErr = (mvErr ? mvErr + '; ' : '') + 'start.seconds=: ' + String(eMv.message || eMv);
             }
@@ -1214,23 +1243,13 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         continue;
       }
 
-      /* --- set_clip_speed: изменить скорость клипа --- */
+      /* --- set_clip_speed: УДАЛЕНО как нереализуемое на PP 2025 ---
+       * TrackItem.setSpeed() отсутствует в Premiere Pro 2024+ ScriptingAPI
+       * (есть только TrackItem.getSpeed). Программное изменение скорости
+       * через ExtendScript не поддерживается. Пользователь меняет скорость
+       * вручную в Premiere (правый клик → Speed/Duration). */
       if (a === 'set_clip_speed') {
-        found = $._EXT_PRM_._findClipByNodeId(seq, op.nodeId);
-        if (!found) {
-          results.push({ op: a, ok: false, error: 'Клип не найден: ' + op.nodeId });
-          continue;
-        }
-        if (typeof op.speed !== 'number' || op.speed <= 0) {
-          results.push({ op: a, ok: false, error: 'Нужен speed > 0 (1.0 = нормально, 2.0 = 2x)' });
-          continue;
-        }
-        try {
-          var speedOk = found.clip.setSpeed(op.speed, true);
-          results.push({ op: a, ok: speedOk !== false, speed: op.speed });
-        } catch (eSp) {
-          results.push({ op: a, ok: false, error: String(eSp.message || eSp) });
-        }
+        results.push({ op: a, ok: false, error: 'set_clip_speed не поддерживается ScriptingAPI Premiere Pro 2025' });
         continue;
       }
 
@@ -1245,7 +1264,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
             results.push({ op: a, ok: false, error: 'Дорожка не найдена: ' + trType + '[' + trIdx + ']' });
             continue;
           }
-          targetTrack.setMute(trMute ? 1 : 0);
+          targetTrack.setMute(trMute ? 1 : 0); $._EXT_PRM_._bump();
           results.push({ op: a, ok: true, trackType: trType, trackIndex: trIdx, muted: trMute });
         } catch (eTM) {
           results.push({ op: a, ok: false, error: String(eTM.message || eTM) });
@@ -1261,9 +1280,9 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
       results.push({ op: a || '?', ok: false, error: 'Неизвестное действие' });
     }
 
-    return JSON.stringify({ ok: true, results: results, hostVersion: $._EXT_PRM_.version });
+    return JSON.stringify({ ok: true, results: results, undoSteps: $._EXT_PRM_._opCounter, hostVersion: $._EXT_PRM_.version });
   } catch (e) {
-    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e), undoSteps: $._EXT_PRM_._opCounter });
   } finally {
     if (undoOpened && typeof app.endUndoGroup === 'function') {
       try {
@@ -1285,6 +1304,7 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       app.beginUndoGroup('ИИ: монтаж по тексту');
       undoOpened = true;
     }
+    $._EXT_PRM_._resetOps();
     var intervals = cuts.removeIntervals || [];
     var sorted = intervals.slice().sort(function (x, y) {
       return y.startSec - x.startSec;
@@ -1305,10 +1325,11 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       ok: true,
       appliedIntervals: sorted.length,
       details: allLog,
+      undoSteps: $._EXT_PRM_._opCounter,
       hostVersion: $._EXT_PRM_.version
     });
   } catch (e) {
-    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e), undoSteps: $._EXT_PRM_._opCounter });
   } finally {
     if (undoOpened && typeof app.endUndoGroup === 'function') {
       try {
@@ -1330,6 +1351,7 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
       app.beginUndoGroup('ИИ: маркеры');
       undoOpened = true;
     }
+    $._EXT_PRM_._resetOps();
     var markers = seq.markers;
     var i,
       m,
@@ -1349,13 +1371,19 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
       var mmk = null;
       try { mmk = strategyFn(); } catch (eTC) { mmk = null; }
       if (!mmk) return { mk: null, verifiedSec: null, drift: null };
+      $._EXT_PRM_._bump(); /* createMarker → шаг undo */
       var vs = _mkPos(mmk);
       var dr = vs !== null ? Math.abs(vs - targetSec) : null;
       return { mk: mmk, verifiedSec: vs, drift: dr };
     };
-    /* Вспом.: удалить маркер (для retry). */
+    /* Вспом.: удалить маркер (для retry). Откатывает счётчик: создание + удаление = 0 чистых шагов. */
     var _mkDelete = function (mm) {
-      try { if (mm && typeof markers.deleteMarker === 'function') markers.deleteMarker(mm); } catch (eDel) {}
+      try {
+        if (mm && typeof markers.deleteMarker === 'function') {
+          markers.deleteMarker(mm);
+          if ($._EXT_PRM_._opCounter > 0) $._EXT_PRM_._opCounter--;
+        }
+      } catch (eDel) {}
     };
 
     for (i = 0; i < list.length; i++) {
@@ -1519,18 +1547,25 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
     var anyDrift = false;
     var anySpanRequested = false;
     var anySpanApplied = false;
+    var createdSeconds = [];
     for (var cd = 0; cd < created.length; cd++) {
       if (created[cd].driftSec !== null && created[cd].driftSec > 1.0) anyDrift = true;
       if (created[cd].spanRequested) anySpanRequested = true;
       if (created[cd].spanApplied) anySpanApplied = true;
+      var ks = created[cd].verifiedSec !== null && created[cd].verifiedSec !== undefined
+        ? created[cd].verifiedSec : created[cd].timeSec;
+      if (typeof ks === 'number' && !isNaN(ks)) createdSeconds.push(ks);
     }
     var spanNotSupported = anySpanRequested && !anySpanApplied;
     return JSON.stringify({
       ok: true,
       created: created,
+      createdSeconds: createdSeconds,
       count: created.length,
       failed: failed,
       failedCount: failed.length,
+      undoSteps: $._EXT_PRM_._opCounter,
+      undoMode: 'markers',
       driftWarning: anyDrift ? 'Некоторые маркеры сместились более чем на 1 с от запрошенной позиции — проверьте визуально' : null,
       spanNotSupported: spanNotSupported,
       spanNotice: spanNotSupported
@@ -1871,28 +1906,182 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
 };
 
 /**
- * Один шаг отмены в Premiere (меню Edit → Undo / локализованные варианты).
+ * Откат таймкодов / монтажа по тексту средствами плагина НЕ реализован.
+ * Причина: Edit→Undo на PP 2025 нестабилен после ripple-cuts, а пакетный
+ * откат N шагов (десятки операций в реальных монтажах) — нерабочее решение.
+ * Пользователь откатывает штатно: Cmd+Z / Ctrl+Z в таймлайне Premiere.
+ * Для маркеров откат сохранён ниже через removeMarkersBySeconds
+ * (markers.deleteMarker по списку секунд) — Edit→Undo маркеры не откатывает.
+ *
+ * Ранее здесь жили: $._EXT_PRM_.undoSteps(n), $._EXT_PRM_.undoLast(),
+ * $._EXT_PRM_._resolveUndoCid() — все удалены.
  */
-$._EXT_PRM_.undoLast = function () {
-  var labels = ['Edit > Undo', 'Undo', 'Отменить', 'Редактирование > Отменить'];
-  var i,
-    cid;
-  for (i = 0; i < labels.length; i++) {
-    try {
-      cid = app.findMenuCommandId(labels[i]);
-      if (cid > 0) {
-        app.executeCommand(cid);
-        return JSON.stringify({ ok: true, hostVersion: $._EXT_PRM_.version, via: labels[i] });
-      }
-    } catch (e1) {}
-  }
+
+/**
+ * Удалить маркеры по их позициям (секундам). Используется как механизм undo
+ * для addSequenceMarkers, потому что Edit→Undo на PP 2025 НЕ откатывает
+ * создание маркеров (known broken). Толерантность ±0.1 с к дрейфу.
+ */
+$._EXT_PRM_.removeMarkersBySeconds = function (jsonArg) {
   try {
-    app.executeCommand(199);
-    return JSON.stringify({ ok: true, hostVersion: $._EXT_PRM_.version, via: 'fallback_199' });
-  } catch (e2) {}
-  return JSON.stringify({
-    ok: false,
-    error: 'Команда Undo не найдена. Сфокусируйте таймлайн Premiere и нажмите Cmd+Z (Ctrl+Z).',
-    hostVersion: $._EXT_PRM_.version
-  });
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+    var arg = JSON.parse(jsonArg);
+    var seconds = arg.seconds || [];
+    if (!seconds.length) return JSON.stringify({ ok: true, removed: 0 });
+    var tol = typeof arg.tolerance === 'number' ? arg.tolerance : 0.15;
+    var markers = seq.markers;
+    var removed = 0;
+    var failed = [];
+    /* Проходим по каждому запрошенному секундному значению; для каждого ищем самый близкий маркер. */
+    var s, mk, best, bestD, found;
+    for (var i = 0; i < seconds.length; i++) {
+      s = parseFloat(seconds[i]);
+      if (isNaN(s)) continue;
+      best = null; bestD = 1e9;
+      try {
+        if (typeof markers.getFirstMarker === 'function') {
+          mk = markers.getFirstMarker();
+          while (mk) {
+            try {
+              var ms = mk.start && typeof mk.start.seconds === 'number' ? mk.start.seconds : null;
+              if (ms !== null) {
+                var d = Math.abs(ms - s);
+                if (d < bestD && d <= tol) { bestD = d; best = mk; }
+              }
+            } catch (eGS) {}
+            try { mk = markers.getNextMarker(mk); } catch (eGN) { mk = null; }
+          }
+        } else if (markers.numMarkers !== undefined) {
+          for (var k = 0; k < markers.numMarkers; k++) {
+            try {
+              var mm = markers[k];
+              if (!mm) continue;
+              var ms2 = mm.start && typeof mm.start.seconds === 'number' ? mm.start.seconds : null;
+              if (ms2 !== null) {
+                var d2 = Math.abs(ms2 - s);
+                if (d2 < bestD && d2 <= tol) { bestD = d2; best = mm; }
+              }
+            } catch (eIx) {}
+          }
+        }
+      } catch (eIter) {}
+      if (best) {
+        try {
+          markers.deleteMarker(best);
+          removed++;
+        } catch (eDel) {
+          failed.push({ sec: s, error: String(eDel.message || eDel) });
+        }
+      } else {
+        failed.push({ sec: s, error: 'не найден маркер ближе ' + tol + ' с' });
+      }
+    }
+    return JSON.stringify({
+      ok: true,
+      removed: removed,
+      requested: seconds.length,
+      failed: failed,
+      hostVersion: $._EXT_PRM_.version
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
 };
+
+/**
+ * Импортировать файл в проект (в корневой bin или в "AI Renders" если задано).
+ * jsonArg: { path:string, binName?:string }
+ * Возвращает { ok, projectItemName }
+ */
+$._EXT_PRM_.importMediaFile = function (jsonArg) {
+  try {
+    if (!app.project) return JSON.stringify({ ok: false, error: 'Нет открытого проекта' });
+    var arg = JSON.parse(jsonArg);
+    var p = String(arg.path || '').replace(/\\/g, '/');
+    if (!p || !$._EXT_PRM_._fileExists(p)) {
+      return JSON.stringify({ ok: false, error: 'Файл не найден: ' + p });
+    }
+    var binName = String(arg.binName || 'AI Renders');
+    /* Находим/создаём bin */
+    var rootItem = app.project.rootItem;
+    var targetBin = null;
+    try {
+      for (var ci = 0; ci < rootItem.children.numItems; ci++) {
+        var ch = rootItem.children[ci];
+        if (ch && ch.name === binName && ch.type === 2 /* BIN */) {
+          targetBin = ch; break;
+        }
+      }
+    } catch (eFind) {}
+    if (!targetBin) {
+      try {
+        targetBin = rootItem.createBin(binName);
+      } catch (eBin) { targetBin = rootItem; }
+    }
+    /* Определяем количество элементов до импорта, чтобы найти новый */
+    var beforeCount = 0;
+    try { beforeCount = targetBin.children.numItems; } catch (eBC) {}
+    var imported = false;
+    try {
+      app.project.importFiles([p], false, targetBin, false);
+      imported = true;
+    } catch (eImp1) {
+      try { app.project.importFiles([p]); imported = true; } catch (eImp2) {
+        return JSON.stringify({ ok: false, error: 'importFiles упал: ' + String(eImp1.message || eImp1) });
+      }
+    }
+    /* Имя нового элемента — basename файла. Не используем regex с '/' в char class —
+       ExtendScript некорректно завершает regex literal на '/' даже внутри [...]. */
+    var basename = p;
+    var slashIdx = basename.lastIndexOf('/');
+    if (slashIdx >= 0) basename = basename.substring(slashIdx + 1);
+    var bsIdx = basename.lastIndexOf('\\');
+    if (bsIdx >= 0) basename = basename.substring(bsIdx + 1);
+    return JSON.stringify({
+      ok: true,
+      projectItemName: basename,
+      binName: binName,
+      imported: imported,
+      hostVersion: $._EXT_PRM_.version
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
+ * Получить mediaPath клипа по nodeId (быстрый lookup без полного снимка).
+ */
+$._EXT_PRM_.getClipMediaPath = function (nodeId) {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+    var found = $._EXT_PRM_._findClipByNodeId(seq, nodeId);
+    if (!found) return JSON.stringify({ ok: false, error: 'Клип не найден: ' + nodeId });
+    var clip = found.clip;
+    var pi = clip.projectItem;
+    var mp = '';
+    try {
+      if (pi && typeof pi.getMediaPath === 'function') mp = String(pi.getMediaPath() || '');
+      else if (pi && pi.mediaPath) mp = String(pi.mediaPath);
+    } catch (eGP) {}
+    if (!mp) return JSON.stringify({ ok: false, error: 'У клипа нет mediaPath (вложенная секвенция/генератор)' });
+    return JSON.stringify({
+      ok: true,
+      mediaPath: mp.replace(/\\/g, '/'),
+      name: clip.name || '',
+      startSec: clip.start.seconds,
+      endSec: clip.end.seconds,
+      inPointSec: clip.inPoint ? clip.inPoint.seconds : 0,
+      outPointSec: clip.outPoint ? clip.outPoint.seconds : null
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+

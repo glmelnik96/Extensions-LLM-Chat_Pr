@@ -138,7 +138,7 @@
       var text = await res.text();
       if (isPayloadTooLarge(res.status, text)) {
         throw new Error(
-          '413 Payload Too Large — аудио слишком большое для API. Включите пресет .epr и transcribeExportChunkSec в fm-defaults.js (экспорт In–Out чанками).'
+          '413 Payload Too Large — аудио слишком большое для API. Установите ffmpeg (brew install ffmpeg / apt install ffmpeg) — плагин автоматически нарежет диапазон на чанки. Альтернатива: создайте .epr пресет и пропишите exportAudioPresetPath в fm-defaults.js (см. host/presets/README.txt).'
         );
       }
       var data = parseJsonResponse(text, 'Транскрипция: не JSON');

@@ -2,7 +2,12 @@
 
 Документ фиксирует **что подтверждено в работе**, **что с оговорками**, **что не срабатывает** и **какие правки уже пробовали** — без превращения в список задач на разработку.
 
-**Обновлено:** 2026-04-07 · ориентир хоста `premiere.jsx` ~2.4.7.
+**Обновлено:** 2026-04-08 · ориентир хоста `premiere.jsx` ~2.4.8.
+
+**Изменения 2.4.8 (2026-04-08):**
+- **Локальная транскрибация через whisper.cpp.** Новый модуль `client/shared/whisper-cpp-client.js`, диспетчер `backendTranscribe()` в `timeline-transcribe.js`. `FM_DEFAULTS.transcribeBackend = 'whisper.cpp'` (дефолт). Для локального бэкенда снят лимит 20 МБ (`maxBytes = Infinity`) — 413 Payload Too Large больше не возникает. Видео-контейнеры принудительно экстрагируются в wav через ffmpeg перед подачей в whisper-cli (`isAudioExt()` проверка). `ContextStore.getResolvedSettings()` whitelist дополнен полями `transcribeBackend / whisperCpp*` — без этого `undefined` молча откатывался на cloud.
+- **ExtendScript regex lexer — grep'нуть до деплоя.** В `host/premiere.jsx` `importMediaFile` regex `/^.*[\\/]/` ломал загрузку всего `.jsx` с `SyntaxError: Expected: )`. Причина: лексер ExtendScript терминирует regex-literal на первом `/` даже внутри character class `[...]`. Фикс — `lastIndexOf('/')` + `lastIndexOf('\\')`. Универсальное правило: **в ExtendScript не класть `/` в `[...]` regex, использовать строковые методы**. Зафиксировано в `docs/lessons-learned.md` (раздел 2).
+- **Test 4 (Audio ducking) / Test 5 (LUFS normalization)** — код `audio-ducking.js`, `audio-render.js` (offline ffmpeg рендер) **оставлен в пайплайне**, но **не фиксируется как 100% рабочий**. Пользователь не использует эти функции в продакшене; они остаются в коде как основа для §3.3.
 
 ## ⚠️ Известные нерабочие функции (зафиксировано, не чинить сейчас)
 

@@ -1,0 +1,2931 @@
+/**
+ * Единая панель: все функции (таймкоды / текст / маркеры / аудио) в одном чате.
+ *
+ * Архитектура:
+ *  - Один panelId 'unified', один набор инструментов TOOLS_UNIFIED, единый промпт.
+ *  - Транскрибация ОБЩАЯ — одна кнопка, общий кэш-файл.
+ *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
+ *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
+ */
+PanelBoot.run('ИИ: монтаж', function () {
+  var cs = new CSInterface();
+  try {
+    ContextStore.setExtensionRoot((cs.getExtensionPath() || '').replace(/\\/g, '/'));
+    var udU = cs.getSystemPath('userData');
+    if (udU) ContextStore.setTranscriptUserDataBase(udU.replace(/\\/g, '/'));
+  } catch (eRoot) {}
+
+  /* Все обращения к транскриптам идут под одним panelId — на самом деле кэш всё равно
+     общий через файл, panelId сейчас служит ключом группы в localStorage-fallback и не
+     ограничивает чтения между пресетами. Используем единый ключ для прозрачности. */
+  var TRANSCRIPT_PID = 'unified';
+
+  var el = {
+    chat: document.getElementById('chat'),
+    input: document.getElementById('input'),
+    send: document.getElementById('send'),
+    stop: document.getElementById('stop'),
+    err: document.getElementById('err'),
+    transcribe: document.getElementById('btn-transcribe'),
+    hintBox: document.getElementById('hint-chips'),
+    startersBox: document.getElementById('starters-container'),
+    ledText: document.getElementById('transcript-led-text'),
+    moreMenu: document.getElementById('more-menu'),
+    moreBtn: document.getElementById('more-btn')
+  };
+  if (!el.chat || !el.input || !el.send || !el.stop || !el.err) {
+    throw new Error('Не найдены узлы UI единой панели.');
+  }
+
+  var statusUi = PanelUIStatus.create('statusBar');
+
+  /* Состояние, общее на единую панель: */
+  var lastSnap = null;
+  var runAbort = null;
+  var _activeSystemAddon = null;
+  var _pendingProposal = null;
+  /* { kind: 'transcript_cuts'|'timecode_edits'|'markers'|'audio_ducking'|'loudness',
+       payload: ..., summary, createdAt, simulation? (для timecode), verification? (для transcript_cuts) } */
+
+  function extensionRootForHost() {
+    return (cs.getExtensionPath() || '').replace(/\\/g, '/');
+  }
+
+  function showErr(t) {
+    el.err.textContent = t || '';
+  }
+
+  function setTranscriptLed(state) {
+    var led = document.getElementById('transcript-led');
+    if (!led) return;
+    var s = state === 'busy' ? 'yellow' : state === 'ok' ? 'green' : 'red';
+    led.className = 'transcript-led transcript-led--' + s;
+    var t = state === 'ok' ? 'есть' : state === 'busy' ? 'идёт' : 'нет';
+    if (el.ledText) el.ledText.textContent = t;
+    led.setAttribute(
+      'aria-label',
+      state === 'ok' ? 'Транскрипт в кэше' : state === 'busy' ? 'Идёт транскрибация' : 'Нет транскрипта'
+    );
+  }
+
+  /* ─── Tools schemas (по пресетам) ────────────────────────────────── */
+
+  /* Унифицированный EditPlan (§2.1): один контракт для всех правок.
+     Добавляется в TOOLS_TIMECODE и TOOLS_TEXTMONTAGE как приоритетный путь.
+     Старые propose_transcript_cuts / propose_timecode_edits остаются для
+     обратной совместимости, но prompts.js теперь рекомендует propose_edit_plan. */
+  var UNIFIED_EDIT_PLAN_TOOLS = [
+    {
+      type: 'function',
+      'function': {
+        name: 'propose_edit_plan',
+        description:
+          'Единый контракт для правок таймлайна. Показывает карточку подтверждения. После вызова — ЗАВЕРШИ ход. kind: ripple_delete_interval, lift_delete_interval, remove_clip, trim_in, trim_out, trim_bounds, move_clip, set_clip_enabled, shift_ripple, mute_track, note.',
+        parameters: {
+          type: 'object',
+          properties: {
+            ops: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  kind: {
+                    type: 'string',
+                    enum: [
+                      'ripple_delete_interval',
+                      'lift_delete_interval',
+                      'remove_clip',
+                      'trim_in',
+                      'trim_out',
+                      'trim_bounds',
+                      'move_clip',
+                      'set_clip_enabled',
+                      'shift_ripple',
+                      'mute_track',
+                      'note'
+                    ]
+                  },
+                  startSec: { type: 'number' },
+                  endSec: { type: 'number' },
+                  timeSec: { type: 'number' },
+                  nodeId: { type: 'string' },
+                  newStartSec: { type: 'number' },
+                  fromSec: { type: 'number' },
+                  deltaSec: { type: 'number' },
+                  enabled: { type: 'boolean' },
+                  trackType: { type: 'string' },
+                  trackIndex: { type: 'number' },
+                  muted: { type: 'boolean' },
+                  reason: { type: 'string', description: 'Короткое объяснение (показывается пользователю рядом с операцией).' },
+                  quote: { type: 'string', description: 'Для ripple/lift — цитата 10-25 слов из транскрипта (что именно вырезаем).' },
+                  note: { type: 'string' }
+                },
+                required: ['kind']
+              }
+            },
+            summary: { type: 'string' },
+            rationale: { type: 'string' }
+          },
+          required: ['ops', 'summary']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'apply_edit_plan',
+        description:
+          'Прямое применение EditPlan БЕЗ подтверждения. Только если пользователь сказал «делай сразу».',
+        parameters: {
+          type: 'object',
+          properties: {
+            ops: { type: 'array', items: { type: 'object' } },
+            summary: { type: 'string' }
+          },
+          required: ['ops']
+        }
+      }
+    }
+  ];
+
+  var TOOLS_TIMECODE = [
+    {
+      type: 'function',
+      'function': {
+        name: 'get_timeline_snapshot',
+        description: 'Список клипов активной секвенции: имена, nodeId, startSec/endSec на таймлайне.',
+        parameters: { type: 'object', properties: {} }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'apply_timecode_edits',
+        description:
+          'Правки на активной секвенции: ripple_delete_range, lift_delete_range, remove_clip, trim, move_clip, shift_timeline_ripple, set_clip_enabled, set_clips_enabled_by_name, set_playhead, mute_track, note.',
+        parameters: {
+          type: 'object',
+          properties: {
+            operations: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  nodeId: { type: 'string' },
+                  action: {
+                    type: 'string',
+                    enum: [
+                      'set_timeline_in',
+                      'set_timeline_out',
+                      'set_timeline_bounds',
+                      'remove_clip',
+                      'ripple_delete_range',
+                      'ripple_delete_range_all_tracks',
+                      'lift_delete_range',
+                      'lift_delete_range_all_tracks',
+                      'set_clip_enabled',
+                      'set_clips_enabled_by_name',
+                      'move_clip',
+                      'shift_timeline_ripple',
+                      'set_playhead',
+                      'mute_track',
+                      'note'
+                    ]
+                  },
+                  timeSec: { type: 'number' },
+                  startSec: { type: 'number' },
+                  endSec: { type: 'number' },
+                  newStartSec: { type: 'number' },
+                  shiftBlockingClips: { type: 'boolean' },
+                  makeRoom: { type: 'boolean' },
+                  fromSec: { type: 'number' },
+                  deltaSec: { type: 'number' },
+                  excludeNodeIds: { type: 'array', items: { type: 'string' } },
+                  enabled: { type: 'boolean' },
+                  trackType: { type: 'string' },
+                  trackIndex: { type: 'number' },
+                  muted: { type: 'boolean' },
+                  clipName: { type: 'string' },
+                  note: { type: 'string' }
+                }
+              }
+            },
+            summary: { type: 'string' }
+          },
+          required: ['operations']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'propose_timecode_edits',
+        description:
+          'Предложить план правок таймлайна пользователю на подтверждение (НЕ выполняет правку). Покажет карточку «было/станет» с diff-полосой и кнопками «Применить / Отмена». ВСЕГДА предпочитай этот инструмент перед apply_timecode_edits, кроме случаев, когда пользователь явно сказал «без подтверждения». Параметры — те же operations и summary.',
+        parameters: {
+          type: 'object',
+          properties: {
+            operations: { type: 'array', items: { type: 'object' } },
+            summary: { type: 'string' }
+          },
+          required: ['operations', 'summary']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'dry_run_edit_plan',
+        description:
+          'Симулирует план правок на текущем снимке БЕЗ обращения к Premiere. Принимает либо унифицированный формат {ops:[...]}, либо legacy {operations:[...]}. Возвращает предсказанное состояние клипов (что удалится, что обрежется, итоговая длительность). Используй перед propose_edit_plan / propose_timecode_edits.',
+        parameters: {
+          type: 'object',
+          properties: {
+            ops: { type: 'array', items: { type: 'object' } },
+            operations: { type: 'array', items: { type: 'object' } }
+          }
+        }
+      }
+    }
+  ];
+
+  var TOOLS_TEXTMONTAGE = [
+    {
+      type: 'function',
+      'function': {
+        name: 'get_timeline_snapshot',
+        description: 'Снимок активной секвенции (имена клипов, nodeId, время на таймлайне).',
+        parameters: { type: 'object', properties: {} }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'get_transcript_from_cache',
+        description:
+          'Получить сохранённый транскрипт по ключу (имя секвенции). Сегменты с startSec/endSec/text. Для обзора материала используй get_transcript_structure.',
+        parameters: {
+          type: 'object',
+          properties: { sequenceKey: { type: 'string' } },
+          required: ['sequenceKey']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'get_transcript_structure',
+        description:
+          'Структурное представление транскрипта: paragraphs (с полным текстом), topics, speakers, silences. ' +
+          'Для коротких видео (<80 абзацев) отдаёт всё сразу. Для длинных — используй fromParagraph/toParagraph для постраничного доступа.',
+        parameters: {
+          type: 'object',
+          properties: {
+            sequenceKey: { type: 'string' },
+            fromParagraph: { type: 'number', description: 'Начальный индекс абзаца (включительно). По умолчанию 0.' },
+            toParagraph: { type: 'number', description: 'Конечный индекс абзаца (не включительно). По умолчанию — все.' }
+          },
+          required: ['sequenceKey']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'propose_transcript_cuts',
+        description:
+          'Предложить план вырезания интервалов пользователю на подтверждение (НЕ выполняет правку). Покажет карточку «Применить / Отмена». Передавай keepSummary и removeSummary с цитатами.',
+        parameters: {
+          type: 'object',
+          properties: {
+            removeIntervals: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  startSec: { type: 'number' },
+                  endSec: { type: 'number' },
+                  reason: { type: 'string' }
+                },
+                required: ['startSec', 'endSec']
+              }
+            },
+            keepSummary: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  startSec: { type: 'number' },
+                  endSec: { type: 'number' },
+                  quote: { type: 'string' }
+                }
+              }
+            },
+            removeSummary: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  startSec: { type: 'number' },
+                  endSec: { type: 'number' },
+                  quote: { type: 'string' },
+                  reason: { type: 'string' }
+                }
+              }
+            },
+            summary: { type: 'string' }
+          },
+          required: ['removeIntervals', 'summary']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'apply_transcript_cuts',
+        description:
+          'Вырезать интервалы времени на таймлайне. Все дорожки. ВНИМАНИЕ: используй только если пользователь явно попросил «без подтверждения», иначе используй propose_transcript_cuts.',
+        parameters: {
+          type: 'object',
+          properties: {
+            removeIntervals: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  startSec: { type: 'number' },
+                  endSec: { type: 'number' },
+                  reason: { type: 'string' }
+                },
+                required: ['startSec', 'endSec']
+              }
+            },
+            summary: { type: 'string' }
+          },
+          required: ['removeIntervals']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'apply_timecode_edits',
+        description: 'Те же операции, что в пресете «Таймкоды».',
+        parameters: {
+          type: 'object',
+          properties: {
+            operations: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  nodeId: { type: 'string' },
+                  action: {
+                    type: 'string',
+                    enum: [
+                      'set_timeline_in',
+                      'set_timeline_out',
+                      'set_timeline_bounds',
+                      'remove_clip',
+                      'ripple_delete_range',
+                      'ripple_delete_range_all_tracks',
+                      'lift_delete_range',
+                      'lift_delete_range_all_tracks',
+                      'set_clip_enabled',
+                      'set_clips_enabled_by_name',
+                      'move_clip',
+                      'shift_timeline_ripple',
+                      'set_playhead',
+                      'mute_track',
+                      'note'
+                    ]
+                  },
+                  timeSec: { type: 'number' },
+                  startSec: { type: 'number' },
+                  endSec: { type: 'number' },
+                  newStartSec: { type: 'number' },
+                  shiftBlockingClips: { type: 'boolean' },
+                  makeRoom: { type: 'boolean' },
+                  fromSec: { type: 'number' },
+                  deltaSec: { type: 'number' },
+                  excludeNodeIds: { type: 'array', items: { type: 'string' } },
+                  enabled: { type: 'boolean' },
+                  trackType: { type: 'string' },
+                  trackIndex: { type: 'number' },
+                  muted: { type: 'boolean' },
+                  clipName: { type: 'string' },
+                  note: { type: 'string' }
+                }
+              }
+            },
+            summary: { type: 'string' }
+          },
+          required: ['operations']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'find_moments',
+        description:
+          'Семантический поиск моментов в транскрипте по запросу. Возвращает топ-K параграфов или сегментов с интервалами времени и оценкой совпадения. Используй вместо чтения всего транскрипта, если ищешь конкретное место.',
+        parameters: {
+          type: 'object',
+          properties: {
+            sequenceKey: { type: 'string', description: 'Имя секвенции (ключ кэша).' },
+            query: { type: 'string', description: 'Запрос на естественном языке. Сначала literal-поиск по словоформам (стратегия → стратегии/стратегиям), потом TF-IDF fallback.' },
+            k: { type: 'number', description: 'Сколько результатов вернуть (по умолчанию 20). Возвращаются ВСЕ literal-совпадения до этого лимита.' }
+          },
+          required: ['sequenceKey', 'query']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'analyze_transcript_for_cuts',
+        description:
+          'Анализ транскрипта: локальные детекторы + LLM. Классифицирует сегменты (content/filler/intro/outro/outtake/repeat/artifact/digression). Возвращает removeIntervals. Кэш 30 мин.',
+        parameters: {
+          type: 'object',
+          properties: {
+            sequenceKey: { type: 'string', description: 'Имя секвенции (ключ кэша).' },
+            tasks: {
+              type: 'array',
+              items: { type: 'string', enum: ['filler', 'intro', 'outro', 'outtake', 'repeat', 'artifact', 'digression'] },
+              description: 'Какие категории искать. По умолчанию все. Примеры: ["filler","intro"] для «убери паразиты и вступление»; ["outtake","repeat"] для «убери оговорки и повторы».'
+            },
+            forceRefresh: { type: 'boolean', description: 'true — игнорировать кэш и запустить анализ заново.' }
+          },
+          required: ['sequenceKey']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'propose_audio_ducking',
+        description:
+          'Рассчитать ducking для МУЗЫКАЛЬНОГО клипа на основе речевых параграфов и предложить РЕАЛЬНЫЙ рендер через ffmpeg. По «Применить» в карточке плагин рендерит новый WAV (музыка с приглушением на интервалах речи) и импортирует его в проект Premiere в bin "AI Renders". targetNodeId — nodeId музыкального клипа из get_timeline_snapshot (обычно на дорожке A2/A3, не A1).',
+        parameters: {
+          type: 'object',
+          properties: {
+            sequenceKey: { type: 'string' },
+            targetNodeId: { type: 'string', description: 'nodeId музыкального клипа из снимка (audio-клип на A2/A3 с длинным mediaPath).' },
+            duckDb: { type: 'number', description: 'Глубина приглушения в дБ (по умолчанию -12).' },
+            fadeInSec: { type: 'number', description: 'Длительность fade-in перед речью (по умолчанию 0.15).' },
+            fadeOutSec: { type: 'number', description: 'Длительность fade-out после речи (по умолчанию 0.3).' }
+          },
+          required: ['sequenceKey', 'targetNodeId']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'propose_loudness_normalization',
+        description:
+          'Нормализация громкости РЕЧЕВОГО клипа под целевой LUFS через ffmpeg loudnorm. По «Применить» рендерит новый WAV и импортирует в проект. targetNodeId — речевой клип (обычно на A1).',
+        parameters: {
+          type: 'object',
+          properties: {
+            sequenceKey: { type: 'string' },
+            targetNodeId: { type: 'string', description: 'nodeId речевого клипа из снимка (обычно A1).' },
+            targetLufs: { type: 'number', description: 'Целевой LUFS (по умолчанию -16 для YouTube).' }
+          },
+          required: ['sequenceKey', 'targetNodeId']
+        }
+      }
+    }
+  ];
+
+  var TOOLS_MARKERS = [
+    {
+      type: 'function',
+      'function': {
+        name: 'get_timeline_snapshot',
+        description: 'Снимок активной секвенции.',
+        parameters: { type: 'object', properties: {} }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'get_transcript_from_cache',
+        description: 'Транскрипт из кэша по имени секвенции.',
+        parameters: {
+          type: 'object',
+          properties: { sequenceKey: { type: 'string' } },
+          required: ['sequenceKey']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'get_transcript_structure',
+        description: 'Структурное представление транскрипта с пагинацией (fromParagraph/toParagraph).',
+        parameters: {
+          type: 'object',
+          properties: {
+            sequenceKey: { type: 'string' },
+            fromParagraph: { type: 'number' },
+            toParagraph: { type: 'number' }
+          },
+          required: ['sequenceKey']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'add_markers',
+        description:
+          'Создать маркеры на активной секвенции. Маркер может быть точечным (только timeSec) или span (timeSec+endSec).',
+        parameters: {
+          type: 'object',
+          properties: {
+            markers: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  timeSec: { type: 'number' },
+                  endSec: { type: 'number' },
+                  name: { type: 'string' },
+                  comment: { type: 'string' },
+                  type: { type: 'string' }
+                },
+                required: ['timeSec', 'name']
+              }
+            },
+            summary: { type: 'string' }
+          },
+          required: ['markers']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'propose_markers',
+        description:
+          'Предложить набор маркеров пользователю на подтверждение (НЕ создаёт). Покажет карточку с превью маркеров на полосе таймлайна и кнопками «Применить / Отмена». ВСЕГДА предпочитай этот инструмент перед add_markers, если не сказано «без подтверждения».',
+        parameters: {
+          type: 'object',
+          properties: {
+            markers: { type: 'array', items: { type: 'object' } },
+            summary: { type: 'string' }
+          },
+          required: ['markers', 'summary']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'find_moments',
+        description:
+          'Семантический поиск моментов в транскрипте по запросу. Возвращает топ-K параграфов с временными интервалами. Удобно для расстановки маркеров на конкретные темы.',
+        parameters: {
+          type: 'object',
+          properties: {
+            sequenceKey: { type: 'string' },
+            query: { type: 'string' },
+            k: { type: 'number' }
+          },
+          required: ['sequenceKey', 'query']
+        }
+      }
+    }
+  ];
+
+  /* §2.1: пробрасываем унифицированный EditPlan в timecode и textmontage */
+  TOOLS_TIMECODE = TOOLS_TIMECODE.concat(UNIFIED_EDIT_PLAN_TOOLS);
+  TOOLS_TEXTMONTAGE = TOOLS_TEXTMONTAGE.concat(UNIFIED_EDIT_PLAN_TOOLS);
+
+  /* ═══ Единый набор инструментов: дедупликация по имени ═══ */
+  var TOOLS_UNIFIED = (function () {
+    var all = [].concat(TOOLS_TEXTMONTAGE, TOOLS_MARKERS, TOOLS_TIMECODE, UNIFIED_EDIT_PLAN_TOOLS);
+    var seen = {};
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      var nm = all[i] && all[i]['function'] && all[i]['function'].name;
+      if (nm && !seen[nm]) { seen[nm] = 1; out.push(all[i]); }
+    }
+    return out;
+  })();
+
+  /* ─── Executors (общие функции) ──────────────────────────────────── */
+
+  function execGetSnapshot() {
+    return new Promise(function (resolve, reject) {
+      PremiereBridge.getTimelineSnapshot(function (err, data) {
+        if (err) reject(err);
+        else {
+          lastSnap = data;
+          resolve(data);
+        }
+      });
+    });
+  }
+
+  function execGetTranscriptFromCache(args) {
+    var key = args.sequenceKey || '';
+    var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+    if (!found.entry) {
+      var keys = ContextStore.listTranscriptCacheKeys(TRANSCRIPT_PID);
+      return Promise.resolve({
+        error:
+          'Нет кэша для «' + key + '». Проверьте имя секвенции. Кэш общий: ~/.extensions_llm_chat_pr/_llm_transcript_cache.json.',
+        requestedKey: key,
+        availableKeysInCache: keys.slice(0, 32)
+      });
+    }
+    var out = {};
+    for (var kk in found.entry) {
+      if (Object.prototype.hasOwnProperty.call(found.entry, kk)) out[kk] = found.entry[kk];
+    }
+    if (out.editedAfterTranscribe) {
+      out._notice =
+        'Транскрипт автоматически сдвинут по применённым ripple-удалениям — тайминги соответствуют ТЕКУЩЕМУ таймлайну. ' +
+        (out.possiblyStale
+          ? 'Внимание: были также неизвестные сдвиги — сверяйся с get_timeline_snapshot.'
+          : 'Можно работать как с актуальным.');
+    }
+    return Promise.resolve(out);
+  }
+
+  /* ─── Бюджет символов для get_transcript_structure ─── */
+  var TRANSCRIPT_TEXT_BUDGET = 12000; /* символов — если суммарный текст меньше, отдаём полностью */
+  var TRANSCRIPT_PAGE_SIZE  = 60;    /* абзацев на страницу по умолчанию */
+
+  function execGetTranscriptStructure(args) {
+    var key2 = args.sequenceKey || '';
+    var found2 = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key2);
+    if (!found2.entry) {
+      var keys2 = ContextStore.listTranscriptCacheKeys(TRANSCRIPT_PID);
+      return Promise.resolve({
+        error: 'Нет кэша для «' + key2 + '». Сначала транскрибируйте In–Out.',
+        requestedKey: key2,
+        availableKeysInCache: keys2.slice(0, 32)
+      });
+    }
+    var e = found2.entry;
+    if ((!e.paragraphs || !e.paragraphs.length) && typeof TranscriptStructure !== 'undefined') {
+      try {
+        TranscriptStructure.buildStructure(e);
+        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found2.matchedKey, e);
+      } catch (eRB) {}
+    }
+
+    var allParagraphs = (e.paragraphs || []);
+    var totalCount = allParagraphs.length;
+
+    /* Считаем суммарный размер текста */
+    var totalChars = 0;
+    for (var ti = 0; ti < allParagraphs.length; ti++) {
+      totalChars += String(allParagraphs[ti].text || '').length;
+    }
+    var fitsInBudget = totalChars <= TRANSCRIPT_TEXT_BUDGET;
+
+    /* Пагинация: если указаны fromParagraph/toParagraph — уважаем их.
+       Если не указаны и текст не влезает в бюджет — отдаём первую страницу + подсказку. */
+    var from = typeof args.fromParagraph === 'number' ? Math.max(0, Math.floor(args.fromParagraph)) : 0;
+    var to;
+    if (typeof args.toParagraph === 'number') {
+      to = Math.min(totalCount, Math.floor(args.toParagraph));
+    } else if (fitsInBudget) {
+      to = totalCount;
+    } else {
+      to = Math.min(totalCount, from + TRANSCRIPT_PAGE_SIZE);
+    }
+
+    var sliced = allParagraphs.slice(from, to);
+    var paragraphsCompact = sliced.map(function (p, idx) {
+      var globalIdx = from + idx;
+      /* Если весь текст влезает или это запрошенная страница — полный текст.
+         Иначе (авто-первая страница длинного транскрипта) — тоже полный, но ограниченная порция. */
+      return {
+        i: globalIdx,
+        startSec: p.startSec,
+        endSec: p.endSec,
+        durationSec: Math.round((p.endSec - p.startSec) * 100) / 100,
+        pauseBeforeSec: p.pauseBeforeSec,
+        pauseAfterSec: p.pauseAfterSec,
+        text: String(p.text || '')
+      };
+    });
+
+    var silencesCompact = ((e.audioAnalysis && e.audioAnalysis.silences) || []).slice(0, 200);
+    var out2 = {
+      sequenceKey: found2.matchedKey,
+      totalParagraphs: totalCount,
+      totalTextChars: totalChars,
+      returnedRange: { from: from, to: to },
+      hasMore: to < totalCount,
+      paragraphCount: paragraphsCompact.length,
+      paragraphs: paragraphsCompact,
+      topics: e.topics || null,
+      speakers: e.speakers || null,
+      silences: silencesCompact,
+      silenceCount: silencesCompact.length,
+      loudness: e.audioAnalysis && e.audioAnalysis.loudness ? e.audioAnalysis.loudness : null,
+      editedAfterTranscribe: !!e.editedAfterTranscribe,
+      possiblyStale: !!e.possiblyStale,
+      structureMeta: e.structureMeta || null
+    };
+    if (out2.hasMore) {
+      out2._pagination = 'Показано ' + from + '–' + to + ' из ' + totalCount + ' абзацев. ' +
+        'Для следующей страницы: get_transcript_structure(sequenceKey, fromParagraph=' + to + '). ' +
+        'Для полного анализа длинного транскрипта используй analyze_transcript_for_cuts.';
+    }
+    if (out2.editedAfterTranscribe) {
+      out2._notice = 'Структура пересчитана под текущее состояние таймлайна.';
+    }
+    return Promise.resolve(out2);
+  }
+
+  function execApplyTimecodeEdits(panelId, args) {
+    return new Promise(function (resolve, reject) {
+      var v = ToolValidators.validateTimecodePlan(lastSnap, args);
+      if (v) {
+        resolve({
+          validationError: v,
+          hint: 'Сделайте get_timeline_snapshot и исправьте nodeId или интервал.'
+        });
+        return;
+      }
+      PremiereBridge.applyTimecodeEdits(args, function (err, data) {
+        if (err) {
+          reject(err);
+          return;
+        }
+        /* Откат таймкодов средствами плагина не реализован — Cmd+Z в таймлайне Premiere вручную. */
+        PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
+          if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
+          data._autoSnapshot = snapData || null;
+          try {
+            var seqKey = (snapData && snapData.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
+            if (seqKey && Array.isArray(args.operations)) {
+              var rippleIvs = [];
+              var hasUnknownShift = false;
+              args.operations.forEach(function (op) {
+                if (!op || !op.action) return;
+                if (op.action === 'ripple_delete_range' || op.action === 'ripple_delete_range_all_tracks') {
+                  if (typeof op.startSec === 'number' && typeof op.endSec === 'number') {
+                    rippleIvs.push({ startSec: op.startSec, endSec: op.endSec });
+                  }
+                } else if (
+                  op.action === 'move_clip' ||
+                  op.action === 'shift_timeline_ripple' ||
+                  op.action === 'set_timeline_in' ||
+                  op.action === 'set_timeline_out' ||
+                  op.action === 'set_timeline_bounds' ||
+                  op.action === 'remove_clip'
+                ) {
+                  hasUnknownShift = true;
+                }
+              });
+              if (rippleIvs.length) {
+                ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, seqKey, rippleIvs);
+                data._transcriptShifted = true;
+              }
+              if (hasUnknownShift) {
+                ContextStore.markTranscriptStale(
+                  TRANSCRIPT_PID,
+                  seqKey,
+                  'apply_timecode_edits: ' +
+                    args.operations
+                      .map(function (o) {
+                        return o.action;
+                      })
+                      .join(',')
+                );
+                data._transcriptPossiblyStale = true;
+              }
+            }
+          } catch (eSh3) {}
+          resolve(data);
+        });
+      });
+    });
+  }
+
+  function execAddMarkers(panelId, args) {
+    return new Promise(function (resolve, reject) {
+      var list = args.markers || [];
+      var v = ToolValidators.validateMarkersList(lastSnap, list);
+      if (v) {
+        resolve({ validationError: v, hint: 'Обновите снимок или поправьте timeSec.' });
+        return;
+      }
+      PremiereBridge.addSequenceMarkers(list, function (err, data) {
+        if (err) {
+          reject(err);
+          return;
+        }
+        if (data && data.createdSeconds && data.createdSeconds.length) {
+          var seqNm = lastSnap && lastSnap.sequenceName ? lastSnap.sequenceName : '';
+          ContextStore.setLastUndo(panelId, data.createdSeconds.length, 'маркеры', seqNm, {
+            mode: 'markers',
+            markerSeconds: data.createdSeconds
+          });
+          refreshUndoButton();
+        }
+        resolve(data);
+      });
+    });
+  }
+
+  /* ─── Verification + propose/apply (textmontage) ─────────────────── */
+
+  function fmtSec(s) {
+    if (typeof s !== 'number' || isNaN(s)) return '?';
+    var sign = s < 0 ? '-' : '';
+    s = Math.abs(s);
+    var m = Math.floor(s / 60);
+    var ss = s - m * 60;
+    return sign + m + ':' + (ss < 10 ? '0' : '') + ss.toFixed(1);
+  }
+
+  /**
+   * Привязка границ removeIntervals к ближайшим границам сегментов транскрипта.
+   * Предотвращает обрезку слов на полуслове: startSec привязывается к ближайшему
+   * segment.startSec/endSec, endSec — аналогично, с приоритетом на ближайший endSec.
+   */
+  function snapIntervalsToSegmentBoundaries(removeIntervals) {
+    if (!removeIntervals || !removeIntervals.length) return removeIntervals;
+    /* Собираем сегменты из transcript кэша */
+    var segments = null;
+    try {
+      var seqKey = lastSnap && lastSnap.sequenceName ? lastSnap.sequenceName : '';
+      if (seqKey) {
+        var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqKey);
+        if (found && found.entry && found.entry.segments) {
+          segments = found.entry.segments;
+        }
+      }
+    } catch (e) {}
+    if (!segments || !segments.length) return removeIntervals;
+
+    /* Собираем все уникальные boundaries из сегментов */
+    var boundaries = [];
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      if (typeof seg.startSec === 'number') boundaries.push(seg.startSec);
+      else if (typeof seg.start === 'number') boundaries.push(seg.start);
+      if (typeof seg.endSec === 'number') boundaries.push(seg.endSec);
+      else if (typeof seg.end === 'number') boundaries.push(seg.end);
+    }
+    boundaries.sort(function (a, b) { return a - b; });
+
+    function snapTo(val, maxDrift) {
+      var best = val;
+      var bestD = maxDrift + 1;
+      for (var j = 0; j < boundaries.length; j++) {
+        var d = Math.abs(boundaries[j] - val);
+        if (d < bestD) { bestD = d; best = boundaries[j]; }
+        if (boundaries[j] > val + maxDrift) break;
+      }
+      return bestD <= maxDrift ? best : val;
+    }
+
+    var MAX_DRIFT = 0.5; /* не двигаем границу больше чем на 0.5с */
+    return removeIntervals.map(function (iv) {
+      var s = snapTo(iv.startSec, MAX_DRIFT);
+      var e = snapTo(iv.endSec, MAX_DRIFT);
+      if (e <= s) { e = iv.endSec; s = iv.startSec; } /* откат если snap сломал */
+      return { startSec: s, endSec: e, reason: iv.reason };
+    });
+  }
+
+  function computeVerification(removeList) {
+    var seqEnd = lastSnap && lastSnap.sequenceEndSec ? lastSnap.sequenceEndSec : 0;
+    var removes = (removeList || []).slice().sort(function (a, b) {
+      return a.startSec - b.startSec;
+    });
+    var totalRemoveSec = 0;
+    removes.forEach(function (iv) {
+      totalRemoveSec += iv.endSec - iv.startSec;
+    });
+    var keepIntervals = [];
+    var cursor = 0;
+    removes.forEach(function (iv) {
+      if (iv.startSec > cursor + 0.05) {
+        keepIntervals.push({
+          startSec: Math.round(cursor * 100) / 100,
+          endSec: Math.round(iv.startSec * 100) / 100
+        });
+      }
+      cursor = Math.max(cursor, iv.endSec);
+    });
+    if (seqEnd > 0 && cursor < seqEnd - 0.05) {
+      keepIntervals.push({
+        startSec: Math.round(cursor * 100) / 100,
+        endSec: Math.round(seqEnd * 100) / 100
+      });
+    }
+    var totalKeepSec = 0;
+    keepIntervals.forEach(function (iv) {
+      totalKeepSec += iv.endSec - iv.startSec;
+    });
+    return {
+      removeCount: removes.length,
+      totalRemoveSec: Math.round(totalRemoveSec * 100) / 100,
+      keepIntervals: keepIntervals,
+      keepCount: keepIntervals.length,
+      totalKeepSec: Math.round(totalKeepSec * 100) / 100,
+      originalDurationSec: seqEnd > 0 ? Math.round(seqEnd * 100) / 100 : null
+    };
+  }
+
+  /* ─── Diff-полоса (общий рендер для timecode и transcript_cuts) ──── */
+
+  function renderTimelineStrip(clips, opt) {
+    opt = opt || {};
+    var totalSec = opt.totalSec || 0;
+    if (!totalSec) {
+      clips.forEach(function (c) {
+        if (c.endSec > totalSec) totalSec = c.endSec;
+      });
+    }
+    if (totalSec <= 0) totalSec = 1;
+    var wrap = document.createElement('div');
+    wrap.className = 'diff-strip';
+    wrap.style.cssText =
+      'position:relative;height:18px;background:#1a1a1a;border:1px solid #333;border-radius:3px;margin:2px 0;overflow:hidden;';
+    clips.forEach(function (c) {
+      var rect = document.createElement('div');
+      var left = (c.startSec / totalSec) * 100;
+      var width = ((c.endSec - c.startSec) / totalSec) * 100;
+      var bg = '#3a6';
+      if (c._removed) bg = '#a33';
+      else if (c._trimmed) bg = '#c80';
+      else if (c._moved) bg = '#06a';
+      else if (c.disabled) bg = '#444';
+      rect.style.cssText =
+        'position:absolute;top:1px;bottom:1px;left:' + left + '%;width:' + Math.max(0.5, width) + '%;' +
+        'background:' + bg + ';border-radius:1px;';
+      rect.title = (c.name || c.nodeId || '') + ' [' + c.startSec.toFixed(2) + '–' + c.endSec.toFixed(2) + ']';
+      wrap.appendChild(rect);
+    });
+    /* красные полосы для removeIntervals */
+    if (opt.removeIntervals) {
+      opt.removeIntervals.forEach(function (iv) {
+        var bar = document.createElement('div');
+        var left = (iv.startSec / totalSec) * 100;
+        var width = ((iv.endSec - iv.startSec) / totalSec) * 100;
+        bar.style.cssText =
+          'position:absolute;top:0;bottom:0;left:' + left + '%;width:' + Math.max(0.5, width) + '%;' +
+          'background:rgba(244,63,94,0.5);border-left:1px solid #f43f5e;border-right:1px solid #f43f5e;';
+        bar.title = '✗ remove ' + iv.startSec.toFixed(1) + '–' + iv.endSec.toFixed(1);
+        wrap.appendChild(bar);
+      });
+    }
+    /* жёлтые точки маркеров */
+    if (opt.markers) {
+      opt.markers.forEach(function (m) {
+        var dot = document.createElement('div');
+        var left = (m.timeSec / totalSec) * 100;
+        dot.style.cssText =
+          'position:absolute;top:0;bottom:0;left:' + left + '%;width:2px;background:#fbbf24;';
+        dot.title = m.name + ' @ ' + m.timeSec.toFixed(2);
+        wrap.appendChild(dot);
+      });
+    }
+    return wrap;
+  }
+
+  function renderDiffSection(card, snapshot, simulation) {
+    if (!snapshot || !snapshot.clips) return;
+    var totalSec = snapshot.sequenceEndSec || 0;
+    snapshot.clips.forEach(function (c) {
+      if (c.endSec > totalSec) totalSec = c.endSec;
+    });
+    if (simulation && simulation.clips) {
+      simulation.clips.forEach(function (c) {
+        if (c.endSec > totalSec) totalSec = c.endSec;
+      });
+    }
+
+    var labelB = document.createElement('div');
+    labelB.style.cssText = 'font-size:10px;color:#888;margin-top:6px;';
+    labelB.textContent = 'было — ' + snapshot.clips.length + ' клип(ов), ' + fmtSec(totalSec);
+    card.appendChild(labelB);
+    card.appendChild(renderTimelineStrip(snapshot.clips.slice(), { totalSec: totalSec }));
+
+    if (simulation && simulation.clips) {
+      var removedSet = {};
+      (simulation.removed || []).forEach(function (id) { removedSet[id] = 1; });
+      var trimmedSet = {};
+      (simulation.trimmed || []).forEach(function (id) { trimmedSet[id] = 1; });
+      var movedSet = {};
+      (simulation.moved || []).forEach(function (id) { movedSet[id] = 1; });
+      var afterClips = simulation.clips.map(function (c) {
+        return {
+          nodeId: c.nodeId,
+          name: c.name,
+          startSec: c.startSec,
+          endSec: c.endSec,
+          disabled: c.disabled,
+          _trimmed: !!trimmedSet[String(c.nodeId)],
+          _moved: !!movedSet[String(c.nodeId)]
+        };
+      });
+      var labelA = document.createElement('div');
+      labelA.style.cssText = 'font-size:10px;color:#888;margin-top:4px;';
+      var s = simulation.summary || {};
+      labelA.textContent =
+        'станет — ' + s.clipsAfter + ' клип(ов), ' + fmtSec(s.durationAfterSec) +
+        ' (Δ ' + (s.deltaSec >= 0 ? '+' : '') + s.deltaSec + 'с) · ' +
+        'remove ' + s.removedCount + ' · trim ' + s.trimmedCount + ' · move ' + s.movedCount;
+      card.appendChild(labelA);
+      card.appendChild(renderTimelineStrip(afterClips, { totalSec: totalSec }));
+    }
+  }
+
+  function renderPendingProposalCard() {
+    var existing = document.getElementById('pending-proposal-card');
+    if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+    if (!_pendingProposal) return;
+    var kind = _pendingProposal.kind || 'transcript_cuts';
+    var v = _pendingProposal.verification || {};
+    var card = document.createElement('div');
+    card.id = 'pending-proposal-card';
+    card.className = 'bubble tool';
+    card.style.border = '1px solid #d97706';
+    card.style.background = 'rgba(217,119,6,0.08)';
+    card.style.padding = '10px';
+    card.style.margin = '8px 0';
+    card.style.borderRadius = '6px';
+
+    var title = document.createElement('div');
+    title.style.fontWeight = '600';
+    title.style.marginBottom = '6px';
+    var titleByKind = {
+      transcript_cuts: '⚠ Требуется подтверждение: план монтажа по тексту',
+      timecode_edits: '⚠ Требуется подтверждение: правки таймлайна',
+      edit_plan: '⚠ Требуется подтверждение: единый EditPlan',
+      markers: '⚠ Требуется подтверждение: маркеры',
+      audio_ducking: '⚠ Требуется подтверждение: ducking музыки',
+      loudness: '⚠ Требуется подтверждение: LUFS-нормализация'
+    };
+    title.textContent = titleByKind[kind] || titleByKind.transcript_cuts;
+    card.appendChild(title);
+
+    /* ── kind: timecode_edits ─────────────────────────────────────── */
+    if (kind === 'timecode_edits') {
+      if (_pendingProposal.summary) {
+        var sumT = document.createElement('div');
+        sumT.style.cssText =
+          'font-size:12px;line-height:1.4;margin-bottom:8px;padding:6px 8px;border-left:3px solid #d97706;background:rgba(217,119,6,0.06);';
+        sumT.textContent = String(_pendingProposal.summary);
+        card.appendChild(sumT);
+      }
+      renderDiffSection(card, _pendingProposal.snapshot, _pendingProposal.simulation);
+      var opsList = document.createElement('div');
+      opsList.style.cssText = 'font-size:11px;margin-top:8px;max-height:140px;overflow-y:auto;font-family:monospace;opacity:0.85;';
+      (_pendingProposal.operations || []).forEach(function (op, i) {
+        var line = document.createElement('div');
+        line.textContent = (i + 1) + '. ' + op.action + ' ' + JSON.stringify(_compactOp(op));
+        opsList.appendChild(line);
+      });
+      card.appendChild(opsList);
+      card.appendChild(_buildButtons('Применить правки'));
+      el.chat.appendChild(card);
+      el.chat.scrollTop = el.chat.scrollHeight;
+      return;
+    }
+
+    /* ── kind: edit_plan (§2.1 unified) ───────────────────────────── */
+    if (kind === 'edit_plan') {
+      if (_pendingProposal.summary) {
+        var sumE = document.createElement('div');
+        sumE.style.cssText =
+          'font-size:12px;line-height:1.4;margin-bottom:8px;padding:6px 8px;border-left:3px solid #d97706;background:rgba(217,119,6,0.06);';
+        sumE.textContent = String(_pendingProposal.summary);
+        card.appendChild(sumE);
+      }
+      if (_pendingProposal.rationale) {
+        var ratE = document.createElement('div');
+        ratE.style.cssText = 'font-size:11px;opacity:0.75;margin-bottom:8px;font-style:italic;';
+        ratE.textContent = String(_pendingProposal.rationale);
+        card.appendChild(ratE);
+      }
+      renderDiffSection(card, _pendingProposal.snapshot, _pendingProposal.simulation);
+      var normOps = _pendingProposal.normalizedOperations || [];
+      var origOps = _pendingProposal.ops || [];
+      var rej = _pendingProposal.rejectedOpIdxs || [];
+      if (rej.length) {
+        var rejBox = document.createElement('div');
+        rejBox.style.cssText =
+          'font-size:11px;color:#f43f5e;background:rgba(244,63,94,0.1);padding:4px 6px;border-radius:3px;margin:6px 0;';
+        rejBox.textContent = 'Отклонено нормализацией: ' + rej.length + ' ops (idx ' + rej.join(', ') + ')';
+        card.appendChild(rejBox);
+      }
+      var opsEList = document.createElement('div');
+      opsEList.style.cssText = 'font-size:11px;margin-top:8px;max-height:160px;overflow-y:auto;font-family:monospace;opacity:0.9;';
+      normOps.forEach(function (op, i) {
+        var row = document.createElement('div');
+        row.style.marginBottom = '3px';
+        var head = document.createElement('div');
+        head.textContent = (i + 1) + '. ' + op.action + ' ' + JSON.stringify(_compactOp(op));
+        row.appendChild(head);
+        if (op._reason) {
+          var rr = document.createElement('div');
+          rr.style.cssText = 'padding-left:14px;opacity:0.7;font-style:italic;';
+          rr.textContent = '— ' + String(op._reason);
+          row.appendChild(rr);
+        }
+        if (op._quote) {
+          var qq = document.createElement('div');
+          qq.style.cssText = 'padding-left:14px;opacity:0.75;text-decoration:line-through;';
+          qq.textContent = '«' + String(op._quote).slice(0, 160) + '»';
+          row.appendChild(qq);
+        }
+        opsEList.appendChild(row);
+      });
+      card.appendChild(opsEList);
+      card.appendChild(_buildButtons('Применить EditPlan'));
+      el.chat.appendChild(card);
+      el.chat.scrollTop = el.chat.scrollHeight;
+      return;
+    }
+
+    /* ── kind: markers ────────────────────────────────────────────── */
+    if (kind === 'markers') {
+      if (_pendingProposal.summary) {
+        var sumM = document.createElement('div');
+        sumM.style.cssText =
+          'font-size:12px;line-height:1.4;margin-bottom:8px;padding:6px 8px;border-left:3px solid #d97706;background:rgba(217,119,6,0.06);';
+        sumM.textContent = String(_pendingProposal.summary);
+        card.appendChild(sumM);
+      }
+      var snap = _pendingProposal.snapshot || lastSnap;
+      if (snap && snap.clips) {
+        var totalSec = snap.sequenceEndSec || 0;
+        snap.clips.forEach(function (c) { if (c.endSec > totalSec) totalSec = c.endSec; });
+        var lblM = document.createElement('div');
+        lblM.style.cssText = 'font-size:10px;color:#888;margin-top:4px;';
+        lblM.textContent = 'таймлайн ' + fmtSec(totalSec) + ' · маркеров: ' + (_pendingProposal.markers || []).length;
+        card.appendChild(lblM);
+        card.appendChild(renderTimelineStrip(snap.clips.slice(), { totalSec: totalSec, markers: _pendingProposal.markers }));
+      }
+      var mList = document.createElement('div');
+      mList.style.cssText = 'font-size:11px;max-height:160px;overflow-y:auto;margin-top:6px;';
+      (_pendingProposal.markers || []).forEach(function (m, i) {
+        var row = document.createElement('div');
+        row.style.cssText = 'padding:2px 0;';
+        row.textContent = (i + 1) + '. [' + fmtSec(m.timeSec) + '] ' + (m.name || '');
+        if (m.comment) {
+          var c2 = document.createElement('div');
+          c2.style.cssText = 'padding-left:14px;opacity:0.7;font-style:italic;';
+          c2.textContent = m.comment;
+          row.appendChild(c2);
+        }
+        mList.appendChild(row);
+      });
+      card.appendChild(mList);
+      card.appendChild(_buildButtons('Создать маркеры'));
+      el.chat.appendChild(card);
+      el.chat.scrollTop = el.chat.scrollHeight;
+      return;
+    }
+
+    /* ── kind: audio_ducking ──────────────────────────────────────── */
+    if (kind === 'audio_ducking') {
+      var dp = _pendingProposal.duckingPlan || {};
+      var dsum = document.createElement('div');
+      dsum.style.cssText = 'font-size:12px;line-height:1.4;margin-bottom:8px;';
+      dsum.textContent = _pendingProposal.summary || '';
+      card.appendChild(dsum);
+      var stt = document.createElement('div');
+      stt.style.cssText = 'font-size:11px;color:#aaa;margin-bottom:6px;';
+      stt.textContent =
+        'Интервалов речи: ' + (dp.summary && dp.summary.intervalCount) + ' · ' +
+        'duck: ' + (dp.summary && dp.summary.duckDb) + ' dB · ' +
+        'fade-in: ' + (dp.summary && dp.summary.fadeInSec) + 'с · ' +
+        'fade-out: ' + (dp.summary && dp.summary.fadeOutSec) + 'с · ' +
+        'всего ducked: ' + (dp.summary && dp.summary.totalDuckSec) + 'с';
+      card.appendChild(stt);
+      var note = document.createElement('div');
+      note.style.cssText =
+        'font-size:11px;background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.4);' +
+        'padding:6px 8px;border-radius:4px;margin-bottom:8px;';
+      note.textContent =
+        'По «Применить» будет выполнен офлайн-рендер ffmpeg (volume filter с between()), ' +
+        'результат импортируется в bin «AI Renders». Перетащите новый клип поверх оригинала на A2/A3. ' +
+        'Оригинал и тайминги таймлайна не затрагиваются.';
+      card.appendChild(note);
+      /* diff-strip: целевой клип подсвечиваем через renderDiffSection */
+      try {
+        var dTgt = _pendingProposal.target;
+        var dSnap = _pendingProposal.snapshot || lastSnap;
+        if (dSnap && dSnap.ok && dTgt && dTgt.nodeId && window.EditPlanSimulator) {
+          /* используем simulateUnified с note-операцией — clipsAfter не меняется */
+          var dSim = window.EditPlanSimulator.simulateUnified(dSnap, { ops: [] });
+          if (dSim && dSim.ok) {
+            dSim.trimmed = [String(dTgt.nodeId)]; /* подсветим как изменённый */
+            renderDiffSection(card, dSnap, dSim);
+          }
+        }
+      } catch (eDiffDk) {}
+      var ivList = document.createElement('div');
+      ivList.style.cssText = 'font-size:11px;max-height:140px;overflow-y:auto;font-family:monospace;opacity:0.85;';
+      (dp.intervals || []).forEach(function (iv, i) {
+        var row = document.createElement('div');
+        row.textContent = (i + 1) + '. ' + fmtSec(iv.startSec) + ' → ' + fmtSec(iv.endSec) + ' (' + (iv.endSec - iv.startSec).toFixed(2) + 'с)';
+        ivList.appendChild(row);
+      });
+      card.appendChild(ivList);
+      card.appendChild(_buildButtons('Запустить рендер ducking'));
+      el.chat.appendChild(card);
+      el.chat.scrollTop = el.chat.scrollHeight;
+      return;
+    }
+
+    /* ── kind: loudness ───────────────────────────────────────────── */
+    if (kind === 'loudness') {
+      var lr = _pendingProposal.loudness || {};
+      var lsum = document.createElement('div');
+      lsum.style.cssText = 'font-size:12px;line-height:1.5;';
+      lsum.innerHTML =
+        '<div><b>Input:</b> ' + lr.inputLufs + ' LUFS' +
+        (lr.inputTpDb !== null ? ' · True Peak ' + lr.inputTpDb + ' dBTP' : '') + '</div>' +
+        '<div><b>Target:</b> ' + lr.targetLufs + ' LUFS</div>' +
+        '<div><b>Рекомендуемый gain:</b> <span style="color:#10b981;font-size:14px;font-weight:600;">' +
+        (lr.gainDb >= 0 ? '+' : '') + lr.gainDb + ' dB</span>' +
+        (lr.clipped ? ' <span style="color:#f43f5e;">(ограничен headroom)</span>' : '') + '</div>' +
+        (lr.tpHeadroomDb !== null ? '<div style="font-size:11px;color:#888;">TP headroom до -1 dBTP: ' + lr.tpHeadroomDb + ' dB</div>' : '');
+      card.appendChild(lsum);
+      var note2 = document.createElement('div');
+      note2.style.cssText =
+        'font-size:11px;background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.4);' +
+        'padding:6px 8px;border-radius:4px;margin:8px 0;';
+      note2.textContent =
+        'По «Применить» будет выполнен офлайн-рендер ffmpeg loudnorm (двухпроходный), ' +
+        'результат импортируется в bin «AI Renders». Перетащите новый клип поверх оригинала. ' +
+        'Оригинал и таймлайн не изменятся.';
+      card.appendChild(note2);
+      card.appendChild(_buildButtons('Запустить рендер loudnorm'));
+      el.chat.appendChild(card);
+      el.chat.scrollTop = el.chat.scrollHeight;
+      return;
+    }
+
+    /* ── kind: transcript_cuts (исходный путь) ────────────────────── */
+    if (_pendingProposal.summary) {
+      var sumBlock = document.createElement('div');
+      sumBlock.style.fontSize = '12px';
+      sumBlock.style.lineHeight = '1.4';
+      sumBlock.style.marginBottom = '8px';
+      sumBlock.style.padding = '6px 8px';
+      sumBlock.style.borderLeft = '3px solid #d97706';
+      sumBlock.style.background = 'rgba(217,119,6,0.06)';
+      sumBlock.textContent = String(_pendingProposal.summary);
+      card.appendChild(sumBlock);
+    }
+
+    var stats = document.createElement('div');
+    stats.style.fontSize = '12px';
+    stats.style.opacity = '0.85';
+    stats.style.marginBottom = '8px';
+    var orig = v.originalDurationSec || 0;
+    var keepS = v.totalKeepSec || 0;
+    var pct = orig > 0 ? Math.round((keepS / orig) * 100) : 0;
+    stats.textContent =
+      'Останется: ' + fmtSec(keepS) + ' из ' + fmtSec(orig) + ' (' + pct + '%) · ' +
+      'фрагментов keep: ' + (v.keepCount || 0) + ' · вырезов remove: ' + (v.removeCount || 0);
+    card.appendChild(stats);
+
+    /* §2.2: diff-strip для transcript_cuts — симулируем через EditPlanSimulator */
+    try {
+      var tcSnap = _pendingProposal.snapshot || lastSnap;
+      var tcRemove = _pendingProposal.removeIntervals || [];
+      if (tcSnap && tcSnap.ok && tcSnap.clips && tcRemove.length && window.EditPlanSimulator) {
+        var tcSim = window.EditPlanSimulator.simulateUnified(tcSnap, {
+          ops: tcRemove.map(function (iv) {
+            return { kind: 'ripple_delete_interval', startSec: iv.startSec, endSec: iv.endSec };
+          })
+        });
+        if (tcSim && tcSim.ok) {
+          renderDiffSection(card, tcSnap, tcSim);
+        }
+      }
+    } catch (eDiffTc) { /* не критично */ }
+
+    function _findQuote(arr, startSec) {
+      if (!Array.isArray(arr)) return null;
+      for (var qi = 0; qi < arr.length; qi++) {
+        var qq = arr[qi];
+        if (qq && typeof qq.startSec === 'number' && Math.abs(qq.startSec - startSec) < 1.5) return qq;
+      }
+      return null;
+    }
+
+    if (Array.isArray(v.keepIntervals) && v.keepIntervals.length) {
+      var keepHdr = document.createElement('div');
+      keepHdr.textContent = '✓ Остаётся в ролике (' + v.keepIntervals.length + ')';
+      keepHdr.style.cssText = 'font-size:11px;font-weight:600;color:#10b981;margin-bottom:4px;';
+      card.appendChild(keepHdr);
+      var keepList = document.createElement('div');
+      keepList.style.cssText =
+        'max-height:160px;overflow-y:auto;font-size:11px;background:rgba(16,185,129,0.08);padding:6px 8px;border-radius:4px;margin-bottom:8px;';
+      var keepQuotes = _pendingProposal.keepSummary || [];
+      v.keepIntervals.forEach(function (iv, idx) {
+        var row = document.createElement('div');
+        row.style.marginBottom = '4px';
+        var head = document.createElement('div');
+        head.style.fontFamily = 'monospace';
+        head.style.opacity = '0.8';
+        head.textContent =
+          (idx + 1) + '. [' + fmtSec(iv.startSec) + '–' + fmtSec(iv.endSec) + '] · ' +
+          (iv.endSec - iv.startSec).toFixed(1) + 'с';
+        row.appendChild(head);
+        var qq = _findQuote(keepQuotes, iv.startSec);
+        if (qq && qq.quote) {
+          var qt = document.createElement('div');
+          qt.style.cssText = 'font-style:italic;padding-left:14px;';
+          qt.textContent = '«' + String(qq.quote).slice(0, 200) + '»';
+          row.appendChild(qt);
+        }
+        keepList.appendChild(row);
+      });
+      card.appendChild(keepList);
+    }
+
+    var removeList = _pendingProposal.removeIntervals || [];
+    if (removeList.length) {
+      var rmHdr = document.createElement('div');
+      rmHdr.textContent = '✗ Убирается (' + removeList.length + ')';
+      rmHdr.style.cssText = 'font-size:11px;font-weight:600;color:#f43f5e;margin-bottom:4px;';
+      card.appendChild(rmHdr);
+      var rmBox = document.createElement('div');
+      rmBox.style.cssText =
+        'max-height:160px;overflow-y:auto;font-size:11px;background:rgba(244,63,94,0.08);padding:6px 8px;border-radius:4px;margin-bottom:8px;';
+      var rmQuotes = _pendingProposal.removeSummary || [];
+      removeList.forEach(function (iv, idx) {
+        var row = document.createElement('div');
+        row.style.marginBottom = '4px';
+        var head = document.createElement('div');
+        head.style.fontFamily = 'monospace';
+        head.style.opacity = '0.8';
+        head.textContent =
+          (idx + 1) + '. [' + fmtSec(iv.startSec) + '–' + fmtSec(iv.endSec) + '] · ' +
+          (iv.endSec - iv.startSec).toFixed(1) + 'с';
+        row.appendChild(head);
+        var rq = _findQuote(rmQuotes, iv.startSec);
+        var quoteText = rq && rq.quote ? String(rq.quote) : '';
+        var reasonText = (rq && rq.reason) || iv.reason || '';
+        if (quoteText) {
+          var qt2 = document.createElement('div');
+          qt2.style.cssText = 'font-style:italic;padding-left:14px;text-decoration:line-through;opacity:0.85;';
+          qt2.textContent = '«' + quoteText.slice(0, 200) + '»';
+          row.appendChild(qt2);
+        }
+        if (reasonText) {
+          var rt = document.createElement('div');
+          rt.style.cssText = 'padding-left:14px;opacity:0.7;';
+          rt.textContent = '— ' + reasonText;
+          row.appendChild(rt);
+        }
+        rmBox.appendChild(row);
+      });
+      card.appendChild(rmBox);
+    }
+
+    card.appendChild(_buildButtons('✓ Применить монтаж'));
+    el.chat.appendChild(card);
+    el.chat.scrollTop = el.chat.scrollHeight;
+  }
+
+  function _buildButtons(applyLabel) {
+    var btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:8px;margin-top:10px;';
+    var applyBtn = document.createElement('button');
+    applyBtn.type = 'button';
+    applyBtn.textContent = '✓ ' + (applyLabel || 'Применить');
+    applyBtn.style.flex = '1';
+    applyBtn.onclick = function () { applyPendingProposal(); };
+    var cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Отмена';
+    cancelBtn.className = 'secondary';
+    cancelBtn.style.flex = '0 0 auto';
+    cancelBtn.onclick = function () { cancelPendingProposal(); };
+    btnRow.appendChild(applyBtn);
+    btnRow.appendChild(cancelBtn);
+    return btnRow;
+  }
+
+  function _compactOp(op) {
+    var keys = ['nodeId', 'startSec', 'endSec', 'timeSec', 'newStartSec', 'fromSec', 'deltaSec', 'enabled', 'clipName', 'trackType', 'trackIndex', 'muted'];
+    var out = {};
+    for (var k = 0; k < keys.length; k++) {
+      if (op[keys[k]] !== undefined) out[keys[k]] = op[keys[k]];
+    }
+    return out;
+  }
+
+  function applyPendingProposal() {
+    if (!_pendingProposal) return;
+    var prop = _pendingProposal;
+    var kind = prop.kind || 'transcript_cuts';
+    _pendingProposal = null;
+    var card = document.getElementById('pending-proposal-card');
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+    var panelId = active.panelId;
+
+    if (kind === 'edit_plan') {
+      statusUi.show('Применяю EditPlan…', true);
+      var normOpsE = prop.normalizedOperations || [];
+      if (!normOpsE.length) {
+        statusUi.hide();
+        showErr('EditPlan пуст после нормализации.');
+        return;
+      }
+      PremiereBridge.applyTimecodeEdits(
+        { operations: normOpsE, summary: prop.summary || '' },
+        function (errE, dataE) {
+          if (errE) {
+            statusUi.hide();
+            showErr('Ошибка применения EditPlan: ' + String(errE.message || errE));
+            return;
+          }
+          PremiereBridge.getTimelineSnapshot(function (snapErrE, snapDataE) {
+            if (!snapErrE && snapDataE && snapDataE.ok) lastSnap = snapDataE;
+            try {
+              var seqKeyE = (snapDataE && snapDataE.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
+              if (seqKeyE) {
+                var rippleIvsE = EditPlanSimulator.extractRippleIntervals(normOpsE);
+                if (rippleIvsE.length) {
+                  ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, seqKeyE, rippleIvsE);
+                }
+                var hasShiftE = normOpsE.some(function (o) {
+                  return (
+                    o.action === 'move_clip' ||
+                    o.action === 'shift_timeline_ripple' ||
+                    o.action === 'set_timeline_in' ||
+                    o.action === 'set_timeline_out' ||
+                    o.action === 'set_timeline_bounds' ||
+                    o.action === 'remove_clip'
+                  );
+                });
+                if (hasShiftE) {
+                  ContextStore.markTranscriptStale(
+                    TRANSCRIPT_PID,
+                    seqKeyE,
+                    'edit_plan apply: ' + normOpsE.map(function (o) { return o.action; }).join(',')
+                  );
+                }
+              }
+            } catch (eShE) {}
+            statusUi.show('Готово', false);
+            setTimeout(function () { statusUi.hide(); }, 1200);
+            var sE = prop.simulation && prop.simulation.summary;
+            var msgsE = ContextStore.getMessages(panelId);
+            msgsE.push({
+              role: 'assistant',
+              content:
+                'EditPlan применён атомарно (' + normOpsE.length + ' ops). ' +
+                (sE ? ('Удалено: ' + sE.removedCount + ', обрезано: ' + sE.trimmedCount + ', перемещено: ' + sE.movedCount + '. Длительность: ' + sE.durationBeforeSec + ' → ' + sE.durationAfterSec + 'с.') : '') +
+                ' Откат: Cmd+Z / Ctrl+Z в таймлайне.'
+            });
+            ContextStore.setMessages(panelId, msgsE);
+            renderMessages(msgsE);
+          });
+        }
+      );
+      return;
+    }
+
+    if (kind === 'timecode_edits') {
+      statusUi.show('Применяю правки таймлайна…', true);
+      PremiereBridge.applyTimecodeEdits(
+        { operations: prop.operations, summary: prop.summary },
+        function (err, data) {
+          if (err) {
+            statusUi.hide();
+            showErr('Ошибка применения правок: ' + String(err.message || err));
+            return;
+          }
+          PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
+            if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
+            statusUi.show('Готово', false);
+            setTimeout(function () { statusUi.hide(); }, 1200);
+            var s = prop.simulation && prop.simulation.summary;
+            var msgs = ContextStore.getMessages(panelId);
+            msgs.push({
+              role: 'assistant',
+              content:
+                'Правки применены. ' +
+                (s ? ('Удалено: ' + s.removedCount + ', обрезано: ' + s.trimmedCount + ', перемещено: ' + s.movedCount + '. Длительность: ' + s.durationBeforeSec + ' → ' + s.durationAfterSec + 'с.') : '')
+            });
+            ContextStore.setMessages(panelId, msgs);
+            renderMessages(msgs);
+          });
+        }
+      );
+      return;
+    }
+
+    if (kind === 'markers') {
+      statusUi.show('Создаю маркеры…', true);
+      PremiereBridge.addSequenceMarkers(prop.markers || [], function (err, data) {
+        if (err) {
+          statusUi.hide();
+          showErr('Ошибка создания маркеров: ' + String(err.message || err));
+          return;
+        }
+        if (data && data.createdSeconds && data.createdSeconds.length) {
+          var seqNm = lastSnap && lastSnap.sequenceName ? lastSnap.sequenceName : '';
+          ContextStore.setLastUndo(panelId, data.createdSeconds.length, 'маркеры', seqNm, {
+            mode: 'markers',
+            markerSeconds: data.createdSeconds
+          });
+          refreshUndoButton();
+        }
+        statusUi.show('Готово', false);
+        setTimeout(function () { statusUi.hide(); }, 1200);
+        var msgs = ContextStore.getMessages(panelId);
+        msgs.push({
+          role: 'assistant',
+          content: 'Маркеры созданы: ' + ((data && data.created && data.created.length) || 0) + '.'
+        });
+        ContextStore.setMessages(panelId, msgs);
+        renderMessages(msgs);
+      });
+      return;
+    }
+
+    if (kind === 'audio_ducking') {
+      var dp = prop.duckingPlan || {};
+      var tgt = prop.target || {};
+      if (!tgt.mediaPath) {
+        showErr('Нет mediaPath у целевого клипа — рендер невозможен.');
+        return;
+      }
+      statusUi.show('ffmpeg: рендер ducking…', true);
+      AudioRender.renderDucking({
+        inputPath: tgt.mediaPath,
+        speechIntervalsTimeline: (dp.intervals || []),
+        clipStartSec: tgt.startSec || 0,
+        clipInPointSec: tgt.inPointSec || 0,
+        duckDb: prop.duckDb || -12,
+        fadeSec: prop.fadeSec || 0.2,
+        onProgress: function (msg) { statusUi.show(msg, true); }
+      }).then(function (rRes) {
+        statusUi.show('Импорт в проект…', true);
+        PremiereBridge.importMediaFile({ path: rRes.outputPath, binName: 'AI Renders' }, function (impErr, impData) {
+          statusUi.show('Готово', false);
+          setTimeout(function () { statusUi.hide(); }, 1500);
+          var msgs = ContextStore.getMessages(panelId);
+          var importNote = (impErr || !impData || !impData.ok)
+            ? 'Импорт в проект не удался: ' + String((impErr && impErr.message) || (impData && impData.error) || 'неизв. ошибка') + '. Файл лежит на диске — перетащите вручную.'
+            : 'Импортировано в bin "' + (impData.binName || 'AI Renders') + '" как «' + (impData.projectItemName || '') + '». Перетащите этот клип на дорожку A2/A3 поверх оригинала «' + (tgt.name || '') + '».';
+          msgs.push({
+            role: 'assistant',
+            content:
+              'Готово: ducking ' + (prop.duckDb || -12) + ' dB на ' + ((dp.intervals && dp.intervals.length) || 0) + ' речевых интервалах применён к «' + (tgt.name || '') + '».\n' +
+              'Файл: ' + rRes.outputPath + '\n' +
+              importNote
+          });
+          ContextStore.setMessages(panelId, msgs);
+          renderMessages(msgs);
+        });
+      }).catch(function (err) {
+        statusUi.hide();
+        showErr('ffmpeg ducking упал: ' + String(err && err.message || err));
+      });
+      return;
+    }
+
+    if (kind === 'loudness') {
+      var ltgt = prop.target || {};
+      var lufs = prop.targetLufs || -16;
+      if (!ltgt.mediaPath) {
+        showErr('Нет mediaPath у целевого клипа.');
+        return;
+      }
+      statusUi.show('ffmpeg: loudnorm I=' + lufs + '…', true);
+      AudioRender.renderLoudnorm({
+        inputPath: ltgt.mediaPath,
+        targetLufs: lufs,
+        onProgress: function (msg) { statusUi.show(msg, true); }
+      }).then(function (rR) {
+        statusUi.show('Импорт в проект…', true);
+        PremiereBridge.importMediaFile({ path: rR.outputPath, binName: 'AI Renders' }, function (impErr2, impData2) {
+          statusUi.show('Готово', false);
+          setTimeout(function () { statusUi.hide(); }, 1500);
+          var msgs2 = ContextStore.getMessages(panelId);
+          var note2 = (impErr2 || !impData2 || !impData2.ok)
+            ? 'Импорт не удался: ' + String((impErr2 && impErr2.message) || (impData2 && impData2.error) || 'неизв.') + '. Перетащите файл вручную.'
+            : 'Импортировано в bin "' + (impData2.binName || 'AI Renders') + '" как «' + (impData2.projectItemName || '') + '». Перетащите на дорожку поверх оригинала «' + (ltgt.name || '') + '».';
+          var measured = rR.summary && rR.summary.measuredOutputLufs;
+          msgs2.push({
+            role: 'assistant',
+            content:
+              'Готово: loudnorm на «' + (ltgt.name || '') + '» → ' + lufs + ' LUFS' +
+              (measured !== null && measured !== undefined ? ' (фактически ' + measured + ' LUFS)' : '') + '.\n' +
+              'Файл: ' + rR.outputPath + '\n' +
+              note2
+          });
+          ContextStore.setMessages(panelId, msgs2);
+          renderMessages(msgs2);
+        });
+      }).catch(function (errL) {
+        statusUi.hide();
+        showErr('ffmpeg loudnorm упал: ' + String(errL && errL.message || errL));
+      });
+      return;
+    }
+
+    /* default: transcript_cuts (исходный путь) */
+    statusUi.show('Применяю монтаж…', true);
+    PremiereBridge.applyTranscriptCuts(
+      { removeIntervals: prop.removeIntervals, summary: prop.summary },
+      function (err, data) {
+        if (err) {
+          statusUi.hide();
+          showErr('Ошибка применения монтажа: ' + String(err.message || err));
+          return;
+        }
+        PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
+          if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
+          try {
+            var seqKey = (snapData && snapData.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
+            if (seqKey) {
+              ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, seqKey, prop.removeIntervals || []);
+            }
+          } catch (eShift) {}
+          statusUi.show('Готово', false);
+          setTimeout(function () { statusUi.hide(); }, 1200);
+          var msgs = ContextStore.getMessages(panelId);
+          msgs.push({
+            role: 'assistant',
+            content:
+              'Монтаж применён по подтверждённому плану. Вырезано ' +
+              (prop.verification ? prop.verification.removeCount : '?') +
+              ' интервал(ов), осталось ' +
+              (prop.verification ? fmtSec(prop.verification.totalKeepSec) : '?') +
+              '. Кэш транскрипта пересчитан под новый таймлайн.'
+          });
+          ContextStore.setMessages(panelId, msgs);
+          renderMessages(msgs);
+        });
+      }
+    );
+  }
+
+  function cancelPendingProposal() {
+    _pendingProposal = null;
+    var card = document.getElementById('pending-proposal-card');
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+    var panelId = active.panelId;
+    var msgs = ContextStore.getMessages(panelId);
+    msgs.push({
+      role: 'assistant',
+      content: 'План монтажа отменён пользователем. Ничего не изменено на таймлайне.'
+    });
+    ContextStore.setMessages(panelId, msgs);
+    renderMessages(msgs);
+  }
+
+  function execProposeTranscriptCuts(args) {
+    var vr = ToolValidators.validateTranscriptCuts(lastSnap, args);
+    if (vr && vr.error) return Promise.resolve({ validationError: vr.error });
+    /* Snap к границам сегментов для предотвращения обрезки слов */
+    var snappedIntervals = snapIntervalsToSegmentBoundaries(args.removeIntervals || []);
+    var verification = computeVerification(snappedIntervals);
+    _pendingProposal = {
+      kind: 'transcript_cuts',
+      removeIntervals: snappedIntervals,
+      keepSummary: args.keepSummary || [],
+      removeSummary: args.removeSummary || [],
+      summary: args.summary || '',
+      verification: verification,
+      snapshot: lastSnap,
+      createdAt: Date.now()
+    };
+    renderPendingProposalCard();
+    return Promise.resolve({
+      ok: true,
+      status: 'waiting_user_confirmation',
+      message:
+        'План предложен пользователю. Жди, пока он нажмёт «Применить» или «Отмена». ' +
+        'НЕ вызывай apply_transcript_cuts сам — это сделает UI по кнопке.',
+      _verification: verification
+    });
+  }
+
+  /* ─── Новые executors: propose_timecode_edits / propose_markers / find_moments / ducking / loudness ── */
+
+  function execProposeTimecodeEdits(args) {
+    if (!lastSnap || !lastSnap.ok) {
+      return Promise.resolve({
+        validationError: 'Сначала вызовите get_timeline_snapshot.',
+        hint: 'propose_timecode_edits требует свежий снимок для симуляции.'
+      });
+    }
+    var v = ToolValidators.validateTimecodePlan(lastSnap, args);
+    if (v) return Promise.resolve({ validationError: v });
+    var sim = EditPlanSimulator.simulate(lastSnap, args);
+    if (!sim.ok) return Promise.resolve({ validationError: sim.error || 'Симуляция не удалась' });
+    _pendingProposal = {
+      kind: 'timecode_edits',
+      operations: args.operations || [],
+      summary: args.summary || '',
+      simulation: sim,
+      snapshot: lastSnap,
+      createdAt: Date.now()
+    };
+    renderPendingProposalCard();
+    return Promise.resolve({
+      ok: true,
+      status: 'waiting_user_confirmation',
+      message: 'План правок таймлайна предложен пользователю. НЕ вызывай apply_timecode_edits сам — это сделает UI.',
+      simulation: sim.summary
+    });
+  }
+
+  function execDryRunEditPlan(args) {
+    if (!lastSnap || !lastSnap.ok) {
+      return Promise.resolve({ error: 'Сначала вызовите get_timeline_snapshot.' });
+    }
+    /* §2.1: принимаем и {ops:[...]} (unified), и {operations:[...]} (legacy). */
+    var sim;
+    if (args && Array.isArray(args.ops)) {
+      var vu = ToolValidators.validateEditPlan(lastSnap, args);
+      if (vu) return Promise.resolve({ validationError: vu });
+      sim = EditPlanSimulator.simulateUnified(lastSnap, args);
+    } else {
+      var v = ToolValidators.validateTimecodePlan(lastSnap, args || {});
+      if (v) return Promise.resolve({ validationError: v });
+      sim = EditPlanSimulator.simulate(lastSnap, args || {});
+    }
+    if (!sim.ok) return Promise.resolve({ error: sim.error });
+    return Promise.resolve({
+      ok: true,
+      summary: sim.summary,
+      removedNodeIds: sim.removed,
+      trimmedNodeIds: sim.trimmed,
+      movedNodeIds: sim.moved,
+      rejectedOpIdxs: sim.rejectedOpIdxs || [],
+      errors: sim.errors,
+      clipsAfter: sim.clips.map(function (c) {
+        return {
+          nodeId: c.nodeId,
+          name: c.name,
+          startSec: Math.round(c.startSec * 100) / 100,
+          endSec: Math.round(c.endSec * 100) / 100,
+          disabled: c.disabled
+        };
+      })
+    });
+  }
+
+  /* §2.1: propose_edit_plan — единый пропоз на смешанные ops.
+     Симулирует через EditPlanSimulator.simulateUnified, показывает карточку edit_plan. */
+  function execProposeEditPlan(args) {
+    if (!lastSnap || !lastSnap.ok) {
+      return Promise.resolve({
+        validationError: 'Сначала вызовите get_timeline_snapshot.',
+        hint: 'propose_edit_plan требует свежий снимок для симуляции.'
+      });
+    }
+    var vErr = ToolValidators.validateEditPlan(lastSnap, args || {});
+    if (vErr) return Promise.resolve({ validationError: vErr });
+    var sim = EditPlanSimulator.simulateUnified(lastSnap, args);
+    if (!sim.ok) return Promise.resolve({ validationError: sim.error || 'Симуляция не удалась' });
+    _pendingProposal = {
+      kind: 'edit_plan',
+      ops: args.ops || [],
+      normalizedOperations: sim.normalizedOperations || [],
+      rejectedOpIdxs: sim.rejectedOpIdxs || [],
+      summary: args.summary || '',
+      rationale: args.rationale || '',
+      simulation: sim,
+      snapshot: lastSnap,
+      createdAt: Date.now()
+    };
+    renderPendingProposalCard();
+    return Promise.resolve({
+      ok: true,
+      status: 'waiting_user_confirmation',
+      message:
+        'EditPlan предложен пользователю. Жди кнопки «Применить» / «Отмена». ' +
+        'НЕ вызывай apply_edit_plan сам — это сделает UI.',
+      simulation: sim.summary,
+      rejectedOpIdxs: sim.rejectedOpIdxs || []
+    });
+  }
+
+  /* §2.1: apply_edit_plan без подтверждения — нормализует ops и дёргает
+     applyTimecodeEdits одним вызовом (один undo-group в Premiere). */
+  function execApplyEditPlan(panelId, args) {
+    return new Promise(function (resolve, reject) {
+      var vErr = ToolValidators.validateEditPlan(lastSnap, args || {});
+      if (vErr) {
+        resolve({ validationError: vErr, hint: 'Обновите снимок или поправьте ops.' });
+        return;
+      }
+      var norm = EditPlanSimulator.normalizeUnifiedPlan(args);
+      if (!norm.operations.length) {
+        resolve({ error: 'После нормализации не осталось валидных ops.' });
+        return;
+      }
+      PremiereBridge.applyTimecodeEdits(
+        { operations: norm.operations, summary: args.summary || '' },
+        function (err, data) {
+          if (err) {
+            reject(err);
+            return;
+          }
+          PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
+            if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
+            data._autoSnapshot = snapData || null;
+            /* Пересчёт кэша транскрипта — как в execApplyTimecodeEdits */
+            try {
+              var seqKey = (snapData && snapData.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
+              if (seqKey) {
+                var rippleIvs = EditPlanSimulator.extractRippleIntervals(norm.operations);
+                if (rippleIvs.length) {
+                  ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, seqKey, rippleIvs);
+                  data._transcriptShifted = true;
+                }
+                var hasShift = norm.operations.some(function (o) {
+                  return (
+                    o.action === 'move_clip' ||
+                    o.action === 'shift_timeline_ripple' ||
+                    o.action === 'set_timeline_in' ||
+                    o.action === 'set_timeline_out' ||
+                    o.action === 'set_timeline_bounds' ||
+                    o.action === 'remove_clip'
+                  );
+                });
+                if (hasShift) {
+                  ContextStore.markTranscriptStale(
+                    TRANSCRIPT_PID,
+                    seqKey,
+                    'apply_edit_plan: ' + norm.operations.map(function (o) { return o.action; }).join(',')
+                  );
+                  data._transcriptPossiblyStale = true;
+                }
+              }
+            } catch (eSh) {}
+            resolve(data);
+          });
+        }
+      );
+    });
+  }
+
+  function execProposeMarkers(args) {
+    var list = args.markers || [];
+    var v = ToolValidators.validateMarkersList(lastSnap, list);
+    if (v) return Promise.resolve({ validationError: v });
+    _pendingProposal = {
+      kind: 'markers',
+      markers: list,
+      summary: args.summary || '',
+      snapshot: lastSnap,
+      createdAt: Date.now()
+    };
+    renderPendingProposalCard();
+    return Promise.resolve({
+      ok: true,
+      status: 'waiting_user_confirmation',
+      message: 'Маркеры предложены пользователю. НЕ вызывай add_markers сам — это сделает UI.',
+      markerCount: list.length
+    });
+  }
+
+  function execFindMoments(args) {
+    var key = args.sequenceKey || '';
+    var q = args.query || '';
+    var k = typeof args.k === 'number' ? args.k : 20;
+    if (!key || !q) return Promise.resolve({ error: 'Нужны sequenceKey и query' });
+    var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+    if (!found.entry) {
+      return Promise.resolve({
+        error: 'Нет кэша для «' + key + '». Сначала транскрибируйте.',
+        availableKeysInCache: ContextStore.listTranscriptCacheKeys(TRANSCRIPT_PID).slice(0, 32)
+      });
+    }
+    var e = found.entry;
+    if ((!e.paragraphs || !e.paragraphs.length) && typeof TranscriptStructure !== 'undefined') {
+      try {
+        TranscriptStructure.buildStructure(e);
+        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, e);
+      } catch (eR) {}
+    }
+    var moments = FindMoments.find(e, q, { k: k });
+    return Promise.resolve({
+      ok: true,
+      query: q,
+      sequenceKey: found.matchedKey,
+      count: moments.length,
+      matchType: moments.length ? moments[0].matchType : null,
+      moments: moments.map(function (m) {
+        return {
+          startSec: Math.round(m.startSec * 100) / 100,
+          endSec: Math.round(m.endSec * 100) / 100,
+          source: m.source,
+          matchType: m.matchType,
+          quote: String(m.text || '').slice(0, 240)
+        };
+      })
+    });
+  }
+
+  /* ─── analyze_transcript_for_cuts: глубокий анализ через вторую модель ── */
+
+  /* Локальный кэш анализа: { [sequenceKey + '|' + tasksKey]: {result, timestamp} } */
+  var _analysisCache = {};
+  var ANALYSIS_CACHE_TTL = 1800000; /* 30 мин */
+
+  function analysisCacheKey(seqKey, tasks) {
+    var tk = tasks ? tasks.slice().sort().join(',') : '*';
+    return seqKey + '|' + tk;
+  }
+
+  function execAnalyzeTranscriptForCuts(args) {
+    var key = args.sequenceKey || '';
+    var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+    if (!found.entry) {
+      return Promise.resolve({
+        error: 'Нет кэша для «' + key + '». Сначала транскрибируйте In–Out.',
+        availableKeysInCache: ContextStore.listTranscriptCacheKeys(TRANSCRIPT_PID).slice(0, 32)
+      });
+    }
+    var e = found.entry;
+
+    /* Обеспечиваем наличие segments */
+    if (!e.segments || !e.segments.length) {
+      return Promise.resolve({ error: 'У транскрипта нет сегментов. Возможно, пустая транскрибация.' });
+    }
+
+    /* Строим paragraphs если нет (для структуры) */
+    if ((!e.paragraphs || !e.paragraphs.length) && typeof TranscriptStructure !== 'undefined') {
+      try {
+        TranscriptStructure.buildStructure(e);
+        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, e);
+      } catch (eB) {}
+    }
+
+    var tasks = Array.isArray(args.tasks) ? args.tasks : null;
+    var forceRefresh = args.forceRefresh === true;
+
+    /* Проверяем кэш анализа */
+    var cKey = analysisCacheKey(found.matchedKey, tasks);
+    if (!forceRefresh && _analysisCache[cKey] && (Date.now() - _analysisCache[cKey].timestamp < ANALYSIS_CACHE_TTL)) {
+      statusUi.show('Анализ из кэша (повторный запрос)', false);
+      setTimeout(function () { statusUi.hide(); }, 800);
+      return Promise.resolve(_analysisCache[cKey].result);
+    }
+
+    var settings = ContextStore.getResolvedSettings ? ContextStore.getResolvedSettings() : {};
+    var segments = e.segments;
+
+    /* Подготавливаем сегменты для анализа */
+    var segmentsForAnalysis = segments.map(function (s, i) {
+      return {
+        i: i,
+        startSec: typeof s.startSec === 'number' ? s.startSec : (s.start || 0),
+        endSec: typeof s.endSec === 'number' ? s.endSec : (s.end || 0),
+        text: String(s.text || '')
+      };
+    });
+
+    /* P0-3: Используем pre-computed labels если есть */
+    var preLabels = null;
+    if (e.preAnalysis && e.preAnalysis.labels && e.preAnalysis.labels.length) {
+      preLabels = e.preAnalysis.labels;
+      statusUi.show('Используем ' + preLabels.length + ' pre-computed меток + LLM для остальных (' + segmentsForAnalysis.length + ' сегментов)…', true);
+    } else {
+      statusUi.show('Запуск анализа транскрипта (' + segmentsForAnalysis.length + ' сегментов)…', true);
+    }
+
+    return TranscriptStructure.analyzeForCutsWithLLM(
+      segmentsForAnalysis,
+      {
+        settings: settings,
+        CloudRuClient: typeof CloudRuClient !== 'undefined' ? CloudRuClient : null,
+        signal: runAbort ? runAbort.signal : null,
+        abortCheck: runAbort ? function () { return runAbort.aborted; } : null,
+        tasks: tasks,
+        preLabels: preLabels,
+        onProgress: function (ev) {
+          statusUi.show(ev.message || 'Анализ…', true);
+        }
+      }
+    ).then(function (result) {
+      /* Формируем удобный ответ для агента — на уровне сегментов */
+      var toRemove = [];
+      var toKeep = [];
+      for (var ri = 0; ri < result.labels.length; ri++) {
+        var lb = result.labels[ri];
+        var seg = segments[lb.i];
+        if (!seg) continue;
+        var startSec = typeof seg.startSec === 'number' ? seg.startSec : (seg.start || 0);
+        var endSec = typeof seg.endSec === 'number' ? seg.endSec : (seg.end || 0);
+        var entry = {
+          i: lb.i,
+          label: lb.label,
+          reason: lb.reason,
+          startSec: startSec,
+          endSec: endSec,
+          textPreview: String(seg.text || '').split(/\s+/).slice(0, 15).join(' ')
+        };
+        if (lb.label !== 'content' && lb.label !== 'digression') {
+          toRemove.push(entry);
+        } else {
+          toKeep.push(entry);
+        }
+      }
+
+      /* Группируем смежные toRemove сегменты в интервалы для удобства */
+      var removeIntervals = [];
+      if (toRemove.length) {
+        toRemove.sort(function (a, b) { return a.startSec - b.startSec; });
+        var cur = { startSec: toRemove[0].startSec, endSec: toRemove[0].endSec,
+                    segments: [toRemove[0]], reasons: [toRemove[0].label + ': ' + (toRemove[0].reason || '')] };
+        for (var gi = 1; gi < toRemove.length; gi++) {
+          var gap = toRemove[gi].startSec - cur.endSec;
+          if (gap <= 0.3) {
+            /* Смежные или перекрывающиеся — объединяем */
+            cur.endSec = Math.max(cur.endSec, toRemove[gi].endSec);
+            cur.segments.push(toRemove[gi]);
+            cur.reasons.push(toRemove[gi].label + ': ' + (toRemove[gi].reason || ''));
+          } else {
+            removeIntervals.push({
+              startSec: cur.startSec,
+              endSec: cur.endSec,
+              reason: cur.reasons.slice(0, 3).join('; ') + (cur.reasons.length > 3 ? ' +' + (cur.reasons.length - 3) : ''),
+              segmentCount: cur.segments.length
+            });
+            cur = { startSec: toRemove[gi].startSec, endSec: toRemove[gi].endSec,
+                    segments: [toRemove[gi]], reasons: [toRemove[gi].label + ': ' + (toRemove[gi].reason || '')] };
+          }
+        }
+        removeIntervals.push({
+          startSec: cur.startSec,
+          endSec: cur.endSec,
+          reason: cur.reasons.slice(0, 3).join('; ') + (cur.reasons.length > 3 ? ' +' + (cur.reasons.length - 3) : ''),
+          segmentCount: cur.segments.length
+        });
+      }
+
+      var finalResult = {
+        ok: true,
+        sequenceKey: found.matchedKey,
+        totalSegments: result.totalSegments,
+        chunksUsed: result.chunks,
+        analysisModel: settings.analysisModel || settings.activeAgentModel || settings.chatModel,
+        stats: result.stats,
+        removeIntervals: removeIntervals,
+        toRemove: toRemove,
+        toKeep: toKeep,
+        _hint: removeIntervals.length
+          ? 'removeIntervals уже готовы для propose_transcript_cuts. ' +
+            'Используй их напрямую: startSec/endSec выровнены по границам сегментов Whisper. ' +
+            'Сформируй keepSummary и removeSummary из toKeep/toRemove.'
+          : 'Анализ не нашёл сегментов для удаления. Транскрипт чистый.'
+      };
+
+      /* Сохраняем в кэш */
+      _analysisCache[cKey] = { result: finalResult, timestamp: Date.now() };
+
+      statusUi.show('Анализ завершён: удалить ' + toRemove.length + ' из ' + result.totalSegments + ' сегментов', false);
+      setTimeout(function () { statusUi.hide(); }, 2000);
+
+      return finalResult;
+    });
+  }
+
+  function _findClipInSnap(nodeId) {
+    if (!lastSnap || !lastSnap.clips || !nodeId) return null;
+    for (var i = 0; i < lastSnap.clips.length; i++) {
+      if (String(lastSnap.clips[i].nodeId) === String(nodeId)) return lastSnap.clips[i];
+    }
+    return null;
+  }
+
+  function execProposeAudioDucking(args) {
+    var key = args.sequenceKey || '';
+    var targetNodeId = args.targetNodeId || '';
+    if (!targetNodeId) {
+      return Promise.resolve({
+        validationError: 'Нужен targetNodeId — nodeId музыкального клипа из get_timeline_snapshot.'
+      });
+    }
+    if (!lastSnap || !lastSnap.ok) {
+      return Promise.resolve({ error: 'Сначала вызовите get_timeline_snapshot.' });
+    }
+    var clip = _findClipInSnap(targetNodeId);
+    if (!clip) {
+      return Promise.resolve({ error: 'Клип ' + targetNodeId + ' не найден в текущем снимке.' });
+    }
+    if (clip.trackType !== 'audio') {
+      return Promise.resolve({ error: 'Клип ' + targetNodeId + ' не аудио-клип (' + clip.trackType + ').' });
+    }
+    if (!clip.mediaPath) {
+      return Promise.resolve({ error: 'У клипа нет mediaPath — рендер невозможен. Возможно вложенная секвенция или генератор.' });
+    }
+    var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+    if (!found.entry) {
+      return Promise.resolve({ error: 'Нет кэша транскрипта для «' + key + '». Сначала транскрибируйте.' });
+    }
+    var e = found.entry;
+    if ((!e.paragraphs || !e.paragraphs.length) && typeof TranscriptStructure !== 'undefined') {
+      try { TranscriptStructure.buildStructure(e); } catch (eR) {}
+    }
+    if (!e.paragraphs || !e.paragraphs.length) {
+      return Promise.resolve({ error: 'Не удалось построить параграфы из транскрипта.' });
+    }
+    /* Берём только параграфы, попадающие в диапазон клипа на таймлайне. */
+    var ivs = [];
+    for (var pi = 0; pi < e.paragraphs.length; pi++) {
+      var p = e.paragraphs[pi];
+      var s = Math.max(p.startSec, clip.startSec);
+      var en = Math.min(p.endSec, clip.endSec);
+      if (en > s + 0.05) ivs.push({ startSec: s, endSec: en });
+    }
+    if (!ivs.length) {
+      return Promise.resolve({ error: 'Речевые интервалы не пересекаются с клипом «' + (clip.name || targetNodeId) + '».' });
+    }
+    var plan = AudioDucking.computeDucking(ivs, {
+      duckDb: typeof args.duckDb === 'number' ? args.duckDb : -12,
+      fadeInSec: typeof args.fadeInSec === 'number' ? args.fadeInSec : 0.15,
+      fadeOutSec: typeof args.fadeOutSec === 'number' ? args.fadeOutSec : 0.3
+    });
+    _pendingProposal = {
+      kind: 'audio_ducking',
+      duckingPlan: plan,
+      sequenceKey: found.matchedKey,
+      target: {
+        nodeId: clip.nodeId,
+        name: clip.name,
+        mediaPath: clip.mediaPath,
+        startSec: clip.startSec,
+        endSec: clip.endSec,
+        inPointSec: clip.inPointSec || 0,
+        trackIndex: clip.trackIndex
+      },
+      duckDb: typeof args.duckDb === 'number' ? args.duckDb : -12,
+      fadeSec: Math.max(args.fadeInSec || 0.15, args.fadeOutSec || 0.3),
+      summary: args.summary || ('Ducking ' + plan.summary.duckDb + ' dB на «' + (clip.name || targetNodeId) + '» (' + plan.summary.intervalCount + ' речевых интервалов)'),
+      snapshot: lastSnap,
+      createdAt: Date.now()
+    };
+    renderPendingProposalCard();
+    return Promise.resolve({
+      ok: true,
+      status: 'waiting_user_confirmation',
+      summary: plan.summary,
+      target: { nodeId: clip.nodeId, name: clip.name, mediaPath: clip.mediaPath },
+      message: 'План ducking показан пользователю. По «Применить» плагин рендерит новый WAV через ffmpeg и импортирует в bin "AI Renders".'
+    });
+  }
+
+  function execProposeLoudness(args) {
+    var key = args.sequenceKey || '';
+    var targetNodeId = args.targetNodeId || '';
+    if (!targetNodeId) {
+      return Promise.resolve({ validationError: 'Нужен targetNodeId — nodeId речевого клипа.' });
+    }
+    if (!lastSnap || !lastSnap.ok) {
+      return Promise.resolve({ error: 'Сначала вызовите get_timeline_snapshot.' });
+    }
+    var clip = _findClipInSnap(targetNodeId);
+    if (!clip) {
+      return Promise.resolve({ error: 'Клип ' + targetNodeId + ' не найден.' });
+    }
+    if (clip.trackType !== 'audio') {
+      return Promise.resolve({ error: 'Клип ' + targetNodeId + ' не аудио (' + clip.trackType + ').' });
+    }
+    if (!clip.mediaPath) {
+      return Promise.resolve({ error: 'У клипа нет mediaPath — рендер невозможен.' });
+    }
+    var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+    var loud = found.entry && found.entry.audioAnalysis && found.entry.audioAnalysis.loudness;
+    var targetLufs = typeof args.targetLufs === 'number' ? args.targetLufs : -16;
+    /* Расчёт через AudioDucking — справочный, для карточки. ffmpeg loudnorm всё равно
+       измерит и применит сам. */
+    var res = loud ? AudioDucking.computeLoudnessGain(loud, { targetLufs: targetLufs }) : null;
+    _pendingProposal = {
+      kind: 'loudness',
+      loudness: res || { ok: false, targetLufs: targetLufs, inputLufs: null, gainDb: null },
+      sequenceKey: (found && found.matchedKey) || key,
+      target: {
+        nodeId: clip.nodeId,
+        name: clip.name,
+        mediaPath: clip.mediaPath,
+        startSec: clip.startSec,
+        endSec: clip.endSec
+      },
+      targetLufs: targetLufs,
+      summary:
+        'LUFS-нормализация «' + (clip.name || targetNodeId) + '» → ' + targetLufs + ' LUFS' +
+        (res && res.ok ? ' (расчётный gain ' + (res.gainDb >= 0 ? '+' : '') + res.gainDb + ' dB)' : ' — ffmpeg loudnorm измерит и применит'),
+      createdAt: Date.now()
+    };
+    renderPendingProposalCard();
+    return Promise.resolve({
+      ok: true,
+      status: 'waiting_user_confirmation',
+      result: res,
+      target: { nodeId: clip.nodeId, name: clip.name },
+      message: 'Карточка LUFS показана. По «Применить» ffmpeg loudnorm рендерит новый WAV и импортирует в bin "AI Renders".'
+    });
+  }
+
+  function execApplyTranscriptCuts(panelId, args) {
+    return new Promise(function (resolve, reject) {
+      var vr = ToolValidators.validateTranscriptCuts(lastSnap, args);
+      if (vr.error) {
+        resolve({ validationError: vr.error });
+        return;
+      }
+      /* Snap к границам сегментов */
+      args = Object.assign({}, args, {
+        removeIntervals: snapIntervalsToSegmentBoundaries(args.removeIntervals || [])
+      });
+      var verification = computeVerification(args.removeIntervals);
+      PremiereBridge.applyTranscriptCuts(args, function (err, data) {
+        if (err) {
+          reject(err);
+          return;
+        }
+        /* Откат монтажа по тексту средствами плагина не реализован — Cmd+Z в таймлайне Premiere вручную. */
+        if (vr.warn) {
+          if (data && typeof data === 'object') data.validatorWarn = vr.warn;
+          else data = { raw: data, validatorWarn: vr.warn };
+        }
+        if (data && typeof data === 'object') data._verification = verification;
+        PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
+          if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
+          data._autoSnapshot = snapData || null;
+          try {
+            var seqKey = (snapData && snapData.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
+            if (seqKey) {
+              ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, seqKey, args.removeIntervals || []);
+              data._transcriptShifted = true;
+            }
+          } catch (eSh2) {}
+          resolve(data);
+        });
+      });
+    });
+  }
+
+  /* ─── Сборщики executors по пресету ─────────────────────────────── */
+
+  function buildExecutorsForPreset(preset) {
+    var pid = preset.panelId;
+    /* Единый набор: все экзекуторы доступны всегда */
+    return {
+      get_timeline_snapshot: execGetSnapshot,
+      get_transcript_from_cache: execGetTranscriptFromCache,
+      get_transcript_structure: execGetTranscriptStructure,
+      /* таймкоды */
+      apply_timecode_edits: function (args) { return execApplyTimecodeEdits(pid, args); },
+      propose_timecode_edits: execProposeTimecodeEdits,
+      dry_run_edit_plan: execDryRunEditPlan,
+      /* EditPlan (§2.1) */
+      propose_edit_plan: execProposeEditPlan,
+      apply_edit_plan: function (args) { return execApplyEditPlan(pid, args); },
+      /* текст */
+      propose_transcript_cuts: execProposeTranscriptCuts,
+      apply_transcript_cuts: function (args) { return execApplyTranscriptCuts(pid, args); },
+      /* маркеры */
+      add_markers: function (args) { return execAddMarkers(pid, args); },
+      propose_markers: execProposeMarkers,
+      /* поиск + аудио */
+      find_moments: execFindMoments,
+      analyze_transcript_for_cuts: execAnalyzeTranscriptForCuts,
+      propose_audio_ducking: execProposeAudioDucking,
+      propose_loudness_normalization: execProposeLoudness
+    };
+  }
+
+  /* ─── Единый пресет (все функции в одном чате) ────────────────────── */
+
+  var UNIFIED_PRESET = {
+    id: 'unified',
+    panelId: 'unified',
+    label: 'ИИ: монтаж',
+    sub: 'Таймкоды · Текст · Маркеры · Аудио — один чат. Откат правок таймлайна: Cmd+Z / Ctrl+Z в Premiere.',
+    sysprompt: function () {
+      return AgentPrompts.unified;
+    },
+    tools: TOOLS_UNIFIED,
+    hintsKey: 'unified',
+    placeholder: 'Опишите задачу обычными словами…'
+  };
+
+  /* Legacy aliases для совместимости */
+  var PRESETS = {
+    unified: UNIFIED_PRESET,
+    timecode: UNIFIED_PRESET,
+    textmontage: UNIFIED_PRESET,
+    markers: UNIFIED_PRESET
+  };
+
+  var active = UNIFIED_PRESET;
+
+  /* ─── Render history ────────────────────────────────────────────── */
+
+  function renderMessages(msgs) {
+    el.chat.innerHTML = '';
+    msgs.forEach(function (m) {
+      if (m.role === 'system') return;
+
+      var isToolRole = m.role === 'tool';
+      var isAssistantToolCalls = m.role === 'assistant' && m.tool_calls && !m.content;
+      var collapsible = isToolRole || isAssistantToolCalls;
+
+      var div = document.createElement('div');
+      div.className =
+        'bubble ' +
+        (m.role === 'user' ? 'user' : m.role === 'assistant' ? 'assistant' : 'tool') +
+        (collapsible ? ' collapsible collapsed' : '');
+
+      var role = document.createElement('div');
+      role.className = 'role';
+
+      if (collapsible) {
+        var toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'bubble-toggle';
+        toggle.textContent = '▸';
+        var label = isAssistantToolCalls
+          ? 'assistant · tools (' +
+            m.tool_calls
+              .map(function (t) {
+                return t.function.name;
+              })
+              .join(', ') +
+            ')'
+          : 'tool result';
+        var roleText = document.createElement('span');
+        roleText.textContent = label;
+        toggle.onclick = function () {
+          var isCollapsed = div.classList.toggle('collapsed');
+          toggle.textContent = isCollapsed ? '▸' : '▾';
+        };
+        role.appendChild(toggle);
+        role.appendChild(roleText);
+      } else {
+        role.textContent = m.role + (m.tool_calls ? ' · tools' : '');
+      }
+      div.appendChild(role);
+
+      var body = document.createElement('div');
+      body.className = 'bubble-body';
+      body.textContent =
+        m.content ||
+        (m.tool_calls
+          ? JSON.stringify(
+              m.tool_calls.map(function (t) {
+                return t.function.name;
+              })
+            )
+          : '');
+      div.appendChild(body);
+      el.chat.appendChild(div);
+    });
+    if (_pendingProposal) renderPendingProposalCard();
+    el.chat.scrollTop = el.chat.scrollHeight;
+  }
+
+  /* ─── Hint chips / starters / transcribe LED ─────────────────────── */
+
+  /* ── Активная категория стартеров ──────────────────────────────── */
+  var _activeStarterCat = 'timeline';
+
+  /* Подсказки-чипы фильтруются по активной категории стартеров */
+  var CAT_GROUP_MAP = { timeline: 'timeline', text: 'text', markers: 'markers' };
+  function rebuildHintChips() {
+    if (!el.hintBox) return;
+    el.hintBox.innerHTML = '';
+    var list = typeof UiHints !== 'undefined' ? UiHints.unified : null;
+    if (!list) return;
+    var grp = CAT_GROUP_MAP[_activeStarterCat] || _activeStarterCat;
+    list.forEach(function (h) {
+      if (h.group && h.group !== grp) return; /* фильтр по категории */
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'hint-chip';
+      b.textContent = h.label;
+      b.title = h.text;
+      b.onclick = function () {
+        el.input.value = h.text;
+        el.input.focus();
+      };
+      el.hintBox.appendChild(b);
+    });
+  }
+
+  function rebuildStarters() {
+    if (!el.startersBox || typeof StartersUI === 'undefined') return;
+    el.startersBox.innerHTML = '';
+    /* Заголовок */
+    var title = document.createElement('div');
+    title.className = 'starters-section-title';
+    title.textContent = 'Быстрые сценарии';
+    el.startersBox.appendChild(title);
+    /* Кнопки категорий */
+    var catBar = document.createElement('div');
+    catBar.className = 'starters-cat-bar';
+    var cats = [
+      { id: 'timeline', label: 'Таймлайн', panelId: 'timecode' },
+      { id: 'text', label: 'По тексту', panelId: 'textmontage' },
+      { id: 'markers', label: 'Маркеры', panelId: 'markers' }
+    ];
+    cats.forEach(function (cat) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'starters-cat-btn' + (cat.id === _activeStarterCat ? ' active' : '');
+      btn.setAttribute('data-cat', cat.id);
+      btn.textContent = cat.label;
+      btn.onclick = function () {
+        _activeStarterCat = cat.id;
+        rebuildStarters();
+        rebuildHintChips();
+      };
+      catBar.appendChild(btn);
+    });
+    el.startersBox.appendChild(catBar);
+    /* Стартеры для выбранной категории */
+    var catPanelId = (cats.filter(function (c) { return c.id === _activeStarterCat; })[0] || cats[0]).panelId;
+    var listHolder = document.createElement('div');
+    listHolder.className = 'starters-row';
+    el.startersBox.appendChild(listHolder);
+    StartersUI.init(catPanelId, {
+      container: listHolder,
+      onUse: function (starter) {
+        el.input.value = starter.userPrompt || '';
+        el.input.focus();
+      },
+      onSystemAddon: function (addon) {
+        _activeSystemAddon = addon;
+      },
+      onError: function (msg) {
+        showErr(msg);
+        setTimeout(function () { showErr(''); }, 4000);
+      }
+    });
+  }
+
+  function refreshTranscriptBanner() {
+    PremiereBridge.getTimelineSnapshot(function (err, snap) {
+      var seq = !err && snap && snap.ok && snap.sequenceName ? snap.sequenceName : '';
+      if (seq) {
+        if (ContextStore.hasTranscriptForSequence(TRANSCRIPT_PID, seq)) {
+          var ent = ContextStore.getTranscriptEntry(TRANSCRIPT_PID, seq);
+          var sc = ent && ent.segments ? ent.segments.length : 0;
+          setTranscriptLed('ok');
+          showErr('Секвенция «' + seq + '»: транскрипт в кэше (' + sc + ' сегм.).');
+        } else {
+          setTranscriptLed('red');
+          showErr('Секвенция «' + seq + '»: транскрипта нет — выставьте In/Out и нажмите «Транскрибировать».');
+        }
+      } else {
+        setTranscriptLed('red');
+      }
+      setTimeout(function () {
+        showErr('');
+      }, 6000);
+    });
+  }
+
+  /* ─── Undo button (только для пресета «Маркеры») ──────────────────
+   *
+   * Откат таймкодов и монтажа по тексту средствами плагина не реализован
+   * (PP 2025 Edit→Undo нестабилен на ripple-cuts, накапливать N шагов и
+   * откатывать их пачкой в больших монтажах — нерабочее решение).
+   * Для этих пресетов кнопка скрыта; пользователь использует штатный
+   * Cmd+Z / Ctrl+Z в таймлайне Premiere. Для «Маркеров» откат остаётся,
+   * т.к. реализован через markers.deleteMarker по списку секунд.
+   */
+
+  var btnUndo = document.getElementById('btn-undo');
+  function refreshUndoButton() {
+    if (!btnUndo) return;
+    btnUndo.style.display = '';
+    var u = ContextStore.getLastUndo(active.panelId);
+    if (u && u.count > 0 && u.mode === 'markers') {
+      btnUndo.textContent =
+        'Откатить ' + u.count + ' маркер' + (u.count === 1 ? '' : u.count >= 2 && u.count <= 4 ? 'а' : 'ов');
+      btnUndo.title = 'Удалить добавленные маркеры через markers.deleteMarker';
+      btnUndo.disabled = false;
+    } else {
+      btnUndo.textContent = 'Откат маркеров';
+      btnUndo.title = 'Нет маркеров для отката';
+      btnUndo.disabled = true;
+    }
+  }
+  if (btnUndo) {
+    btnUndo.onclick = function () {
+      var u = ContextStore.getLastUndo(active.panelId);
+      if (!u || !u.count || u.mode !== 'markers' || !u.markerSeconds || !u.markerSeconds.length) return;
+      PremiereBridge.removeMarkersBySeconds(u.markerSeconds, function (err, data) {
+        if (err) {
+          showErr(String(err.message || err));
+          return;
+        }
+        if (data && data.ok) {
+          showErr(
+            'Удалено маркеров: ' +
+              (data.removed || 0) +
+              ' из ' +
+              (data.requested || u.markerSeconds.length) +
+              '.'
+          );
+          ContextStore.clearLastUndoCount(active.panelId);
+          refreshUndoButton();
+        } else {
+          showErr((data && data.error) || 'Не удалось удалить маркеры.');
+        }
+        setTimeout(function () {
+          showErr('');
+        }, 3500);
+      });
+    };
+  }
+
+  /* ─── Меню «Ещё» ─────────────────────────────────────────────────── */
+
+  if (el.moreBtn && el.moreMenu) {
+    el.moreBtn.onclick = function (e) {
+      e.stopPropagation();
+      el.moreMenu.classList.toggle('open');
+    };
+    document.addEventListener('click', function (e) {
+      if (!el.moreMenu.contains(e.target)) el.moreMenu.classList.remove('open');
+    });
+  }
+
+  var btnClrChat = document.getElementById('btn-clear-chat');
+  if (btnClrChat) {
+    btnClrChat.onclick = function () {
+      ContextStore.clearChat(active.panelId);
+      renderMessages([]);
+      el.moreMenu.classList.remove('open');
+    };
+  }
+  var btnClrCache = document.getElementById('btn-clear-cache');
+  if (btnClrCache) {
+    btnClrCache.onclick = function () {
+      ContextStore.clearTranscriptCache(TRANSCRIPT_PID);
+      setTranscriptLed('red');
+      showErr('Общий кэш транскриптов очищен.');
+      setTimeout(function () {
+        showErr('');
+      }, 2000);
+      el.moreMenu.classList.remove('open');
+    };
+  }
+  var btnClrAll = document.getElementById('btn-clear-all');
+  if (btnClrAll) {
+    btnClrAll.onclick = function () {
+      ContextStore.clearAllPanelCache(active.panelId);
+      renderMessages([]);
+      refreshUndoButton();
+      el.moreMenu.classList.remove('open');
+    };
+  }
+
+  /* ─── Send / Stop ────────────────────────────────────────────────── */
+
+  el.stop.onclick = function () {
+    if (runAbort && typeof runAbort.abort === 'function') runAbort.abort();
+  };
+
+  /** Быстрый путь для timecode: «удали с 3 по 5 сек» без LLM. */
+  function parseTimelineIntervalDeleteSec(text) {
+    var raw = String(text || '');
+    var t = raw.toLowerCase().replace(/ё/g, 'е');
+    var ripple = true;
+    if (
+      /не\s*смыка|без\s*смык|не\s+сомык|остав(ь|ить)\s+дыр|с\s+дыр|lift|без\s+ripple|не\s+сомкн/i.test(raw)
+    )
+      ripple = false;
+    if (!/(удал|убер|выреж|вырез|очист|cut|remove|промежут|интервал|дырк|пуст)/i.test(t)) return null;
+    var m =
+      t.match(/между\s+(\d+)\s*[-]?\s*[йиюяех]?\s+и\s+(\d+)\s*[-]?\s*[йиюяех]?\s*(?:сек|секунд)/i) ||
+      t.match(
+        /между\s+(\d+(?:[.,]\d+)?)(?:-?[ийюеях]+)?\s+(?:и|до)\s+(\d+(?:[.,]\d+)?)(?:-?[ийюеях]+)?\s*(?:сек|секунд)/i
+      ) ||
+      t.match(/(?:с|от)\s+(\d+(?:[.,]\d+)?)\s+(?:по|до)\s+(\d+(?:[.,]\d+)?)\s*(?:сек|секунд)/i) ||
+      t.match(/(\d+(?:[.,]\d+)?)\s*[-–—]\s*(\d+(?:[.,]\d+)?)\s*(?:сек|секунд)/i);
+    if (!m) return null;
+    var a = parseFloat(String(m[1]).replace(',', '.'));
+    var b = parseFloat(String(m[2]).replace(',', '.'));
+    if (isNaN(a) || isNaN(b)) return null;
+    return { startSec: Math.min(a, b), endSec: Math.max(a, b), ripple: ripple };
+  }
+
+  async function onSend() {
+    var text = el.input.value.trim();
+    if (!text) return;
+    showErr('');
+    el.input.value = '';
+    var settings = ContextStore.getResolvedSettings();
+    var panelId = active.panelId;
+    var stored = ContextStore.getMessages(panelId);
+    stored.push({ role: 'user', content: text });
+    ContextStore.setMessages(panelId, stored);
+    renderMessages(stored);
+
+    /* Fast-path для простых команд «удали с X по Y секунду» */
+    {
+      var direct = parseTimelineIntervalDeleteSec(text);
+      if (direct && direct.endSec > direct.startSec + 0.02) {
+        el.send.disabled = true;
+        el.stop.disabled = false;
+        runAbort = createAbortPair();
+        var acFast = runAbort;
+        statusUi.show('Вырезание интервала на таймлайне…', true);
+        try {
+          if (acFast.aborted) throw new Error('Остановлено');
+          var delAction = direct.ripple ? 'ripple_delete_range' : 'lift_delete_range';
+          var plan = {
+            operations: [{ action: delAction, startSec: direct.startSec, endSec: direct.endSec }],
+            summary: 'Удалён участок ' + direct.startSec + '–' + direct.endSec + ' с (' + delAction + ')'
+          };
+          var fastRes = await new Promise(function (resolve, reject) {
+            PremiereBridge.applyTimecodeEdits(plan, function (err, data) {
+              if (err) reject(err);
+              else resolve(data);
+            });
+          });
+          /* Откат таймкодов средствами плагина не реализован — Cmd+Z в таймлайне Premiere вручную. */
+          if (fastRes && !fastRes.ok) throw new Error(fastRes.error || 'Ошибка применения правки');
+          stored = ContextStore.getMessages(panelId);
+          stored.push({
+            role: 'assistant',
+            content:
+              'Готово: вырезан интервал с ' + direct.startSec + ' по ' + direct.endSec + ' с (' + delAction + ').'
+          });
+          ContextStore.setMessages(panelId, stored);
+          renderMessages(stored);
+          statusUi.show('Готово', false);
+          setTimeout(function () {
+            statusUi.hide();
+          }, 1200);
+        } catch (e) {
+          statusUi.hide();
+          if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1))
+            showErr('Остановлено.');
+          else showErr(String(e.message || e));
+        } finally {
+          if (runAbort === acFast) runAbort = null;
+          el.send.disabled = false;
+          el.stop.disabled = true;
+        }
+        return;
+      }
+    }
+
+    /* P1-1: Tiered prompt — подключаем только релевантные секции */
+    var sysContent = (typeof AgentPrompts !== 'undefined' && AgentPrompts.buildPrompt)
+      ? AgentPrompts.buildPrompt(text)
+      : active.sysprompt();
+    if (_activeSystemAddon) {
+      sysContent += '\n\n' + _activeSystemAddon;
+      _activeSystemAddon = null;
+    }
+    var apiMessages = [{ role: 'system', content: sysContent }].concat(stored);
+
+    el.send.disabled = true;
+    el.stop.disabled = false;
+    runAbort = createAbortPair();
+    var ac = runAbort;
+
+    /* P0-1: Auto-inject timeline snapshot — убираем 1 обязательный round-trip */
+    statusUi.show('Получение снимка таймлайна…', true);
+    try {
+      var autoSnap = await execGetSnapshot();
+      if (autoSnap && autoSnap.ok) {
+        /* Компактный снимок для контекста — не передаём полные mediaPath, только ключевое */
+        var compactSnap = {
+          sequenceName: autoSnap.sequenceName,
+          sequenceEndSec: autoSnap.sequenceEndSec,
+          fps: autoSnap.fps,
+          trackCount: (autoSnap.tracks || []).length,
+          clipCount: (autoSnap.clips || []).length,
+          tracks: (autoSnap.tracks || []).map(function (t) {
+            return { type: t.type, index: t.index, name: t.name, muted: t.muted, clipCount: t.clipCount };
+          }),
+          clips: (autoSnap.clips || []).map(function (c) {
+            return {
+              nodeId: c.nodeId, name: c.name, trackType: c.trackType, trackIndex: c.trackIndex,
+              startSec: c.startSec, endSec: c.endSec, durationSec: c.durationSec, disabled: c.disabled
+            };
+          })
+        };
+        apiMessages.push({
+          role: 'user',
+          content: '[auto-snapshot таймлайна]\n' + JSON.stringify(compactSnap)
+        });
+      }
+    } catch (eSnap) { /* не критично — агент сам вызовет get_timeline_snapshot */ }
+
+    statusUi.show('Запрос к Cloud.ru FM…', true);
+    try {
+      var result = await runAgentLoop({
+        settings: settings,
+        messages: apiMessages,
+        tools: active.tools,
+        toolExecutors: buildExecutorsForPreset(active),
+        maxSteps: settings.maxAgentSteps || 24,
+        abortSignal: ac.signal,
+        abortCheck: function () {
+          return ac.aborted;
+        },
+        onStatus: function (ev) {
+          statusUi.show(ev.message || ev.name || '…', true);
+        }
+      });
+      statusUi.show('Готово', false);
+      setTimeout(function () {
+        statusUi.hide();
+      }, 1200);
+      ContextStore.setMessages(
+        panelId,
+        result.messages.filter(function (m) {
+          return m.role !== 'system';
+        })
+      );
+      renderMessages(ContextStore.getMessages(panelId));
+    } catch (e) {
+      statusUi.hide();
+      if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1))
+        showErr('Остановлено (запрос к API FM прерван).');
+      else showErr(String(e.message || e));
+    } finally {
+      if (runAbort === ac) runAbort = null;
+      el.send.disabled = false;
+      el.stop.disabled = true;
+    }
+  }
+
+  el.send.onclick = onSend;
+  el.input.onkeydown = function (e) {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) onSend();
+  };
+
+  /* ─── Транскрибация (общая, единственная кнопка) ─────────────────── */
+
+  async function onTranscribeTimeline() {
+    showErr('');
+    var settings = ContextStore.getResolvedSettings();
+    el.transcribe.disabled = true;
+    el.stop.disabled = false;
+    runAbort = createAbortPair();
+    var ac = runAbort;
+    var prep = null;
+    statusUi.show('Подготовка аудио с таймлайна (In–Out)…', true);
+    setTranscriptLed('busy');
+    try {
+      prep = await new Promise(function (resolve, reject) {
+        PremiereBridge.prepareTranscribeFromTimeline(
+          {
+            extensionRoot: extensionRootForHost(),
+            exportPresetPath: settings.exportAudioPresetPath || '',
+            maxDirectTranscribeMediaSec: settings.maxDirectTranscribeMediaSec,
+            transcribeExportChunkSec: settings.transcribeExportChunkSec,
+            exportChunkExtension: settings.exportChunkExtension || 'wav'
+          },
+          function (err, data) {
+            if (err) reject(err);
+            else resolve(data);
+          }
+        );
+      });
+      if (!prep || !prep.ok) throw new Error((prep && prep.error) || 'Не удалось подготовить аудио');
+
+      var snap = await new Promise(function (resolve, reject) {
+        PremiereBridge.getTimelineSnapshot(function (err, data) {
+          if (err) reject(err);
+          else resolve(data);
+        });
+      });
+      if (!snap || !snap.ok) throw new Error((snap && snap.error) || 'Нет активной секвенции');
+      var key = snap.sequenceName || 'sequence';
+
+      var norm = await TimelineTranscribe.runFromPrep(prep, {
+        settings: settings,
+        signal: ac.signal,
+        abortCheck: function () {
+          return ac.aborted;
+        },
+        onProgress: function (msg) {
+          statusUi.show(msg, true);
+        },
+        CloudRuClient: CloudRuClient
+      });
+
+      try {
+        if (typeof TranscriptStructure !== 'undefined') {
+          TranscriptStructure.buildStructure(norm, { pauseThresholdSec: 0.9, maxParagraphSec: 60 });
+        }
+      } catch (eStr) {}
+      ContextStore.setTranscriptEntry(TRANSCRIPT_PID, key, norm);
+
+      try {
+        if (typeof TranscriptStructure !== 'undefined' && norm.paragraphs && norm.paragraphs.length) {
+          statusUi.show('Построение глав (LLM)…', true);
+          TranscriptStructure.buildTopicsWithLLM(norm.paragraphs, {
+            settings: settings,
+            CloudRuClient: CloudRuClient,
+            signal: ac.signal,
+            abortCheck: function () {
+              return ac.aborted;
+            }
+          }).then(function (topics) {
+            if (topics && topics.length) {
+              norm.topics = topics;
+              if (!norm.structureMeta) norm.structureMeta = {};
+              norm.structureMeta.topicsSource = 'llm';
+              ContextStore.setTranscriptEntry(TRANSCRIPT_PID, key, norm);
+            }
+          }, function () {});
+        }
+      } catch (eT) {}
+
+      /* P0-3: Pre-compute local analysis при транскрибации */
+      try {
+        if (typeof TranscriptStructure !== 'undefined' && norm.segments && norm.segments.length) {
+          statusUi.show('Локальный анализ сегментов…', true);
+          var segsForLocal = norm.segments.map(function (s, idx) {
+            return {
+              i: idx,
+              startSec: typeof s.startSec === 'number' ? s.startSec : (s.start || 0),
+              endSec: typeof s.endSec === 'number' ? s.endSec : (s.end || 0),
+              text: String(s.text || '')
+            };
+          });
+          var localResult = TranscriptStructure.runLocalDetectors(segsForLocal);
+          norm.preAnalysis = {
+            labels: localResult.labels,
+            stats: localResult.stats,
+            builtAt: Date.now()
+          };
+          ContextStore.setTranscriptEntry(TRANSCRIPT_PID, key, norm);
+          statusUi.show('Локальный анализ: ' + localResult.labels.length + ' меток', false);
+        }
+      } catch (eLA) {}
+
+      var again = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+      if (!again.entry) {
+        showErr('Не удалось сохранить или прочитать кэш.');
+        setTranscriptLed('red');
+      } else {
+        setTranscriptLed('ok');
+      }
+      statusUi.show('Транскрипт в кэше: «' + key + '»', false);
+      setTimeout(function () {
+        statusUi.hide();
+      }, 2500);
+      showErr('Сохранено «' + key + '», сегментов: ' + norm.segments.length + ' (' + norm.mode + ').');
+      setTimeout(function () {
+        showErr('');
+      }, 5000);
+    } catch (e) {
+      statusUi.hide();
+      setTranscriptLed('red');
+      if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1))
+        showErr('Транскрибация остановлена.');
+      else showErr(String(e.message || e));
+    } finally {
+      if (TimelineTranscribe && TimelineTranscribe.unlinkWorkFiles) TimelineTranscribe.unlinkWorkFiles(prep);
+      if (runAbort === ac) runAbort = null;
+      el.transcribe.disabled = false;
+      el.stop.disabled = true;
+    }
+  }
+
+  if (el.transcribe) el.transcribe.onclick = onTranscribeTimeline;
+
+  /* ─── Инициализация единой панели ─────────────────────────────────── */
+
+  function initUnifiedPanel() {
+    active = UNIFIED_PRESET;
+    if (el.input) el.input.placeholder = active.placeholder || '';
+    renderMessages(ContextStore.getMessages(active.panelId));
+    rebuildHintChips();
+    rebuildStarters();
+    refreshUndoButton();
+    refreshTranscriptBanner();
+  }
+
+  /* Legacy-совместимость: если где-то вызывается activatePreset — просто noop */
+  function activatePreset() { /* единая панель, переключения нет */ }
+
+  initUnifiedPanel();
+});

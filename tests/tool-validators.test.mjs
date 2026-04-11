@@ -4,6 +4,69 @@ import { loadToolValidators } from './load-tool-validators.mjs';
 
 const TV = loadToolValidators();
 
+describe('validateEditPlan (§2.1)', () => {
+  const snap = {
+    ok: true,
+    sequenceName: 'Seq',
+    clips: [
+      { nodeId: 'a', name: 'intro', startSec: 0, endSec: 10 },
+      { nodeId: 'b', name: 'body', startSec: 10, endSec: 30 }
+    ]
+  };
+
+  test('отклоняет пустой plan', () => {
+    assert.match(TV.validateEditPlan(snap, {}), /ops/);
+  });
+
+  test('требует снимок', () => {
+    assert.match(
+      TV.validateEditPlan({ ok: false }, { ops: [{ kind: 'ripple_delete_interval', startSec: 0, endSec: 1 }] }),
+      /snapshot|снимок/i
+    );
+  });
+
+  test('валидный ripple_delete_interval', () => {
+    assert.equal(
+      TV.validateEditPlan(snap, { ops: [{ kind: 'ripple_delete_interval', startSec: 1, endSec: 4 }] }),
+      null
+    );
+  });
+
+  test('ripple_delete_interval с endSec <= startSec — ошибка', () => {
+    assert.match(
+      TV.validateEditPlan(snap, { ops: [{ kind: 'ripple_delete_interval', startSec: 5, endSec: 3 }] }),
+      /endSec/
+    );
+  });
+
+  test('remove_clip с несуществующим nodeId — ошибка', () => {
+    assert.match(
+      TV.validateEditPlan(snap, { ops: [{ kind: 'remove_clip', nodeId: 'missing' }] }),
+      /не найден/
+    );
+  });
+
+  test('валидный mixed plan', () => {
+    assert.equal(
+      TV.validateEditPlan(snap, {
+        ops: [
+          { kind: 'ripple_delete_interval', startSec: 2, endSec: 5 },
+          { kind: 'remove_clip', nodeId: 'a' },
+          { kind: 'trim_in', nodeId: 'b', timeSec: 12 }
+        ]
+      }),
+      null
+    );
+  });
+
+  test('неизвестный kind — ошибка', () => {
+    assert.match(
+      TV.validateEditPlan(snap, { ops: [{ kind: 'launch_rockets' }] }),
+      /неизвестн/i
+    );
+  });
+});
+
 const snapOk = {
   ok: true,
   sequenceName: 'TestSeq',
@@ -162,20 +225,12 @@ describe('validateTimecodePlan', () => {
     assert.ok(err);
   });
 
-  test('set_clip_speed: speed <= 0', () => {
+  test('set_clip_speed: всегда отбивается (не поддерживается ScriptingAPI PP 2025)', () => {
     const err = TV.validateTimecodePlan(snapOk, {
-      operations: [{ action: 'set_clip_speed', nodeId: 'clip-a', speed: 0 }]
+      operations: [{ action: 'set_clip_speed', nodeId: 'clip-a', speed: 2 }]
     });
     assert.ok(err);
-  });
-
-  test('set_clip_speed: валидный', () => {
-    assert.equal(
-      TV.validateTimecodePlan(snapOk, {
-        operations: [{ action: 'set_clip_speed', nodeId: 'clip-a', speed: 2 }]
-      }),
-      null
-    );
+    assert.match(String(err), /не поддерживается/i);
   });
 
   test('set_playhead: отрицательный', () => {

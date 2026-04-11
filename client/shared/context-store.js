@@ -210,6 +210,7 @@
       var chatModel = String(d.chatModel || '').trim();
       var codeModel = String(d.codeModel || '').trim();
       var whisperModel = String(d.whisperModel || '').trim();
+      var analysisModel = String(d.analysisModel || '').trim();
       var useCode = d.useCodeModelForAgent === true;
       var agentModel = useCode && codeModel ? codeModel : chatModel;
       var off = d.transcriptTimelineOffsetSec;
@@ -228,6 +229,7 @@
         whisperModel: whisperModel,
         useCodeModel: useCode,
         activeAgentModel: agentModel,
+        analysisModel: analysisModel || agentModel,
         transcriptTimelineOffsetSec: transcriptTimelineOffsetSec,
         exportAudioPresetPath: String(d.exportAudioPresetPath || '').trim(),
         maxDirectTranscribeMediaSec:
@@ -237,6 +239,18 @@
         maxTranscribeUploadBytes:
           typeof maxUp === 'number' && !isNaN(maxUp) ? maxUp : 20971520,
         exportChunkExtension: chunkExt,
+        /* Локальный бэкенд транскрибации (whisper.cpp). */
+        transcribeBackend: String(d.transcribeBackend || 'cloud'),
+        whisperCppBin: String(d.whisperCppBin || '').trim(),
+        whisperCppModel: String(d.whisperCppModel || '').trim(),
+        whisperCppLanguage: String(d.whisperCppLanguage || 'ru').trim(),
+        whisperCppThreads:
+          typeof d.whisperCppThreads === 'number' && d.whisperCppThreads >= 0
+            ? d.whisperCppThreads
+            : 0,
+        whisperCppExtraArgs: Array.isArray(d.whisperCppExtraArgs)
+          ? d.whisperCppExtraArgs.slice()
+          : [],
         maxChatHistoryMessages:
           typeof d.maxChatHistoryMessages === 'number' && d.maxChatHistoryMessages > 0
             ? d.maxChatHistoryMessages
@@ -449,6 +463,39 @@
     clearAllPanelCache: function (panelId) {
       this.clearChat(panelId);
       this.clearTranscriptCache(panelId);
+      this.clearLastUndoCount(panelId);
+    },
+
+    /* --- Счётчик последних undo-шагов панели (см. host $._EXT_PRM_._opCounter). --- */
+    _undoKey: function (panelId) { return PREFIX + 'undo_' + panelId; },
+    getLastUndo: function (panelId) {
+      try {
+        var raw = localStorage.getItem(this._undoKey(panelId));
+        if (!raw) return null;
+        var obj = JSON.parse(raw);
+        if (!obj || typeof obj.count !== 'number' || obj.count <= 0) return null;
+        return obj;
+      } catch (e) { return null; }
+    },
+    setLastUndo: function (panelId, count, label, sequenceName, opts) {
+      try {
+        if (typeof count !== 'number' || count <= 0) {
+          this.clearLastUndoCount(panelId);
+          return;
+        }
+        var payload = {
+          count: count,
+          label: label || '',
+          sequenceName: sequenceName || '',
+          ts: Date.now()
+        };
+        if (opts && opts.mode) payload.mode = opts.mode;
+        if (opts && opts.markerSeconds && opts.markerSeconds.length) payload.markerSeconds = opts.markerSeconds;
+        localStorage.setItem(this._undoKey(panelId), JSON.stringify(payload));
+      } catch (e) {}
+    },
+    clearLastUndoCount: function (panelId) {
+      try { localStorage.removeItem(this._undoKey(panelId)); } catch (e) {}
     }
   };
 })(window);

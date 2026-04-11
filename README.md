@@ -22,8 +22,8 @@
 | `move_clip` | nodeId, newStartSec, shiftBlockingClips? | Переместить; по умолчанию ripple-сдвиг всех клипов правее цели |
 | `shift_timeline_ripple` | fromSec, deltaSec | Сдвинуть вправо все клипы с start ≥ fromSec |
 | `set_clip_enabled` | nodeId, enabled | Включить/выключить без удаления |
-| `set_clip_speed` | nodeId, speed | Скорость (1.0=норма, 2.0=2x, 0.5=замедление) |
 | `set_playhead` | timeSec | Переместить курсор воспроизведения |
+| ~~`set_clip_speed`~~ | — | Удалено: не поддерживается ScriptingAPI Premiere Pro 2025 (`TrackItem.setSpeed` отсутствует). Меняйте скорость вручную. |
 | `mute_track` | trackType, trackIndex, muted | Заглушить/включить дорожку |
 
 ### Снимок таймлайна (get_timeline_snapshot)
@@ -113,7 +113,8 @@ npm test
 
 ## Документация
 
-- [docs/README.md](docs/README.md) — указатель по `docs/`
-- [docs/PROJECT.md](docs/PROJECT.md) — архитектура и чек перед правками
-- [docs/premiere-extension-audit.md](docs/premiere-extension-audit.md) — аудит: работает / не работает, качество STT, скорость
+- [docs/PROJECT.md](docs/PROJECT.md) — архитектура, три панели, цепочка CEP → FM → ExtendScript, чек перед правками
+- [docs/roadmap.md](docs/roadmap.md) — план развития, статусы (✓/☐/⚠/✗) и журнал свежих изменений
+- [docs/premiere-extension-audit.md](docs/premiere-extension-audit.md) — аудит: что работает, оговорки, сбои, качество STT, скорость
 - [docs/PREMIERE_AI_ASSISTANT.md](docs/PREMIERE_AI_ASSISTANT.md) — продуктовое ТЗ и референсы
+- [docs/KNOWN_ISSUES_AND_TEST_GAPS.md](docs/KNOWN_ISSUES_AND_TEST_GAPS.md) — известные ограничения CEP/FM/агента и пробелы в автотестах

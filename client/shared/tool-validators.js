@@ -82,7 +82,6 @@
           (a === 'remove_clip' ||
             a === 'set_clip_enabled' ||
             a === 'move_clip' ||
-            a === 'set_clip_speed' ||
             a.indexOf('timeline') >= 0 ||
             a === 'set_timeline_bounds');
         if (needsNodeId) {
@@ -121,7 +120,10 @@
           if (op.newStartSec < 0) return 'move_clip: newStartSec не может быть отрицательным';
         }
         if (a === 'set_clip_speed') {
-          if (typeof op.speed !== 'number' || op.speed <= 0) return 'set_clip_speed: speed должен быть > 0';
+          /* set_clip_speed помечен как нереализуемый на PP 2025 (TrackItem.setSpeed
+             отсутствует в ScriptingAPI). Валидатор отбивает запрос на уровне панели,
+             чтобы не делать заведомо неуспешный round-trip к хосту. */
+          return 'set_clip_speed: операция не поддерживается ScriptingAPI Premiere Pro 2025 (измените скорость вручную: правый клик → Speed/Duration)';
         }
         if (a === 'set_playhead') {
           if (typeof op.timeSec !== 'number') return 'set_playhead: нужен числовой timeSec';
@@ -161,6 +163,88 @@
         }
       }
       return { error: null, warn: warn };
+    },
+
+    /**
+     * Валидатор унифицированного EditPlan (§2.1).
+     * Принимает {ops:[...]} с высокоуровневыми op.kind.
+     * Возвращает error string или null.
+     */
+    validateEditPlan: function (snap, plan) {
+      if (!plan || typeof plan !== 'object') {
+        return 'propose_edit_plan: ожидается объект { ops: [...] }';
+      }
+      var ops = plan.ops;
+      if (!Array.isArray(ops) || !ops.length) {
+        return 'propose_edit_plan: поле ops должно быть непустым массивом';
+      }
+      if (!snap || !snap.ok) {
+        return 'propose_edit_plan: сначала вызовите get_timeline_snapshot';
+      }
+      var ids = clipIdSet(snap);
+      var span = timelineSpanSec(snap);
+      var clipKinds = {
+        ripple_delete_interval: 1,
+        lift_delete_interval: 1,
+        remove_clip: 1,
+        trim_in: 1,
+        trim_out: 1,
+        trim_bounds: 1,
+        move_clip: 1,
+        set_clip_enabled: 1,
+        disable_clip: 1,
+        enable_clip: 1,
+        shift_ripple: 1,
+        mute_track: 1,
+        note: 1
+      };
+      for (var i = 0; i < ops.length; i++) {
+        var op = ops[i];
+        if (!op || typeof op !== 'object') return 'ops[' + i + ']: не объект';
+        var kind = String(op.kind || op.action || '').toLowerCase();
+        if (!kind) return 'ops[' + i + ']: нужно поле kind';
+        if (!clipKinds[kind]) {
+          return 'ops[' + i + ']: неизвестный kind "' + kind + '"';
+        }
+        if (kind === 'ripple_delete_interval' || kind === 'lift_delete_interval') {
+          if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number') {
+            return 'ops[' + i + '] (' + kind + '): нужны числа startSec/endSec';
+          }
+          if (op.endSec <= op.startSec) {
+            return 'ops[' + i + '] (' + kind + '): endSec должен быть > startSec';
+          }
+          if (span > 0 && op.endSec > span + 120) {
+            return 'ops[' + i + '] (' + kind + '): интервал выходит далеко за конец таймлайна';
+          }
+        } else if (kind === 'remove_clip' || kind === 'set_clip_enabled' || kind === 'enable_clip' || kind === 'disable_clip') {
+          if (!op.nodeId) return 'ops[' + i + '] (' + kind + '): нужен nodeId';
+          if (!ids[String(op.nodeId)]) {
+            return 'ops[' + i + '] (' + kind + '): клип ' + op.nodeId + ' не найден в снимке';
+          }
+        } else if (kind === 'trim_in' || kind === 'trim_out') {
+          if (!op.nodeId) return 'ops[' + i + '] (' + kind + '): нужен nodeId';
+          if (typeof op.timeSec !== 'number') return 'ops[' + i + '] (' + kind + '): нужен timeSec';
+          if (!ids[String(op.nodeId)]) return 'ops[' + i + '] (' + kind + '): клип не найден';
+        } else if (kind === 'trim_bounds') {
+          if (!op.nodeId) return 'ops[' + i + '] (trim_bounds): нужен nodeId';
+          if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number') {
+            return 'ops[' + i + '] (trim_bounds): нужны startSec/endSec';
+          }
+          if (op.endSec <= op.startSec) return 'ops[' + i + '] (trim_bounds): endSec > startSec';
+        } else if (kind === 'move_clip') {
+          if (!op.nodeId) return 'ops[' + i + '] (move_clip): нужен nodeId';
+          if (typeof op.newStartSec !== 'number' || op.newStartSec < 0) {
+            return 'ops[' + i + '] (move_clip): нужен newStartSec >= 0';
+          }
+        } else if (kind === 'shift_ripple') {
+          if (typeof op.fromSec !== 'number' || typeof op.deltaSec !== 'number') {
+            return 'ops[' + i + '] (shift_ripple): нужны числа fromSec/deltaSec';
+          }
+        } else if (kind === 'mute_track') {
+          if (typeof op.trackIndex !== 'number') return 'ops[' + i + '] (mute_track): нужен trackIndex';
+        }
+      }
+      return null;
     },
 
     validateMarkersList: function (snap, markers) {

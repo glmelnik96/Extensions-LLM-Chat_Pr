@@ -63,6 +63,17 @@
     };
   }
 
+  /**
+   * Проверка: файл — уже аудио в формате, который whisper.cpp принимает
+   * без конвертации (wav/mp3/ogg/flac). Для mov/mp4/mkv вернёт false,
+   * и вызывающий код должен извлечь аудио через ffmpeg перед whisper-cli.
+   */
+  function isAudioExt(p) {
+    var low = String(p || '').toLowerCase();
+    /* Форматы, которые whisper.cpp принимает напрямую (см. whisper-cli --help). */
+    return /\.(wav|mp3|ogg|oga|flac)$/.test(low);
+  }
+
   function guessMime(path) {
     var low = String(path || '').toLowerCase();
     if (low.indexOf('.wav') !== -1) return 'audio/wav';
@@ -168,6 +179,80 @@
     return path.join(os.tmpdir(), '_llm_audio_' + base + '_' + Date.now() + '.wav');
   }
 
+  /**
+   * Нарезать [srcStartSec .. srcStartSec+totalSpanSec] исходника на короткие WAV-чанки
+   * через ffmpeg (16 kHz mono PCM, ~1.92 МБ за 60 с) — минует 413 без .epr-пресета.
+   *
+   * Возвращает [{path, durationSec, offsetInSpanSec}], где offsetInSpanSec — смещение
+   * от начала запрошенного диапазона (для перевода в координаты таймлайна).
+   */
+  function extractAudioChunksWithFfmpeg(inputPath, srcStartSec, totalSpanSec, chunkSec, progress) {
+    if (typeof require === 'undefined') {
+      return Promise.reject(new Error('Node.js недоступен для ffmpeg'));
+    }
+    var ffmpegBin = findFfmpegPath();
+    if (!ffmpegBin) {
+      return Promise.reject(new Error(
+        'ffmpeg не найден. Установите: brew install ffmpeg (macOS) или apt install ffmpeg (Linux). ' +
+        'Альтернатива — создайте .epr пресет (см. host/presets/README.txt) и пропишите exportAudioPresetPath в fm-defaults.js.'
+      ));
+    }
+    var execFile = require('child_process').execFile;
+    var os = require('os');
+    var path = require('path');
+    var fs = require('fs');
+    var base = path.basename(inputPath, path.extname(inputPath));
+    var stamp = Date.now();
+    var step = Math.max(15, chunkSec || 90);
+    var totalChunks = Math.max(1, Math.ceil(totalSpanSec / step));
+
+    var chunks = [];
+    var idx = 0;
+    function nextChunk() {
+      if (idx >= totalChunks) return Promise.resolve(chunks);
+      var offset = idx * step;
+      var dur = Math.min(step, totalSpanSec - offset);
+      if (dur <= 0.05) return Promise.resolve(chunks);
+      var outPath = path.join(os.tmpdir(), '_llm_chunk_' + base + '_' + stamp + '_' + idx + '.wav');
+      if (progress) progress('Извлечение аудио (ffmpeg) ' + (idx + 1) + '/' + totalChunks + '…');
+      var args = [
+        '-ss', String(srcStartSec + offset),
+        '-t', String(dur),
+        '-i', inputPath,
+        '-vn',
+        '-acodec', 'pcm_s16le',
+        '-ar', '16000',
+        '-ac', '1',
+        '-y',
+        outPath
+      ];
+      return new Promise(function (resolve, reject) {
+        execFile(ffmpegBin, args, { timeout: 300000 }, function (err) {
+          if (err) {
+            reject(new Error('ffmpeg error (chunk ' + idx + '): ' + String(err.message || err)));
+            return;
+          }
+          if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 1024) {
+            reject(new Error('ffmpeg создал пустой чанк ' + idx + ' (' + outPath + ')'));
+            return;
+          }
+          chunks.push({ path: outPath, durationSec: dur, offsetInSpanSec: offset });
+          idx++;
+          resolve(nextChunk());
+        });
+      });
+    }
+    return nextChunk();
+  }
+
+  function unlinkChunkList(list) {
+    if (typeof require === 'undefined' || !list) return;
+    var fs = require('fs');
+    list.forEach(function (c) {
+      try { if (c && c.path && fs.existsSync(c.path)) fs.unlinkSync(c.path); } catch (eU) {}
+    });
+  }
+
   function mergeSegmentLists(lists) {
     var all = [];
     lists.forEach(function (list) {
@@ -195,6 +280,83 @@
   }
 
   /**
+   * Постпроцесс аудио через AudioPreprocess (ffmpeg): silencedetect + loudnorm.
+   * Вызывается после основной транскрибации. Не должен падать всю транскрибацию — ошибки глотаем.
+   * pathForAnalysis — один реальный WAV-файл, который уже есть на диске (prep.path или первый чанк).
+   * timelineOffsetSec — смещение, чтобы перевести "секунды файла" в "секунды таймлайна".
+   */
+  async function computeAudioPreprocess(pathForAnalysis, timelineOffsetSec, progress) {
+    if (!pathForAnalysis || typeof global.AudioPreprocess === 'undefined') {
+      return null;
+    }
+    var off = typeof timelineOffsetSec === 'number' && !isNaN(timelineOffsetSec) ? timelineOffsetSec : 0;
+    try {
+      if (progress) progress('Анализ аудио (silencedetect + loudnorm)…');
+      var res = await global.AudioPreprocess.analyzeAll(pathForAnalysis, {
+        silence: { thresholdDb: -30, minDurationSec: 0.5 }
+        /* rms опущен — дорого на длинных файлах; подключим по прямому запросу пользователя */
+      });
+      /* Сдвигаем тишины в таймлайн-координаты */
+      var silences = [];
+      if (Array.isArray(res.silences)) {
+        silences = res.silences.map(function (s) {
+          return {
+            startSec: Math.round((s.startSec + off) * 1000) / 1000,
+            endSec: Math.round((s.endSec + off) * 1000) / 1000,
+            durationSec: s.durationSec
+          };
+        });
+      }
+      return {
+        silences: silences,
+        loudness: res.loudness && !res.loudness.error ? res.loudness : null,
+        silencesError: Array.isArray(res.silences) ? null : (res.silences && res.silences.error) || null,
+        loudnessError: res.loudness && res.loudness.error ? res.loudness.error : null
+      };
+    } catch (eP) {
+      return { error: String(eP && eP.message || eP) };
+    }
+  }
+
+  /**
+   * Универсальный вызов одного аудио-файла через выбранный бэкенд.
+   * Возвращает объект в формате Whisper verbose_json: { segments:[{start,end,text}], text }.
+   *
+   * settings.transcribeBackend:
+   *   'whisper.cpp' — локальный whisper.cpp (WhisperCppClient). Не имеет лимита
+   *                   на размер; для .mov/.mp4 всё равно нужен промежуточный WAV
+   *                   (вызывающий код делает это через ffmpeg).
+   *   'cloud'       — облачный CloudRuClient.transcribeAudio. Лимит ~20 МБ.
+   */
+  async function backendTranscribe(settings, opts) {
+    var backend = (settings && settings.transcribeBackend) || 'cloud';
+    var onProgress = opts && opts.onProgress;
+    if (backend === 'whisper.cpp') {
+      if (typeof global.WhisperCppClient === 'undefined') {
+        throw new Error('WhisperCppClient не загружен (проверь script в index.html).');
+      }
+      return global.WhisperCppClient.transcribeFile({
+        filePath: opts.path,
+        binPath: settings.whisperCppBin || '',
+        modelPath: settings.whisperCppModel || '',
+        language: settings.whisperCppLanguage || 'ru',
+        threads: settings.whisperCppThreads || 0,
+        extraArgs: Array.isArray(settings.whisperCppExtraArgs) ? settings.whisperCppExtraArgs : [],
+        signal: opts.signal,
+        onProgress: onProgress
+      });
+    }
+    /* Облачный путь — как раньше: multipart через CloudRuClient */
+    var CC = opts.CloudRuClient;
+    if (!CC) throw new Error('CloudRuClient не передан в backendTranscribe');
+    var blob = readPathAsBlob(opts.path);
+    return CC.transcribeAudio(Object.assign({}, opts.transcribeOptsBase, {
+      fileBlob: blob,
+      fileName: opts.fileName
+    }));
+  }
+
+  /**
    * prep — ответ prepareTranscribeFromTimeline (ok, mode, …).
    * opt: { settings, signal, abortCheck, onProgress(str), CloudRuClient }
    */
@@ -207,10 +369,15 @@
     var abortCheck = opt.abortCheck;
     var progress = typeof opt.onProgress === 'function' ? opt.onProgress : function () {};
     var CC = opt.CloudRuClient || global.CloudRuClient;
-    var maxBytes =
-      typeof settings.maxTranscribeUploadBytes === 'number' && !isNaN(settings.maxTranscribeUploadBytes)
-        ? settings.maxTranscribeUploadBytes
-        : 24 * 1024 * 1024;
+    var backend = settings.transcribeBackend || 'cloud';
+    var isLocal = backend === 'whisper.cpp';
+    /* Для локального бэкенда размер файла не ограничен — ставим заведомо большой лимит. */
+    var maxBytes = isLocal
+      ? Number.POSITIVE_INFINITY
+      : (typeof settings.maxTranscribeUploadBytes === 'number' && !isNaN(settings.maxTranscribeUploadBytes)
+          ? settings.maxTranscribeUploadBytes
+          : 24 * 1024 * 1024);
+    if (progress) progress('Бэкенд транскрибации: ' + backend + (isLocal ? ' (локально, оффлайн)' : ' (Cloud.ru)'));
 
     function beforeAwait() {
       throwIfAborted(signal, abortCheck);
@@ -239,25 +406,33 @@
             'Файл слишком большой для API (~' + Math.round(sz / 1024 / 1024) + ' МБ). Уменьшите transcribeExportChunkSec в fm-defaults.js.'
           );
         }
-        blob = readPathAsBlob(ch.path);
         beforeAwait();
         var ext = String(ch.path || '').replace(/^.*\./, '') || 'wav';
-        data = await CC.transcribeAudio(
-          Object.assign({}, transcribeOptsBase, {
-            fileBlob: blob,
-            fileName: 'chunk_' + ci + '.' + ext
-          })
-        );
+        data = await backendTranscribe(settings, {
+          path: ch.path,
+          fileName: 'chunk_' + ci + '.' + ext,
+          signal: signal,
+          onProgress: progress,
+          CloudRuClient: CC,
+          transcribeOptsBase: transcribeOptsBase
+        });
         norm = normalizeWhisperExport(data, ch.timelineOffsetSec);
         combined = combined.concat(norm.segments);
         textAcc += (norm.text || '') + ' ';
       }
+      /* 1.1 аудиопрепроцессинг: анализируем первый чанк как репрезентативный образец
+         (полный файл чанками уже удалён по одному, но первый ещё доступен до unlinkWorkFiles). */
+      var audioAnalysisChunks = null;
+      try {
+        audioAnalysisChunks = await computeAudioPreprocess(prep.chunks[0].path, prep.chunks[0].timelineOffsetSec, progress);
+      } catch (eAC) {}
       return {
         raw: { chunks: prep.chunks.length },
         segments: mergeSegmentLists([combined]),
         text: textAcc.trim(),
         timelineOffsetSec: prep.chunks[0].timelineOffsetSec,
-        mode: 'export_chunks'
+        mode: 'export_chunks',
+        audioAnalysis: audioAnalysisChunks
       };
     }
 
@@ -268,18 +443,25 @@
       if (szW > maxBytes) {
         throw new Error('Файл экспорта слишком большой; задайте transcribeExportChunkSec и пресет .epr.');
       }
-      var blobW = readPathAsBlob(prep.path);
       beforeAwait();
-      var dataW = await CC.transcribeAudio(
-        Object.assign({}, transcribeOptsBase, {
-          fileBlob: blobW,
-          fileName: 'timeline_inout.wav'
-        })
-      );
-      return normalizeWhisperExport(dataW, prep.timelineOffsetSec);
+      var dataW = await backendTranscribe(settings, {
+        path: prep.path,
+        fileName: 'timeline_inout.wav',
+        signal: signal,
+        onProgress: progress,
+        CloudRuClient: CC,
+        transcribeOptsBase: transcribeOptsBase
+      });
+      var normW = normalizeWhisperExport(dataW, prep.timelineOffsetSec);
+      try {
+        normW.audioAnalysis = await computeAudioPreprocess(prep.path, prep.timelineOffsetSec, progress);
+      } catch (eAW) {}
+      return normW;
     }
 
     if (prep.mode === 'clip_queue' && prep.items && prep.items.length) {
+      var chunkSecCfgQ = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
+        ? settings.transcribeExportChunkSec : 90;
       var whisperByPath = {};
       var segLists = [];
       var allText = '';
@@ -290,30 +472,46 @@
         it = prep.items[qi];
         pathQ = it.path;
         progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + '…');
-        if (!whisperByPath[pathQ]) {
-          szQ = fileSizeSync(pathQ);
-          var actualPath = pathQ;
-          if (szQ > maxBytes) {
-            /* Файл слишком большой — извлекаем аудио через ffmpeg */
-            progress('Извлечение аудио из ' + String(pathQ).replace(/^.*[\\/]/, '') + ' (ffmpeg)…');
-            var tmpQ = tempAudioPath(pathQ);
-            beforeAwait();
-            await extractAudioWithFfmpeg(pathQ, tmpQ);
-            ffmpegTempFiles.push(tmpQ);
-            actualPath = tmpQ;
-            szQ = fileSizeSync(tmpQ);
-            if (szQ > maxBytes) {
-              throw new Error('Даже после извлечения аудио файл слишком большой (' + Math.round(szQ / 1024 / 1024) + ' МБ). Уменьшите длину In–Out или задайте exportAudioPresetPath.');
-            }
-          }
-          blobQ = readPathAsBlob(actualPath);
+        szQ = fileSizeSync(pathQ);
+        var spanQ = it.workOutSec - it.workInSec;
+        var srcStartQ = (it.clipInPointSec || 0) + (it.workInSec - (it.clipStartSec || 0));
+        /* Для whisper.cpp: если исходник — видео, всегда уходим в ffmpeg-чанкинг. */
+        var needChunkQ = spanQ > chunkSecCfgQ * 1.5 || szQ > maxBytes || (isLocal && !isAudioExt(pathQ));
+        if (needChunkQ) {
+          /* Нарезаем нужный диапазон через ffmpeg на короткие WAV-чанки */
           beforeAwait();
-          whisperByPath[pathQ] = await CC.transcribeAudio(
-            Object.assign({}, transcribeOptsBase, {
-              fileBlob: blobQ,
-              fileName: String(pathQ).replace(/^.*[\\/]/, '') || 'media'
-            })
-          );
+          var qChunks = await extractAudioChunksWithFfmpeg(pathQ, srcStartQ, spanQ, chunkSecCfgQ, progress);
+          ffmpegTempFiles = ffmpegTempFiles.concat(qChunks.map(function (c) { return c.path; }));
+          var qLocal = [];
+          for (var qci = 0; qci < qChunks.length; qci++) {
+            beforeAwait();
+            var qch = qChunks[qci];
+            progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + ', фрагмент ' + (qci + 1) + '/' + qChunks.length + '…');
+            var qData = await backendTranscribe(settings, {
+              path: qch.path,
+              fileName: 'clip_' + qi + '_chunk_' + qci + '.wav',
+              signal: signal,
+              onProgress: progress,
+              CloudRuClient: CC,
+              transcribeOptsBase: transcribeOptsBase
+            });
+            var qNorm = normalizeWhisperExport(qData, it.workInSec + qch.offsetInSpanSec);
+            qLocal = qLocal.concat(qNorm.segments);
+            allText += (qNorm.text || '') + ' ';
+          }
+          segLists.push(qLocal);
+          continue;
+        }
+        if (!whisperByPath[pathQ]) {
+          beforeAwait();
+          whisperByPath[pathQ] = await backendTranscribe(settings, {
+            path: pathQ,
+            fileName: String(pathQ).replace(/^.*[\\/]/, '') || 'media',
+            signal: signal,
+            onProgress: progress,
+            CloudRuClient: CC,
+            transcribeOptsBase: transcribeOptsBase
+          });
         }
         rawW = whisperByPath[pathQ];
         nq = normalizeWhisperMediaFile(rawW, it.clipStartSec, it.clipInPointSec, it.workInSec, it.workOutSec);
@@ -324,23 +522,79 @@
       ffmpegTempFiles.forEach(function (tf) {
         try { if (typeof require !== 'undefined') require('fs').unlinkSync(tf); } catch (eU) {}
       });
+      /* Для clip_queue анализ делаем на первом оригинальном файле (до удаления ffmpeg-tmp). */
+      var audioAnalysisCQ = null;
+      try {
+        var firstQ = prep.items && prep.items[0];
+        if (firstQ && firstQ.path) {
+          audioAnalysisCQ = await computeAudioPreprocess(firstQ.path, firstQ.clipStartSec || 0, progress);
+        }
+      } catch (eACQ) {}
       return {
         raw: whisperByPath,
         segments: mergeSegmentLists(segLists),
         text: allText.trim(),
         timelineOffsetSec: prep.workInSec,
-        mode: 'clip_queue'
+        mode: 'clip_queue',
+        audioAnalysis: audioAnalysisCQ
       };
     }
 
     if (prep.mode === 'media_file') {
+      var chunkSecCfgM = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
+        ? settings.transcribeExportChunkSec : 90;
+      var spanSecM = prep.workOutSec - prep.workInSec;
+      var srcStartM = (prep.clipInPointSec || 0) + (prep.workInSec - (prep.clipStartSec || 0));
+      var szPre = fileSizeSync(prep.path);
+      /* Для whisper.cpp: видеоконтейнер → ffmpeg-чанкинг (там и диапазон -ss/-t, и pcm). */
+      var needChunkM = spanSecM > chunkSecCfgM * 1.5 || szPre > maxBytes || (isLocal && !isAudioExt(prep.path));
+      if (needChunkM) {
+        beforeAwait();
+        progress('Извлечение аудио чанками через ffmpeg (минует 413)…');
+        var mChunks = await extractAudioChunksWithFfmpeg(prep.path, srcStartM, spanSecM, chunkSecCfgM, progress);
+        var combinedM = [];
+        var textAccM = '';
+        try {
+          for (var mci = 0; mci < mChunks.length; mci++) {
+            beforeAwait();
+            var mch = mChunks[mci];
+            progress('Транскрибация: фрагмент ' + (mci + 1) + '/' + mChunks.length + '…');
+            var mData = await backendTranscribe(settings, {
+              path: mch.path,
+              fileName: 'mediafile_chunk_' + mci + '.wav',
+              signal: signal,
+              onProgress: progress,
+              CloudRuClient: CC,
+              transcribeOptsBase: transcribeOptsBase
+            });
+            var mNorm = normalizeWhisperExport(mData, prep.workInSec + mch.offsetInSpanSec);
+            combinedM = combinedM.concat(mNorm.segments);
+            textAccM += (mNorm.text || '') + ' ';
+          }
+          var audioAnalysisM = null;
+          try {
+            audioAnalysisM = await computeAudioPreprocess(mChunks[0].path, prep.workInSec, progress);
+          } catch (eAMC) {}
+          return {
+            raw: { ffmpegChunks: mChunks.length },
+            segments: mergeSegmentLists([combinedM]),
+            text: textAccM.trim(),
+            timelineOffsetSec: prep.workInSec,
+            mode: 'media_file_ffmpeg_chunks',
+            audioAnalysis: audioAnalysisM
+          };
+        } finally {
+          unlinkChunkList(mChunks);
+        }
+      }
       beforeAwait();
       progress('Транскрибация: отправка в Whisper…');
-      var szM = fileSizeSync(prep.path);
+      var szM = szPre;
       var actualPathM = prep.path;
       var ffmpegTmpM = null;
-      if (szM > maxBytes) {
-        /* Файл слишком большой — извлекаем аудио через ffmpeg */
+      /* Для whisper.cpp видео-контейнеры (.mov/.mp4) не принимаются — всегда извлекаем. */
+      var needExtractForLocal = isLocal && !isAudioExt(prep.path);
+      if (szM > maxBytes || needExtractForLocal) {
         progress('Извлечение аудио через ffmpeg…');
         ffmpegTmpM = tempAudioPath(prep.path);
         beforeAwait();
@@ -352,24 +606,31 @@
           throw new Error('Даже после извлечения аудио файл слишком большой (' + Math.round(szM / 1024 / 1024) + ' МБ). Задайте exportAudioPresetPath (.epr) для экспорта чанками.');
         }
       }
-      var blobM = readPathAsBlob(actualPathM);
       beforeAwait();
-      var dataM = await CC.transcribeAudio(
-        Object.assign({}, transcribeOptsBase, {
-          fileBlob: blobM,
-          fileName: String(prep.path || 'media').replace(/^.*[\\/]/, '') || 'media'
-        })
-      );
-      if (ffmpegTmpM) {
-        try { if (typeof require !== 'undefined') require('fs').unlinkSync(ffmpegTmpM); } catch (eU2) {}
-      }
-      return normalizeWhisperMediaFile(
+      var dataM = await backendTranscribe(settings, {
+        path: actualPathM,
+        fileName: String(prep.path || 'media').replace(/^.*[\\/]/, '') || 'media',
+        signal: signal,
+        onProgress: progress,
+        CloudRuClient: CC,
+        transcribeOptsBase: transcribeOptsBase
+      });
+      var normM = normalizeWhisperMediaFile(
         dataM,
         prep.clipStartSec,
         prep.clipInPointSec,
         prep.workInSec,
         prep.workOutSec
       );
+      try {
+        /* Для media_file используем путь к исходнику (или tmp если был извлечён).
+           Смещение — clipStartSec, чтобы тишины были в координатах таймлайна. */
+        normM.audioAnalysis = await computeAudioPreprocess(actualPathM, prep.clipStartSec || 0, progress);
+      } catch (eAM) {}
+      if (ffmpegTmpM) {
+        try { if (typeof require !== 'undefined') require('fs').unlinkSync(ffmpegTmpM); } catch (eU2) {}
+      }
+      return normM;
     }
 
     throw new Error('Неизвестный режим транскрибации: ' + String(prep.mode));
