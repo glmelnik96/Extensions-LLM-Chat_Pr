@@ -106,8 +106,23 @@
           durationSec: Math.round(ends[i].duration * 1000) / 1000
         });
       }
-      /* Если остался "silence_start" без соответствующего end — тишина тянется до конца файла.
-         Оставляем только пары — half-open игнорируем, это безопаснее. */
+      /* Half-open silence: silence_start без silence_end → тишина до конца файла.
+         Определяем длительность файла из stderr (Duration: HH:MM:SS.xx) и замыкаем. */
+      if (starts.length > ends.length) {
+        var lastStart = starts[starts.length - 1];
+        var durM = stderr.match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
+        if (durM) {
+          var fileDur = parseInt(durM[1], 10) * 3600 + parseInt(durM[2], 10) * 60 + parseFloat(durM[3]);
+          var halfDur = Math.round((fileDur - lastStart) * 1000) / 1000;
+          if (halfDur > 0) {
+            out.push({
+              startSec: Math.round(lastStart * 1000) / 1000,
+              endSec: Math.round(fileDur * 1000) / 1000,
+              durationSec: halfDur
+            });
+          }
+        }
+      }
       return out;
     });
   }
@@ -203,23 +218,78 @@
   /**
    * Все три анализа одним махом. Возвращает объект с тремя полями.
    * Если какой-то шаг упал — в поле кладётся {error}.
+   *
+   * Двухпроходная стратегия silencedetect:
+   *   1-й проход: loudness (EBU R128) → получаем inputI (средний уровень).
+   *   2-й проход: silencedetect с адаптивным порогом:
+   *     - Если inputI > silenceOpt.thresholdDb → используем заданный порог.
+   *     - Если inputI ≤ порога → порог = inputI - 10 dB (ниже среднего уровня).
+   *       Это гарантирует, что silencedetect найдёт реальные паузы даже в тихом аудио.
+   *   3-й проход (retry): если silences всё ещё пустые и половина от адаптивного порога
+   *     даст разумное значение — пробуем ещё раз.
    */
   function analyzeAll(inputPath, opt) {
     opt = opt || {};
+    var silenceOpt = opt.silence || {};
+    var requestedThreshold = typeof silenceOpt.thresholdDb === 'number' ? silenceOpt.thresholdDb : -30;
+
+    /* Шаг 1: loudness + rms параллельно */
     return Promise.all([
-      detectSilences(inputPath, opt.silence || {}).then(function (v) { return { ok: true, v: v }; },
-                                                         function (e) { return { ok: false, e: String(e.message || e) }; }),
       analyzeLoudness(inputPath).then(function (v) { return { ok: true, v: v }; },
                                       function (e) { return { ok: false, e: String(e.message || e) }; }),
       opt.rms ? computeRmsTimeline(inputPath, opt.rms).then(function (v) { return { ok: true, v: v }; },
                                                             function (e) { return { ok: false, e: String(e.message || e) }; })
               : Promise.resolve({ ok: true, v: null })
     ]).then(function (r) {
-      return {
-        silences: r[0].ok ? r[0].v : { error: r[0].e },
-        loudness: r[1].ok ? r[1].v : { error: r[1].e },
-        rms: r[2].ok ? r[2].v : { error: r[2].e }
-      };
+      var loudness = r[0].ok ? r[0].v : { error: r[0].e };
+      var rms = r[1].ok ? r[1].v : { error: r[1].e };
+
+      /* Шаг 2: адаптивный порог на основе loudness */
+      var adaptiveThreshold = requestedThreshold;
+      if (loudness && typeof loudness.inputI === 'number' && !isNaN(loudness.inputI)) {
+        /* Если средний уровень тише (или равен) порога — silencedetect ничего не найдёт.
+           Опускаем порог на 10 dB ниже среднего уровня. */
+        if (loudness.inputI <= requestedThreshold + 3) {
+          adaptiveThreshold = Math.floor(loudness.inputI - 10);
+          /* Не опускать ниже -60 dB — там уже шум квантования */
+          if (adaptiveThreshold < -60) adaptiveThreshold = -60;
+        }
+      }
+
+      var silOpt = { thresholdDb: adaptiveThreshold, minDurationSec: silenceOpt.minDurationSec };
+
+      return detectSilences(inputPath, silOpt).then(
+        function (sils) {
+          /* Retry: если 0 тишин и можно понизить порог ещё */
+          if (sils.length === 0 && adaptiveThreshold > -55) {
+            var retryThreshold = adaptiveThreshold - 10;
+            if (retryThreshold < -60) retryThreshold = -60;
+            return detectSilences(inputPath, { thresholdDb: retryThreshold, minDurationSec: silOpt.minDurationSec })
+              .then(
+                function (sils2) {
+                  return {
+                    silences: sils2,
+                    loudness: loudness,
+                    rms: rms,
+                    silenceThresholdUsed: sils2.length > 0 ? retryThreshold : adaptiveThreshold
+                  };
+                },
+                function () {
+                  return { silences: sils, loudness: loudness, rms: rms, silenceThresholdUsed: adaptiveThreshold };
+                }
+              );
+          }
+          return {
+            silences: sils,
+            loudness: loudness,
+            rms: rms,
+            silenceThresholdUsed: adaptiveThreshold
+          };
+        },
+        function (e) {
+          return { silences: { error: String(e.message || e) }, loudness: loudness, rms: rms };
+        }
+      );
     });
   }
 

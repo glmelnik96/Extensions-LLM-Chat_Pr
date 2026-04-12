@@ -392,6 +392,14 @@
    * detectArtifacts — повторяющиеся фразы Whisper.
    * Если одна и та же фраза (после нормализации) встречается ≥3 раз подряд или ≥4 раз всего — artifact.
    */
+  /**
+   * detectArtifacts — повторяющиеся фразы Whisper.
+   *
+   * ОСТОРОЖНО: не помечаем сегменты как artifact если текст
+   * содержит >5 уникальных слов — это может быть реальная речь.
+   * Artifact = ТОЛЬКО короткая повторяющаяся фраза (≤5 слов),
+   * встречающаяся ≥5 раз всего ИЛИ ≥3 раза ПОДРЯД.
+   */
   function detectArtifacts(segments) {
     if (!segments || !segments.length) return [];
     var results = [];
@@ -400,33 +408,39 @@
     var freq = {};
     for (var i = 0; i < segments.length; i++) {
       var txt = normText(segments[i].text);
-      if (!txt || txt.split(/\s+/).length < 2) continue; /* слишком короткие не считаем */
+      var wordCount = txt ? txt.split(/\s+/).length : 0;
+      /* Только короткие фразы (≤5 слов) — длинные = реальная речь */
+      if (!txt || wordCount < 2 || wordCount > 5) continue;
       freq[txt] = (freq[txt] || 0) + 1;
     }
 
-    /* Отмечаем сегменты с текстом, повторяющимся ≥4 раз */
+    /* Отмечаем тексты, повторяющиеся ≥5 раз (строгий порог) */
     var artifactTexts = {};
     for (var key in freq) {
-      if (freq[key] >= 4) artifactTexts[key] = freq[key];
+      if (freq[key] >= 5) artifactTexts[key] = freq[key];
     }
 
-    /* Также ищем 3+ подряд */
+    /* Также ищем 3+ подряд ИДЕНТИЧНЫХ (и коротких ≤5 слов) */
     for (var j = 0; j < segments.length - 2; j++) {
       var t1 = normText(segments[j].text);
+      var wc1 = t1 ? t1.split(/\s+/).length : 0;
+      if (!t1 || wc1 > 5) continue;
       var t2 = normText(segments[j + 1].text);
       var t3 = normText(segments[j + 2].text);
-      if (t1 && t1 === t2 && t2 === t3) {
-        artifactTexts[t1] = (artifactTexts[t1] || 0);
+      if (t1 === t2 && t2 === t3) {
+        if (!artifactTexts[t1]) artifactTexts[t1] = freq[t1] || 3;
       }
     }
 
-    /* Размечаем сегменты как artifact, оставляя первое вхождение */
+    /* Размечаем: оставляем ПЕРВОЕ вхождение, остальные = artifact */
     var seen = {};
     for (var k = 0; k < segments.length; k++) {
       var nt = normText(segments[k].text);
+      var ntWc = nt ? nt.split(/\s+/).length : 0;
+      if (ntWc > 5) continue; /* длинные сегменты не трогаем */
       if (artifactTexts[nt] !== undefined) {
         if (!seen[nt]) {
-          seen[nt] = true; /* первое вхождение оставляем */
+          seen[nt] = true;
         } else {
           results.push({
             i: segments[k].i !== undefined ? segments[k].i : k,

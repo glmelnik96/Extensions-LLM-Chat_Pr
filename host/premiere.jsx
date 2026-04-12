@@ -125,44 +125,22 @@ $._EXT_PRM_._removeClipAndLinked = function (seq, nodeId) {
   var found = $._EXT_PRM_._findClipByNodeId(seq, nodeId);
   if (!found) return { ok: false, error: 'Клип не найден: ' + nodeId };
   var clip = found.clip;
-  var name = clip.name || '';
-  var s = clip.start.seconds;
-  var e = clip.end.seconds;
-  var eps = $._EXT_PRM_._EPS;
-  var toRemove = [];
-  var vi, ai, j, tr, it, n;
-  for (vi = 0; vi < seq.videoTracks.numTracks; vi++) {
-    tr = seq.videoTracks[vi];
-    n = tr.clips.numItems;
-    for (j = n - 1; j >= 0; j--) {
-      try {
-        it = tr.clips[j];
-        if (!it) continue;
-        if (it.name === name && Math.abs(it.start.seconds - s) < eps && Math.abs(it.end.seconds - e) < eps) {
-          toRemove.push(it);
-        }
-      } catch (e0) {}
-    }
-  }
-  for (ai = 0; ai < seq.audioTracks.numTracks; ai++) {
-    tr = seq.audioTracks[ai];
-    n = tr.clips.numItems;
-    for (j = n - 1; j >= 0; j--) {
-      try {
-        it = tr.clips[j];
-        if (!it) continue;
-        if (it.name === name && Math.abs(it.start.seconds - s) < eps && Math.abs(it.end.seconds - e) < eps) {
-          toRemove.push(it);
-        }
-      } catch (e1) {}
-    }
-  }
+
+  /* Используем _findLinkedClips (getLinkedItems API), а не name-matching —
+     name-matching может случайно удалить чужие клипы с таким же именем. */
+  var toRemove = $._EXT_PRM_._findLinkedClips(seq, clip);
+
   var removed = [];
+  /* Удаляем в обратном порядке (по позиции), чтобы индексы не сбивались */
+  toRemove.sort(function (a, b) {
+    try { return b.start.seconds - a.start.seconds; } catch (eS) { return 0; }
+  });
   for (var k = 0; k < toRemove.length; k++) {
     try {
+      var nid = String(toRemove[k].nodeId);
       toRemove[k].remove(1, 1);
       $._EXT_PRM_._bump();
-      removed.push(String(toRemove[k].nodeId));
+      removed.push(nid);
     } catch (eR) {}
   }
   return { ok: true, removed: removed, count: removed.length };
@@ -815,6 +793,57 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
   }
 };
 
+/**
+ * J-cut / L-cut: сдвинуть точку монтажа аудио относительно видео.
+ *
+ * J-cut: аудио следующего клипа начинается ДО видео (offsetFrames < 0 на аудио-inPoint).
+ * L-cut: аудио предыдущего клипа продолжается ПОСЛЕ видео (offsetFrames > 0 на аудио-outPoint).
+ *
+ * Параметры (JSON): { offsetFrames: number (default -4), mode: "j"|"l"|"both" }
+ * Применяется ко всем стыкам на V1/A1 (linked пары).
+ *
+ * Ограничение: работает только если есть запас source-медиа (handle) для сдвига.
+ */
+/**
+ * J-cuts / L-cuts — сдвиг точки монтажа видео относительно аудио.
+ *
+ * Подход: модифицируем ВИДЕО-клипы, оставляя аудио на месте.
+ * - J-cut: видео B обрезается позже (зритель ещё видит A, но слышит B)
+ *   → Реализация: обрезаем END видео A на offsetFrames РАНЬШЕ (видео A короче),
+ *     а START видео B сдвигаем на offsetFrames РАНЬШЕ (видео B начинается раньше).
+ * - L-cut: видео A продолжается дольше (зритель видит A, но слышит уже B)
+ *   → Реализация: обрезаем START видео B на offsetFrames ПОЗЖЕ (видео B короче).
+ *
+ * Ограничения Premiere ExtendScript:
+ * - На одной дорожке клипы НЕ МОГУТ перекрываться.
+ * - Поэтому мы УКОРАЧИВАЕМ видеоклип с одной стороны стыка,
+ *   создавая «окно», где аудио играет, а видео уже переключилось (или ещё нет).
+ * - Для полноценных J/L-cuts с перекрытием нужны multi-track (V2/A2).
+ */
+$._EXT_PRM_.applyJCuts = function (jsonParams) {
+  /*
+   * J/L-cuts невозможны на связанных клипах одной дорожки (V1+A1).
+   * В Premiere Pro при обрезке видео-части связанного клипа аудио-часть
+   * обрезается вместе с ней — клип просто укорачивается.
+   *
+   * J/L-cuts требуют:
+   *  1. Клипы на V1/A1 (первый) и V2/A2 (второй) с нахлёстом, ИЛИ
+   *  2. Отвязанные (unlinked) клипы на одной дорожке.
+   *
+   * ExtendScript API не предоставляет метод unlink() для программного
+   * разрыва связи видео/аудио. Поэтому эта функция отключена до
+   * появления поддержки unlink в ExtendScript или UXP.
+   */
+  return JSON.stringify({
+    ok: false,
+    error: 'J/L-cuts невозможны на связанных клипах одной дорожки. ' +
+      'При обрезке видео-части связанного клипа аудио обрезается вместе с ним. ' +
+      'J/L-cuts требуют клипы на отдельных дорожках (V1/A1 + V2/A2) с перекрытием, ' +
+      'либо отвязанные (unlinked) клипы. ExtendScript не поддерживает программное ' +
+      'отвязывание клипов. Выполните J/L-cuts вручную в Premiere Pro.'
+  });
+};
+
 $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
   var undoOpened = false;
   try {
@@ -839,7 +868,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
 
     for (i = 0; i < ops.length; i++) {
       op = ops[i];
-      a = op.action;
+      a = op.action || op.kind || op.type;
 
       if (a === 'ripple_delete_range' || a === 'ripple_delete_range_all_tracks') {
         if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number') {

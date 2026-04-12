@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ExtensionList>
-  <Extension Id="com.extensionsllm.chatpr.timecode" />
-  <Extension Id="com.extensionsllm.chatpr.textmontage" />
-  <Extension Id="com.extensionsllm.chatpr.markers" />
+  <Extension Id="com.extensionsllm.chatpr.unified">
+    <HostList>
+      <Host Name="PPRO" Port="8098" />
+    </HostList>
+  </Extension>
 </ExtensionList>

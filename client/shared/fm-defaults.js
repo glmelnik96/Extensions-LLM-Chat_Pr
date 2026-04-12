@@ -69,10 +69,19 @@
      * Классифицирует абзацы: filler/intro/outro/repeat/digression.
      * Не требует Function Calling — достаточно Structured Output (JSON).
      *
-     * GLM-4.7-Flash: 202K контекст, бесплатный, быстрый — идеален для анализа.
+     * openai/gpt-oss-120b: 131K контекст, FC+SO, быстрый на Cloud.ru.
      * Пустая строка '' — используется та же модель, что и для агента.
      */
-    analysisModel: 'zai-org/GLM-4.7-Flash',
+    analysisModel: 'openai/gpt-oss-120b',
+
+    /**
+     * Быстрая модель для простых задач (маркеры, классификация, структура).
+     * Двухмодельная стратегия: простые intent'ы → fastModel (дешевле, быстрее),
+     * сложные → chatModel. Пустая строка '' — отключает routing, всегда chatModel.
+     *
+     * openai/gpt-oss-120b: 131K, FC+SO, быстрый на Cloud.ru.
+     */
+    fastModel: 'openai/gpt-oss-120b',
 
     /** Whisper для облачной транскрибации */
     whisperModel: 'openai/whisper-large-v3',
@@ -86,7 +95,7 @@
      *                   режутся через ffmpeg.
      * По умолчанию используем локальный бэкенд.
      */
-    transcribeBackend: 'whisper.cpp',
+    transcribeBackend: 'cloud',
 
     /**
      * Абсолютный путь к whisper-cli. Пусто — автопоиск:

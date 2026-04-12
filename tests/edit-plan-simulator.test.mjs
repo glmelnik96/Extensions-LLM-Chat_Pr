@@ -88,6 +88,23 @@ describe('EditPlanSimulator.simulateUnified — новый контракт', ()
   });
 });
 
+describe('EditPlanSimulator.simulate — kind/type alias for action', () => {
+  test('kind вместо action работает', () => {
+    const r = EP.simulate(snap, {
+      operations: [{ kind: 'ripple_delete_range', startSec: 5, endSec: 15 }]
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.summary.deltaSec, -10);
+  });
+
+  test('type вместо action работает', () => {
+    const r = EP.simulate(snap, {
+      operations: [{ type: 'remove_clip', nodeId: 'v1' }]
+    });
+    assert.equal(r.summary.removedCount, 1);
+  });
+});
+
 describe('EditPlanSimulator.extractRippleIntervals', () => {
   test('извлекает только ripple-интервалы', () => {
     const { operations } = EP.normalizeUnifiedPlan({

@@ -39,12 +39,23 @@
     },
 
     evalJson: function (extendScriptExpr, callback) {
+      var TIMEOUT_MS = 30000; /* 30 секунд — защита от зависания ExtendScript */
       this.ensureHost(function (err) {
         if (err) {
           callback(err, null);
           return;
         }
+        var called = false;
+        var timer = setTimeout(function () {
+          if (!called) {
+            called = true;
+            callback(new Error('ExtendScript не ответил за ' + (TIMEOUT_MS / 1000) + 'с. Premiere может быть занят — попробуйте снова.'), null);
+          }
+        }, TIMEOUT_MS);
         cs.evalScript(extendScriptExpr, function (raw) {
+          if (called) return;
+          called = true;
+          clearTimeout(timer);
           try {
             var s = typeof raw === 'string' ? raw : String(raw);
             if (s === 'EvalScript error.' || s === 'undefined') {
@@ -100,6 +111,12 @@
     importMediaFile: function (params, cb) {
       var json = escapeDoubleQuoted(JSON.stringify(params || {}));
       this.evalJson('$._EXT_PRM_.importMediaFile("' + json + '")', cb);
+    },
+
+    /** J-cut / L-cut automation. params: {offsetFrames, mode} */
+    applyJCuts: function (params, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify(params || {}));
+      this.evalJson('$._EXT_PRM_.applyJCuts("' + json + '")', cb);
     },
 
     /** Получить mediaPath клипа на таймлайне по nodeId. */

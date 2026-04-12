@@ -282,7 +282,7 @@ describe('TranscriptStructure.detectIntroOutro', () => {
 });
 
 describe('TranscriptStructure.detectArtifacts', () => {
-  test('повторяющаяся фраза ≥4 раз → artifact', () => {
+  test('короткая повторяющаяся фраза (≤5 слов, ≥5 раз) → artifact', () => {
     const segs = [];
     for (let i = 0; i < 6; i++) {
       segs.push({ i: i, startSec: i * 5, endSec: (i + 1) * 5, text: 'И Валерий Курас представляет' });

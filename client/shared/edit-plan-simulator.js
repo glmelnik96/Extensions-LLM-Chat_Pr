@@ -141,7 +141,8 @@
     var ops = (plan && plan.operations) || [];
     for (var i = 0; i < ops.length; i++) {
       var op = ops[i];
-      var a = op && op.action;
+      /* Поддержка и action (legacy), и kind (unified), и type */
+      var a = op && (op.action || op.kind || op.type);
       try {
         if (a === 'ripple_delete_range' || a === 'ripple_delete_range_all_tracks') {
           clips = rippleDeleteRange(clips, +op.startSec, +op.endSec);

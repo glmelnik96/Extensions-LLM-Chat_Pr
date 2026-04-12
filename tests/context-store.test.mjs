@@ -45,6 +45,22 @@ describe('ContextStore (файловый кэш + ключи секвенции)
     c2();
   });
 
+  test('setExtensionRoot корректно обрабатывает file:/// URL с %20', () => {
+    const { ContextStore: CS4, tmpRoot: tmpRoot4, cleanup: c4 } = loadContextStoreWithTempRoot();
+    /* Имитируем CEP cs.getExtensionPath() который возвращает file:/// URL */
+    const fileUrl = 'file:///' + tmpRoot4.replace(/ /g, '%20');
+    CS4.setExtensionRoot(fileUrl);
+    const ok = CS4.setTranscriptEntry('unified', 'TestSeq', { segments: [{ text: 'hello' }] });
+    assert.equal(ok, true);
+    /* Файл должен быть по реальному пути, не по file:/// */
+    const realFile = path.join(tmpRoot4, '_llm_transcript_cache.json');
+    assert.ok(fs.existsSync(realFile), 'файл должен быть по реальному пути без file:///');
+    const data = JSON.parse(fs.readFileSync(realFile, 'utf8'));
+    assert.ok(data.TestSeq);
+    assert.equal(data.TestSeq.segments[0].text, 'hello');
+    c4();
+  });
+
   test('setTranscriptUserDataBase — дублирует кэш в каталог userData (T3)', () => {
     const { ContextStore: CS3, tmpRoot, cleanup: c3 } = loadContextStoreWithTempRoot();
     const fakeUd = path.join(tmpRoot, 'cep-user-data');

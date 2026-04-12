@@ -185,7 +185,12 @@
 
   global.ContextStore = {
     setExtensionRoot: function (absPath) {
-      _extensionRoot = String(absPath || '').replace(/\\/g, '/').trim() || null;
+      var s = String(absPath || '');
+      /* CEP cs.getExtensionPath() может вернуть file:/// URL с %20 вместо пробелов.
+         file:///Users/foo → /Users/foo — стрипаем только «file://», оставляя корневой «/». */
+      s = s.replace(/^file:\/\//, '');
+      try { s = decodeURIComponent(s); } catch (eD) {}
+      _extensionRoot = s.replace(/\\/g, '/').trim() || null;
     },
 
     /**
@@ -196,7 +201,9 @@
       if (!userDataDirAbs || typeof require === 'undefined') return;
       try {
         var path = require('path');
-        var base = String(userDataDirAbs || '').replace(/\\/g, '/').trim();
+        var base = String(userDataDirAbs || '').replace(/^file:\/\//, '');
+        try { base = decodeURIComponent(base); } catch (eDD) {}
+        base = base.replace(/\\/g, '/').trim();
         if (!base) return;
         _transcriptUserDataFile = path.join(base, 'com.extensionsllm.chatpr', '_llm_transcript_cache.json');
       } catch (eU) {}
@@ -260,7 +267,8 @@
             ? d.maxAgentSteps
             : 24,
         chatParams: shallowCopy(d.chatParams || {}),
-        transcribeParams: shallowCopy(d.transcribeParams || {})
+        transcribeParams: shallowCopy(d.transcribeParams || {}),
+        fastModel: String(d.fastModel || '').trim()
       };
     },
 

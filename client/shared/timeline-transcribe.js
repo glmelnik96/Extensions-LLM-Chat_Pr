@@ -2,6 +2,49 @@
  * Нормализация ответа Whisper для транскрибации с таймлайна (экспорт In–Out или один медиафайл).
  */
 (function (global) {
+  /**
+   * Запускает массив задач-функций с ограничением параллелизма.
+   * tasks: [() => Promise<T>], concurrency: number
+   * Возвращает Promise<T[]> в исходном порядке.
+   */
+  function promisePool(tasks, concurrency) {
+    if (!tasks.length) return Promise.resolve([]);
+    var limit = Math.min(concurrency, tasks.length);
+    var results = new Array(tasks.length);
+    var nextIdx = 0;
+    var running = 0;
+
+    return new Promise(function (resolve, reject) {
+      var rejected = false;
+      function runNext() {
+        while (running < limit && nextIdx < tasks.length) {
+          (function (idx) {
+            running++;
+            nextIdx++;
+            tasks[idx]().then(
+              function (val) {
+                if (rejected) return;
+                results[idx] = val;
+                running--;
+                if (nextIdx >= tasks.length && running === 0) {
+                  resolve(results);
+                } else {
+                  runNext();
+                }
+              },
+              function (err) {
+                if (!rejected) { rejected = true; reject(err); }
+              }
+            );
+          })(nextIdx);
+        }
+      }
+      runNext();
+    });
+  }
+
+  var CLOUD_CONCURRENCY = 20; /* Cloud.ru поддерживает до 20 параллельных запросов */
+
   function normalizeWhisperExport(data, timelineOffsetSec) {
     var off = typeof timelineOffsetSec === 'number' && !isNaN(timelineOffsetSec) ? timelineOffsetSec : 0;
     /* Защита от мусорных значений из ExtendScript: getInPoint() в редких случаях
@@ -311,7 +354,8 @@
         silences: silences,
         loudness: res.loudness && !res.loudness.error ? res.loudness : null,
         silencesError: Array.isArray(res.silences) ? null : (res.silences && res.silences.error) || null,
-        loudnessError: res.loudness && res.loudness.error ? res.loudness.error : null
+        loudnessError: res.loudness && res.loudness.error ? res.loudness.error : null,
+        silenceThresholdUsed: typeof res.silenceThresholdUsed === 'number' ? res.silenceThresholdUsed : null
       };
     } catch (eP) {
       return { error: String(eP && eP.message || eP) };
@@ -346,14 +390,43 @@
         onProgress: onProgress
       });
     }
-    /* Облачный путь — как раньше: multipart через CloudRuClient */
+    /* Облачный путь — multipart через CloudRuClient */
     var CC = opts.CloudRuClient;
     if (!CC) throw new Error('CloudRuClient не передан в backendTranscribe');
-    var blob = readPathAsBlob(opts.path);
-    return CC.transcribeAudio(Object.assign({}, opts.transcribeOptsBase, {
-      fileBlob: blob,
-      fileName: opts.fileName
-    }));
+    var maxUpload = (settings && typeof settings.maxTranscribeUploadBytes === 'number')
+      ? settings.maxTranscribeUploadBytes : 20 * 1024 * 1024;
+    var filePath = opts.path;
+    var tmpExtracted = null;
+    /* Для облачного API: если файл — видео (не аудио), сначала извлечь аудио через ffmpeg.
+       Это радикально уменьшает размер (500 МБ .mov → 5 МБ wav) и предотвращает 413. */
+    if (!isAudioExt(filePath)) {
+      var ffTmp = tempAudioPath(filePath);
+      await extractAudioWithFfmpeg(filePath, ffTmp);
+      tmpExtracted = ffTmp;
+      filePath = ffTmp;
+    }
+    /* Проверяем размер перед отправкой */
+    var sz = fileSizeSync(filePath);
+    if (sz > maxUpload) {
+      if (tmpExtracted) {
+        try { require('fs').unlinkSync(tmpExtracted); } catch (e) {}
+      }
+      throw new Error(
+        'Файл ' + Math.round(sz / 1024 / 1024) + ' МБ превышает лимит API (' +
+        Math.round(maxUpload / 1024 / 1024) + ' МБ). Файл будет автоматически нарезан на чанки.'
+      );
+    }
+    try {
+      var blob = readPathAsBlob(filePath);
+      return await CC.transcribeAudio(Object.assign({}, opts.transcribeOptsBase, {
+        fileBlob: blob,
+        fileName: opts.fileName || String(filePath).replace(/^.*[\\/]/, '')
+      }));
+    } finally {
+      if (tmpExtracted) {
+        try { require('fs').unlinkSync(tmpExtracted); } catch (e) {}
+      }
+    }
   }
 
   /**
@@ -395,36 +468,77 @@
     if (prep.mode === 'export_chunks' && prep.chunks && prep.chunks.length) {
       var combined = [];
       var textAcc = '';
-      var ci, ch, sz, blob, data, norm;
+      var ci, ch, sz;
+      /* Проверяем размеры ДО запуска */
       for (ci = 0; ci < prep.chunks.length; ci++) {
-        beforeAwait();
-        ch = prep.chunks[ci];
-        progress('Транскрибация: фрагмент ' + (ci + 1) + '/' + prep.chunks.length + '…');
-        sz = fileSizeSync(ch.path);
+        sz = fileSizeSync(prep.chunks[ci].path);
         if (sz > maxBytes) {
           throw new Error(
             'Файл слишком большой для API (~' + Math.round(sz / 1024 / 1024) + ' МБ). Уменьшите transcribeExportChunkSec в fm-defaults.js.'
           );
         }
-        beforeAwait();
-        var ext = String(ch.path || '').replace(/^.*\./, '') || 'wav';
-        data = await backendTranscribe(settings, {
-          path: ch.path,
-          fileName: 'chunk_' + ci + '.' + ext,
-          signal: signal,
-          onProgress: progress,
-          CloudRuClient: CC,
-          transcribeOptsBase: transcribeOptsBase
-        });
-        norm = normalizeWhisperExport(data, ch.timelineOffsetSec);
+      }
+      beforeAwait();
+      /* Параллельная транскрибация всех чанков */
+      var doneCount = 0;
+      var totalChunks = prep.chunks.length;
+      progress('Транскрибация: отправляю ' + totalChunks + ' фрагментов параллельно…');
+      var chunkTasks = prep.chunks.map(function (ch, idx) {
+        return function () {
+          var ext = String(ch.path || '').replace(/^.*\./, '') || 'wav';
+          return backendTranscribe(settings, {
+            path: ch.path,
+            fileName: 'chunk_' + idx + '.' + ext,
+            signal: signal,
+            onProgress: function () {},
+            CloudRuClient: CC,
+            transcribeOptsBase: transcribeOptsBase
+          }).then(function (data) {
+            doneCount++;
+            progress('Транскрибация: ' + doneCount + '/' + totalChunks + ' готово…');
+            return { index: idx, data: data, offset: ch.timelineOffsetSec };
+          });
+        };
+      });
+      var chunkResults = await promisePool(chunkTasks, CLOUD_CONCURRENCY);
+      /* Сборка в правильном порядке */
+      chunkResults.sort(function (a, b) { return a.index - b.index; });
+      for (ci = 0; ci < chunkResults.length; ci++) {
+        var norm = normalizeWhisperExport(chunkResults[ci].data, chunkResults[ci].offset);
         combined = combined.concat(norm.segments);
         textAcc += (norm.text || '') + ' ';
       }
-      /* 1.1 аудиопрепроцессинг: анализируем первый чанк как репрезентативный образец
-         (полный файл чанками уже удалён по одному, но первый ещё доступен до unlinkWorkFiles). */
+      /* 1.1 аудиопрепроцессинг: анализируем ВСЕ чанки и объединяем silences.
+         Раньше анализировался только первый чанк — тишины в остальных терялись. */
       var audioAnalysisChunks = null;
       try {
-        audioAnalysisChunks = await computeAudioPreprocess(prep.chunks[0].path, prep.chunks[0].timelineOffsetSec, progress);
+        var allSilCh = [];
+        var firstLoudCh = null;
+        var firstThreshCh = null;
+        for (var ach = 0; ach < prep.chunks.length; ach++) {
+          var ch = prep.chunks[ach];
+          if (!ch || !ch.path) continue;
+          try {
+            var aaCh = await computeAudioPreprocess(ch.path, ch.timelineOffsetSec, progress);
+            if (aaCh && Array.isArray(aaCh.silences)) {
+              allSilCh = allSilCh.concat(aaCh.silences);
+            }
+            if (!firstLoudCh && aaCh && aaCh.loudness) {
+              firstLoudCh = aaCh.loudness;
+            }
+            if (firstThreshCh == null && aaCh && aaCh.silenceThresholdUsed != null) {
+              firstThreshCh = aaCh.silenceThresholdUsed;
+            }
+          } catch (eChA) {}
+        }
+        allSilCh.sort(function (a, b) { return a.startSec - b.startSec; });
+        audioAnalysisChunks = {
+          silences: allSilCh,
+          loudness: firstLoudCh,
+          silencesError: null,
+          loudnessError: null,
+          silenceThresholdUsed: firstThreshCh
+        };
       } catch (eAC) {}
       return {
         raw: { chunks: prep.chunks.length },
@@ -438,11 +552,71 @@
 
     if (prep.mode === 'export_wav') {
       beforeAwait();
-      progress('Транскрибация: отправка в Whisper…');
       var szW = fileSizeSync(prep.path);
       if (szW > maxBytes) {
-        throw new Error('Файл экспорта слишком большой; задайте transcribeExportChunkSec и пресет .epr.');
+        /* Файл слишком велик для API — авто-чанкование через ffmpeg */
+        progress('Файл ' + Math.round(szW / 1024 / 1024) + ' МБ > лимита — нарезаю через ffmpeg…');
+        var chunkSecW = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
+          ? settings.transcribeExportChunkSec : 90;
+        /* Определяем длительность файла. timelineOffsetSec = In, workOutSec может быть в prep */
+        var spanSecW = 0;
+        try {
+          var probeRes = await AudioPreprocess.analyzeLoudness(prep.path);
+          /* Длительность = из stderr Duration, но loudness не даёт напрямую.
+             Рассчитаем из размера файла (PCM 16kHz mono = 32000 bytes/sec). */
+        } catch (eP) {}
+        /* Надёжный расчёт: для PCM 16kHz mono WAV ~32000 B/s; для MP3 ~16000 B/s */
+        var estBytesPerSec = String(prep.path || '').match(/\.wav$/i) ? 32000 : 16000;
+        spanSecW = Math.max(30, Math.ceil(szW / estBytesPerSec));
+        var ewChunks = await extractAudioChunksWithFfmpeg(prep.path, 0, spanSecW, chunkSecW, progress);
+        var combinedW = [];
+        var textAccW = '';
+        var wOff = typeof prep.timelineOffsetSec === 'number' ? prep.timelineOffsetSec : 0;
+        try {
+          /* Параллельная транскрибация чанков */
+          var wDone = 0;
+          progress('Транскрибация: отправляю ' + ewChunks.length + ' фрагментов параллельно…');
+          var wTasks = ewChunks.map(function (wch, wci) {
+            return function () {
+              return backendTranscribe(settings, {
+                path: wch.path,
+                fileName: 'export_chunk_' + wci + '.wav',
+                signal: signal,
+                onProgress: function () {},
+                CloudRuClient: CC,
+                transcribeOptsBase: transcribeOptsBase
+              }).then(function (wData) {
+                wDone++;
+                progress('Транскрибация: ' + wDone + '/' + ewChunks.length + ' готово…');
+                return { index: wci, data: wData, offset: wOff + wch.offsetInSpanSec };
+              });
+            };
+          });
+          var wResults = await promisePool(wTasks, CLOUD_CONCURRENCY);
+          wResults.sort(function (a, b) { return a.index - b.index; });
+          for (var wri = 0; wri < wResults.length; wri++) {
+            var wNorm = normalizeWhisperExport(wResults[wri].data, wResults[wri].offset);
+            combinedW = combinedW.concat(wNorm.segments);
+            textAccW += (wNorm.text || '') + ' ';
+          }
+          /* Аудиоанализ на оригинальном файле */
+          var audioAnalysisW = null;
+          try {
+            audioAnalysisW = await computeAudioPreprocess(prep.path, wOff, progress);
+          } catch (eAWC) {}
+          return {
+            raw: { ffmpegChunks: ewChunks.length },
+            segments: mergeSegmentLists([combinedW]),
+            text: textAccW.trim(),
+            timelineOffsetSec: wOff,
+            mode: 'export_wav_chunked',
+            audioAnalysis: audioAnalysisW
+          };
+        } finally {
+          unlinkChunkList(ewChunks);
+        }
       }
+      progress('Транскрибация: отправка в Whisper…');
       beforeAwait();
       var dataW = await backendTranscribe(settings, {
         path: prep.path,
@@ -465,7 +639,8 @@
       var whisperByPath = {};
       var segLists = [];
       var allText = '';
-      var ffmpegTempFiles = [];
+      /* Собираем ВСЕ WAV-чанки со всех клипов для аудиоанализа ПОСЛЕ транскрибации */
+      var allChunksForAnalysis = []; /* {path, timelineOffsetSec} */
       var qi, it, pathQ, szQ, blobQ, rawW, nq;
       for (qi = 0; qi < prep.items.length; qi++) {
         beforeAwait();
@@ -475,33 +650,51 @@
         szQ = fileSizeSync(pathQ);
         var spanQ = it.workOutSec - it.workInSec;
         var srcStartQ = (it.clipInPointSec || 0) + (it.workInSec - (it.clipStartSec || 0));
-        /* Для whisper.cpp: если исходник — видео, всегда уходим в ffmpeg-чанкинг. */
-        var needChunkQ = spanQ > chunkSecCfgQ * 1.5 || szQ > maxBytes || (isLocal && !isAudioExt(pathQ));
+        /* Для cloud: видео → ffmpeg-чанкинг (предотвращает 413 и OOM).
+           Для whisper.cpp: видео → ffmpeg-чанкинг (не принимает контейнеры). */
+        var needChunkQ = spanQ > chunkSecCfgQ * 1.5 || szQ > maxBytes || !isAudioExt(pathQ);
         if (needChunkQ) {
           /* Нарезаем нужный диапазон через ffmpeg на короткие WAV-чанки */
           beforeAwait();
           var qChunks = await extractAudioChunksWithFfmpeg(pathQ, srcStartQ, spanQ, chunkSecCfgQ, progress);
-          ffmpegTempFiles = ffmpegTempFiles.concat(qChunks.map(function (c) { return c.path; }));
-          var qLocal = [];
-          for (var qci = 0; qci < qChunks.length; qci++) {
-            beforeAwait();
-            var qch = qChunks[qci];
-            progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + ', фрагмент ' + (qci + 1) + '/' + qChunks.length + '…');
-            var qData = await backendTranscribe(settings, {
-              path: qch.path,
-              fileName: 'clip_' + qi + '_chunk_' + qci + '.wav',
-              signal: signal,
-              onProgress: progress,
-              CloudRuClient: CC,
-              transcribeOptsBase: transcribeOptsBase
+          /* Сохраняем чанки для аудиоанализа (НЕ удаляем пока!) */
+          for (var qci2 = 0; qci2 < qChunks.length; qci2++) {
+            allChunksForAnalysis.push({
+              path: qChunks[qci2].path,
+              timelineOffsetSec: it.workInSec + qChunks[qci2].offsetInSpanSec
             });
-            var qNorm = normalizeWhisperExport(qData, it.workInSec + qch.offsetInSpanSec);
+          }
+          /* Параллельная транскрибация чанков клипа */
+          var qDoneCount = 0;
+          progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + ', ' + qChunks.length + ' фрагментов…');
+          var qTasks = qChunks.map(function (qch, qci) {
+            return function () {
+              return backendTranscribe(settings, {
+                path: qch.path,
+                fileName: 'clip_' + qi + '_chunk_' + qci + '.wav',
+                signal: signal,
+                onProgress: function () {},
+                CloudRuClient: CC,
+                transcribeOptsBase: transcribeOptsBase
+              }).then(function (qData) {
+                qDoneCount++;
+                progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + ', ' + qDoneCount + '/' + qChunks.length + ' готово…');
+                return { index: qci, data: qData, offset: it.workInSec + qch.offsetInSpanSec };
+              });
+            };
+          });
+          var qResults = await promisePool(qTasks, CLOUD_CONCURRENCY);
+          qResults.sort(function (a, b) { return a.index - b.index; });
+          var qLocal = [];
+          for (var qri = 0; qri < qResults.length; qri++) {
+            var qNorm = normalizeWhisperExport(qResults[qri].data, qResults[qri].offset);
             qLocal = qLocal.concat(qNorm.segments);
             allText += (qNorm.text || '') + ' ';
           }
           segLists.push(qLocal);
           continue;
         }
+        /* Маленький аудиофайл — отправить напрямую */
         if (!whisperByPath[pathQ]) {
           beforeAwait();
           whisperByPath[pathQ] = await backendTranscribe(settings, {
@@ -517,22 +710,84 @@
         nq = normalizeWhisperMediaFile(rawW, it.clipStartSec, it.clipInPointSec, it.workInSec, it.workOutSec);
         segLists.push(nq.segments);
         allText += (nq.text || '') + ' ';
+        /* Для аудиоанализа: извлечь WAV из этого аудиофайла (только нужный диапазон) */
+        try {
+          var directChunkPath = tempAudioPath(pathQ);
+          await extractAudioWithFfmpeg(pathQ, directChunkPath);
+          allChunksForAnalysis.push({
+            path: directChunkPath,
+            timelineOffsetSec: it.clipStartSec || 0
+          });
+        } catch (eDirectExtract) {}
       }
-      /* Удаляем временные файлы ffmpeg */
-      ffmpegTempFiles.forEach(function (tf) {
-        try { if (typeof require !== 'undefined') require('fs').unlinkSync(tf); } catch (eU) {}
-      });
-      /* Для clip_queue анализ делаем на первом оригинальном файле (до удаления ffmpeg-tmp). */
+
+      /* ── Аудиоанализ: запускаем на извлечённых WAV-чанках (не на исходных .braw/.mp3) ──
+       * Это даёт корректные тишины: анализируется реальное аудио,
+       * а offset уже в координатах таймлайна. */
       var audioAnalysisCQ = null;
       try {
-        var firstQ = prep.items && prep.items[0];
-        if (firstQ && firstQ.path) {
-          audioAnalysisCQ = await computeAudioPreprocess(firstQ.path, firstQ.clipStartSec || 0, progress);
+        var allSilences = [];
+        var firstLoudness = null;
+        var firstThreshCQ = null;
+        progress('Анализ аудио (silencedetect на ' + allChunksForAnalysis.length + ' чанков)…');
+        for (var aq = 0; aq < allChunksForAnalysis.length; aq++) {
+          var chunkForAA = allChunksForAnalysis[aq];
+          if (!chunkForAA || !chunkForAA.path) continue;
+          try {
+            var aaQ = await computeAudioPreprocess(
+              chunkForAA.path,
+              chunkForAA.timelineOffsetSec,
+              progress
+            );
+            if (aaQ && Array.isArray(aaQ.silences)) {
+              allSilences = allSilences.concat(aaQ.silences);
+            }
+            if (!firstLoudness && aaQ && aaQ.loudness) {
+              firstLoudness = aaQ.loudness;
+            }
+            if (firstThreshCQ == null && aaQ && aaQ.silenceThresholdUsed != null) {
+              firstThreshCQ = aaQ.silenceThresholdUsed;
+            }
+          } catch (eChunkAA) {}
         }
+        allSilences.sort(function (a, b) { return a.startSec - b.startSec; });
+        audioAnalysisCQ = {
+          silences: allSilences,
+          loudness: firstLoudness,
+          silencesError: null,
+          loudnessError: null,
+          silenceThresholdUsed: firstThreshCQ
+        };
       } catch (eACQ) {}
+
+      /* Удаляем ВСЕ временные файлы (чанки) ПОСЛЕ аудиоанализа */
+      for (var cf = 0; cf < allChunksForAnalysis.length; cf++) {
+        try { if (typeof require !== 'undefined') require('fs').unlinkSync(allChunksForAnalysis[cf].path); } catch (eU) {}
+      }
+
+      /* Дедупликация сегментов: убрать перекрытия (например, музыка + речь дают
+         сегменты на одних и тех же таймкодах). Приоритет — более длинный текст. */
+      var mergedSegs = mergeSegmentLists(segLists);
+      var dedupedSegs = [];
+      for (var di = 0; di < mergedSegs.length; di++) {
+        var seg = mergedSegs[di];
+        var dominated = false;
+        for (var dj = 0; dj < mergedSegs.length; dj++) {
+          if (di === dj) continue;
+          var other = mergedSegs[dj];
+          /* seg полностью внутри other И текст other длиннее → seg дубликат */
+          if (other.startSec <= seg.startSec + 0.1 && other.endSec >= seg.endSec - 0.1 &&
+              (other.text || '').length > (seg.text || '').length) {
+            dominated = true;
+            break;
+          }
+        }
+        if (!dominated) dedupedSegs.push(seg);
+      }
+
       return {
         raw: whisperByPath,
-        segments: mergeSegmentLists(segLists),
+        segments: dedupedSegs,
         text: allText.trim(),
         timelineOffsetSec: prep.workInSec,
         mode: 'clip_queue',
@@ -546,8 +801,8 @@
       var spanSecM = prep.workOutSec - prep.workInSec;
       var srcStartM = (prep.clipInPointSec || 0) + (prep.workInSec - (prep.clipStartSec || 0));
       var szPre = fileSizeSync(prep.path);
-      /* Для whisper.cpp: видеоконтейнер → ffmpeg-чанкинг (там и диапазон -ss/-t, и pcm). */
-      var needChunkM = spanSecM > chunkSecCfgM * 1.5 || szPre > maxBytes || (isLocal && !isAudioExt(prep.path));
+      /* Видеоконтейнеры (.mov/.mp4) всегда через ffmpeg — предотвращает 413 и OOM. */
+      var needChunkM = spanSecM > chunkSecCfgM * 1.5 || szPre > maxBytes || !isAudioExt(prep.path);
       if (needChunkM) {
         beforeAwait();
         progress('Извлечение аудио чанками через ffmpeg (минует 413)…');
@@ -555,25 +810,51 @@
         var combinedM = [];
         var textAccM = '';
         try {
-          for (var mci = 0; mci < mChunks.length; mci++) {
-            beforeAwait();
-            var mch = mChunks[mci];
-            progress('Транскрибация: фрагмент ' + (mci + 1) + '/' + mChunks.length + '…');
-            var mData = await backendTranscribe(settings, {
-              path: mch.path,
-              fileName: 'mediafile_chunk_' + mci + '.wav',
-              signal: signal,
-              onProgress: progress,
-              CloudRuClient: CC,
-              transcribeOptsBase: transcribeOptsBase
-            });
-            var mNorm = normalizeWhisperExport(mData, prep.workInSec + mch.offsetInSpanSec);
+          /* Параллельная транскрибация чанков */
+          var mDoneCount = 0;
+          var mTotalChunks = mChunks.length;
+          progress('Транскрибация: отправляю ' + mTotalChunks + ' фрагментов параллельно…');
+          var mTasks = mChunks.map(function (mch, mci) {
+            return function () {
+              return backendTranscribe(settings, {
+                path: mch.path,
+                fileName: 'mediafile_chunk_' + mci + '.wav',
+                signal: signal,
+                onProgress: function () {},
+                CloudRuClient: CC,
+                transcribeOptsBase: transcribeOptsBase
+              }).then(function (mData) {
+                mDoneCount++;
+                progress('Транскрибация: ' + mDoneCount + '/' + mTotalChunks + ' готово…');
+                return { index: mci, data: mData, offset: prep.workInSec + mch.offsetInSpanSec };
+              });
+            };
+          });
+          var mResults = await promisePool(mTasks, CLOUD_CONCURRENCY);
+          mResults.sort(function (a, b) { return a.index - b.index; });
+          for (var mri = 0; mri < mResults.length; mri++) {
+            var mNorm = normalizeWhisperExport(mResults[mri].data, mResults[mri].offset);
             combinedM = combinedM.concat(mNorm.segments);
             textAccM += (mNorm.text || '') + ' ';
           }
+          /* Анализ всех ffmpeg-чанков — silences + loudness */
           var audioAnalysisM = null;
           try {
-            audioAnalysisM = await computeAudioPreprocess(mChunks[0].path, prep.workInSec, progress);
+            var allSilM = [];
+            var firstLoudM = null;
+            var firstThreshM = null;
+            for (var amci = 0; amci < mChunks.length; amci++) {
+              var mck = mChunks[amci];
+              if (!mck || !mck.path) continue;
+              try {
+                var aaMck = await computeAudioPreprocess(mck.path, prep.workInSec + (mck.offsetInSpanSec || 0), progress);
+                if (aaMck && Array.isArray(aaMck.silences)) allSilM = allSilM.concat(aaMck.silences);
+                if (!firstLoudM && aaMck && aaMck.loudness) firstLoudM = aaMck.loudness;
+                if (firstThreshM == null && aaMck && aaMck.silenceThresholdUsed != null) firstThreshM = aaMck.silenceThresholdUsed;
+              } catch (eMckA) {}
+            }
+            allSilM.sort(function (a, b) { return a.startSec - b.startSec; });
+            audioAnalysisM = { silences: allSilM, loudness: firstLoudM, silencesError: null, loudnessError: null, silenceThresholdUsed: firstThreshM };
           } catch (eAMC) {}
           return {
             raw: { ffmpegChunks: mChunks.length },
@@ -602,8 +883,55 @@
         actualPathM = ffmpegTmpM;
         szM = fileSizeSync(ffmpegTmpM);
         if (szM > maxBytes) {
-          try { if (typeof require !== 'undefined') require('fs').unlinkSync(ffmpegTmpM); } catch (eU) {}
-          throw new Error('Даже после извлечения аудио файл слишком большой (' + Math.round(szM / 1024 / 1024) + ' МБ). Задайте exportAudioPresetPath (.epr) для экспорта чанками.');
+          /* Файл всё ещё слишком велик — авто-чанкование */
+          progress('Аудио ' + Math.round(szM / 1024 / 1024) + ' МБ > лимита — дополнительная нарезка…');
+          var chunkSecFB = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
+            ? settings.transcribeExportChunkSec : 90;
+          var spanFB = Math.max(30, Math.ceil(szM / 32000));
+          var fbChunks = await extractAudioChunksWithFfmpeg(ffmpegTmpM, 0, spanFB, chunkSecFB, progress);
+          try {
+            var fbDone = 0;
+            progress('Транскрибация: отправляю ' + fbChunks.length + ' фрагментов параллельно…');
+            var fbTasks = fbChunks.map(function (fbc, fbi) {
+              return function () {
+                return backendTranscribe(settings, {
+                  path: fbc.path,
+                  fileName: 'media_fb_' + fbi + '.wav',
+                  signal: signal,
+                  onProgress: function () {},
+                  CloudRuClient: CC,
+                  transcribeOptsBase: transcribeOptsBase
+                }).then(function (fbData) {
+                  fbDone++;
+                  progress('Транскрибация: ' + fbDone + '/' + fbChunks.length + ' готово…');
+                  return { index: fbi, data: fbData, offset: (prep.clipStartSec || 0) + fbc.offsetInSpanSec };
+                });
+              };
+            });
+            var fbResults = await promisePool(fbTasks, CLOUD_CONCURRENCY);
+            fbResults.sort(function (a, b) { return a.index - b.index; });
+            var fbSegs = [], fbText = '';
+            for (var fbr = 0; fbr < fbResults.length; fbr++) {
+              var fbNorm = normalizeWhisperMediaFile(
+                fbResults[fbr].data, fbResults[fbr].offset, 0, prep.workInSec, prep.workOutSec
+              );
+              fbSegs = fbSegs.concat(fbNorm.segments);
+              fbText += (fbNorm.text || '') + ' ';
+            }
+            var fbAA = null;
+            try { fbAA = await computeAudioPreprocess(ffmpegTmpM, prep.clipStartSec || 0, progress); } catch (eAFB) {}
+            return {
+              raw: { ffmpegChunks: fbChunks.length },
+              segments: mergeSegmentLists([fbSegs]),
+              text: fbText.trim(),
+              timelineOffsetSec: prep.workInSec,
+              mode: 'media_file_auto_chunked',
+              audioAnalysis: fbAA
+            };
+          } finally {
+            unlinkChunkList(fbChunks);
+            try { if (typeof require !== 'undefined') require('fs').unlinkSync(ffmpegTmpM); } catch (eU) {}
+          }
         }
       }
       beforeAwait();

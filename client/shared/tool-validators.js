@@ -47,7 +47,7 @@
         clip;
       for (j = 0; j < plan.operations.length; j++) {
         op = plan.operations[j];
-        a = op.action;
+        a = op.action || op.kind || op.type;
         if (!a) continue;
         if (a === 'shift_timeline_ripple') {
           if (typeof op.fromSec !== 'number' || typeof op.deltaSec !== 'number') {

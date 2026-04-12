@@ -282,6 +282,26 @@ describe('validateTimecodePlan', () => {
   });
 });
 
+describe('validateTimecodePlan — kind/type alias for action', () => {
+  test('kind вместо action: ripple_delete_range', () => {
+    assert.equal(
+      TV.validateTimecodePlan(snapOk, {
+        operations: [{ kind: 'ripple_delete_range', startSec: 1, endSec: 4 }]
+      }),
+      null
+    );
+  });
+
+  test('type вместо action: remove_clip', () => {
+    assert.equal(
+      TV.validateTimecodePlan(snapOk, {
+        operations: [{ type: 'remove_clip', nodeId: 'clip-a' }]
+      }),
+      null
+    );
+  });
+});
+
 describe('validateTranscriptCuts', () => {
   test('нужен removeIntervals', () => {
     const r = TV.validateTranscriptCuts(snapOk, {});
