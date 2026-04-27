@@ -21,3 +21,11 @@ _llm_transcript_cache.json
 _llm_transcript_cache.json.tmp
 host/_llm_transcript_cache.json
 host/_llm_transcript_cache.json.tmp
+
+# OMC runtime-артефакты (ralph jobs, состояние сессии, временные ошибки).
+# PRD/plans/research коммитим — они проектные артефакты.
+.omc/state/
+.omc/sessions/
+.omc/notepad.md
+.omc/project-memory.json
+.omc/logs/

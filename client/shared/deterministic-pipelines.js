@@ -197,6 +197,15 @@
       }
     }
 
+    /* Merge overlapping/adjacent intervals */
+    removeIntervals = _mergeIntervals(removeIntervals);
+
+    /* Фильтр микро-зазоров: интервалы < 0.15с оставляют 2-3 кадра мусора после razor */
+    var MIN_CUT = 0.15;
+    removeIntervals = removeIntervals.filter(function (iv) {
+      return (iv.endSec - iv.startSec) >= MIN_CUT;
+    });
+
     if (removeIntervals.length === 0) {
       var modeLabel = expanded ? 'расширенном' : 'строгом';
       return {
@@ -206,9 +215,6 @@
         noChanges: true
       };
     }
-
-    /* Merge overlapping/adjacent intervals */
-    removeIntervals = _mergeIntervals(removeIntervals);
 
     var totalRemoveSec = 0;
     removeIntervals.forEach(function (iv) { totalRemoveSec += iv.endSec - iv.startSec; });
@@ -232,13 +238,86 @@
   }
 
   /**
-   * /cut_silences — убрать длинные паузы (без LLM).
-   * Параметры: minDuration (сек), padding (сек).
+   * detectSilenceIntervals — унифицированный детектор тишин для cutSilences/jumpCuts.
    *
-   * Гибридный подход:
-   *   1. Gaps между сегментами транскрипта ≥ minDuration → тишина
-   *   2. ffmpeg silencedetect → дополнительные тишины
-   * Результаты мержатся, перекрытия объединяются.
+   * @param {Object} entry — transcript entry с опциональным audioAnalysis
+   * @param {Object} opts:
+   *   - minDuration (сек, default 1.0): мин. длительность чтобы считать тишиной
+   *   - padding (сек, default 0.15): отступ внутри тишины (не режем край)
+   *   - thresholdDb (dB, default null): порог громкости для ffmpeg-тишин.
+   *     Если null — используем silenceThresholdUsed из entry.audioAnalysis.
+   *     Если задан И строже (меньше) чем thresholdUsed — ffmpeg-тишины отфильтровываются
+   *     (они обнаружены при менее строгом пороге, могут содержать слышимый звук).
+   *   - source (default 'gaps+ffmpeg'): 'gaps' | 'ffmpeg' | 'gaps+ffmpeg'
+   * @returns {Array<{startSec, endSec, reason}>}
+   */
+  function detectSilenceIntervals(entry, opts) {
+    opts = opts || {};
+    var minDuration = typeof opts.minDuration === 'number' ? opts.minDuration : 1.0;
+    var padding = typeof opts.padding === 'number' ? opts.padding : 0.15;
+    var source = opts.source || 'gaps+ffmpeg';
+
+    var segs = (entry && entry.segments) || [];
+    var audio = (entry && entry.audioAnalysis) || null;
+    var thresholdUsed = (audio && typeof audio.silenceThresholdUsed === 'number') ? audio.silenceThresholdUsed : -30;
+    var effectiveThreshold = typeof opts.thresholdDb === 'number' ? opts.thresholdDb : thresholdUsed;
+    var includeFFmpeg = (source !== 'gaps') && (effectiveThreshold >= thresholdUsed);
+
+    var intervals = [];
+
+    /* Источник 1: gaps между Whisper-сегментами (Whisper знает границы речи). */
+    if (source === 'gaps' || source === 'gaps+ffmpeg') {
+      for (var gi = 1; gi < segs.length; gi++) {
+        var prevEnd = typeof segs[gi - 1].endSec === 'number' ? segs[gi - 1].endSec :
+                      (typeof segs[gi - 1].end === 'number' ? segs[gi - 1].end : NaN);
+        var nextStart = typeof segs[gi].startSec === 'number' ? segs[gi].startSec :
+                        (typeof segs[gi].start === 'number' ? segs[gi].start : NaN);
+        if (isNaN(prevEnd) || isNaN(nextStart)) continue;
+        var gap = nextStart - prevEnd;
+        if (gap < minDuration) continue;
+        var gs = prevEnd + padding;
+        var ge = nextStart - padding;
+        if (ge > gs + 0.02) {
+          intervals.push({
+            startSec: gs,
+            endSec: ge,
+            reason: 'пауза между фразами ' + gap.toFixed(2) + 'с'
+          });
+        }
+      }
+    }
+
+    /* Источник 2: ffmpeg silencedetect (ловит тишину внутри сегментов). */
+    if (includeFFmpeg) {
+      var silences = (audio && audio.silences) || [];
+      var threshLabel = effectiveThreshold + ' dB';
+      for (var i = 0; i < silences.length; i++) {
+        var sil = silences[i];
+        var silStart = typeof sil.startSec === 'number' ? sil.startSec : (typeof sil.start === 'number' ? sil.start : NaN);
+        var silEnd = typeof sil.endSec === 'number' ? sil.endSec : (typeof sil.end === 'number' ? sil.end : NaN);
+        if (isNaN(silStart) || isNaN(silEnd)) continue;
+        var dur = silEnd - silStart;
+        if (dur < minDuration) continue;
+        var ss = silStart + padding;
+        var se = silEnd - padding;
+        if (se <= ss + 0.02) continue;
+        intervals.push({
+          startSec: ss,
+          endSec: se,
+          reason: 'тишина ' + dur.toFixed(2) + 'с (уровень < ' + threshLabel + ')'
+        });
+      }
+    }
+
+    return intervals;
+  }
+
+  /**
+   * /cut_silences — гигиена: убрать явные длинные паузы (≥1с).
+   * Параметры: minDuration (сек), padding (сек), silenceThresholdDelta (dB).
+   *
+   * Использует detectSilenceIntervals с source='gaps+ffmpeg'.
+   * Сохраняет естественный ритм речи.
    */
   async function cutSilences(ctx, params) {
     params = params || {};
@@ -252,56 +331,33 @@
 
     var thresholdUsed = (entry.audioAnalysis && typeof entry.audioAnalysis.silenceThresholdUsed === 'number')
       ? entry.audioAnalysis.silenceThresholdUsed : -30;
-    var threshLabel = thresholdUsed + ' dB';
 
-    var removeIntervals = [];
-    var segs = entry.segments || [];
+    /* silenceThresholdDelta: пользовательский порог (разница со средней громкостью).
+       Если задан — пересчитываем порог: inputI - delta. */
+    var userDelta = typeof params.silenceThresholdDelta === 'number' ? params.silenceThresholdDelta : 0;
+    var inputI = (entry.audioAnalysis && typeof entry.audioAnalysis.inputI === 'number')
+      ? entry.audioAnalysis.inputI : -24;
+    var effectiveThreshold = userDelta > 0 ? Math.floor(inputI - userDelta) : thresholdUsed;
+    var threshLabel = effectiveThreshold + ' dB';
 
-    /* Источник 1: Gaps между сегментами транскрипта.
-       Whisper знает, где заканчивается речь → gap = реальная пауза. */
-    for (var gi = 1; gi < segs.length; gi++) {
-      var prevEnd = typeof segs[gi - 1].endSec === 'number' ? segs[gi - 1].endSec :
-                    (typeof segs[gi - 1].end === 'number' ? segs[gi - 1].end : NaN);
-      var nextStart = typeof segs[gi].startSec === 'number' ? segs[gi].startSec :
-                      (typeof segs[gi].start === 'number' ? segs[gi].start : NaN);
-      if (isNaN(prevEnd) || isNaN(nextStart)) continue;
-      var gap = nextStart - prevEnd;
-      if (gap >= minDuration) {
-        var gs = prevEnd + padding;
-        var ge = nextStart - padding;
-        if (ge > gs + 0.05) {
-          removeIntervals.push({
-            startSec: gs,
-            endSec: ge,
-            reason: 'пауза между фразами ' + gap.toFixed(1) + 'с'
-          });
-        }
-      }
-    }
+    var removeIntervals = detectSilenceIntervals(entry, {
+      minDuration: minDuration,
+      padding: padding,
+      thresholdDb: effectiveThreshold,
+      source: 'gaps+ffmpeg'
+    });
 
-    /* Источник 2: ffmpeg silencedetect */
     var silences = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
-    for (var i = 0; i < silences.length; i++) {
-      var sil = silences[i];
-      var silStart = typeof sil.startSec === 'number' ? sil.startSec : (typeof sil.start === 'number' ? sil.start : NaN);
-      var silEnd = typeof sil.endSec === 'number' ? sil.endSec : (typeof sil.end === 'number' ? sil.end : NaN);
-      if (isNaN(silStart) || isNaN(silEnd)) continue;
-      var dur = silEnd - silStart;
-      if (dur < minDuration) continue;
-
-      var start = silStart + padding;
-      var end = silEnd - padding;
-      if (end <= start + 0.05) continue;
-
-      removeIntervals.push({
-        startSec: start,
-        endSec: end,
-        reason: 'тишина ' + dur.toFixed(1) + 'с (уровень < ' + threshLabel + ')'
-      });
-    }
+    var segs = entry.segments || [];
 
     /* Мержим перекрытия */
     removeIntervals = _mergeIntervals(removeIntervals);
+
+    /* Фильтр микро-зазоров: интервалы < 0.15с оставляют 2-3 кадра мусора после razor */
+    var MIN_CUT = 0.15;
+    removeIntervals = removeIntervals.filter(function (iv) {
+      return (iv.endSec - iv.startSec) >= MIN_CUT;
+    });
 
     if (removeIntervals.length === 0) {
       var maxSilDur = 0;
@@ -326,8 +382,6 @@
       };
     }
 
-    removeIntervals = _mergeIntervals(removeIntervals);
-
     var totalRemoveSec = 0;
     removeIntervals.forEach(function (iv) { totalRemoveSec += iv.endSec - iv.startSec; });
 
@@ -349,7 +403,8 @@
    * /chapterize — расставить маркеры-главы (1 LLM-вызов через topics).
    * Если topics уже есть в кэше — 0 LLM-вызовов.
    */
-  async function chapterize(ctx) {
+  async function chapterize(ctx, params) {
+    params = params || {};
     var entry = ctx.transcriptEntry;
     if (!entry || !entry.segments || !entry.segments.length) {
       return { ok: false, error: 'Нет транскрипта.' };
@@ -405,43 +460,81 @@
       return { ok: false, error: 'Не удалось определить темы видео. Возможно, транскрипт слишком короткий или API недоступен. Попробуйте через чат: «Поставь маркеры на главы».' };
     }
 
+    /* US-005: валидация «бойлерплейт» имён и замена на реальный текст.
+       Имена вида «Часть N», «Part N», «Продолжение», «Следующая часть» — мусор. */
+    var boilerplateRe = /^(часть|part)\s*\d+$|^продолжение$|^следующ.+\s*часть$/i;
+    var paragraphsForNames = entry.paragraphs || _segmentsToParagraphs(entry.segments);
+
     /* Convert topics to markers */
     var markers = topics.map(function (t) {
+      var title = String(t.title || '').trim();
+      if (!title || boilerplateRe.test(title)) {
+        title = _firstWordsForChapter(paragraphsForNames, entry.segments, t.startSec, t.endSec);
+      }
       return {
         timeSec: t.startSec,
         endSec: t.endSec || undefined,
-        name: String(t.title || '').slice(0, 40),
+        name: title.slice(0, 40),
         type: 'chapter',
         comment: t.summary || ''
       };
     });
 
-    /* Filter: remove markers too close together (<15s) */
+    /* US-005: адаптивный минимальный интервал между главами.
+       <3min=10s, 3-10min=20s, >10min=45s (вместо жёстких 15с) */
+    var totalDurForSpacing = _getEntryDuration(entry);
+    var minChapterInterval = _adaptiveChapterMinInterval(totalDurForSpacing);
+
+    /* Filter: remove markers too close together */
     var filtered = [markers[0]];
     for (var i = 1; i < markers.length; i++) {
-      if (markers[i].timeSec - filtered[filtered.length - 1].timeSec >= 15) {
+      if (markers[i].timeSec - filtered[filtered.length - 1].timeSec >= minChapterInterval) {
         filtered.push(markers[i]);
       }
     }
+
+    /* maxChapters: ограничить количество глав (равномерно выбираем из имеющихся) */
+    var maxChapters = typeof params.maxChapters === 'number' ? params.maxChapters : 0;
+    if (maxChapters > 0 && filtered.length > maxChapters) {
+      /* Всегда сохраняем первый (Вступление) и последний маркер.
+         Из оставшихся равномерно выбираем нужное количество. */
+      var reduced = [filtered[0]];
+      var inner = filtered.slice(1, filtered.length - 1);
+      var need = maxChapters - 2; /* минус первый и последний */
+      if (need > 0 && inner.length > 0) {
+        var step = inner.length / (need + 1);
+        for (var ri = 0; ri < need && ri < inner.length; ri++) {
+          reduced.push(inner[Math.round(step * (ri + 1) - 1)]);
+        }
+      }
+      if (filtered.length > 1) reduced.push(filtered[filtered.length - 1]);
+      /* Если maxChapters=1 — только первый */
+      if (maxChapters === 1) reduced = [filtered[0]];
+      filtered = reduced;
+    }
+
+    var chNote = maxChapters > 0 ? ' (лимит: ' + maxChapters + ')' : '';
 
     return {
       ok: true,
       proposal: {
         kind: 'markers',
         markers: filtered,
-        summary: 'Автоматические главы (' + filtered.length + '): по темам из транскрипта.'
+        summary: 'Автоматические главы (' + filtered.length + ')' + chNote + ': по темам из транскрипта.'
       }
     };
   }
 
   /**
-   * /jump_cuts — создать jump cuts по паузам (без LLM).
-   * Убирает паузы от maxPause.
+   * /jump_cuts — ритм: агрессивно сжать все паузы (YouTube-стиль).
    *
-   * Двойной источник пауз:
-   *   1. Gaps между сегментами транскрипта (надёжный — Whisper знает, где речь)
-   *   2. ffmpeg silencedetect (дополнительно — ловит тихие паузы внутри сегментов)
-   * Результаты объединяются и мержатся.
+   * Отличия от cutSilences:
+   *   - Более низкий порог maxPause (default 0.5с vs 1.0с)
+   *   - keepBreathing (default 0.05с): не режем в ноль — оставляем дыхание
+   *   - minSegmentDuration (default 0.3с): соседние интервалы с крошечным
+   *     остаточным сегментом между ними объединяются
+   *   - Gating по threshold применяется ТАК ЖЕ, как в cutSilences (R13) —
+   *     не цепляем фоновый шум как «тишину»
    */
   async function jumpCuts(ctx, params) {
     params = params || {};
@@ -451,53 +544,25 @@
     }
 
     var maxPause = typeof params.maxPause === 'number' ? params.maxPause : 0.5;
-    var padding = 0.08;
+    /* keepBreathing: падинг по краям тишины. 0 = резать в ноль (жёстко),
+       0.05 = оставлять 50 мс дыхания с каждой стороны (естественно). */
+    var keepBreathing = typeof params.keepBreathing === 'number' ? params.keepBreathing : 0.05;
+    if (keepBreathing < 0) keepBreathing = 0;
+    /* minSegmentDuration: если между двумя вырезаемыми интервалами остаётся
+       сегмент речи короче этого — поглотить его (визуальный мусор). */
+    var minSegmentDuration = typeof params.minSegmentDuration === 'number' ? params.minSegmentDuration : 0.3;
+    if (minSegmentDuration < 0) minSegmentDuration = 0;
 
-    var removeIntervals = [];
-
-    /* Источник 1: Gaps между сегментами транскрипта.
-       Это самый надёжный способ: Whisper чётко знает, где заканчивается и начинается речь. */
     var segs = entry.segments;
-    for (var gi = 1; gi < segs.length; gi++) {
-      var prevEnd = typeof segs[gi - 1].endSec === 'number' ? segs[gi - 1].endSec :
-                    (typeof segs[gi - 1].end === 'number' ? segs[gi - 1].end : NaN);
-      var nextStart = typeof segs[gi].startSec === 'number' ? segs[gi].startSec :
-                      (typeof segs[gi].start === 'number' ? segs[gi].start : NaN);
-      if (isNaN(prevEnd) || isNaN(nextStart)) continue;
-      var gap = nextStart - prevEnd;
-      if (gap >= maxPause) {
-        var s = prevEnd + padding;
-        var e = nextStart - padding;
-        if (e > s + 0.02) {
-          removeIntervals.push({
-            startSec: s,
-            endSec: e,
-            reason: 'пауза между фразами ' + gap.toFixed(2) + 'с'
-          });
-        }
-      }
-    }
-
-    /* Источник 2: ffmpeg silencedetect (дополнительные тишины) */
     var silences = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
-    for (var si = 0; si < silences.length; si++) {
-      var sil = silences[si];
-      var silStart = typeof sil.startSec === 'number' ? sil.startSec : (typeof sil.start === 'number' ? sil.start : NaN);
-      var silEnd = typeof sil.endSec === 'number' ? sil.endSec : (typeof sil.end === 'number' ? sil.end : NaN);
-      if (isNaN(silStart) || isNaN(silEnd)) continue;
-      var silDur = silEnd - silStart;
-      if (silDur >= maxPause) {
-        var ss = silStart + padding;
-        var se = silEnd - padding;
-        if (se > ss + 0.02) {
-          removeIntervals.push({
-            startSec: ss,
-            endSec: se,
-            reason: 'тишина (аудио) ' + silDur.toFixed(2) + 'с'
-          });
-        }
-      }
-    }
+
+    /* R13: применяем тот же gating по threshold, что и cutSilences. */
+    var removeIntervals = detectSilenceIntervals(entry, {
+      minDuration: maxPause,
+      padding: keepBreathing,
+      source: 'gaps+ffmpeg'
+      /* thresholdDb опущен → detectSilenceIntervals использует silenceThresholdUsed из entry */
+    });
 
     if (removeIntervals.length === 0) {
       return {
@@ -510,8 +575,44 @@
 
     removeIntervals = _mergeIntervals(removeIntervals);
 
+    /* R15: поглощаем крошечные речевые сегменты между соседними вырезами.
+       Если между cur.endSec и next.startSec меньше minSegmentDuration —
+       мёрджим интервалы (мусорный микро-клип исчезает). */
+    if (minSegmentDuration > 0 && removeIntervals.length > 1) {
+      var merged = [removeIntervals[0]];
+      for (var mi = 1; mi < removeIntervals.length; mi++) {
+        var prev = merged[merged.length - 1];
+        var cur = removeIntervals[mi];
+        var gapBetween = cur.startSec - prev.endSec;
+        if (gapBetween > 0 && gapBetween < minSegmentDuration) {
+          prev.endSec = cur.endSec;
+          prev.reason = prev.reason + '; ' + cur.reason +
+            ' (+ мини-сегмент ' + gapBetween.toFixed(2) + 'с поглощён)';
+        } else {
+          merged.push(cur);
+        }
+      }
+      removeIntervals = merged;
+    }
+
+    /* Фильтр микро-зазоров: интервалы < 0.15с оставляют 2-3 кадра мусора после razor */
+    var MIN_CUT = 0.15;
+    removeIntervals = removeIntervals.filter(function (iv) {
+      return (iv.endSec - iv.startSec) >= MIN_CUT;
+    });
+
+    if (removeIntervals.length === 0) {
+      return {
+        ok: true,
+        summary: 'Пауз длиннее ' + maxPause + 'с не найдено после фильтрации микро-зазоров.',
+        noChanges: true
+      };
+    }
+
     var totalRemoveSec = 0;
     removeIntervals.forEach(function (iv) { totalRemoveSec += iv.endSec - iv.startSec; });
+
+    var breathLabel = keepBreathing > 0 ? ', дыхание ' + (keepBreathing * 1000).toFixed(0) + 'мс' : ', без дыхания';
 
     return {
       ok: true,
@@ -519,7 +620,7 @@
         kind: 'transcript_cuts',
         removeIntervals: removeIntervals,
         summary: 'Jump cuts: ' + removeIntervals.length + ' пауз (>' + maxPause + 'с, суммарно ' +
-          totalRemoveSec.toFixed(1) + 'с). Вырезать?',
+          totalRemoveSec.toFixed(1) + 'с' + breathLabel + '). Вырезать?',
         removeSummary: removeIntervals.map(function (iv) {
           return { startSec: iv.startSec, endSec: iv.endSec, reason: iv.reason };
         })
@@ -597,14 +698,85 @@
       var nextTime = (c + 1 < numChapters) ? (c + 1) * step : totalDur;
       var previewText = _getTextInRange(segments, snapTime, snapTime + 10).slice(0, 40);
 
+      /* US-005: осмысленные названия вместо «Часть N».
+         Для первой главы оставляем «Вступление», для остальных — первые 4 слова
+         ближайшего сегмента. Если текста нет — fallback на «Часть N». */
+      var title;
+      if (c === 0) {
+        title = 'Вступление';
+      } else {
+        title = _firstWordsFromSegments(segments, snapTime, nextTime) || ('Часть ' + (c + 1));
+      }
+
       chapters.push({
         startSec: snapTime,
         endSec: nextTime,
-        title: c === 0 ? 'Вступление' : 'Часть ' + (c + 1),
+        title: title,
         summary: previewText || ''
       });
     }
     return chapters;
+  }
+
+  /**
+   * US-005: адаптивный min-interval между главами в зависимости от длительности.
+   *   <3min  = 10s
+   *   3-10min = 20s
+   *   >10min = 45s
+   */
+  function _adaptiveChapterMinInterval(totalDurSec) {
+    if (!totalDurSec || totalDurSec <= 0) return 15;
+    if (totalDurSec < 180) return 10;
+    if (totalDurSec <= 600) return 20;
+    return 45;
+  }
+
+  /**
+   * US-005: первые 4 слова из абзаца/сегмента в диапазоне [startSec, endSec].
+   * Используется для замены boilerplate-заголовков вроде «Часть N».
+   */
+  function _firstWordsForChapter(paragraphs, segments, startSec, endSec) {
+    var reference = (typeof endSec === 'number' && endSec > startSec) ? endSec : (startSec + 15);
+    /* Ищем первый абзац, пересекающий окно */
+    if (paragraphs && paragraphs.length) {
+      for (var p = 0; p < paragraphs.length; p++) {
+        var par = paragraphs[p];
+        var ps = typeof par.startSec === 'number' ? par.startSec : par.start;
+        var pe = typeof par.endSec === 'number' ? par.endSec : par.end;
+        if (typeof ps !== 'number' || typeof pe !== 'number') continue;
+        if (pe > startSec && ps < reference) {
+          var w = _firstNWords(par.text, 4);
+          if (w) return w;
+        }
+      }
+    }
+    /* Fallback — по сегментам в окне */
+    return _firstWordsFromSegments(segments, startSec, reference) || 'Глава';
+  }
+
+  function _firstWordsFromSegments(segments, startSec, endSec) {
+    if (!segments || !segments.length) return '';
+    var collected = '';
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      var s = typeof seg.startSec === 'number' ? seg.startSec : seg.start;
+      var e = typeof seg.endSec === 'number' ? seg.endSec : seg.end;
+      if (typeof s !== 'number') continue;
+      if (typeof e === 'number' ? (e > startSec && s < endSec) : (s >= startSec && s < endSec)) {
+        collected += ' ' + String(seg.text || '').trim();
+        if (collected.split(/\s+/).filter(Boolean).length >= 6) break;
+      }
+    }
+    return _firstNWords(collected, 4);
+  }
+
+  function _firstNWords(text, n) {
+    var words = String(text || '')
+      .replace(/[«»"'()\[\]{}]/g, '')
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, n);
+    return words.join(' ').trim();
   }
 
   /**
@@ -740,6 +912,7 @@
     chapterize: chapterize,
     jumpCuts: jumpCuts,
     jCuts: jCuts,
+    detectSilenceIntervals: detectSilenceIntervals,
     parsePipelineCommand: parsePipelineCommand,
     _mergeIntervals: _mergeIntervals,
     _silencesFromSegmentGaps: _silencesFromSegmentGaps

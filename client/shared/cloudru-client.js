@@ -52,31 +52,71 @@
   }
 
   /* ─── Retry wrapper ───────────────────────────────────────────────
-   * Retry 2-3x for 5xx/429 errors with exponential backoff.
+   * Retry 2-3x for 5xx/429 errors with exponential backoff + jitter.
    * Don't retry 4xx (except 429) — those are client errors.
+   *
+   * Встроенный timeout: если запрос висит >FETCH_TIMEOUT_MS без ответа —
+   * прерываем через AbortController. Без этого при зависшем FM UI замирал
+   * до ручной отмены пользователем.
    */
   var MAX_RETRIES = 3;
   var BASE_DELAY_MS = 1000;
+  var FETCH_TIMEOUT_MS = 120000; /* 2 минуты на одну попытку */
 
-  async function fetchWithRetry(url, fetchOpts, abortCheck) {
+  async function fetchWithRetry(url, fetchOpts, abortCheck, opts) {
+    opts = opts || {};
+    var timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : FETCH_TIMEOUT_MS;
     var lastErr = null;
     for (var attempt = 0; attempt < MAX_RETRIES; attempt++) {
       throwIfAbortCheck(abortCheck);
+
+      /* Per-attempt AbortController — отдельный, чтобы внешний signal
+         от caller'а продолжал работать параллельно. */
+      var ctrl = null;
+      var tmId = null;
+      var mergedOpts = fetchOpts;
+      if (typeof AbortController !== 'undefined' && timeoutMs > 0) {
+        ctrl = new AbortController();
+        tmId = setTimeout(function () {
+          try { ctrl.abort(); } catch (_) {}
+        }, timeoutMs);
+        mergedOpts = Object.assign({}, fetchOpts, { signal: ctrl.signal });
+        /* Если caller передал свой signal — слушаем оба. */
+        if (fetchOpts && fetchOpts.signal) {
+          try {
+            fetchOpts.signal.addEventListener('abort', function () {
+              try { ctrl.abort(); } catch (_) {}
+            });
+          } catch (_) {}
+        }
+      }
+
       try {
-        var res = await fetch(url, fetchOpts);
+        var res = await fetch(url, mergedOpts);
+        if (tmId) clearTimeout(tmId);
         if (!isRetryable(res.status) || attempt === MAX_RETRIES - 1) {
           return res;
         }
         /* Retryable error — wait and try again */
         lastErr = new Error('HTTP ' + res.status);
       } catch (fetchErr) {
-        if (fetchErr && fetchErr.name === 'AbortError') throw fetchErr;
-        if (attempt === MAX_RETRIES - 1) throw fetchErr;
-        lastErr = fetchErr;
+        if (tmId) clearTimeout(tmId);
+        /* AbortError от внешнего abortCheck — пробрасываем. */
+        if (fetchErr && fetchErr.name === 'AbortError') {
+          if (typeof abortCheck === 'function' && abortCheck()) throw fetchErr;
+          /* Иначе это наш таймаут — делаем retryable ошибкой. */
+          lastErr = new Error('Таймаут запроса (' + (timeoutMs / 1000).toFixed(0) + 'с)');
+          if (attempt === MAX_RETRIES - 1) throw lastErr;
+        } else {
+          if (attempt === MAX_RETRIES - 1) throw fetchErr;
+          lastErr = fetchErr;
+        }
       }
-      /* Exponential backoff: 1s, 2s, 4s */
-      var delayMs = BASE_DELAY_MS * Math.pow(2, attempt);
-      await sleep(delayMs);
+      /* Exponential backoff с джиттером (±20%): 1s, 2s, 4s — рандомизация
+         спасает от синхронного retry-шторма при параллельных чанках. */
+      var base = BASE_DELAY_MS * Math.pow(2, attempt);
+      var jitter = base * 0.2 * (Math.random() * 2 - 1);
+      await sleep(Math.round(base + jitter));
     }
     throw lastErr || new Error('Retry exhausted');
   }

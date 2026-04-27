@@ -343,6 +343,185 @@ describe('DeterministicPipelines.jumpCuts', () => {
     assert.equal(r.ok, true);
     assert.equal(r.noChanges, true);
   });
+
+  test('keepBreathing=0.05 → padding в интервалах 50мс, не ноль', async () => {
+    const entry = makeEntry(
+      [{ startSec: 0, endSec: 20, text: 'тест' }],
+      {
+        audioAnalysis: {
+          silences: [{ startSec: 5, endSec: 7 }] /* 2с → >maxPause */
+        }
+      }
+    );
+    const r = await DP.jumpCuts(makeCtx({ transcriptEntry: entry }), {
+      maxPause: 0.5,
+      keepBreathing: 0.05,
+      minSegmentDuration: 0
+    });
+    assert.equal(r.ok, true);
+    assert.ok(r.proposal);
+    const iv = r.proposal.removeIntervals[0];
+    /* дыхание 0.05с с каждой стороны */
+    assert.ok(Math.abs(iv.startSec - 5.05) < 0.001, 'startSec должен быть 5.05 (5 + 0.05)');
+    assert.ok(Math.abs(iv.endSec - 6.95) < 0.001, 'endSec должен быть 6.95 (7 - 0.05)');
+  });
+
+  test('keepBreathing=0 → режет в ноль (startSec/endSec = границы тишины)', async () => {
+    const entry = makeEntry(
+      [{ startSec: 0, endSec: 20, text: 'тест' }],
+      {
+        audioAnalysis: {
+          silences: [{ startSec: 5, endSec: 7 }]
+        }
+      }
+    );
+    const r = await DP.jumpCuts(makeCtx({ transcriptEntry: entry }), {
+      maxPause: 0.5,
+      keepBreathing: 0,
+      minSegmentDuration: 0
+    });
+    const iv = r.proposal.removeIntervals[0];
+    assert.equal(iv.startSec, 5);
+    assert.equal(iv.endSec, 7);
+  });
+
+  test('minSegmentDuration=0.3 → соседние интервалы с мини-сегментом между ними поглощаются', async () => {
+    /* Два интервала тишины с речью в 0.2с между ними — должны слиться. */
+    const entry = makeEntry(
+      [{ startSec: 0, endSec: 20, text: 'тест' }],
+      {
+        audioAnalysis: {
+          silences: [
+            { startSec: 5, endSec: 7 },    /* 2с */
+            { startSec: 7.2, endSec: 9 }  /* 1.8с, gap 0.2с */
+          ]
+        }
+      }
+    );
+    const r = await DP.jumpCuts(makeCtx({ transcriptEntry: entry }), {
+      maxPause: 0.5,
+      keepBreathing: 0,
+      minSegmentDuration: 0.3
+    });
+    assert.equal(r.proposal.removeIntervals.length, 1, 'два интервала с мини-gap 0.2с должны слиться');
+    const iv = r.proposal.removeIntervals[0];
+    assert.equal(iv.startSec, 5);
+    assert.equal(iv.endSec, 9);
+  });
+
+  test('minSegmentDuration=0 → интервалы НЕ мёрджатся по gap', async () => {
+    const entry = makeEntry(
+      [{ startSec: 0, endSec: 20, text: 'тест' }],
+      {
+        audioAnalysis: {
+          silences: [
+            { startSec: 5, endSec: 7 },
+            { startSec: 7.2, endSec: 9 }
+          ]
+        }
+      }
+    );
+    const r = await DP.jumpCuts(makeCtx({ transcriptEntry: entry }), {
+      maxPause: 0.5,
+      keepBreathing: 0,
+      minSegmentDuration: 0
+    });
+    assert.equal(r.proposal.removeIntervals.length, 2);
+  });
+
+  test('R13: jumpCuts gating по threshold — строгий порог убирает ffmpeg тишины', async () => {
+    /* silenceThresholdUsed=-30; пользователь хочет -40 (строже) →
+       ffmpeg silences обнаружены при -30 и не попадают в результат. */
+    const entry = makeEntry(
+      [{ startSec: 0, endSec: 20, text: 'тест' }],
+      {
+        audioAnalysis: {
+          silenceThresholdUsed: -30,
+          silences: [{ startSec: 5, endSec: 7 }]
+        }
+      }
+    );
+    /* direct call detectSilenceIntervals with stricter threshold */
+    const intervals = DP.detectSilenceIntervals(entry, {
+      minDuration: 0.5,
+      padding: 0,
+      thresholdDb: -40, /* строже чем -30 → gating отсекает ffmpeg */
+      source: 'gaps+ffmpeg'
+    });
+    assert.equal(intervals.length, 0, 'ffmpeg тишина должна быть отфильтрована строгим порогом');
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * detectSilenceIntervals (shared helper)
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('DeterministicPipelines.detectSilenceIntervals', () => {
+  test('source=gaps — только gaps между сегментами', () => {
+    const entry = makeEntry(
+      [
+        { startSec: 0, endSec: 3, text: 'a' },
+        { startSec: 5, endSec: 8, text: 'b' } /* gap 2с */
+      ],
+      {
+        audioAnalysis: {
+          silences: [{ startSec: 10, endSec: 12 }]
+        }
+      }
+    );
+    const r = DP.detectSilenceIntervals(entry, { minDuration: 1, padding: 0, source: 'gaps' });
+    assert.equal(r.length, 1);
+    assert.equal(r[0].startSec, 3);
+    assert.equal(r[0].endSec, 5);
+  });
+
+  test('source=ffmpeg — только ffmpeg silences, gaps игнорируются', () => {
+    const entry = makeEntry(
+      [
+        { startSec: 0, endSec: 3, text: 'a' },
+        { startSec: 5, endSec: 8, text: 'b' }
+      ],
+      {
+        audioAnalysis: {
+          silenceThresholdUsed: -30,
+          silences: [{ startSec: 10, endSec: 12 }]
+        }
+      }
+    );
+    const r = DP.detectSilenceIntervals(entry, { minDuration: 1, padding: 0, source: 'ffmpeg' });
+    assert.equal(r.length, 1);
+    assert.equal(r[0].startSec, 10);
+    assert.equal(r[0].endSec, 12);
+  });
+
+  test('source=gaps+ffmpeg (default) — оба источника', () => {
+    const entry = makeEntry(
+      [
+        { startSec: 0, endSec: 3, text: 'a' },
+        { startSec: 5, endSec: 8, text: 'b' }
+      ],
+      {
+        audioAnalysis: {
+          silenceThresholdUsed: -30,
+          silences: [{ startSec: 10, endSec: 12 }]
+        }
+      }
+    );
+    const r = DP.detectSilenceIntervals(entry, { minDuration: 1, padding: 0 });
+    assert.equal(r.length, 2);
+  });
+
+  test('padding применяется к обоим источникам', () => {
+    const entry = makeEntry(
+      [
+        { startSec: 0, endSec: 3, text: 'a' },
+        { startSec: 6, endSec: 9, text: 'b' }
+      ]
+    );
+    const r = DP.detectSilenceIntervals(entry, { minDuration: 1, padding: 0.3, source: 'gaps' });
+    assert.equal(r[0].startSec, 3.3);
+    assert.equal(r[0].endSec, 5.7);
+  });
 });
 
 /* ═══════════════════════════════════════════════════════════════
@@ -413,6 +592,144 @@ describe('DeterministicPipelines.chapterize', () => {
     assert.ok(r.proposal);
     assert.equal(r.proposal.kind, 'markers');
     assert.ok(r.proposal.markers.length >= 2, 'time-based fallback должен дать ≥2 глав');
+  });
+
+  /* US-005: adaptive min-interval между главами (3 тира длительности) */
+  test('US-005: короткий ролик (<3min) — min-interval 10с, главы через 10с проходят', async () => {
+    /* 120с, главы на 0, 10, 20, 30 — все должны пройти при пороге 10с */
+    const segs = [];
+    for (let i = 0; i < 12; i++) {
+      segs.push({ startSec: i * 10, endSec: (i + 1) * 10, text: 'Текст ' + i });
+    }
+    const entry = makeEntry(segs, {
+      topics: [
+        { startSec: 0, endSec: 10, title: 'Альфа тема один', summary: '' },
+        { startSec: 10, endSec: 20, title: 'Бета тема два', summary: '' },
+        { startSec: 20, endSec: 30, title: 'Гамма тема три', summary: '' },
+        { startSec: 30, endSec: 40, title: 'Дельта тема четыре', summary: '' }
+      ]
+    });
+    const r = await DP.chapterize(makeCtx({ transcriptEntry: entry }));
+    assert.equal(r.ok, true);
+    assert.equal(r.proposal.markers.length, 4, 'при 120с порог 10с должен пропустить все 4 главы');
+  });
+
+  test('US-005: средний ролик (3-10min) — min-interval 20с, главы через 15с отсеиваются', async () => {
+    const segs = [];
+    for (let i = 0; i < 30; i++) {
+      segs.push({ startSec: i * 20, endSec: (i + 1) * 20, text: 'Текст ' + i });
+    }
+    /* 600с, главы на 0/15/30/50 — при пороге 20с вторая (15с) отсеется, третья (30с от 0) пройдёт */
+    const entry = makeEntry(segs, {
+      topics: [
+        { startSec: 0, endSec: 15, title: 'Альфа раз два', summary: '' },
+        { startSec: 15, endSec: 30, title: 'Бета три четыре', summary: '' },
+        { startSec: 30, endSec: 50, title: 'Гамма пять шесть', summary: '' },
+        { startSec: 50, endSec: 70, title: 'Дельта семь восемь', summary: '' }
+      ]
+    });
+    const r = await DP.chapterize(makeCtx({ transcriptEntry: entry }));
+    assert.equal(r.ok, true);
+    /* 0 (keep) → 15 (15с < 20 → skip) → 30 (30с от 0 → keep) → 50 (20с → keep) */
+    assert.equal(r.proposal.markers.length, 3);
+  });
+
+  test('US-005: длинный ролик (>10min) — min-interval 45с, главы через 20-30с отсеиваются', async () => {
+    const segs = [];
+    for (let i = 0; i < 50; i++) {
+      segs.push({ startSec: i * 20, endSec: (i + 1) * 20, text: 'Текст ' + i });
+    }
+    /* 1000с → порог 45с. Главы на 0/20/40/50/100 */
+    const entry = makeEntry(segs, {
+      topics: [
+        { startSec: 0, endSec: 20, title: 'Альфа раз', summary: '' },
+        { startSec: 20, endSec: 40, title: 'Бета два', summary: '' },
+        { startSec: 40, endSec: 50, title: 'Гамма три', summary: '' },
+        { startSec: 50, endSec: 100, title: 'Дельта четыре', summary: '' },
+        { startSec: 100, endSec: 200, title: 'Эпсилон пять', summary: '' }
+      ]
+    });
+    const r = await DP.chapterize(makeCtx({ transcriptEntry: entry }));
+    assert.equal(r.ok, true);
+    /* 0 (keep) → 20 skip → 40 skip → 50 keep (50с от 0) → 100 keep (50с от 50) */
+    assert.equal(r.proposal.markers.length, 3);
+  });
+
+  /* US-005: boilerplate-имена («Часть N», «Продолжение», «Следующая часть») заменяются */
+  test('US-005: название «Часть 2» заменяется на реальные слова из абзаца', async () => {
+    const segs = [
+      { startSec: 0, endSec: 30, text: 'Вступительный текст про проект' },
+      { startSec: 30, endSec: 60, text: 'Архитектура системы состоит из компонентов' },
+      { startSec: 60, endSec: 90, text: 'Заключение подведение итогов' }
+    ];
+    const entry = makeEntry(segs, {
+      paragraphs: [
+        { startSec: 0, endSec: 30, text: 'Вступительный текст про проект' },
+        { startSec: 30, endSec: 60, text: 'Архитектура системы состоит из компонентов' },
+        { startSec: 60, endSec: 90, text: 'Заключение подведение итогов' }
+      ],
+      topics: [
+        { startSec: 0, endSec: 30, title: 'Вступление', summary: '' },
+        { startSec: 30, endSec: 60, title: 'Часть 2', summary: '' },
+        { startSec: 60, endSec: 90, title: 'Продолжение', summary: '' }
+      ]
+    });
+    const r = await DP.chapterize(makeCtx({ transcriptEntry: entry }));
+    assert.equal(r.ok, true);
+    assert.equal(r.proposal.markers[0].name, 'Вступление');
+    assert.doesNotMatch(r.proposal.markers[1].name, /^часть\s*\d+$/i, '«Часть 2» должно быть заменено');
+    assert.ok(r.proposal.markers[1].name.length > 0);
+    assert.doesNotMatch(r.proposal.markers[2].name, /^продолжение$/i, '«Продолжение» должно быть заменено');
+  });
+
+  test('US-005: boilerplate-паттерны «Part 3», «Следующая часть» тоже ловятся', async () => {
+    const segs = [
+      { startSec: 0, endSec: 30, text: 'Обзор решения и контекст' },
+      { startSec: 30, endSec: 60, text: 'Детали реализации модулей кода' }
+    ];
+    const entry = makeEntry(segs, {
+      paragraphs: [
+        { startSec: 0, endSec: 30, text: 'Обзор решения и контекст' },
+        { startSec: 30, endSec: 60, text: 'Детали реализации модулей кода' }
+      ],
+      topics: [
+        { startSec: 0, endSec: 30, title: 'Part 3', summary: '' },
+        { startSec: 30, endSec: 60, title: 'Следующая часть', summary: '' }
+      ]
+    });
+    const r = await DP.chapterize(makeCtx({ transcriptEntry: entry }));
+    assert.equal(r.ok, true);
+    assert.doesNotMatch(r.proposal.markers[0].name, /^part\s*\d+$/i);
+    assert.doesNotMatch(r.proposal.markers[1].name, /^следующ.+часть$/i);
+  });
+
+  test('US-005: time-based fallback даёт осмысленные названия, не «Часть N»', async () => {
+    const segs = [];
+    for (let i = 0; i < 20; i++) {
+      segs.push({
+        startSec: i * 10,
+        endSec: (i + 1) * 10,
+        text: 'Сегмент ' + i + ' интересный смысловой контент'
+      });
+    }
+    const entry = makeEntry(segs);
+    const DP2 = loadDeterministicPipelines({
+      TranscriptStructure: {
+        buildParagraphs: () => [],
+        buildTopicsWithLLM: () => Promise.resolve([])
+      }
+    });
+    const r = await DP2.chapterize(makeCtx({ transcriptEntry: entry }));
+    assert.equal(r.ok, true);
+    /* markers[0] = 'Вступление', остальные должны быть НЕ «Часть N» */
+    for (let i = 1; i < r.proposal.markers.length; i++) {
+      assert.doesNotMatch(
+        r.proposal.markers[i].name,
+        /^часть\s*\d+$/i,
+        'fallback-глава ' + i + ' должна содержать реальные слова, а не «Часть N»: ' + r.proposal.markers[i].name
+      );
+      assert.ok(r.proposal.markers[i].name.length > 0);
+    }
   });
 });
 

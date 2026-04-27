@@ -338,12 +338,13 @@ PanelBoot.run('ИИ: монтаж', function () {
       'function': {
         name: 'propose_transcript_cuts',
         description:
-          'Предложить план вырезания интервалов пользователю на подтверждение (НЕ выполняет правку). Покажет карточку «Применить / Отмена». Передавай keepSummary и removeSummary с цитатами.',
+          'Предложить план вырезания интервалов пользователю на подтверждение (НЕ выполняет правку). Покажет карточку «Применить / Отмена». Передавай keepSummary и removeSummary с цитатами. ДЛЯ СБОРОЧНОГО МОНТАЖА («собери ролик про X», «сделай выжимку»): используй keepIntervals — список того, что ОСТАВИТЬ. Плагин сам вычислит removeIntervals как дополнение. keepIntervals и removeIntervals взаимоисключают друг друга.',
         parameters: {
           type: 'object',
           properties: {
             removeIntervals: {
               type: 'array',
+              description: 'Интервалы для удаления. Используй для обычной чистки («убери паузы»).',
               items: {
                 type: 'object',
                 properties: {
@@ -353,6 +354,24 @@ PanelBoot.run('ИИ: монтаж', function () {
                 },
                 required: ['startSec', 'endSec']
               }
+            },
+            keepIntervals: {
+              type: 'array',
+              description: 'Интервалы, которые ОСТАВИТЬ (сборочный монтаж). Плагин вычислит removeIntervals автоматически как дополнение к этим интервалам. Границы выровняются по сегментам транскрипта. Не передавай вместе с removeIntervals.',
+              items: {
+                type: 'object',
+                properties: {
+                  startSec: { type: 'number' },
+                  endSec: { type: 'number' },
+                  reason: { type: 'string' }
+                },
+                required: ['startSec', 'endSec']
+              }
+            },
+            sequenceKey: { type: 'string', description: 'Имя секвенции. Нужно для keepIntervals-инверсии (чтобы знать границы транскрипта).' },
+            paddingSec: {
+              type: 'number',
+              description: 'Дыхание в секундах вокруг каждого removeInterval (по умолчанию 0.3). Каждый интервал ужимается на padding с обеих сторон, чтобы оставить запас перед/после фразы — речь не будет звучать обрезанной. 0 = резать впритык. Применяется ДО привязки к границам сегментов. Хорошие значения: 0.2 для агрессивного монтажа, 0.3 default, 0.5 для медитативной речи.'
             },
             keepSummary: {
               type: 'array',
@@ -379,7 +398,7 @@ PanelBoot.run('ИИ: монтаж', function () {
             },
             summary: { type: 'string' }
           },
-          required: ['removeIntervals', 'summary']
+          required: ['summary']
         }
       }
     },
@@ -490,7 +509,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       'function': {
         name: 'analyze_transcript_for_cuts',
         description:
-          'Анализ транскрипта: локальные детекторы + LLM. Классифицирует сегменты (content/filler/intro/outro/outtake/repeat/artifact/digression). Возвращает removeIntervals. Кэш 30 мин.',
+          'Анализ транскрипта: локальные детекторы + LLM. Классифицирует сегменты (content/filler/intro/outro/outtake/repeat/artifact/digression). Возвращает removeIntervals. Кэш 30 мин. Параметр aggressiveness регулирует, насколько много попадает в toRemove (по умолчанию normal).',
         parameters: {
           type: 'object',
           properties: {
@@ -499,6 +518,11 @@ PanelBoot.run('ИИ: монтаж', function () {
               type: 'array',
               items: { type: 'string', enum: ['filler', 'intro', 'outro', 'outtake', 'repeat', 'artifact', 'digression'] },
               description: 'Какие категории искать. По умолчанию все. Примеры: ["filler","intro"] для «убери паразиты и вступление»; ["outtake","repeat"] для «убери оговорки и повторы».'
+            },
+            aggressiveness: {
+              type: 'string',
+              enum: ['gentle', 'normal', 'aggressive'],
+              description: 'Агрессивность роутинга меток в toRemove. gentle: только filler+artifact режем; intro/outro/outtake/repeat/digression остаются в toKeep. normal (по умолчанию): filler+artifact+intro+outro+outtake+repeat режем, digression остаётся. aggressive: всё не-content режем (включая digression — для «убери всю воду»).'
             },
             forceRefresh: { type: 'boolean', description: 'true — игнорировать кэш и запустить анализ заново.' }
           },
@@ -936,6 +960,68 @@ PanelBoot.run('ИИ: монтаж', function () {
    * Предотвращает обрезку слов на полуслове: startSec привязывается к ближайшему
    * segment.startSec/endSec, endSec — аналогично, с приоритетом на ближайший endSec.
    */
+  /**
+   * «Дыхание» вокруг семантических резов: ужимает каждый removeInterval
+   * на padding с обеих сторон. Если интервал становится слишком коротким
+   * (< 0.05с) — отбрасывается.
+   *
+   * Заимствовано из openshorts (main.py): «start 0.2–0.4s ДО hook, end 0.2–0.4s ПОСЛЕ payoff».
+   * Применяется ДО snapIntervalsToSegmentBoundaries.
+   */
+  function _padRemoveIntervals(removeIntervals, paddingSec) {
+    if (!Array.isArray(removeIntervals) || !removeIntervals.length) return removeIntervals;
+    if (!paddingSec || paddingSec <= 0) return removeIntervals;
+    var MIN_DURATION = 0.05;
+    var out = [];
+    for (var i = 0; i < removeIntervals.length; i++) {
+      var iv = removeIntervals[i];
+      if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') continue;
+      var s = iv.startSec + paddingSec;
+      var e = iv.endSec - paddingSec;
+      if (e - s < MIN_DURATION) continue; /* интервал короче 2*padding — пропустить полностью */
+      out.push({ startSec: s, endSec: e, reason: iv.reason });
+    }
+    return out;
+  }
+
+  /**
+   * Форматирует маркеры-главы в YouTube-описание.
+   * Делегирует в YouTubeExport (../shared/youtube-export.js) — чистая функция,
+   * покрытая unit-тестами в tests/youtube-export.test.mjs.
+   * Локальный fallback нужен если глобал не загрузился (бутстрап-баг).
+   */
+  function _formatChaptersForYouTube(markers) {
+    if (typeof YouTubeExport !== 'undefined' && YouTubeExport.formatChaptersForYouTube) {
+      return YouTubeExport.formatChaptersForYouTube(markers);
+    }
+    /* Минимальный fallback. */
+    if (!Array.isArray(markers) || !markers.length) return '';
+    return markers.map(function (m) {
+      var t = Math.max(0, Math.floor(m.timeSec || 0));
+      var mm = Math.floor(t / 60), ss = t % 60;
+      var pad = function (n) { return n < 10 ? '0' + n : String(n); };
+      return mm + ':' + pad(ss) + ' ' + (m.name || 'Глава');
+    }).join('\n');
+  }
+
+  /**
+   * Fallback-копирование через временный textarea (CEP < Chromium 92).
+   */
+  function _fallbackCopy(text, statusEl) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:-100px;left:-100px;opacity:0;';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      if (statusEl) statusEl.textContent = ok ? 'Скопировано' : 'Ошибка копирования';
+    } catch (e) {
+      if (statusEl) statusEl.textContent = 'Ошибка: ' + (e.message || e);
+    }
+  }
+
   function snapIntervalsToSegmentBoundaries(removeIntervals) {
     if (!removeIntervals || !removeIntervals.length) return removeIntervals;
     /* Собираем сегменты из transcript кэша */
@@ -1274,6 +1360,50 @@ PanelBoot.run('ИИ: монтаж', function () {
         mList.appendChild(row);
       });
       card.appendChild(mList);
+
+      /* YouTube chapter export — заимствовано из openshorts (thumbnail.py:276).
+         Формат описания YouTube: «M:SS Название\n…», первый маркер ОБЯЗАН быть 0:00. */
+      var ytRow = document.createElement('div');
+      ytRow.style.cssText = 'margin-top:6px;display:flex;gap:6px;align-items:center;';
+      var ytBtn = document.createElement('button');
+      ytBtn.type = 'button';
+      ytBtn.textContent = '📋 Описание для YouTube';
+      ytBtn.style.cssText =
+        'font-size:11px;padding:4px 8px;background:rgba(255,0,0,0.08);' +
+        'border:1px solid rgba(255,0,0,0.35);color:#f88;border-radius:3px;cursor:pointer;';
+      ytBtn.title = 'Скопировать главы в формате YouTube-описания (0:00 Название…)';
+      var ytStatus = document.createElement('span');
+      ytStatus.style.cssText = 'font-size:10px;color:#888;';
+      ytBtn.addEventListener('click', function () {
+        var markers = _pendingProposal.markers || [];
+        var text = _formatChaptersForYouTube(markers);
+        if (!text) {
+          ytStatus.textContent = '— нет маркеров';
+          return;
+        }
+        /* YouTube требует минимум 3 главы для активации разметки в плеере.
+           Если меньше — копируем текст, но предупреждаем пользователя. */
+        if (markers.length < 3) {
+          ytStatus.textContent = '⚠ YouTube нужно ≥3 глав, у тебя ' + markers.length + ' — копирую как есть';
+        }
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () {
+              ytStatus.textContent = 'Скопировано (' + text.split('\n').length + ' глав)';
+            }, function () {
+              _fallbackCopy(text, ytStatus);
+            });
+          } else {
+            _fallbackCopy(text, ytStatus);
+          }
+        } catch (e) {
+          _fallbackCopy(text, ytStatus);
+        }
+      });
+      ytRow.appendChild(ytBtn);
+      ytRow.appendChild(ytStatus);
+      card.appendChild(ytRow);
+
       card.appendChild(_buildButtons('Создать маркеры'));
       el.chat.appendChild(card);
       el.chat.scrollTop = el.chat.scrollHeight;
@@ -1827,10 +1957,46 @@ PanelBoot.run('ИИ: монтаж', function () {
   }
 
   function execProposeTranscriptCuts(args) {
-    var vr = ToolValidators.validateTranscriptCuts(lastSnap, args);
+    args = args || {};
+    var hasRemove = Array.isArray(args.removeIntervals) && args.removeIntervals.length > 0;
+    var hasKeep = Array.isArray(args.keepIntervals) && args.keepIntervals.length > 0;
+
+    /* US-004: mutual exclusion */
+    if (hasRemove && hasKeep) {
+      return Promise.resolve({
+        validationError: 'Передавай ЛИБО removeIntervals (для «убери X»), ЛИБО keepIntervals ' +
+          '(для «собери ролик про X»). Одновременно нельзя — это неоднозначно.'
+      });
+    }
+    if (!hasRemove && !hasKeep) {
+      return Promise.resolve({
+        validationError: 'Нужен хотя бы один из: removeIntervals или keepIntervals.'
+      });
+    }
+
+    /* US-004: если keepIntervals — инвертируем в removeIntervals. */
+    var workingArgs = args;
+    if (hasKeep) {
+      var invRes = _invertKeepToRemove(args.keepIntervals, args.sequenceKey);
+      if (invRes.error) {
+        return Promise.resolve({ validationError: invRes.error });
+      }
+      workingArgs = Object.assign({}, args, { removeIntervals: invRes.removeIntervals });
+    }
+
+    var vr = ToolValidators.validateTranscriptCuts(lastSnap, workingArgs);
     if (vr && vr.error) return Promise.resolve({ validationError: vr.error });
+
+    /* «Дыхание» (padding 0.2–0.4с): ужимаем removeIntervals на padding с обеих сторон.
+       Идея заимствована из openshorts FFmpeg time contract: «start 0.2–0.4s ДО hook,
+       end 0.2–0.4s ПОСЛЕ payoff» — речь не звучит обрезанной.
+       Делаем ДО snap'а, иначе snap сначала зацепит границу слова, а потом padding
+       уведёт интервал внутрь следующего слова. */
+    var paddingSec = typeof args.paddingSec === 'number' ? Math.max(0, args.paddingSec) : 0.3;
+    var paddedIntervals = _padRemoveIntervals(workingArgs.removeIntervals || [], paddingSec);
+
     /* Snap к границам сегментов для предотвращения обрезки слов */
-    var snappedIntervals = snapIntervalsToSegmentBoundaries(args.removeIntervals || []);
+    var snappedIntervals = snapIntervalsToSegmentBoundaries(paddedIntervals);
     var verification = computeVerification(snappedIntervals);
     _pendingProposal = {
       kind: 'transcript_cuts',
@@ -1840,16 +2006,59 @@ PanelBoot.run('ИИ: монтаж', function () {
       summary: args.summary || '',
       verification: verification,
       snapshot: lastSnap,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      invertedFromKeep: hasKeep
     };
     renderPendingProposalCard();
     return Promise.resolve({
       ok: true,
       status: 'waiting_user_confirmation',
       message:
+        (hasKeep ? 'keepIntervals инвертированы в ' + snappedIntervals.length + ' removeIntervals. ' : '') +
         'План предложен пользователю. Жди, пока он нажмёт «Применить» или «Отмена». ' +
         'НЕ вызывай apply_transcript_cuts сам — это сделает UI по кнопке.',
       _verification: verification
+    });
+  }
+
+  /**
+   * US-004: инверсия keepIntervals → removeIntervals.
+   * Определяет границы транскрипта, делегирует пуре-инверсию в AnalysisRouting.
+   */
+  function _invertKeepToRemove(keepIntervals, sequenceKey) {
+    /* Определяем [minSec, maxSec] — границы транскрипта. */
+    var minSec = 0;
+    var maxSec = 0;
+    var segments = null;
+    var seqKey = sequenceKey ? _cleanSeqKey(sequenceKey) : '';
+    if (seqKey) {
+      var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqKey);
+      if (found && found.entry && found.entry.segments && found.entry.segments.length) {
+        segments = found.entry.segments;
+        var first = segments[0];
+        var last = segments[segments.length - 1];
+        var fs = typeof first.startSec === 'number' ? first.startSec : first.start;
+        var le = typeof last.endSec === 'number' ? last.endSec : last.end;
+        if (typeof fs === 'number') minSec = fs;
+        if (typeof le === 'number') maxSec = le;
+      }
+    }
+    /* Fallback: по снапшоту */
+    if (maxSec <= minSec && lastSnap && lastSnap.ok) {
+      minSec = typeof lastSnap.inPointSec === 'number' ? lastSnap.inPointSec : 0;
+      maxSec = typeof lastSnap.outPointSec === 'number' ? lastSnap.outPointSec : (lastSnap.durationSec || 0);
+    }
+    if (maxSec <= minSec) {
+      return { error: 'Не удалось определить границы транскрипта. Передай sequenceKey или сначала транскрибируй In-Out.' };
+    }
+
+    if (typeof AnalysisRouting === 'undefined' || !AnalysisRouting.invertKeepToRemove) {
+      return { error: 'AnalysisRouting.invertKeepToRemove не загружен (клиентский баг).' };
+    }
+    return AnalysisRouting.invertKeepToRemove(keepIntervals, {
+      minSec: minSec,
+      maxSec: maxSec,
+      segments: segments
     });
   }
 
@@ -2089,9 +2298,26 @@ PanelBoot.run('ИИ: монтаж', function () {
   var _analysisCache = {};
   var ANALYSIS_CACHE_TTL = 1800000; /* 30 мин */
 
-  function analysisCacheKey(seqKey, tasks) {
+  function analysisCacheKey(seqKey, tasks, aggressiveness) {
     var tk = tasks ? tasks.slice().sort().join(',') : '*';
-    return seqKey + '|' + tk;
+    var ag = aggressiveness || 'normal';
+    return seqKey + '|' + tk + '|' + ag;
+  }
+
+  /**
+   * Роутинг меток в toRemove по уровню агрессивности (US-003).
+   * Делегирует в AnalysisRouting (../shared/analysis-routing.js) для testability;
+   * inline-fallback на случай если модуль не подгрузился.
+   */
+  function _shouldRemoveLabel(label, aggressiveness) {
+    if (typeof AnalysisRouting !== 'undefined' && AnalysisRouting.shouldRemoveLabel) {
+      return AnalysisRouting.shouldRemoveLabel(label, aggressiveness);
+    }
+    if (label === 'content') return false;
+    var mode = aggressiveness || 'normal';
+    if (mode === 'gentle') return label === 'filler' || label === 'artifact';
+    if (mode === 'aggressive') return label !== 'content';
+    return label !== 'content' && label !== 'digression';
   }
 
   function execAnalyzeTranscriptForCuts(args) {
@@ -2120,9 +2346,11 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     var tasks = Array.isArray(args.tasks) ? args.tasks : null;
     var forceRefresh = args.forceRefresh === true;
+    var aggressiveness = args.aggressiveness === 'gentle' || args.aggressiveness === 'aggressive'
+      ? args.aggressiveness : 'normal';
 
     /* Проверяем кэш анализа */
-    var cKey = analysisCacheKey(found.matchedKey, tasks);
+    var cKey = analysisCacheKey(found.matchedKey, tasks, aggressiveness);
     if (!forceRefresh && _analysisCache[cKey] && (Date.now() - _analysisCache[cKey].timestamp < ANALYSIS_CACHE_TTL)) {
       statusUi.show('Анализ из кэша (повторный запрос)', false);
       setTimeout(function () { statusUi.hide(); }, 800);
@@ -2182,7 +2410,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           endSec: endSec,
           textPreview: String(seg.text || '').split(/\s+/).slice(0, 15).join(' ')
         };
-        if (lb.label !== 'content' && lb.label !== 'digression') {
+        if (_shouldRemoveLabel(lb.label, aggressiveness)) {
           toRemove.push(entry);
         } else {
           toKeep.push(entry);
@@ -2221,16 +2449,34 @@ PanelBoot.run('ИИ: монтаж', function () {
         });
       }
 
+      /* Прозрачность для агента и пользователя: сбойные чанки не должны быть
+         «невидимой грязью». Если хотя бы один чанк упал — LLM должен знать,
+         что для missedSegments получил content по умолчанию (не настоящую метку). */
+      var failedChunks = Array.isArray(result.failedChunks) ? result.failedChunks : [];
+      var missedSegments = typeof result.missedSegments === 'number' ? result.missedSegments : 0;
+      if (failedChunks.length > 0 && typeof statusUi !== 'undefined') {
+        statusUi.show(
+          '⚠ Анализ: ' + failedChunks.length + ' чанк(ов) не разобрано (~' + missedSegments +
+          ' сегм. помечены как content по умолчанию). Предложение может быть неточным.',
+          false
+        );
+      }
+
       var finalResult = {
         ok: true,
         sequenceKey: found.matchedKey,
         totalSegments: result.totalSegments,
         chunksUsed: result.chunks,
         analysisModel: settings.analysisModel || settings.activeAgentModel || settings.chatModel,
+        aggressiveness: aggressiveness,
         stats: result.stats,
         removeIntervals: removeIntervals,
         toRemove: toRemove,
         toKeep: toKeep,
+        /* Проброс в UI и в LLM-ответ tool-result'ом, чтобы агент
+           мог в ответе пользователю упомянуть снижение точности. */
+        failedChunks: failedChunks,
+        missedSegments: missedSegments,
         _hint: removeIntervals.length
           ? 'removeIntervals уже готовы для propose_transcript_cuts. ' +
             'Используй их напрямую: startSec/endSec выровнены по границам сегментов Whisper. ' +
@@ -2732,6 +2978,230 @@ PanelBoot.run('ИИ: монтаж', function () {
       el.moreMenu.classList.remove('open');
     };
   }
+  var btnExport = document.getElementById('btn-export-session');
+  if (btnExport) {
+    btnExport.onclick = function () {
+      try {
+        var fs = require('fs');
+        var path = require('path');
+        var os = require('os');
+        var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'sessions');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+        var messages = ContextStore.getMessages(active.panelId);
+        var snap = lastSnap || null;
+        var settings = ContextStore.getResolvedSettings();
+        var ts = new Date().toISOString().replace(/[:.]/g, '-');
+
+        var session = {
+          exportedAt: new Date().toISOString(),
+          panelId: active.panelId,
+          sequenceName: snap && snap.sequenceName ? snap.sequenceName : null,
+          messagesCount: messages.length,
+          messages: messages,
+          snapshot: snap,
+          settings: {
+            chatModel: settings.chatModel || null,
+            fastModel: settings.fastModel || null,
+            maxAgentSteps: settings.maxAgentSteps || null
+          }
+        };
+
+        var filePath = path.join(dir, 'session_' + ts + '.json');
+        fs.writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf8');
+        showErr('Сессия сохранена: ' + filePath);
+        setTimeout(function () { showErr(''); }, 4000);
+      } catch (e) {
+        showErr('Ошибка сохранения: ' + String(e.message || e));
+      }
+      el.moreMenu.classList.remove('open');
+    };
+  }
+
+  /* ── AI-отчёт о сессии ───────────────────────────────── */
+
+  /**
+   * Подготовить лог сессии: сжать tool_call results, убрать шум.
+   * Возвращает массив строк-чанков, каждый ≤ maxChars.
+   */
+  function _prepareSessionChunks(messages, maxChars) {
+    maxChars = maxChars || 12000;
+    var lines = [];
+    for (var i = 0; i < messages.length; i++) {
+      var m = messages[i];
+      var role = m.role || '?';
+      var content = String(m.content || '').trim();
+
+      /* Сжимаем tool results — оставляем первые 400 символов */
+      if (role === 'tool' || role === 'function') {
+        if (content.length > 400) content = content.slice(0, 400) + '…[обрезано]';
+      }
+      /* Сжимаем assistant tool_call JSON */
+      if (m.tool_calls && Array.isArray(m.tool_calls)) {
+        var tcSummary = m.tool_calls.map(function (tc) {
+          var fn = (tc['function'] && tc['function'].name) || tc.name || '?';
+          var args = (tc['function'] && tc['function'].arguments) || '';
+          if (typeof args === 'string' && args.length > 300) args = args.slice(0, 300) + '…';
+          return fn + '(' + args + ')';
+        }).join('; ');
+        content = (content ? content + '\n' : '') + '[tool_calls: ' + tcSummary + ']';
+      }
+      if (!content) continue;
+      lines.push('[' + role + '] ' + content);
+    }
+
+    /* Разбиваем на чанки по maxChars */
+    var chunks = [];
+    var cur = '';
+    for (var li = 0; li < lines.length; li++) {
+      var line = lines[li];
+      if (cur.length + line.length + 1 > maxChars && cur.length > 0) {
+        chunks.push(cur);
+        cur = '';
+      }
+      cur += (cur ? '\n' : '') + line;
+    }
+    if (cur) chunks.push(cur);
+    return chunks;
+  }
+
+  var REPORT_SYSTEM_PROMPT = [
+    'Ты — QA-аналитик плагина видеомонтажа для Adobe Premiere Pro (CEP-расширение).',
+    'Тебе дан лог сессии пользователя (сообщения чата между пользователем и AI-агентом монтажа).',
+    '',
+    'Проанализируй лог и выдай СТРУКТУРИРОВАННЫЙ отчёт в JSON:',
+    '{',
+    '  "summary": "Краткое описание сессии: что делал пользователь, сколько операций, общий результат",',
+    '  "errors": [{"message": "...", "context": "цитата из лога", "severity": "high|medium|low", "possibleCause": "..."}],',
+    '  "bugs": [{"description": "...", "reproSteps": "что привело к багу", "expected": "что должно было быть", "actual": "что произошло", "component": "имя модуля/функции"}],',
+    '  "quality_issues": [{"description": "...", "example": "цитата", "suggestion": "как улучшить"}],',
+    '  "successes": [{"tool": "имя инструмента", "result": "что получилось"}],',
+    '  "user_requests": [{"request": "что просил пользователь", "fulfilled": true/false, "notes": "..."}],',
+    '  "recommendations": ["что починить в первую очередь", "..."]',
+    '}',
+    '',
+    'ПРАВИЛА:',
+    '• severity: high = крэш/потеря данных/полная неработоспособность, medium = неправильный результат, low = косметика/UX.',
+    '• Если в логе есть ошибки API, validationError, «не удалось» — это errors.',
+    '• Если результат монтажа не соответствует запросу (вырезано не то, не тот хронометраж) — это quality_issues.',
+    '• Если инструмент вернул ok:false — это bug.',
+    '• Если логов несколько чанков — ты получишь их последовательно. Анализируй кумулятивно.',
+    '• Отвечай ТОЛЬКО валидным JSON без markdown-обёртки.'
+  ].join('\n');
+
+  async function _generateReport(messages, settings) {
+    var chunks = _prepareSessionChunks(messages, 12000);
+    if (!chunks.length) throw new Error('Нет сообщений для анализа.');
+
+    var apiOpts = {
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+      model: settings.analysisModel || settings.chatModel,
+      temperature: 0.2,
+      chatParams: { max_tokens: 4096 }
+    };
+
+    /* Если один чанк — один вызов */
+    if (chunks.length === 1) {
+      apiOpts.messages = [
+        { role: 'system', content: REPORT_SYSTEM_PROMPT },
+        { role: 'user', content: 'Лог сессии:\n\n' + chunks[0] }
+      ];
+      var resp = await CloudRuClient.chatCompletions(apiOpts);
+      return _extractReportJson(resp);
+    }
+
+    /* Несколько чанков: отправляем по очереди, финальный запрос — объединение */
+    var partialReports = [];
+    for (var ci = 0; ci < chunks.length; ci++) {
+      apiOpts.messages = [
+        { role: 'system', content: REPORT_SYSTEM_PROMPT },
+        { role: 'user', content: 'Часть ' + (ci + 1) + ' из ' + chunks.length + ' лога сессии:\n\n' + chunks[ci] + '\n\nПроанализируй эту часть. Выдай частичный отчёт JSON.' }
+      ];
+      var partResp = await CloudRuClient.chatCompletions(apiOpts);
+      partialReports.push(_extractContentText(partResp));
+    }
+
+    /* Объединяющий вызов */
+    apiOpts.messages = [
+      { role: 'system', content: REPORT_SYSTEM_PROMPT },
+      { role: 'user', content: 'Ниже частичные отчёты по чанкам одной сессии. Объедини их в ОДИН финальный отчёт JSON. Удали дубли, объедини ошибки, пересчитай summary.\n\n' + partialReports.join('\n\n---\n\n') }
+    ];
+    apiOpts.chatParams = { max_tokens: 8192 };
+    var finalResp = await CloudRuClient.chatCompletions(apiOpts);
+    return _extractReportJson(finalResp);
+  }
+
+  function _extractContentText(resp) {
+    if (resp && resp.choices && resp.choices[0] && resp.choices[0].message) {
+      return String(resp.choices[0].message.content || '');
+    }
+    return JSON.stringify(resp);
+  }
+
+  function _extractReportJson(resp) {
+    var text = _extractContentText(resp);
+    /* Убираем markdown code fences если есть */
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      /* Если не парсится — возвращаем как raw text в обёртке */
+      return { summary: 'Не удалось распарсить JSON ответ', raw: text };
+    }
+  }
+
+  var btnReport = document.getElementById('btn-export-report');
+  if (btnReport) {
+    btnReport.onclick = async function () {
+      el.moreMenu.classList.remove('open');
+      var messages = ContextStore.getMessages(active.panelId);
+      if (!messages.length) {
+        showErr('Нет сообщений для анализа.');
+        return;
+      }
+      var settings = ContextStore.getResolvedSettings();
+      if (!settings.apiKey || !settings.baseUrl) {
+        showErr('Не настроен API (fm-secrets.js / fm-defaults.js).');
+        return;
+      }
+
+      statusUi.show('Генерация AI-отчёта…', true);
+      btnReport.disabled = true;
+      try {
+        var report = await _generateReport(messages, settings);
+
+        /* Сохраняем на диск */
+        var fs = require('fs');
+        var path = require('path');
+        var os = require('os');
+        var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'reports');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        var ts = new Date().toISOString().replace(/[:.]/g, '-');
+
+        var envelope = {
+          reportDate: new Date().toISOString(),
+          sequenceName: lastSnap && lastSnap.sequenceName ? lastSnap.sequenceName : null,
+          model: settings.analysisModel || settings.chatModel,
+          messagesAnalyzed: messages.length,
+          chunksProcessed: _prepareSessionChunks(messages, 12000).length,
+          report: report
+        };
+
+        var filePath = path.join(dir, 'report_' + ts + '.json');
+        fs.writeFileSync(filePath, JSON.stringify(envelope, null, 2), 'utf8');
+        statusUi.hide();
+        showErr('Отчёт сохранён: ' + filePath);
+        setTimeout(function () { showErr(''); }, 6000);
+      } catch (e) {
+        statusUi.hide();
+        showErr('Ошибка генерации отчёта: ' + String(e.message || e));
+      } finally {
+        btnReport.disabled = false;
+      }
+    };
+  }
+
   var btnClrAll = document.getElementById('btn-clear-all');
   if (btnClrAll) {
     btnClrAll.onclick = function () {
@@ -2922,7 +3392,7 @@ PanelBoot.run('ИИ: монтаж', function () {
        Audio-клипы дублируют видео и добавляют шум. */
     statusUi.show('Получение снимка таймлайна…', true);
     try {
-      var autoSnap = await execGetSnapshot();
+      var autoSnap = await execGetSnapshot(true); /* ВСЕГДА свежий snap для каждого нового сообщения */
       if (autoSnap && autoSnap.ok) {
         var videoClips = (autoSnap.clips || []).filter(function (c) { return c.trackType === 'video'; });
         var audioOnlyClips = (autoSnap.clips || []).filter(function (c) {
@@ -3242,7 +3712,41 @@ PanelBoot.run('ИИ: монтаж', function () {
     bindSlider('sil-min', 'sil-min-val', 'с');
     bindSlider('sil-pad', 'sil-pad-val', 'с');
     bindSlider('jmp-pause', 'jmp-pause-val', 'с');
+    bindSlider('jmp-minseg', 'jmp-minseg-val', 'с');
     bindSlider('jcut-offset', 'jcut-offset-val', '');
+
+    /* jmp-breath: показываем миллисекунды для читаемости (0.05с → «50мс») */
+    (function () {
+      var s = document.getElementById('jmp-breath');
+      var v = document.getElementById('jmp-breath-val');
+      if (!s || !v) return;
+      function upd() {
+        var ms = Math.round(parseFloat(s.value) * 1000);
+        v.textContent = ms + 'мс';
+      }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+
+    /* Порог тишины: показываем «-X dB» */
+    (function () {
+      var s = document.getElementById('sil-thresh');
+      var v = document.getElementById('sil-thresh-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = '-' + s.value + ' dB'; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+
+    /* Кол-во глав: 0 = «авто» */
+    (function () {
+      var s = document.getElementById('ch-count');
+      var v = document.getElementById('ch-count-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = s.value === '0' ? 'авто' : s.value; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
 
     /* ── Toggle buttons ───────────────────────────────────── */
     function bindToggle(groupId) {
@@ -3391,6 +3895,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           pipelineFn = DeterministicPipelines.cutSilences;
           params.minDuration = parseFloat(document.getElementById('sil-min').value);
           params.padding = parseFloat(document.getElementById('sil-pad').value);
+          var silThreshEl = document.getElementById('sil-thresh');
+          if (silThreshEl) params.silenceThresholdDelta = parseInt(silThreshEl.value, 10);
           proposalId = 'proposal-silences';
           break;
         case 'fillers':
@@ -3401,10 +3907,19 @@ PanelBoot.run('ИИ: монтаж', function () {
         case 'jumps':
           pipelineFn = DeterministicPipelines.jumpCuts;
           params.maxPause = parseFloat(document.getElementById('jmp-pause').value);
+          var jmpBreathEl = document.getElementById('jmp-breath');
+          if (jmpBreathEl) params.keepBreathing = parseFloat(jmpBreathEl.value);
+          var jmpMinSegEl = document.getElementById('jmp-minseg');
+          if (jmpMinSegEl) params.minSegmentDuration = parseFloat(jmpMinSegEl.value);
           proposalId = 'proposal-jumps';
           break;
         case 'chapters':
           pipelineFn = DeterministicPipelines.chapterize;
+          var chCountEl = document.getElementById('ch-count');
+          if (chCountEl) {
+            var chVal = parseInt(chCountEl.value, 10);
+            if (chVal > 0) params.maxChapters = chVal;
+          }
           proposalId = 'proposal-chapters';
           break;
         case 'jcuts':

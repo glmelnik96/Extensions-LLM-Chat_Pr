@@ -1382,6 +1382,10 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
     }
     $._EXT_PRM_._resetOps();
     var markers = seq.markers;
+    if (!markers) {
+      if (undoOpened && typeof app.endUndoGroup === 'function') { try { app.endUndoGroup(); } catch (eUE) {} }
+      return JSON.stringify({ ok: false, error: 'Коллекция markers недоступна у активной секвенции' });
+    }
     var i,
       m,
       mk;
@@ -1491,7 +1495,7 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
           } catch (e8) {}
         }
 
-        /* Span-маркер: KNOWN BROKEN на PP 2025 (см. docs/premiere-extension-audit.md).
+        /* Span-маркер: KNOWN BROKEN на PP 2025 (см. .omc/research/premiere-api-audit.md).
          *
          * Эмпирически на сборке пользователя (PP 2025) Marker API:
          *   - Пробовали 11+ стратегий: прямое mk.end.seconds, get→modify→put,
@@ -1598,7 +1602,7 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
       driftWarning: anyDrift ? 'Некоторые маркеры сместились более чем на 1 с от запрошенной позиции — проверьте визуально' : null,
       spanNotSupported: spanNotSupported,
       spanNotice: spanNotSupported
-        ? 'Known-broken на этой сборке PP 2025: API не позволяет создавать span-маркеры (длительность) программно — все маркеры получились точечными, несмотря на endSec. Диапазон добавлен в comments маркера текстом. См. docs/premiere-extension-audit.md.'
+        ? 'Known-broken на этой сборке PP 2025: API не позволяет создавать span-маркеры (длительность) программно — все маркеры получились точечными, несмотря на endSec. Диапазон добавлен в comments маркера текстом. См. .omc/research/premiere-api-audit.md.'
         : null,
       hostVersion: $._EXT_PRM_.version
     });
@@ -1962,6 +1966,9 @@ $._EXT_PRM_.removeMarkersBySeconds = function (jsonArg) {
     if (!seconds.length) return JSON.stringify({ ok: true, removed: 0 });
     var tol = typeof arg.tolerance === 'number' ? arg.tolerance : 0.15;
     var markers = seq.markers;
+    if (!markers) {
+      return JSON.stringify({ ok: false, error: 'Коллекция markers недоступна у активной секвенции' });
+    }
     var removed = 0;
     var failed = [];
     /* Проходим по каждому запрошенному секундному значению; для каждого ищем самый близкий маркер. */

@@ -6,7 +6,16 @@
   var hostLoaded = false;
 
   function escapeDoubleQuoted(s) {
-    return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '').replace(/\n/g, '\\n');
+    /* Порядок важен: сначала нормализуем \r\n в \n, потом экранируем backslash,
+       потом кавычки, и ТОЛЬКО В КОНЦЕ разворачиваем \n в литерал "\\n".
+       Иначе реальный backslash в пути "foo\\n" (маловероятно, но возможно)
+       после первой замены стал бы "foo\\\\n", а последняя добавила бы ещё \\n —
+       получилось бы "foo\\\\\\n", ломающее JSON.parse в ExtendScript. */
+    return s
+      .replace(/\r/g, '')
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, '\\n');
   }
 
   function extensionRoot() {
@@ -45,26 +54,30 @@
           callback(err, null);
           return;
         }
-        var called = false;
+        /* State machine: 'pending' | 'completed' | 'timed_out'.
+           Прежняя реализация использовала один флаг `called`, что теоретически
+           допускало двойной callback при гонке setTimeout и cs.evalScript. */
+        var state = 'pending';
+        var finish = function (errArg, dataArg) {
+          if (state !== 'pending') return;
+          state = errArg ? 'timed_out' : 'completed';
+          try { callback(errArg, dataArg); } catch (cbErr) { /* callback сам отвечает за обработку */ }
+        };
         var timer = setTimeout(function () {
-          if (!called) {
-            called = true;
-            callback(new Error('ExtendScript не ответил за ' + (TIMEOUT_MS / 1000) + 'с. Premiere может быть занят — попробуйте снова.'), null);
-          }
+          finish(new Error('ExtendScript не ответил за ' + (TIMEOUT_MS / 1000) + 'с. Premiere может быть занят — попробуйте снова.'), null);
         }, TIMEOUT_MS);
         cs.evalScript(extendScriptExpr, function (raw) {
-          if (called) return;
-          called = true;
           clearTimeout(timer);
+          if (state !== 'pending') return;
           try {
             var s = typeof raw === 'string' ? raw : String(raw);
             if (s === 'EvalScript error.' || s === 'undefined') {
-              callback(new Error('ExtendScript вернул ошибку. Проверьте консоль Premiere (Window → Developer Tools). raw=' + s), null);
+              finish(new Error('ExtendScript вернул ошибку. Проверьте консоль Premiere (Window → Developer Tools). raw=' + s), null);
               return;
             }
-            callback(null, JSON.parse(s));
+            finish(null, JSON.parse(s));
           } catch (e) {
-            callback(new Error('JSON от хоста: ' + String(raw).slice(0, 500)), null);
+            finish(new Error('JSON от хоста: ' + String(raw).slice(0, 500)), null);
           }
         });
       });

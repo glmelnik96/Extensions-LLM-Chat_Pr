@@ -528,8 +528,13 @@
 
     return [
       'Ты — ассистент видеомонтажёра. Тебе дан список СЕГМЕНТОВ (фрагментов) транскрипта видео.',
-      'Каждый сегмент: {i: индекс, t0: начало (сек), t1: конец (сек), text: текст}.',
+      'Каждый сегмент: {i: индекс, t0: начало (сек), t1: конец (сек), text: текст,',
+      '  words?: [{w: слово, s: начало_сек, e: конец_сек}] (ТОЛЬКО для длинных сегментов >15 слов)}.',
       'Сегмент — это 3-30 секунд речи. В одном длинном абзаце может быть 5-15 сегментов.',
+      'Поле words появляется только когда стоит думать о структуре фразы (длинная фраза — где',
+      'начинается мысль, где конец, где filler в середине). Для коротких сегментов words нет — этого',
+      'не нужно. Используй words чтобы понять, где ВНУТРИ сегмента кончается полезное и начинается',
+      'мусор — это поможет LLM-планировщику в следующем шаге выбрать точные таймкоды резов.',
       '',
       'Задача: классифицируй КАЖДЫЙ сегмент ровно одной меткой:',
       '• content    — полезное содержание, факты, мысли по теме (ОСТАВИТЬ)',
@@ -562,9 +567,10 @@
   /**
    * Объединяет локальные pre-labels и LLM-labels в финальный результат.
    */
-  function _buildFinalResult(segments, preByIndex, llmLabels, onProgress, chunksUsed) {
+  function _buildFinalResult(segments, preByIndex, llmLabels, onProgress, chunksUsed, failedChunks) {
     var VALID_LABELS = { content: 1, filler: 1, intro: 1, outro: 1, outtake: 1, repeat: 1, artifact: 1, digression: 1 };
     var stats = { content: 0, filler: 0, intro: 0, outro: 0, outtake: 0, repeat: 0, artifact: 0, digression: 0 };
+    var failedList = Array.isArray(failedChunks) ? failedChunks : [];
 
     /* Индексируем LLM-метки */
     var llmByIndex = {};
@@ -590,12 +596,30 @@
       full.push(entry);
     }
 
+    /* Считаем сколько сегментов осталось без LLM-метки из-за сбойных чанков.
+       Это точный «degradation footprint» — столько сегментов получили
+       content по умолчанию вместо настоящей классификации. */
+    var missedSegments = 0;
+    for (var fi = 0; fi < failedList.length; fi++) {
+      var fc = failedList[fi];
+      if (fc && typeof fc.segStart === 'number' && typeof fc.segEnd === 'number') {
+        missedSegments += (fc.segEnd - fc.segStart + 1);
+      }
+    }
+
+    var doneMsg = 'Анализ завершён: ' + full.length + ' сегментов, удалить ' +
+      (stats.filler + stats.intro + stats.outro + stats.outtake + stats.repeat + stats.artifact) +
+      ', оставить ' + stats.content;
+    if (failedList.length > 0) {
+      doneMsg += ' ⚠ ' + failedList.length + ' чанк(ов) не разобрано (~' + missedSegments + ' сегм. как content)';
+    }
+
     onProgress({
       phase: 'done',
       stats: stats,
-      message: 'Анализ завершён: ' + full.length + ' сегментов, удалить ' +
-        (stats.filler + stats.intro + stats.outro + stats.outtake + stats.repeat + stats.artifact) +
-        ', оставить ' + stats.content
+      failedChunks: failedList,
+      missedSegments: missedSegments,
+      message: doneMsg
     });
 
     return {
@@ -603,7 +627,11 @@
       stats: stats,
       chunks: chunksUsed || 0,
       totalSegments: segments.length,
-      localDetected: Object.keys(preByIndex).length
+      localDetected: Object.keys(preByIndex).length,
+      /* Прозрачность: вернуть сбойные чанки в результате,
+         чтобы panel.js мог показать warning-бадж. */
+      failedChunks: failedList,
+      missedSegments: missedSegments
     };
   }
 
@@ -675,16 +703,72 @@
       return words.slice(0, ANALYSIS_MAX_WORDS_PER_SEG).join(' ') + '…';
     }
 
+    /* WORD_LEVEL_THRESHOLD: сегменты длиннее 15 слов получают синтезированный
+       массив `words` с равномерно распределёнными таймкодами в пределах [t0, t1].
+       Заимствовано из openshorts (main.py) — dual input «raw text + words JSON»
+       помогает LLM рассуждать о структуре длинных фраз и точно ставить резы.
+       На коротких сегментах (≤15 слов) word-level не нужен — экономим токены. */
+    var WORD_LEVEL_THRESHOLD = 15;
+
+    function synthesizeWords(seg) {
+      if (!seg || typeof seg.text !== 'string') return null;
+      /* Если whisper вернул words[] нативно — используем их. */
+      if (Array.isArray(seg.words) && seg.words.length) {
+        return seg.words.map(function (w) {
+          return {
+            w: String(w.w || w.word || '').trim(),
+            s: typeof w.s === 'number' ? w.s : (typeof w.start === 'number' ? w.start : seg.startSec),
+            e: typeof w.e === 'number' ? w.e : (typeof w.end === 'number' ? w.end : seg.endSec)
+          };
+        });
+      }
+      /* Fallback: равномерная интерполяция по всему сегменту.
+         Точность ≈ ширина_сегмента / N_слов, обычно 0.2–0.4 с/слово.
+         Это не идеально, но достаточно для семантической ориентации LLM. */
+      var rawWords = String(seg.text).split(/\s+/).filter(Boolean);
+      if (rawWords.length === 0) return null;
+      var t0 = typeof seg.startSec === 'number' ? seg.startSec : 0;
+      var t1 = typeof seg.endSec === 'number' ? seg.endSec : t0;
+      var dur = Math.max(0, t1 - t0);
+      if (dur === 0) return null;
+      var per = dur / rawWords.length;
+      var out = [];
+      for (var wi = 0; wi < rawWords.length; wi++) {
+        out.push({
+          w: rawWords[wi],
+          s: Math.round((t0 + wi * per) * 100) / 100,
+          e: Math.round((t0 + (wi + 1) * per) * 100) / 100
+        });
+      }
+      return out;
+    }
+
     /* Разбиваем на чанки — только сегменты для LLM */
     var chunks = [];
     for (var ci = 0; ci < segmentsForLLM.length && chunks.length < ANALYSIS_MAX_CHUNKS; ci += ANALYSIS_CHUNK_SIZE) {
       var slice = segmentsForLLM.slice(ci, ci + ANALYSIS_CHUNK_SIZE);
       chunks.push(slice.map(function (s, idx) {
-        return { i: s.i !== undefined ? s.i : (ci + idx), t0: s.startSec, t1: s.endSec, text: truncText(s.text) };
+        var item = {
+          i: s.i !== undefined ? s.i : (ci + idx),
+          t0: s.startSec,
+          t1: s.endSec,
+          text: truncText(s.text)
+        };
+        /* Word-level grounding для длинных сегментов. */
+        var wordCount = String(s.text || '').split(/\s+/).filter(Boolean).length;
+        if (wordCount >= WORD_LEVEL_THRESHOLD) {
+          var ws = synthesizeWords(s);
+          if (ws && ws.length) item.words = ws;
+        }
+        return item;
       }));
     }
 
     var allLabels = [];
+    /* failedChunks: список чанков, которые не удалось разобрать.
+       Пробрасывается в _buildFinalResult и дальше в UI для видимого warning'а
+       (раньше чанки молча игнорировались → пользователь получал неточное предложение). */
+    var failedChunks = [];
     var chunkIdx = 0;
     var totalChunks = chunks.length;
 
@@ -717,6 +801,12 @@
 
       var userMsg = JSON.stringify({ segments: chunk }) + contextNote;
 
+      /* Capture идентификатор чанка в замыкание — chunkIdx увеличивается
+         между await-ами, иначе все ошибки логируются с последним номером. */
+      var thisChunkIdx = chunkIdx;
+      var segStart = chunk[0].i;
+      var segEnd = chunk[chunk.length - 1].i;
+
       return CC.chatCompletions({
         baseUrl: settings.baseUrl,
         apiKey: settings.apiKey,
@@ -725,15 +815,37 @@
           { role: 'system', content: sysPrompt },
           { role: 'user', content: userMsg }
         ],
-        chatParams: { max_tokens: 6000, temperature: 0.1 },
+        /* response_format=json_object — LLM обязан вернуть валидный JSON
+           без markdown-обёрток. Провайдер игнорирует параметр если не поддерживает. */
+        chatParams: {
+          max_tokens: 6000,
+          temperature: 0.1,
+          response_format: { type: 'json_object' }
+        },
         signal: opt.signal,
         abortCheck: opt.abortCheck
       }).then(function (resp) {
         try {
           var content = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
-          if (!content) return processChunk();
+          if (!content) {
+            failedChunks.push({
+              chunkIndex: thisChunkIdx,
+              segStart: segStart,
+              segEnd: segEnd,
+              reason: 'empty response'
+            });
+            return processChunk();
+          }
           var m = String(content).match(/\{[\s\S]*\}/);
-          if (!m) return processChunk();
+          if (!m) {
+            failedChunks.push({
+              chunkIndex: thisChunkIdx,
+              segStart: segStart,
+              segEnd: segEnd,
+              reason: 'no JSON in response'
+            });
+            return processChunk();
+          }
           var j = JSON.parse(m[0]);
           var labels = (j && j.labels) || [];
           if (Array.isArray(labels)) {
@@ -748,33 +860,45 @@
           }
           onProgress({
             phase: 'chunk_done',
-            chunkIndex: chunkIdx,
+            chunkIndex: thisChunkIdx,
             totalChunks: totalChunks,
             labelsInChunk: labels ? labels.length : 0,
-            message: 'Чанк ' + chunkIdx + '/' + totalChunks + ' готов (' + (labels ? labels.length : 0) + ' меток)'
+            message: 'Чанк ' + thisChunkIdx + '/' + totalChunks + ' готов (' + (labels ? labels.length : 0) + ' меток)'
           });
         } catch (parseErr) {
+          failedChunks.push({
+            chunkIndex: thisChunkIdx,
+            segStart: segStart,
+            segEnd: segEnd,
+            reason: 'parse error: ' + String(parseErr.message || parseErr)
+          });
           onProgress({
             phase: 'chunk_error',
-            chunkIndex: chunkIdx,
+            chunkIndex: thisChunkIdx,
             error: String(parseErr.message || parseErr),
-            message: 'Ошибка разбора чанка ' + chunkIdx + ': ' + String(parseErr.message || '')
+            message: 'Ошибка разбора чанка ' + thisChunkIdx + ': ' + String(parseErr.message || '')
           });
         }
         return processChunk();
       }, function (err) {
+        failedChunks.push({
+          chunkIndex: thisChunkIdx,
+          segStart: segStart,
+          segEnd: segEnd,
+          reason: 'api error: ' + String(err && err.message || err)
+        });
         onProgress({
           phase: 'chunk_error',
-          chunkIndex: chunkIdx,
+          chunkIndex: thisChunkIdx,
           error: String(err && err.message || err),
-          message: 'Ошибка API чанка ' + chunkIdx + ': ' + String(err && err.message || '')
+          message: 'Ошибка API чанка ' + thisChunkIdx + ': ' + String(err && err.message || '')
         });
         return processChunk();
       });
     }
 
     return processChunk().then(function () {
-      return _buildFinalResult(segments, preByIndex, allLabels, onProgress, chunks.length);
+      return _buildFinalResult(segments, preByIndex, allLabels, onProgress, chunks.length, failedChunks);
     });
   }
 

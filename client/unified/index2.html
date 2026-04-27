@@ -260,6 +260,8 @@
             <div class="more-popover">
               <button type="button" id="btn-clear-chat">Очистить чат</button>
               <button type="button" id="btn-clear-cache">Очистить кэш транскриптов</button>
+              <button type="button" id="btn-export-session">Сохранить сессию (JSON)</button>
+              <button type="button" id="btn-export-report">AI-отчёт о сессии</button>
               <hr />
               <button type="button" id="btn-clear-all" class="danger">Сбросить всё</button>
             </div>
@@ -303,11 +305,16 @@
           <!-- 1. Cut Silences -->
           <div class="tool-card needs-transcript" id="card-silences">
             <div class="tool-card-title">🔇 Убрать тишины</div>
-            <div class="tool-card-desc">Вырезает паузы длиннее заданного порога.</div>
+            <div class="tool-card-desc">Гигиена звука: убирает явные паузы ≥1с, сохраняет естественный ритм речи.</div>
             <div class="param-row">
               <span class="param-label">Мин. длительность</span>
-              <input type="range" id="sil-min" min="0.3" max="3.0" step="0.1" value="0.5" />
-              <span class="param-val" id="sil-min-val">0.5с</span>
+              <input type="range" id="sil-min" min="0.3" max="3.0" step="0.1" value="1.0" />
+              <span class="param-val" id="sil-min-val">1.0с</span>
+            </div>
+            <div class="param-row">
+              <span class="param-label">Порог тишины</span>
+              <input type="range" id="sil-thresh" min="3" max="30" step="1" value="10" />
+              <span class="param-val" id="sil-thresh-val">-10 dB</span>
             </div>
             <div class="param-row">
               <span class="param-label">Padding</span>
@@ -321,12 +328,12 @@
           <!-- 2. Cut Fillers -->
           <div class="tool-card needs-transcript" id="card-fillers">
             <div class="tool-card-title">✂ Убрать паразиты</div>
-            <div class="tool-card-desc">Удаляет слова-паразиты и артефакты Whisper.</div>
+            <div class="tool-card-desc">Находит слова-паразиты в начале/конце фраз и короткие сегменты-филлеры.</div>
             <div class="param-row">
               <span class="param-label">Режим</span>
               <div class="toggle-group" id="filler-mode">
-                <button class="toggle-btn active" data-val="strict">Строгий</button>
-                <button class="toggle-btn" data-val="normal">Расширенный</button>
+                <button class="toggle-btn" data-val="strict">Строгий</button>
+                <button class="toggle-btn active" data-val="normal">Расширенный</button>
               </div>
             </div>
             <button class="tool-run" data-tool="fillers">Найти и вырезать</button>
@@ -336,11 +343,21 @@
           <!-- 3. Jump Cuts -->
           <div class="tool-card needs-transcript" id="card-jumps">
             <div class="tool-card-title">⚡ Jump cuts</div>
-            <div class="tool-card-desc">Убирает паузы между фразами для динамичного монтажа.</div>
+            <div class="tool-card-desc">Ритм: агрессивно сжимает паузы, YouTube-стиль. Оставляет «дыхание» чтобы не звучало клиппированно.</div>
             <div class="param-row">
               <span class="param-label">Макс. пауза</span>
-              <input type="range" id="jmp-pause" min="0.2" max="2.0" step="0.1" value="0.5" />
+              <input type="range" id="jmp-pause" min="0.1" max="2.0" step="0.05" value="0.5" />
               <span class="param-val" id="jmp-pause-val">0.5с</span>
+            </div>
+            <div class="param-row">
+              <span class="param-label">Дыхание</span>
+              <input type="range" id="jmp-breath" min="0" max="0.2" step="0.01" value="0.05" />
+              <span class="param-val" id="jmp-breath-val">50мс</span>
+            </div>
+            <div class="param-row">
+              <span class="param-label">Мин. сегмент</span>
+              <input type="range" id="jmp-minseg" min="0" max="1.0" step="0.05" value="0.3" />
+              <span class="param-val" id="jmp-minseg-val">0.3с</span>
             </div>
             <button class="tool-run" data-tool="jumps">Найти и вырезать</button>
             <div class="proposal-area" id="proposal-jumps"></div>
@@ -350,6 +367,11 @@
           <div class="tool-card needs-transcript" id="card-chapters">
             <div class="tool-card-title">📑 Авто-главы</div>
             <div class="tool-card-desc">Маркеры-главы по темам. 1 вызов LLM если темы не в кэше.</div>
+            <div class="param-row">
+              <span class="param-label">Кол-во глав</span>
+              <input type="range" id="ch-count" min="0" max="20" step="1" value="0" />
+              <span class="param-val" id="ch-count-val">авто</span>
+            </div>
             <button class="tool-run" data-tool="chapters">Расставить главы</button>
             <div class="proposal-area" id="proposal-chapters"></div>
           </div>
@@ -390,6 +412,8 @@
           '../shared/audio-preprocess.js',
           '../shared/timeline-transcribe.js',
           '../shared/transcript-structure.js',
+          '../shared/analysis-routing.js',
+          '../shared/youtube-export.js',
           '../shared/prompts.js',
           '../shared/tool-validators.js',
           '../shared/find-moments.js',
