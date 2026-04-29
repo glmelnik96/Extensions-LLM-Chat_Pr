@@ -23,28 +23,66 @@
     return (p || '').replace(/\\/g, '/');
   }
 
+  /* Признак «холодного старта» ExtendScript-движка / CEP-bridge:
+     на macOS CEP 12 первые вызовы после открытия панели часто возвращают:
+     - 'EvalScript error.' — движок ExtendScript ещё не прогрелся
+     - 'undefined'         — Premiere ответил, но result не сериализовался
+     - ''                  — пустой ответ (timing issue)
+     - '__adobe_cep__ unavailable' — наш csinterface-shim видит, что bridge
+       window.__adobe_cep__ ещё не инжектирован Premiere в страницу панели
+     Все 4 — известные timing-проблемы. Лечим повтором 2-3 раза с задержкой. */
+  function isColdStartGlitch(s) {
+    return s === 'EvalScript error.' ||
+           s === 'undefined' ||
+           s === '' ||
+           s === '__adobe_cep__ unavailable';
+  }
+
   global.PremiereBridge = {
     ensureHost: function (callback) {
       if (hostLoaded) {
         if (callback) callback(null);
         return;
       }
-      var root = extensionRoot();
-      if (!root) {
-        if (callback) callback(new Error('Нет пути расширения'));
-        return;
-      }
-      var jsxPath = root + '/host/premiere.jsx';
-      var cmd = 'try{$.evalFile("' + jsxPath.replace(/"/g, '\\"') + '");"OK";}catch(e){"ERR:"+e.toString();}';
-      cs.evalScript(cmd, function (res) {
-        var s = String(res || '');
-        if (s.indexOf('OK') !== -1) {
-          hostLoaded = true;
-          if (callback) callback(null);
-        } else {
-          if (callback) callback(new Error('Не удалось загрузить host/premiere.jsx: ' + s));
+      /* Cold-start retry: до 3 попыток с задержкой 0мс / 300мс / 900мс.
+         Только для glitch-ответов — реальные «ERR:...» из try/catch не ретраим.
+         extensionRoot() читается ВНУТРИ цикла: если __adobe_cep__ ещё не
+         инжектирован, путь пустой → ждём и пробуем снова. */
+      var attempt = 0;
+      var DELAYS = [0, 300, 900];
+      function tryLoad() {
+        var root = extensionRoot();
+        if (!root) {
+          /* __adobe_cep__ ещё не доступен — это тоже cold-start. */
+          attempt++;
+          if (attempt < DELAYS.length) {
+            setTimeout(tryLoad, DELAYS[attempt]);
+          } else if (callback) {
+            callback(new Error('Нет пути расширения (__adobe_cep__ unavailable после ' + attempt + ' попыток)'));
+          }
+          return;
         }
-      });
+        var jsxPath = root + '/host/premiere.jsx';
+        var cmd = 'try{$.evalFile("' + jsxPath.replace(/"/g, '\\"') + '");"OK";}catch(e){"ERR:"+e.toString();}';
+        cs.evalScript(cmd, function (res) {
+          var s = String(res || '');
+          if (s.indexOf('OK') !== -1) {
+            hostLoaded = true;
+            if (callback) callback(null);
+            return;
+          }
+          attempt++;
+          if (isColdStartGlitch(s) && attempt < DELAYS.length) {
+            setTimeout(tryLoad, DELAYS[attempt]);
+          } else {
+            if (callback) callback(new Error(
+              'Не удалось загрузить host/premiere.jsx: ' + s +
+              (attempt >= DELAYS.length ? ' (после ' + attempt + ' попыток)' : '')
+            ));
+          }
+        });
+      }
+      setTimeout(tryLoad, DELAYS[attempt]);
     },
 
     evalJson: function (extendScriptExpr, callback) {
@@ -54,9 +92,7 @@
           callback(err, null);
           return;
         }
-        /* State machine: 'pending' | 'completed' | 'timed_out'.
-           Прежняя реализация использовала один флаг `called`, что теоретически
-           допускало двойной callback при гонке setTimeout и cs.evalScript. */
+        /* State machine: 'pending' | 'completed' | 'timed_out'. */
         var state = 'pending';
         var finish = function (errArg, dataArg) {
           if (state !== 'pending') return;
@@ -66,20 +102,37 @@
         var timer = setTimeout(function () {
           finish(new Error('ExtendScript не ответил за ' + (TIMEOUT_MS / 1000) + 'с. Premiere может быть занят — попробуйте снова.'), null);
         }, TIMEOUT_MS);
-        cs.evalScript(extendScriptExpr, function (raw) {
-          clearTimeout(timer);
-          if (state !== 'pending') return;
-          try {
+
+        /* Cold-start retry для evalJson: первая операция после загрузки JSX
+           тоже может наткнуться на непрогретый движок и получить
+           литеральную строку 'EvalScript error.'. Делаем до 3 попыток
+           с возрастающей задержкой. После прогрева retry не нужен. */
+        var attempt = 0;
+        var DELAYS = [0, 250, 750];
+        function tryEval() {
+          cs.evalScript(extendScriptExpr, function (raw) {
+            if (state !== 'pending') return;
             var s = typeof raw === 'string' ? raw : String(raw);
-            if (s === 'EvalScript error.' || s === 'undefined') {
-              finish(new Error('ExtendScript вернул ошибку. Проверьте консоль Premiere (Window → Developer Tools). raw=' + s), null);
+            if (isColdStartGlitch(s)) {
+              attempt++;
+              if (attempt < DELAYS.length) {
+                /* Холодный старт — ждём и повторяем. */
+                setTimeout(tryEval, DELAYS[attempt]);
+                return;
+              }
+              clearTimeout(timer);
+              finish(new Error('ExtendScript вернул ошибку. Проверьте консоль Premiere (Window → Developer Tools). raw=' + s + ' (после ' + attempt + ' попыток)'), null);
               return;
             }
-            finish(null, JSON.parse(s));
-          } catch (e) {
-            finish(new Error('JSON от хоста: ' + String(raw).slice(0, 500)), null);
-          }
-        });
+            clearTimeout(timer);
+            try {
+              finish(null, JSON.parse(s));
+            } catch (e) {
+              finish(new Error('JSON от хоста: ' + String(raw).slice(0, 500)), null);
+            }
+          });
+        }
+        tryEval();
       });
     },
 
