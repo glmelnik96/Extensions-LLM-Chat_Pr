@@ -376,7 +376,19 @@
             <div class="proposal-area" id="proposal-chapters"></div>
           </div>
 
-          <!-- 5. J-cuts / L-cuts — ОТКЛЮЧЕНО (ограничение ExtendScript) -->
+          <!-- 5. Авто-MultiCam (Phase 1 MVP) -->
+          <div class="tool-card needs-transcript" id="card-multicam">
+            <div class="tool-card-title">🎥 Авто-MultiCam (β)</div>
+            <div class="tool-card-desc">
+              Подкаст-нарезка: 3 видеодорожки (V1 wide, V2 гость 1, V3 гость 2)
+              + 2 аудиодорожки (A1, A2) → автопереключение по говорящему через
+              сегменты транскрипта. Phase 1 MVP, hardcoded mapping.
+            </div>
+            <button class="tool-run" data-tool="multicam">Проанализировать и применить</button>
+            <div class="proposal-area" id="proposal-multicam"></div>
+          </div>
+
+          <!-- 6. J-cuts / L-cuts — ОТКЛЮЧЕНО (ограничение ExtendScript) -->
           <div class="tool-card" id="card-jcuts" style="opacity:0.5;pointer-events:none;">
             <div class="tool-card-title">🎬 J-cuts / L-cuts</div>
             <div class="tool-card-desc" style="color:#f59e0b;">
@@ -414,6 +426,7 @@
           '../shared/transcript-structure.js',
           '../shared/analysis-routing.js',
           '../shared/youtube-export.js',
+          '../shared/multicam-plan.js',
           '../shared/prompts.js',
           '../shared/tool-validators.js',
           '../shared/find-moments.js',

@@ -36,6 +36,75 @@ $._EXT_PRM_._resetOps = function () {
 };
 
 /**
+ * Phase 1 (PP-26 stabilization, 2026-04-29; revised 3x 2026-04-30):
+ * НЕТ pre-gate проверки JSON. Просто пытаемся, ловим — fallback на handcrafted JSON.
+ *
+ * История попыток detect'а (все провалились в одну или другую сторону):
+ *   v1: `typeof JSON.stringify === 'function'` — false-negative из-за
+ *       ExtendScript COM-bridge возвращающего 'unknown' для native.
+ *   v2: round-trip при load — JSON может инжектиться Adobe позже загрузки JSX.
+ *   v3: lazy round-trip при первом вызове — всё равно false-negative по неясной
+ *       причине (вероятно strict equality / `.a === 1` ведёт себя необычно
+ *       в ExtendScript COM-context).
+ *   v4 (тут): отказались от pre-check, делаем optimistic try/catch внутри _wrap.
+ *
+ * Преимущество: не нужно гадать о ExtendScript-квирках. Если JSON работает —
+ * сериализация просто пройдёт. Если нет — упадёт в catch и мы handcraft'нем JSON.
+ */
+
+/**
+ * Phase 1: wrap-decorator для экспортируемых функций.
+ *
+ * Раньше: исключение в exported-функции попадало в CEP как литерал
+ *   "EvalScript error." без деталей — отладка слепая.
+ * Теперь: возвращаем структурированный JSON {_hostError:true, msg, line, source, fn},
+ *   bridge-premiere.js парсит его и кидает ОСМЫСЛЕННУЮ ошибку с реальным
+ *   номером строки и stack-trace из ExtendScript-движка.
+ *
+ * Использование:
+ *   $._EXT_PRM_.foo = $._EXT_PRM_._wrap('foo', function (arg) {
+ *     // ... обычный код функции, может бросать ...
+ *     return JSON.stringify({ ok: true, data: ... });
+ *   });
+ */
+$._EXT_PRM_._wrap = function (name, fn) {
+  return function () {
+    try {
+      var result = fn.apply(this, arguments);
+      /* Если функция уже вернула строку — отдаём как есть (legacy-контракт).
+         Все наши exported-функции исторически сами зовут JSON.stringify
+         внутри и возвращают строку. Этот путь не зависит от внешнего JSON. */
+      if (typeof result === 'string') return result;
+      /* Только если функция вернула объект — пытаемся сериализовать. */
+      try {
+        return JSON.stringify(result);
+      } catch (eJ) {
+        return '{"_hostError":true,"msg":"JSON.stringify failed","fn":"' + name + '"}';
+      }
+    } catch (e) {
+      /* Структурированный отчёт об ошибке. Поля e.line/e.source/e.fileName
+         доступны в ExtendScript Error-объекте; $.stack даёт callstack. */
+      var info = {
+        _hostError: true,
+        fn: name,
+        msg: (e && e.toString) ? e.toString() : String(e),
+        line: (e && typeof e.line === 'number') ? e.line : null,
+        source: (e && e.source) ? String(e.source).slice(0, 200) : null,
+        fileName: (e && e.fileName) ? String(e.fileName) : null,
+        stack: (typeof $ !== 'undefined' && $.stack) ? String($.stack).slice(0, 800) : null
+      };
+      try {
+        return JSON.stringify(info);
+      } catch (eJ) {
+        /* JSON.stringify сам упал — отдаём минимум вручную. */
+        return '{"_hostError":true,"fn":"' + name + '","msg":"' +
+               String(info.msg).replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"}';
+      }
+    }
+  };
+};
+
+/**
  * Тики на секунде для активной секвенции (timebase в тиках/сек, см. getTimelineSnapshot).
  * Fallback ~25 fps, если timebase недоступен.
  */
@@ -50,12 +119,26 @@ $._EXT_PRM_._ticksStr = function (seq, sec) {
   return String(Math.round(sec * $._EXT_PRM_._ticksPerSecond(seq)));
 };
 
+/**
+ * Phase 1: безопасное чтение времени клипа.
+ * Раньше: прямые цепочки clip.start.seconds — на PP 26 при null/undefined
+ *   падало с непрозрачным "EvalScript error.".
+ * Теперь: каждое поле читается через try/catch, отсутствие → 0.
+ *   Вызывается из десятков мест — лучше получить нули чем уронить весь снапшот.
+ */
 $._EXT_PRM_._clipTimes = function (clip) {
+  function safeSeconds(timeObj) {
+    try {
+      if (timeObj && typeof timeObj.seconds === 'number') return timeObj.seconds;
+    } catch (e) {}
+    return 0;
+  }
+  if (!clip) return { s: 0, e: 0, srcIn: 0, srcOut: 0 };
   return {
-    s: clip.start.seconds,
-    e: clip.end.seconds,
-    srcIn: clip.inPoint.seconds,
-    srcOut: clip.outPoint.seconds
+    s: safeSeconds(clip.start),
+    e: safeSeconds(clip.end),
+    srcIn: safeSeconds(clip.inPoint),
+    srcOut: safeSeconds(clip.outPoint)
   };
 };
 
@@ -2120,4 +2203,230 @@ $._EXT_PRM_.getClipMediaPath = function (nodeId) {
     return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
   }
 };
+
+/**
+ * Phase 1 (PP-26 stabilization, 2026-04-29):
+ * Декорируем все экспортируемые функции через _wrap. Каждый необработанный
+ * exception теперь попадёт в bridge как структурированный JSON
+ * {_hostError:true, fn, msg, line, source, stack} — вместо непрозрачной
+ * литеральной строки "EvalScript error.".
+ *
+ * Идемпотентно: повторный $.evalFile() не двойной обёрткой.
+ * Отсутствует в legacy путь — если _wrap не загрузился, оригиналы остаются.
+ */
+/**
+ * MultiCam Phase 1 MVP (2026-04-30):
+ * Применить план переключения камер.
+ *
+ * План — это:
+ *   plan.segments = [{tStart, tEnd, activeVideoTrack}]
+ *   plan.mapping  = {wideVideoTrack, speakers: [{audioTrack, videoTrack, label}]}
+ *   plan.params.mode = 'disable' | 'delete'
+ *
+ * Алгоритм:
+ *   1. Razor каждой видеодорожки (только тех что в mapping — wide + speakers) в каждой
+ *      внутренней границе сегментов (т.е. tEnd_i, кроме самого последнего).
+ *   2. Для каждого сегмента и каждой видеодорожки:
+ *      - Найти TrackItem'ы, попадающие в [tStart, tEnd] (после razor — это будет 1 клип).
+ *      - Если track !== activeVideoTrack:
+ *          mode='disable' → clip.disabled = true
+ *          mode='delete'  → clip.remove(0, 0)  (lift, без ripple — оставляем дыру)
+ *
+ * Аудиодорожки НЕ трогаем — пользователь выбирает что слышно через A1/A2 микшер.
+ *
+ * Возвращает: {ok, cutsApplied, segmentsApplied, mode, undoSteps}.
+ *
+ * См. .omc/plans/multicam-phase1-mvp.md и .omc/research/multicam-podcast-feature.md.
+ */
+$._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
+  if (!app.project || !app.project.activeSequence) {
+    return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+  }
+  var plan;
+  try {
+    plan = JSON.parse(jsonPlan);
+  } catch (eJ) {
+    return JSON.stringify({ ok: false, error: 'Невалидный JSON плана: ' + String(eJ) });
+  }
+  if (!plan || !plan.segments || !plan.segments.length) {
+    return JSON.stringify({ ok: false, error: 'plan.segments пустой' });
+  }
+  if (!plan.mapping || typeof plan.mapping.wideVideoTrack !== 'number') {
+    return JSON.stringify({ ok: false, error: 'plan.mapping обязателен' });
+  }
+
+  var mode = (plan.params && plan.params.mode) === 'delete' ? 'delete' : 'disable';
+  var seq = app.project.activeSequence;
+  var eps = $._EXT_PRM_._EPS;
+
+  /* Открываем undo group если поддерживается. */
+  var undoOpened = false;
+  try {
+    if (typeof app.beginUndoGroup === 'function') {
+      app.beginUndoGroup('ИИ: авто-MultiCam');
+      undoOpened = true;
+    }
+  } catch (eU) {}
+  $._EXT_PRM_._resetOps();
+
+  /* Список видеодорожек, которые мы реально режем. */
+  var managedTracks = [plan.mapping.wideVideoTrack];
+  if (plan.mapping.speakers && plan.mapping.speakers.length) {
+    for (var sp = 0; sp < plan.mapping.speakers.length; sp++) {
+      var v = plan.mapping.speakers[sp].videoTrack;
+      if (typeof v === 'number') {
+        var dup = false;
+        for (var d = 0; d < managedTracks.length; d++) {
+          if (managedTracks[d] === v) { dup = true; break; }
+        }
+        if (!dup) managedTracks.push(v);
+      }
+    }
+  }
+
+  /* FPS для QE razor таймкода. */
+  var fps = 24;
+  try {
+    var tb = parseFloat(seq.timebase);
+    if (tb > 0) fps = Math.round(254016000000 / tb);
+  } catch (eF) {}
+
+  /* QE razor доступен? */
+  var qeAvailable = false;
+  var qeSeq = null;
+  try {
+    if (typeof app.enableQE === 'function') app.enableQE();
+    if (typeof qe !== 'undefined' && qe.project && typeof qe.project.getActiveSequence === 'function') {
+      qeSeq = qe.project.getActiveSequence();
+      if (qeSeq) qeAvailable = true;
+    }
+  } catch (eQE) {}
+
+  if (!qeAvailable) {
+    if (undoOpened) try { app.endUndoGroup(); } catch (eEU) {}
+    return JSON.stringify({
+      ok: false,
+      error: 'QE DOM недоступен. MultiCam требует razor() — невозможно без QE.'
+    });
+  }
+
+  /* Шаг 1: razor на ВСЕХ внутренних границах сегментов. */
+  var cutTimes = [];
+  for (var si = 0; si < plan.segments.length - 1; si++) {
+    var t = plan.segments[si].tEnd;
+    if (typeof t !== 'number') continue;
+    cutTimes.push(t);
+  }
+  /* Дедупликация (на случай если соседние сегменты одинаковые). */
+  cutTimes.sort(function (a, b) { return a - b; });
+  var dedup = [];
+  for (var ct = 0; ct < cutTimes.length; ct++) {
+    if (ct === 0 || Math.abs(cutTimes[ct] - cutTimes[ct - 1]) > eps) {
+      dedup.push(cutTimes[ct]);
+    }
+  }
+  cutTimes = dedup;
+
+  var cutsApplied = 0;
+  for (var cti = 0; cti < cutTimes.length; cti++) {
+    var tc = $._EXT_PRM_._secToTimecode(cutTimes[cti], fps);
+    for (var mt = 0; mt < managedTracks.length; mt++) {
+      var trackIdx = managedTracks[mt];
+      try {
+        var qVT = qeSeq.getVideoTrackAt(trackIdx);
+        if (qVT) {
+          try { qVT.razor(tc, true, true); $._EXT_PRM_._bump(); cutsApplied++; } catch (eRZ) {}
+        }
+      } catch (eGT) {}
+    }
+  }
+
+  /* Шаг 2: для каждого сегмента — disable неактивные V-track'и. */
+  var segmentsApplied = 0;
+  var disabledCount = 0;
+  var deletedCount = 0;
+  for (var sgi = 0; sgi < plan.segments.length; sgi++) {
+    var seg = plan.segments[sgi];
+    var t0 = seg.tStart;
+    var t1 = seg.tEnd;
+    var activeV = seg.activeVideoTrack;
+    if (typeof t0 !== 'number' || typeof t1 !== 'number' || typeof activeV !== 'number') continue;
+
+    for (var mvt = 0; mvt < managedTracks.length; mvt++) {
+      var trk = managedTracks[mvt];
+      if (trk >= seq.videoTracks.numTracks) continue;
+      var isActive = (trk === activeV);
+      var vTrack = seq.videoTracks[trk];
+
+      /* Идём по клипам в обратном порядке (если delete-mode — индексы не сбьются). */
+      for (var ci = vTrack.clips.numItems - 1; ci >= 0; ci--) {
+        try {
+          var clip = vTrack.clips[ci];
+          if (!clip) continue;
+          var cs = clip.start.seconds;
+          var ce = clip.end.seconds;
+          /* Клип попадает в [t0, t1] — целиком внутри сегмента (после razor так и должно быть). */
+          if (cs >= t0 - eps && ce <= t1 + eps) {
+            if (isActive) {
+              /* Активная — гарантируем что enabled. */
+              try {
+                if (clip.disabled) { clip.disabled = false; $._EXT_PRM_._bump(); }
+              } catch (eEn) {}
+            } else {
+              /* Неактивная — disable или удалить. */
+              if (mode === 'delete') {
+                try { clip.remove(0, 0); $._EXT_PRM_._bump(); deletedCount++; } catch (eRm) {}
+              } else {
+                try {
+                  if (!clip.disabled) { clip.disabled = true; $._EXT_PRM_._bump(); disabledCount++; }
+                } catch (eDi) {}
+              }
+            }
+          }
+        } catch (eC) {}
+      }
+    }
+    segmentsApplied++;
+  }
+
+  if (undoOpened) try { app.endUndoGroup(); } catch (eEU2) {}
+
+  return JSON.stringify({
+    ok: true,
+    cutsApplied: cutsApplied,
+    segmentsApplied: segmentsApplied,
+    disabledCount: disabledCount,
+    deletedCount: deletedCount,
+    mode: mode,
+    managedTracks: managedTracks,
+    undoSteps: $._EXT_PRM_._opCounter
+  });
+};
+
+(function _decorateExportedFunctions() {
+  if (typeof $._EXT_PRM_._wrap !== 'function') return;
+  var EXPORTED = [
+    'getTimelineSnapshot',
+    'applyJCuts',
+    'applyTimecodeEdits',
+    'applyTranscriptCuts',
+    'addSequenceMarkers',
+    'prepareTranscribeFromTimeline',
+    'removeMarkersBySeconds',
+    'importMediaFile',
+    'getClipMediaPath',
+    'applyMulticamCuts'
+  ];
+  for (var i = 0; i < EXPORTED.length; i++) {
+    var name = EXPORTED[i];
+    var orig = $._EXT_PRM_[name];
+    if (typeof orig !== 'function') continue;
+    if (orig._wrapped) continue; /* уже обёрнут — пропускаем */
+    var wrapped = $._EXT_PRM_._wrap(name, orig);
+    wrapped._wrapped = true;
+    $._EXT_PRM_[name] = wrapped;
+  }
+  /* Маркер для bridge — отметить что host подгружен с Phase-1 wrap'ами. */
+  $._EXT_PRM_._phase1 = true;
+})();
 

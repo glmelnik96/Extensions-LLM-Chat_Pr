@@ -80,6 +80,161 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
   }
 
+  /* ─── Health-check при старте (Install hardening, май 2026) ────────
+   * Проверяем критичные предусловия и показываем жёлтую плашку с
+   * подсказками, если что-то не настроено. Не блокирует работу панели —
+   * просто информирует. См. INSTALL.md для полного Troubleshooting.
+   */
+  function _panelHealthRender(issues) {
+    if (!issues || !issues.length) return;
+    /* Если плашка уже отрисована — не дублируем (повторный запуск). */
+    if (document.getElementById('panel-health-banner')) return;
+    var bn = document.createElement('div');
+    bn.id = 'panel-health-banner';
+    bn.style.cssText =
+      'background:rgba(217,119,6,0.14);border:1px solid rgba(217,119,6,0.5);' +
+      'border-radius:4px;padding:8px 10px;margin:6px 6px 8px;font-size:11px;' +
+      'line-height:1.45;color:#fbbf24;';
+    var hdr = document.createElement('div');
+    hdr.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:6px;font-weight:600;';
+    hdr.innerHTML = '⚠ Установка не завершена · ' + issues.length + ' проблема(ы)';
+    var dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.textContent = '×';
+    dismiss.title = 'Скрыть';
+    dismiss.style.cssText =
+      'margin-left:auto;background:none;border:none;color:#fbbf24;cursor:pointer;' +
+      'font-size:14px;padding:0 4px;';
+    dismiss.onclick = function () { bn.remove(); };
+    hdr.appendChild(dismiss);
+    bn.appendChild(hdr);
+    issues.forEach(function (it) {
+      var row = document.createElement('div');
+      row.style.cssText = 'margin:4px 0 4px 0;';
+      var t = document.createElement('div');
+      t.style.cssText = 'font-weight:600;color:#fde68a;';
+      t.textContent = '• ' + (it.title || 'Проблема');
+      row.appendChild(t);
+      if (it.fix) {
+        var f = document.createElement('div');
+        f.style.cssText = 'padding-left:10px;color:#fcd34d;';
+        f.textContent = it.fix;
+        row.appendChild(f);
+      }
+      if (it.code) {
+        var c = document.createElement('code');
+        c.style.cssText =
+          'display:block;margin:3px 0 3px 10px;padding:3px 6px;background:rgba(0,0,0,0.3);' +
+          'border-radius:3px;color:#fef3c7;font-family:monospace;font-size:10px;' +
+          'white-space:pre-wrap;word-break:break-all;';
+        c.textContent = it.code;
+        row.appendChild(c);
+      }
+      bn.appendChild(row);
+    });
+    var doc = document.createElement('div');
+    doc.style.cssText = 'margin-top:6px;font-size:10px;color:#fcd34d;';
+    doc.innerHTML = 'Полный гайд: <code style="background:rgba(0,0,0,0.3);padding:1px 4px;border-radius:2px;">INSTALL.md</code> · Troubleshooting: <code style="background:rgba(0,0,0,0.3);padding:1px 4px;border-radius:2px;">INSTALL.md#troubleshooting</code>';
+    bn.appendChild(doc);
+    /* Вставляем перед чатом, если возможно. */
+    if (el.chat && el.chat.parentNode) {
+      el.chat.parentNode.insertBefore(bn, el.chat);
+    } else {
+      document.body.insertBefore(bn, document.body.firstChild);
+    }
+  }
+
+  function panelHealthCheck() {
+    var issues = [];
+
+    /* 1. fm-secrets.js → FM_SECRETS.apiKey */
+    var sec = (typeof FM_SECRETS !== 'undefined') ? FM_SECRETS : null;
+    var apiKey = sec && typeof sec.apiKey === 'string' ? sec.apiKey.trim() : '';
+    var isDefaultKey =
+      !apiKey ||
+      apiKey === 'YOUR-KEY' ||
+      apiKey === 'ваш-ключ-cloud-ru' ||
+      apiKey.length < 8;
+    if (!sec) {
+      issues.push({
+        title: 'fm-secrets.js не загружен',
+        fix: 'Создай файл из примера и впиши API-ключ Cloud.ru:',
+        code: 'cp client/shared/fm-secrets.example.js client/shared/fm-secrets.js'
+      });
+    } else if (isDefaultKey) {
+      issues.push({
+        title: 'API-ключ Cloud.ru не настроен (apiKey пустой или дефолтный)',
+        fix: 'Открой client/shared/fm-secrets.js и впиши реальный ключ. Получить — на cloud.ru → Foundation Models → API keys.',
+        code: 'var FM_SECRETS = { apiKey: \'тут-твой-реальный-ключ\' };'
+      });
+    }
+
+    /* 2. ffmpeg через Node spawn — только если Node доступен (CEP с --enable-nodejs) */
+    var hasNode = (typeof require === 'function');
+    if (hasNode) {
+      try {
+        var cp = require('child_process');
+        var checkPaths = [
+          '/opt/homebrew/bin/ffmpeg',
+          '/usr/local/bin/ffmpeg',
+          '/usr/bin/ffmpeg'
+        ];
+        var fs = require('fs');
+        var ffmpegFound = null;
+        for (var i = 0; i < checkPaths.length; i++) {
+          try {
+            if (fs.existsSync(checkPaths[i])) { ffmpegFound = checkPaths[i]; break; }
+          } catch (eFs) {}
+        }
+        if (!ffmpegFound) {
+          /* Попробуем через which */
+          try {
+            var w = cp.execSync('which ffmpeg 2>/dev/null', { timeout: 1500, encoding: 'utf8' }).trim();
+            if (w) ffmpegFound = w;
+          } catch (eW) {}
+        }
+        if (!ffmpegFound) {
+          issues.push({
+            title: 'ffmpeg не найден в PATH',
+            fix: 'Транскрибация и audio analysis работать не будут. Установи и проверь:',
+            code: 'brew install ffmpeg && which ffmpeg'
+          });
+        }
+      } catch (eR) {
+        /* Node может быть недоступен или sandboxed — не пишем ошибку. */
+      }
+    }
+
+    /* 3. Premiere version через bridge (асинхронно). Issues по версии добавим после ответа. */
+    var renderNow = function () { _panelHealthRender(issues); };
+    try {
+      if (typeof PremiereBridge !== 'undefined' && PremiereBridge.evalJson) {
+        PremiereBridge.evalJson('JSON.stringify({v: app.version || ""})', function (err, data) {
+          try {
+            if (!err && data && typeof data.v === 'string' && data.v.length) {
+              var major = parseInt(data.v.split('.')[0], 10);
+              if (!isNaN(major) && major < 24) {
+                issues.push({
+                  title: 'Premiere Pro ' + data.v + ' — слишком старая версия',
+                  fix: 'Manifest требует [24.0,99.9]. Обнови Premiere через Adobe Creative Cloud до 2024+.',
+                  code: 'Help → About — должно быть 24.x, 25.x или 26.x'
+                });
+              }
+            }
+          } catch (eP) {}
+          renderNow();
+        });
+      } else {
+        renderNow();
+      }
+    } catch (eB) {
+      renderNow();
+    }
+  }
+
+  /* Запускаем после DOM-render, с задержкой чтобы bridge успел загрузить host. */
+  setTimeout(panelHealthCheck, 1500);
+
   /* ─── Tools schemas (по пресетам) ────────────────────────────────── */
 
   /* Унифицированный EditPlan (§2.1): один контракт для всех правок.
@@ -3880,6 +4035,29 @@ PanelBoot.run('ИИ: монтаж', function () {
         return;
       }
 
+      if (prop.kind === 'multicam_cuts') {
+        toolsStatusUi.show('Применяю авто-MultiCam…', true);
+        toolsDisableRun(true);
+        _snapDirty = true;
+        lastSnap = null;
+        PremiereBridge.applyMulticamCuts(prop.plan, function (err, data) {
+          toolsDisableRun(false);
+          toolsStatusUi.hide();
+          if (err) { toolsShowErr('Ошибка: ' + String(err.message || err)); return; }
+          toolsHideProposal(area);
+          if (data && data.ok) {
+            var msg = 'MultiCam: ' + (data.cutsApplied || 0) + ' разрезов, ' +
+              (data.segmentsApplied || 0) + ' сегментов, ' +
+              (data.disabledCount || 0) + ' клипов отключено. Откат: Cmd+Z';
+            toolsStatusUi.show(msg, false);
+          } else {
+            toolsShowErr('Ошибка: ' + ((data && data.error) || 'неизвестная'));
+          }
+          setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+        });
+        return;
+      }
+
       toolsShowErr('Неизвестный тип: ' + prop.kind);
     }
 
@@ -3927,6 +4105,10 @@ PanelBoot.run('ИИ: монтаж', function () {
           params.offsetFrames = parseInt(document.getElementById('jcut-offset').value, 10);
           params.mode = getToggle('jcut-mode') || 'j';
           proposalId = 'proposal-jcuts';
+          break;
+        case 'multicam':
+          pipelineFn = DeterministicPipelines.multicamFromTranscript;
+          proposalId = 'proposal-multicam';
           break;
         default:
           toolsShowErr('Неизвестный инструмент.');

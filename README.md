@@ -126,38 +126,61 @@ Slash-команды в чате: `/cut_fillers`, `/cut_silences`, `/jump_cuts`,
 
 ## Установка
 
+> 📖 **Полное пошаговое руководство** с проверками после каждого шага и Troubleshooting — в [INSTALL.md](INSTALL.md). Здесь — краткая версия для опытных пользователей.
+
 ### Требования
 
-- Adobe Premiere Pro 2025 (CEP 12)
-- ffmpeg в PATH (для транскрибации и audio analysis)
-- API-ключ Cloud.ru Foundation Models
+- **Adobe Premiere Pro 2024 или новее** (CEP 12; PP 23 и старше manifest отвергает)
+- **ffmpeg в PATH** — для транскрибации и audio analysis
+- **API-ключ Cloud.ru Foundation Models** — https://cloud.ru/
 
-### macOS
+### macOS — quick start
 
 ```bash
-# 1. Клонировать/скопировать в:
-~/Library/Application Support/Adobe/CEP/extensions/Extensions-LLM-Chat_Pr
-
-# 2. Включить отладку CEP:
+# 1. Включить отладку CEP (CRITICAL — без этого расширение НЕ загрузится):
 defaults write com.adobe.CSXS.12 PlayerDebugMode 1
+# Проверка: defaults read com.adobe.CSXS.12 PlayerDebugMode → должно быть 1
 
-# 3. Установить ffmpeg:
+# 2. Установить ffmpeg:
 brew install ffmpeg
+# Проверка: which ffmpeg → /opt/homebrew/bin/ffmpeg или /usr/local/bin/ffmpeg
+
+# 3. Склонировать репо в правильное место:
+cd ~/Library/Application\ Support/Adobe/CEP/extensions/
+git clone <repo-url> Extensions-LLM-Chat_Pr
+cd Extensions-LLM-Chat_Pr
 
 # 4. Настроить API-ключ:
-cd ~/Library/Application\ Support/Adobe/CEP/extensions/Extensions-LLM-Chat_Pr
 cp client/shared/fm-secrets.example.js client/shared/fm-secrets.js
 # Открыть fm-secrets.js, вписать apiKey
+
+# 5. ПОЛНОСТЬЮ закрыть Premiere (Cmd+Q) и открыть снова
+# 6. Window → Extensions → ИИ: монтаж
 ```
 
-### Windows
+### Windows — quick start
 
 ```
-1. Скопировать в: %AppData%\Adobe\CEP\extensions\Extensions-LLM-Chat_Pr
-2. Реестр: HKEY_CURRENT_USER\SOFTWARE\Adobe\CSXS.12 → PlayerDebugMode = 1
-3. Установить ffmpeg, добавить в PATH
+1. Реестр: HKEY_CURRENT_USER\SOFTWARE\Adobe\CSXS.12 → PlayerDebugMode (DWORD) = 1
+2. Установить ffmpeg → распаковать в C:\Program Files\ffmpeg → добавить bin в PATH
+3. Скопировать в: %AppData%\Adobe\CEP\extensions\Extensions-LLM-Chat_Pr
 4. Скопировать fm-secrets.example.js → fm-secrets.js, вписать apiKey
+5. Полный рестарт Premiere
+6. Window → Extensions → ИИ: монтаж
 ```
+
+### 🆘 Не работает?
+
+Краткие фиксы — здесь, полный Troubleshooting — в [INSTALL.md#troubleshooting](INSTALL.md#-troubleshooting).
+
+| Симптом | Вероятная причина | Быстрый фикс |
+|---|---|---|
+| Нет «ИИ: монтаж» в Window → Extensions | PlayerDebugMode не установлен или Premiere не перезапущен | `defaults read com.adobe.CSXS.12 PlayerDebugMode` → 1, потом Cmd+Q + старт |
+| «Не настроен API (fm-secrets.js)» | apiKey пустой или файла нет | `grep apiKey client/shared/fm-secrets.js` → должен быть твой ключ |
+| «ffmpeg не найден» при транскрибации | ffmpeg не в PATH | `which ffmpeg` → если пусто, `brew install ffmpeg` + рестарт Premiere |
+| «EvalScript error.» при первой операции | Cold-start race ExtendScript | Bridge ретраит 3 раза автоматически. Если стабильно — Cmd+Q + старт. Открой DevTools на `localhost:8098`, пришли скрин Console |
+| «JSON polyfill missing in Premiere ExtendScript» | Старая версия host/premiere.jsx | `git pull` свежую версию (исправлено в Phase 1 wrap-pattern) |
+| Premiere версии < 2024 | manifest требует `[24.0,99.9]` | Обнови Premiere через Creative Cloud |
 
 ### Конфигурация
 

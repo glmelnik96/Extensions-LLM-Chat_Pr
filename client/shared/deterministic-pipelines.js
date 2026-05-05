@@ -906,15 +906,161 @@
     return null;
   }
 
+  /**
+   * MultiCam Phase 1 MVP (2026-04-30):
+   * Авто-нарезка multicam-композиции (3V+2A) для подкаста.
+   *
+   * MVP-стратегия (без ffmpeg-астатс):
+   *   - Используем транскрипт как proxy для активности.
+   *   - Пока что НЕ можем определить кто из 2 спикеров говорит — у нас один
+   *     транскрипт на всю секвенцию. В Phase 1.5 добавим per-track audio analysis.
+   *   - Поэтому MVP делает простую нарезку: чередует V2/V3 каждые ~6 секунд
+   *     по абзацам транскрипта, между ними wide-вставки.
+   *
+   * Это даёт пользователю РАБОЧУЮ нарезку для теста razor+disabled пайплайна
+   * в Premiere. Реальный «кто говорит» — следующий шаг.
+   *
+   * См. .omc/plans/multicam-phase1-mvp.md
+   */
+  async function multicamFromTranscript(ctx, params) {
+    params = params || {};
+    var entry = ctx.transcriptEntry;
+    if (!entry || !entry.segments || !entry.segments.length) {
+      return { ok: false, error: 'Нет транскрипта. Транскрибируйте секвенцию (In-Out).' };
+    }
+    var snap = ctx.snapshot;
+    if (!snap || !snap.ok) {
+      return { ok: false, error: 'Нет снимка таймлайна.' };
+    }
+
+    /* Проверка структуры: нужно >=3 видео и >=2 аудио. */
+    var vTracks = (snap.tracks || []).filter(function (t) { return t.type === 'video'; });
+    var aTracks = (snap.tracks || []).filter(function (t) { return t.type === 'audio'; });
+    if (vTracks.length < 3) {
+      return { ok: false, error: 'Нужно ≥3 видеодорожки (V1=wide, V2/V3=гости). Найдено ' + vTracks.length + '.' };
+    }
+    if (aTracks.length < 2) {
+      return { ok: false, error: 'Нужно ≥2 аудиодорожки. Найдено ' + aTracks.length + '.' };
+    }
+
+    /* Hardcoded mapping для Phase 1 MVP. */
+    var mapping = {
+      wideVideoTrack: 0,
+      speakers: [
+        { audioTrack: 0, videoTrack: 1, label: 'Гость 1' },
+        { audioTrack: 1, videoTrack: 2, label: 'Гость 2' }
+      ]
+    };
+
+    /* Phase 1 MVP: чередуем V2/V3 по абзацам.
+       Если paragraphs нет — сделаем из сегментов (~6с группы). */
+    var paragraphs = entry.paragraphs;
+    if (!paragraphs || !paragraphs.length) {
+      paragraphs = _buildSimpleParagraphs(entry.segments, 6);
+    }
+    if (!paragraphs.length) {
+      return { ok: false, error: 'Не удалось построить абзацы из транскрипта.' };
+    }
+
+    /* Простой план: чередование V2/V3 для абзацев, wide между ними при паузах ≥1с. */
+    var segments = [];
+    for (var pi = 0; pi < paragraphs.length; pi++) {
+      var p = paragraphs[pi];
+      var ps = typeof p.startSec === 'number' ? p.startSec : p.start;
+      var pe = typeof p.endSec === 'number' ? p.endSec : p.end;
+      if (typeof ps !== 'number' || typeof pe !== 'number' || pe <= ps) continue;
+      /* Если перед этим абзацем — длинная пауза, вставляем wide. */
+      var prevEnd = pi === 0 ? 0 : (segments.length ? segments[segments.length - 1].tEnd : 0);
+      if (ps - prevEnd >= 1.0) {
+        segments.push({ tStart: prevEnd, tEnd: ps, activeVideoTrack: mapping.wideVideoTrack });
+      } else if (segments.length) {
+        /* Иначе расширяем предыдущий до начала текущего. */
+        segments[segments.length - 1].tEnd = ps;
+      }
+      var activeVT = (pi % 2 === 0) ? mapping.speakers[0].videoTrack : mapping.speakers[1].videoTrack;
+      segments.push({ tStart: ps, tEnd: pe, activeVideoTrack: activeVT });
+    }
+
+    /* Объединяем подряд идущие одинаковые segments. */
+    var merged = [];
+    for (var mi = 0; mi < segments.length; mi++) {
+      var s = segments[mi];
+      var last = merged[merged.length - 1];
+      if (last && last.activeVideoTrack === s.activeVideoTrack && Math.abs(last.tEnd - s.tStart) < 0.05) {
+        last.tEnd = s.tEnd;
+      } else {
+        merged.push({ tStart: s.tStart, tEnd: s.tEnd, activeVideoTrack: s.activeVideoTrack });
+      }
+    }
+
+    if (!merged.length) {
+      return { ok: false, error: 'Не удалось построить план переключений.' };
+    }
+
+    /* Стат для UI. */
+    var perTrack = {};
+    for (var ms = 0; ms < merged.length; ms++) {
+      var k = String(merged[ms].activeVideoTrack);
+      perTrack[k] = (perTrack[k] || 0) + (merged[ms].tEnd - merged[ms].tStart);
+    }
+
+    var plan = {
+      version: 1,
+      rangeSec: [merged[0].tStart, merged[merged.length - 1].tEnd],
+      mapping: mapping,
+      params: { mode: 'disable' },
+      segments: merged
+    };
+
+    return {
+      ok: true,
+      proposal: {
+        kind: 'multicam_cuts',
+        plan: plan,
+        summary: 'Авто-MultiCam: ' + merged.length + ' сегментов, ' + (merged.length - 1) +
+          ' переключений. V1: ' + ((perTrack['0'] || 0).toFixed(1)) + 'с, V2: ' +
+          ((perTrack['1'] || 0).toFixed(1)) + 'с, V3: ' + ((perTrack['2'] || 0).toFixed(1)) + 'с.',
+        stats: { perTrackSeconds: perTrack, switchCount: merged.length - 1 }
+      }
+    };
+  }
+
+  /**
+   * Простые абзацы из сегментов (если transcript-structure не сработал).
+   * Группирует подряд идущие сегменты пока сумма не превысит maxSec.
+   */
+  function _buildSimpleParagraphs(segments, maxSec) {
+    var out = [];
+    var cur = null;
+    for (var i = 0; i < segments.length; i++) {
+      var s = segments[i];
+      var ss = typeof s.startSec === 'number' ? s.startSec : s.start;
+      var se = typeof s.endSec === 'number' ? s.endSec : s.end;
+      if (typeof ss !== 'number' || typeof se !== 'number') continue;
+      if (!cur) {
+        cur = { startSec: ss, endSec: se };
+      } else if (se - cur.startSec > maxSec) {
+        out.push(cur);
+        cur = { startSec: ss, endSec: se };
+      } else {
+        cur.endSec = se;
+      }
+    }
+    if (cur) out.push(cur);
+    return out;
+  }
+
   global.DeterministicPipelines = {
     cutFillers: cutFillers,
     cutSilences: cutSilences,
     chapterize: chapterize,
     jumpCuts: jumpCuts,
     jCuts: jCuts,
+    multicamFromTranscript: multicamFromTranscript,
     detectSilenceIntervals: detectSilenceIntervals,
     parsePipelineCommand: parsePipelineCommand,
     _mergeIntervals: _mergeIntervals,
-    _silencesFromSegmentGaps: _silencesFromSegmentGaps
+    _silencesFromSegmentGaps: _silencesFromSegmentGaps,
+    _buildSimpleParagraphs: _buildSimpleParagraphs
   };
 })(window);

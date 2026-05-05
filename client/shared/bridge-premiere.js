@@ -126,7 +126,21 @@
             }
             clearTimeout(timer);
             try {
-              finish(null, JSON.parse(s));
+              var parsed = JSON.parse(s);
+              /* Phase 1 (PP-26 stabilization): host теперь оборачивает все
+                 экспортируемые функции через _wrap и при exception возвращает
+                 структурированный JSON {_hostError:true, fn, msg, line, source, stack}.
+                 Поднимаем это как осмысленную ошибку с реальным номером строки. */
+              if (parsed && parsed._hostError === true) {
+                var detail = '[' + (parsed.fn || '?') + '] ' + (parsed.msg || 'unknown error');
+                if (parsed.line != null) detail += ' @line:' + parsed.line;
+                if (parsed.source) detail += ' source="' + String(parsed.source).slice(0, 80) + '"';
+                var hostErr = new Error('Host: ' + detail);
+                hostErr.hostError = parsed; /* полные детали доступны caller'у */
+                finish(hostErr, null);
+                return;
+              }
+              finish(null, parsed);
             } catch (e) {
               finish(new Error('JSON от хоста: ' + String(raw).slice(0, 500)), null);
             }
@@ -143,6 +157,11 @@
     applyTimecodeEdits: function (planObj, cb) {
       var json = escapeDoubleQuoted(JSON.stringify(planObj));
       this.evalJson('$._EXT_PRM_.applyTimecodeEdits("' + json + '")', cb);
+    },
+
+    applyMulticamCuts: function (planObj, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify(planObj));
+      this.evalJson('$._EXT_PRM_.applyMulticamCuts("' + json + '")', cb);
     },
 
     applyTranscriptCuts: function (cutsObj, cb) {
