@@ -154,8 +154,20 @@
         if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') {
           return { error: 'Интервал ' + i + ': нужны startSec и endSec (числа)', warn: null };
         }
+        if (isNaN(iv.startSec) || isNaN(iv.endSec)) {
+          return { error: 'Интервал ' + i + ': startSec/endSec не должны быть NaN', warn: null };
+        }
+        /* HIGH #6 (6 мая 2026): отклоняем negative startSec — host применяет к
+           «секундам таймлайна», отрицательные значения превращаются в нули и
+           частично применяются, что хуже явной ошибки. */
+        if (iv.startSec < 0) {
+          return { error: 'Интервал ' + i + ': startSec не может быть отрицательным (' + iv.startSec.toFixed(2) + ')', warn: null };
+        }
         if (iv.endSec <= iv.startSec) {
           return { error: 'Интервал ' + i + ': endSec должен быть > startSec', warn: null };
+        }
+        if (span > 0 && iv.startSec > span + 120) {
+          return { error: 'Интервал ' + i + ': startSec=' + iv.startSec.toFixed(1) + 'с далеко за концом таймлайна (' + span.toFixed(1) + 'с)', warn: null };
         }
         if (span > 0 && iv.endSec > span + 120) {
           warn =
@@ -242,6 +254,15 @@
           }
         } else if (kind === 'mute_track') {
           if (typeof op.trackIndex !== 'number') return 'ops[' + i + '] (mute_track): нужен trackIndex';
+          /* HIGH #6 (6 мая 2026): unified validator забыл trackType check, который
+             есть в legacy validateTimecodePlan. Без него host получает {trackIndex:0}
+             без trackType → падает или мьютит не ту дорожку. */
+          if (op.trackType !== 'video' && op.trackType !== 'audio') {
+            return 'ops[' + i + '] (mute_track): trackType должен быть "video" или "audio"';
+          }
+          if (typeof op.muted !== 'boolean') {
+            return 'ops[' + i + '] (mute_track): нужен muted (true/false)';
+          }
         }
       }
       return null;

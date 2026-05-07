@@ -2310,86 +2310,92 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     });
   }
 
-  /* Шаг 1: razor на ВСЕХ внутренних границах сегментов. */
-  var cutTimes = [];
-  for (var si = 0; si < plan.segments.length - 1; si++) {
-    var t = plan.segments[si].tEnd;
-    if (typeof t !== 'number') continue;
-    cutTimes.push(t);
-  }
-  /* Дедупликация (на случай если соседние сегменты одинаковые). */
-  cutTimes.sort(function (a, b) { return a - b; });
-  var dedup = [];
-  for (var ct = 0; ct < cutTimes.length; ct++) {
-    if (ct === 0 || Math.abs(cutTimes[ct] - cutTimes[ct - 1]) > eps) {
-      dedup.push(cutTimes[ct]);
-    }
-  }
-  cutTimes = dedup;
-
+  /* HIGH #2 (6 мая 2026): outer try/finally чтобы endUndoGroup ВСЕГДА вызывался,
+     даже если razor/disable выбросил unexpected throw в горячем пути. Без этого
+     открытая undo group leaks в Premiere → пользователь видит «битую» undo. */
   var cutsApplied = 0;
-  for (var cti = 0; cti < cutTimes.length; cti++) {
-    var tc = $._EXT_PRM_._secToTimecode(cutTimes[cti], fps);
-    for (var mt = 0; mt < managedTracks.length; mt++) {
-      var trackIdx = managedTracks[mt];
-      try {
-        var qVT = qeSeq.getVideoTrackAt(trackIdx);
-        if (qVT) {
-          try { qVT.razor(tc, true, true); $._EXT_PRM_._bump(); cutsApplied++; } catch (eRZ) {}
-        }
-      } catch (eGT) {}
-    }
-  }
-
-  /* Шаг 2: для каждого сегмента — disable неактивные V-track'и. */
   var segmentsApplied = 0;
   var disabledCount = 0;
   var deletedCount = 0;
-  for (var sgi = 0; sgi < plan.segments.length; sgi++) {
-    var seg = plan.segments[sgi];
-    var t0 = seg.tStart;
-    var t1 = seg.tEnd;
-    var activeV = seg.activeVideoTrack;
-    if (typeof t0 !== 'number' || typeof t1 !== 'number' || typeof activeV !== 'number') continue;
-
-    for (var mvt = 0; mvt < managedTracks.length; mvt++) {
-      var trk = managedTracks[mvt];
-      if (trk >= seq.videoTracks.numTracks) continue;
-      var isActive = (trk === activeV);
-      var vTrack = seq.videoTracks[trk];
-
-      /* Идём по клипам в обратном порядке (если delete-mode — индексы не сбьются). */
-      for (var ci = vTrack.clips.numItems - 1; ci >= 0; ci--) {
-        try {
-          var clip = vTrack.clips[ci];
-          if (!clip) continue;
-          var cs = clip.start.seconds;
-          var ce = clip.end.seconds;
-          /* Клип попадает в [t0, t1] — целиком внутри сегмента (после razor так и должно быть). */
-          if (cs >= t0 - eps && ce <= t1 + eps) {
-            if (isActive) {
-              /* Активная — гарантируем что enabled. */
-              try {
-                if (clip.disabled) { clip.disabled = false; $._EXT_PRM_._bump(); }
-              } catch (eEn) {}
-            } else {
-              /* Неактивная — disable или удалить. */
-              if (mode === 'delete') {
-                try { clip.remove(0, 0); $._EXT_PRM_._bump(); deletedCount++; } catch (eRm) {}
-              } else {
-                try {
-                  if (!clip.disabled) { clip.disabled = true; $._EXT_PRM_._bump(); disabledCount++; }
-                } catch (eDi) {}
-              }
-            }
-          }
-        } catch (eC) {}
+  try {
+    /* Шаг 1: razor на ВСЕХ внутренних границах сегментов. */
+    var cutTimes = [];
+    for (var si = 0; si < plan.segments.length - 1; si++) {
+      var t = plan.segments[si].tEnd;
+      if (typeof t !== 'number') continue;
+      cutTimes.push(t);
+    }
+    /* Дедупликация (на случай если соседние сегменты одинаковые). */
+    cutTimes.sort(function (a, b) { return a - b; });
+    var dedup = [];
+    for (var ct = 0; ct < cutTimes.length; ct++) {
+      if (ct === 0 || Math.abs(cutTimes[ct] - cutTimes[ct - 1]) > eps) {
+        dedup.push(cutTimes[ct]);
       }
     }
-    segmentsApplied++;
-  }
+    cutTimes = dedup;
 
-  if (undoOpened) try { app.endUndoGroup(); } catch (eEU2) {}
+    for (var cti = 0; cti < cutTimes.length; cti++) {
+      var tc = $._EXT_PRM_._secToTimecode(cutTimes[cti], fps);
+      for (var mt = 0; mt < managedTracks.length; mt++) {
+        var trackIdx = managedTracks[mt];
+        try {
+          var qVT = qeSeq.getVideoTrackAt(trackIdx);
+          if (qVT) {
+            try { qVT.razor(tc, true, true); $._EXT_PRM_._bump(); cutsApplied++; } catch (eRZ) {}
+          }
+        } catch (eGT) {}
+      }
+    }
+
+    /* Шаг 2: для каждого сегмента — disable неактивные V-track'и. */
+    for (var sgi = 0; sgi < plan.segments.length; sgi++) {
+      var seg = plan.segments[sgi];
+      var t0 = seg.tStart;
+      var t1 = seg.tEnd;
+      var activeV = seg.activeVideoTrack;
+      if (typeof t0 !== 'number' || typeof t1 !== 'number' || typeof activeV !== 'number') continue;
+
+      for (var mvt = 0; mvt < managedTracks.length; mvt++) {
+        var trk = managedTracks[mvt];
+        if (trk >= seq.videoTracks.numTracks) continue;
+        var isActive = (trk === activeV);
+        var vTrack = seq.videoTracks[trk];
+
+        /* Идём по клипам в обратном порядке (если delete-mode — индексы не сбьются). */
+        for (var ci = vTrack.clips.numItems - 1; ci >= 0; ci--) {
+          try {
+            var clip = vTrack.clips[ci];
+            if (!clip) continue;
+            var cs = clip.start.seconds;
+            var ce = clip.end.seconds;
+            /* Клип попадает в [t0, t1] — целиком внутри сегмента (после razor так и должно быть). */
+            if (cs >= t0 - eps && ce <= t1 + eps) {
+              if (isActive) {
+                /* Активная — гарантируем что enabled. */
+                try {
+                  if (clip.disabled) { clip.disabled = false; $._EXT_PRM_._bump(); }
+                } catch (eEn) {}
+              } else {
+                /* Неактивная — disable или удалить. */
+                if (mode === 'delete') {
+                  try { clip.remove(0, 0); $._EXT_PRM_._bump(); deletedCount++; } catch (eRm) {}
+                } else {
+                  try {
+                    if (!clip.disabled) { clip.disabled = true; $._EXT_PRM_._bump(); disabledCount++; }
+                  } catch (eDi) {}
+                }
+              }
+            }
+          } catch (eC) {}
+        }
+      }
+      segmentsApplied++;
+    }
+  } finally {
+    /* GUARANTEED endUndoGroup даже на throw из горячего пути. */
+    if (undoOpened) try { app.endUndoGroup(); } catch (eEU2) {}
+  }
 
   return JSON.stringify({
     ok: true,

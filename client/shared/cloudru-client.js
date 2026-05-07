@@ -59,14 +59,33 @@
    * прерываем через AbortController. Без этого при зависшем FM UI замирал
    * до ручной отмены пользователем.
    */
-  var MAX_RETRIES = 3;
+  /* Phase 1.5 (6 мая 2026): MAX_RETRIES 3 → 5. На длинных GLM-4.7 запросах
+     наблюдали `fetch failed` (Node-side network reset) после 4+ минут — частая
+     transient на Cloud.ru free preview. 5 попыток с backoff 1/2/4/8/16с
+     перекрывает 30-сек выпадения сети. */
+  var MAX_RETRIES = 5;
   var BASE_DELAY_MS = 1000;
-  var FETCH_TIMEOUT_MS = 120000; /* 2 минуты на одну попытку */
+  /* Доп. фиксированная задержка после `fetch failed` (Node TypeError, не HTTP).
+     Это network-reset transient — лучше дать сети «успокоиться» дольше чем
+     обычный exp-backoff. */
+  var NETWORK_TRANSIENT_DELAY_MS = 5000;
+  /* Phase 1.5 (май 2026): 120 → 300 сек (5 мин). На GLM-4.7 с thinking mode
+     запросы analyze + buildTopics на 50+ сегментах легко занимают 3-4 мин.
+     Real-call test показал 214сек на одном chunk без таймаута, и failed на
+     третьей попытке. Поднимаем default чтобы перекрыть worst case. */
+  var FETCH_TIMEOUT_MS = 300000;
 
   async function fetchWithRetry(url, fetchOpts, abortCheck, opts) {
     opts = opts || {};
     var timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : FETCH_TIMEOUT_MS;
     var lastErr = null;
+    /* HIGH #3 (6 мая 2026): pre-aborted external signal проверяем явно.
+       addEventListener('abort') не сработает если signal уже aborted. */
+    if (fetchOpts && fetchOpts.signal && fetchOpts.signal.aborted) {
+      var preAbortErr = new Error('Остановлено пользователем');
+      preAbortErr.name = 'AbortError';
+      throw preAbortErr;
+    }
     for (var attempt = 0; attempt < MAX_RETRIES; attempt++) {
       throwIfAbortCheck(abortCheck);
 
@@ -75,6 +94,7 @@
       var ctrl = null;
       var tmId = null;
       var mergedOpts = fetchOpts;
+      var externalAbortHandler = null; /* HIGH #3: ссылку храним для removeEventListener */
       if (typeof AbortController !== 'undefined' && timeoutMs > 0) {
         ctrl = new AbortController();
         tmId = setTimeout(function () {
@@ -84,23 +104,33 @@
         /* Если caller передал свой signal — слушаем оба. */
         if (fetchOpts && fetchOpts.signal) {
           try {
-            fetchOpts.signal.addEventListener('abort', function () {
+            externalAbortHandler = function () {
               try { ctrl.abort(); } catch (_) {}
-            });
+            };
+            fetchOpts.signal.addEventListener('abort', externalAbortHandler);
           } catch (_) {}
+        }
+      }
+      /* Helper для cleanup перед каждым return/throw — снимает listener чтобы
+         не накапливать на shared external signal через retry-цикл. */
+      function _cleanupAttempt() {
+        if (tmId) { try { clearTimeout(tmId); } catch (_) {} tmId = null; }
+        if (externalAbortHandler && fetchOpts && fetchOpts.signal) {
+          try { fetchOpts.signal.removeEventListener('abort', externalAbortHandler); } catch (_) {}
+          externalAbortHandler = null;
         }
       }
 
       try {
         var res = await fetch(url, mergedOpts);
-        if (tmId) clearTimeout(tmId);
+        _cleanupAttempt();
         if (!isRetryable(res.status) || attempt === MAX_RETRIES - 1) {
           return res;
         }
         /* Retryable error — wait and try again */
         lastErr = new Error('HTTP ' + res.status);
       } catch (fetchErr) {
-        if (tmId) clearTimeout(tmId);
+        _cleanupAttempt();
         /* AbortError от внешнего abortCheck — пробрасываем. */
         if (fetchErr && fetchErr.name === 'AbortError') {
           if (typeof abortCheck === 'function' && abortCheck()) throw fetchErr;
@@ -112,11 +142,17 @@
           lastErr = fetchErr;
         }
       }
-      /* Exponential backoff с джиттером (±20%): 1s, 2s, 4s — рандомизация
-         спасает от синхронного retry-шторма при параллельных чанках. */
+      /* Exponential backoff с джиттером (±20%): 1s, 2s, 4s, 8s, 16s — рандомизация
+         спасает от синхронного retry-шторма при параллельных чанках.
+         Для network-transient (fetch failed) — extra 5с поверх backoff. */
       var base = BASE_DELAY_MS * Math.pow(2, attempt);
       var jitter = base * 0.2 * (Math.random() * 2 - 1);
-      await sleep(Math.round(base + jitter));
+      var extraDelay = 0;
+      var errMsg = String(lastErr && lastErr.message || '');
+      if (/fetch failed|network|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(errMsg)) {
+        extraDelay = NETWORK_TRANSIENT_DELAY_MS;
+      }
+      await sleep(Math.round(base + jitter + extraDelay));
     }
     throw lastErr || new Error('Retry exhausted');
   }
@@ -259,10 +295,29 @@
       if (body.temperature === undefined && opts.temperature !== undefined) {
         body.temperature = opts.temperature;
       }
-      if (body.temperature === undefined) body.temperature = 0.5;
+      /* Default temperature 0.1 (Phase 1 quality fix, май 2026): для tool-calling
+         нужна детерминированность. Раньше дефолт 0.5 → hallucinated nodeIds,
+         markdown-обёртки в JSON. См. project_transcript_pipeline_audit (HIGH#2). */
+      if (body.temperature === undefined) body.temperature = 0.1;
       if (opts.tools && opts.tools.length) {
         body.tools = opts.tools;
         body.tool_choice = opts.tool_choice || 'auto';
+      }
+
+      /* Phase 1: response_format passthrough.
+         Для structured-output вызовов (analyze, build topics) — JSON object mode.
+         Не используем вместе с tools[] — OpenAI API контракт несовместим. */
+      if (opts.responseFormat && (!opts.tools || !opts.tools.length)) {
+        body.response_format = (typeof opts.responseFormat === 'string')
+          ? { type: opts.responseFormat }
+          : opts.responseFormat;
+      }
+
+      /* Phase 1: GLM thinking mode passthrough (chat_template_kwargs).
+         Для не-thinking моделей (gpt-oss-120b, Qwen3) поле игнорируется. */
+      if (typeof opts.enableThinking === 'boolean') {
+        body.chat_template_kwargs = body.chat_template_kwargs || {};
+        body.chat_template_kwargs.enable_thinking = opts.enableThinking;
       }
 
       /* Streaming: enable if requested and supported */

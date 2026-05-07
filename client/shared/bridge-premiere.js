@@ -127,6 +127,12 @@
             clearTimeout(timer);
             try {
               var parsed = JSON.parse(s);
+              /* HIGH #4 (6 мая 2026): JSON.parse('null') возвращает null — это
+                 НЕ валидный success. Caller'ы делают `data.ok` → TypeError. Считаем как glitch. */
+              if (parsed === null) {
+                finish(new Error('Host вернул null — возможно ExtendScript синхронно вернул литерал null, не валидный JSON-ответ. raw=' + String(raw).slice(0, 200)), null);
+                return;
+              }
               /* Phase 1 (PP-26 stabilization): host теперь оборачивает все
                  экспортируемые функции через _wrap и при exception возвращает
                  структурированный JSON {_hostError:true, fn, msg, line, source, stack}.

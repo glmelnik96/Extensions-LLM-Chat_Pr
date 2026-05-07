@@ -198,34 +198,77 @@
     var sysMsg =
       'Ты — монтажёр, размечающий видеоролик по смысловым главам. ' +
       'На входе — абзацы расшифровки с таймкодами (секунды на таймлайне). ' +
-      'Сгруппируй их в 3–12 глав по смене темы. ' +
+      'Сгруппируй их в 3–12 глав по СМЕНЕ ТЕМЫ. ' +
+      'КАЖДАЯ ГЛАВА ДОЛЖНА ИМЕТЬ УНИКАЛЬНОЕ НАЗВАНИЕ — не повторяй одно и то же. ' +
+      'Если несколько абзацев подряд про одно и то же — объедини их в ОДНУ главу. ' +
+      'Если весь ролик на одну тему (короткое выступление, одна мысль) — верни 1-3 главы, не растягивай. ' +
+      'Названия глав: 3-6 слов, отражают СУТЬ блока, на русском. Без слов «Часть N», «Продолжение», «Раздел N». ' +
       'Возвращай СТРОГО JSON {"topics":[{"startSec":N,"endSec":N,"title":"…","summary":"одно предложение"}]}. ' +
       'startSec первой главы = startSec первого абзаца; endSec последней = endSec последнего. ' +
       'Главы без дыр: endSec текущей = startSec следующей. Между главами не меньше 20 сек. Без markdown, только JSON.';
 
     var userMsg = JSON.stringify({ paragraphs: compact });
 
+    /* Phase 1 (Май 2026): chapterModel — отдельная модель для построения глав.
+       Long-context reasoning task — рутим на GLM-4.7 если задано. Fallback на
+       chatModel чтобы не сломать пользователей с кастомным fm-defaults. */
     return CC.chatCompletions({
       baseUrl: settings.baseUrl,
       apiKey: settings.apiKey,
-      model: settings.analysisModel || settings.activeAgentModel || settings.chatModel,
+      model: settings.chapterModel || settings.analysisModel || settings.activeAgentModel || settings.chatModel,
       messages: [
         { role: 'system', content: sysMsg },
         { role: 'user', content: userMsg }
       ],
-      chatParams: { max_tokens: 2000, temperature: 0.2 },
+      /* Phase 1.5 (6 мая 2026): adaptive max_tokens.
+         Production-eval показал зависимость:
+         - 9 параграфов (smoke):    ~2.6K completion → 4000 хватало
+         - 297 параграфов (1ч):     ~6-8K completion → 16000 OK
+         - 900 параграфов (3ч):    ~18-25K оценка → 16000 МАЛО (regression risk)
+         Формула: 16000 + (paragraphs * 30) с потолком 32000. На 1ч даёт 16K+9K=25K
+         (clamped к 32K), на 3ч даёт 16K+27K=32K. Не-thinking модели лишнее не съедят. */
+      chatParams: { max_tokens: Math.min(32000, 16000 + Math.floor(paragraphs.length * 30)), temperature: 0.2 },
+      responseFormat: 'json_object',
+      /* Phase 1.5: per-role thinking — для chapter обычно true (long-context reasoning). */
+      enableThinking: (settings.thinkingPolicy && typeof settings.thinkingPolicy.chapter === 'boolean')
+        ? settings.thinkingPolicy.chapter
+        : settings.enableThinking,
       signal: opt.signal,
       abortCheck: opt.abortCheck
     }).then(function (resp) {
       try {
-        var content = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
-        if (!content) return [];
+        var choice = resp && resp.choices && resp.choices[0];
+        var content = choice && choice.message && choice.message.content;
+        /* Phase 1.5 (6 мая): диагностика — логируем finish_reason/usage если empty.
+           Помогает понять truncation vs API error vs genuine empty response. */
+        if (!content) {
+          if (typeof console !== 'undefined' && console.warn) {
+            console.warn('[buildTopics] empty content. finish_reason=' + (choice && choice.finish_reason) +
+              ' usage=' + JSON.stringify(resp.usage || {}));
+          }
+          return [];
+        }
         var m = String(content).match(/\{[\s\S]*\}/);
-        if (!m) return [];
-        var j = JSON.parse(m[0]);
+        if (!m) {
+          if (typeof console !== 'undefined' && console.warn) {
+            console.warn('[buildTopics] no JSON match. content len=' + content.length +
+              ' first200="' + content.slice(0, 200) + '"');
+          }
+          return [];
+        }
+        var j;
+        try {
+          j = JSON.parse(m[0]);
+        } catch (eParse) {
+          if (typeof console !== 'undefined' && console.warn) {
+            console.warn('[buildTopics] JSON.parse fail: ' + eParse.message + ' content tail="' +
+              content.slice(-200) + '"');
+          }
+          return [];
+        }
         var topics = (j && j.topics) || [];
         if (!Array.isArray(topics)) return [];
-        return topics.map(function (t) {
+        var normalized = topics.map(function (t) {
           return {
             startSec: Number(t.startSec) || 0,
             endSec: Number(t.endSec) || 0,
@@ -233,10 +276,61 @@
             summary: String(t.summary || '').slice(0, 200)
           };
         }).filter(function (t) { return t.endSec > t.startSec && t.title; });
+        /* Phase 1.5 (6 мая): post-process dedup. LLM иногда (особенно на повторяющемся
+           материале) выдаёт N глав с одинаковыми title — сливаем смежные одинаковые
+           в одну. Сравниваем по нормализованному lowercased title. */
+        if (normalized.length <= 1) return normalized;
+        var deduped = [normalized[0]];
+        for (var ti = 1; ti < normalized.length; ti++) {
+          var prev = deduped[deduped.length - 1];
+          var cur = normalized[ti];
+          var sameTitle = prev.title.trim().toLowerCase() === cur.title.trim().toLowerCase();
+          var adjacent = Math.abs(prev.endSec - cur.startSec) < 2;
+          if (sameTitle && adjacent) {
+            /* Сливаем: расширяем prev.endSec, оставляем prev.summary. */
+            prev.endSec = cur.endSec;
+          } else {
+            deduped.push(cur);
+          }
+        }
+        return deduped;
       } catch (e) {
         return [];
       }
     }, function () { return []; });
+  }
+
+  /**
+   * HIGH (6 мая 2026): обнаружение устаревших paragraphs после edit'а таймлайна.
+   *
+   * После applyTranscriptCuts сегменты ремаплятся под новые координаты, но
+   * paragraphs.segmentIdxs могут указывать на удалённые сегменты, или
+   * paragraph.startSec/endSec не совпасть с реальным временем сегментов
+   * (расходимость на >1с). В таком случае LLM получает «корректные» абзацы
+   * с неверными timestamps → ножи режут не там.
+   *
+   * Возвращает true если структура требует пересборки.
+   */
+  function isParagraphsStale(entry) {
+    if (!entry || !Array.isArray(entry.paragraphs) || !entry.paragraphs.length) return false;
+    if (!Array.isArray(entry.segments) || !entry.segments.length) return false;
+    var segLen = entry.segments.length;
+    var DRIFT = 1.0; /* сек — допуск рассогласования (секунда — много для речи) */
+    for (var i = 0; i < entry.paragraphs.length; i++) {
+      var p = entry.paragraphs[i];
+      var idxs = Array.isArray(p.segmentIdxs) ? p.segmentIdxs : [];
+      if (!idxs.length) continue;
+      if (idxs[idxs.length - 1] >= segLen) return true;     /* segIdx out of range */
+      if (idxs[0] < 0) return true;                         /* отрицательный idx */
+      var firstSeg = entry.segments[idxs[0]];
+      var lastSeg = entry.segments[idxs[idxs.length - 1]];
+      if (!firstSeg || !lastSeg) return true;
+      var ss = typeof firstSeg.startSec === 'number' ? firstSeg.startSec : firstSeg.start;
+      var se = typeof lastSeg.endSec === 'number' ? lastSeg.endSec : lastSeg.end;
+      if (typeof ss === 'number' && Math.abs(ss - p.startSec) > DRIFT) return true;
+      if (typeof se === 'number' && Math.abs(se - p.endSec) > DRIFT) return true;
+    }
+    return false;
   }
 
   /**
@@ -542,8 +636,8 @@
       '• intro      — приветствие, представление: «всем привет», «меня зовут», «с вами канал» БЕЗ полезной информации (УДАЛИТЬ)',
       '• outro      — прощание: «подписывайтесь», «до встречи», «с вами был» (УДАЛИТЬ)',
       '• outtake    — оговорка, фальстарт, ругательство, «давай заново», «подожди, тормозни», «блин, это хрень» — спикер сбился и переначал (УДАЛИТЬ)',
-      '• repeat     — почти дословный повтор другого сегмента — спикер сказал то же самое второй раз. Укажи «repeat of i=N» (УДАЛИТЬ первый дубль, оставь второй)',
-      '• artifact   — шум транскрибации: повторяющиеся фрагменты имён/субтитров, вставленные Whisper. Пример: «И Валерий Курас» повторяется в каждом сегменте — это артефакт (УДАЛИТЬ)',
+      '• repeat     — содержательный повтор: спикер сказал ту же мысль/фразу ещё раз. Бывает любой длины — от 5 слов до целого абзаца. Если текст выглядит ОСМЫСЛЕННО и полно (не обрывок), и ты видишь его второй (третий, четвёртый…) раз — это repeat. Укажи «repeat of i=N». УДАЛИТЬ дубли, оставить ОДИН (последний обычно чище).',
+      '• artifact   — НЕсодержательный шум транскрибации Whisper: вставленные обрывочные фрагменты имён ведущих, метаданных, субтитров. Признаки: 1-3 слова, вне контекста, нет грамматической связи с речью. Пример: «И Валерий Курас» вставленный посреди мысли — это artifact. ВАЖНО: если повторяется длинная осмысленная фраза целиком — это НЕ artifact, а repeat.',
       '• digression — уход от основной темы (ПОМЕТИТЬ, решение за пользователем)',
       '',
       'АКТИВНЫЕ ЗАДАЧИ (ищи эти категории, остальное = content): ' + taskList,
@@ -769,7 +863,6 @@
        Пробрасывается в _buildFinalResult и дальше в UI для видимого warning'а
        (раньше чанки молча игнорировались → пользователь получал неточное предложение). */
     var failedChunks = [];
-    var chunkIdx = 0;
     var totalChunks = chunks.length;
 
     onProgress({
@@ -780,30 +873,43 @@
       message: 'Анализ транскрипта: ' + segments.length + ' сегментов, ' + totalChunks + ' чанк(ов), модель ' + (model || '?')
     });
 
-    function processChunk() {
-      if (chunkIdx >= chunks.length) return Promise.resolve();
-      var chunk = chunks[chunkIdx];
-      chunkIdx++;
+    /* Phase 1.5 (6 мая 2026): убран cross-chunk bridging — несовместим с
+       параллельным chunking'ом (мы не знаем выход chunk N-1 при старте chunk N).
+       На синтетических ×10 повторах bridging не дал улучшения качества (см.
+       memory:feedback_glm47_real_call_findings); оставляем sticky-context простой —
+       chunkIdx + segRange. */
+
+    /* Phase 1.5 (6 мая 2026): per-role thinking + параллельный chunking.
+       Per-chunk classification — простая задача, thinking тут overkill (3-5×
+       latency, network transient'ы). Берём policy.analyze, fallback на
+       enableThinking, default false. */
+    var policyAnalyze = (settings.thinkingPolicy && typeof settings.thinkingPolicy.analyze === 'boolean')
+      ? settings.thinkingPolicy.analyze
+      : (typeof settings.enableThinking === 'boolean' ? settings.enableThinking : false);
+
+    function processOneChunk(chunkObj) {
+      var chunk = chunkObj.chunk;
+      var thisChunkIdx = chunkObj.chunkIdx; /* 1-based для прогресса */
 
       onProgress({
         phase: 'chunk',
-        chunkIndex: chunkIdx,
+        chunkIndex: thisChunkIdx,
         totalChunks: totalChunks,
         segRange: chunk[0].i + '–' + chunk[chunk.length - 1].i,
-        message: 'Анализ чанка ' + chunkIdx + '/' + totalChunks + ' (сегменты ' + chunk[0].i + '–' + chunk[chunk.length - 1].i + ')…'
+        message: 'Анализ чанка ' + thisChunkIdx + '/' + totalChunks + ' (сегменты ' + chunk[0].i + '–' + chunk[chunk.length - 1].i + ')…'
       });
 
+      /* Cross-chunk bridging при параллельном запуске не работает (мы не
+         знаем выход chunk N-1 при старте chunk N). Оставляем "сухой"
+         contextNote с информацией о позиции в последовательности. */
       var contextNote = '';
-      if (chunkIdx > 1) {
-        contextNote = '\n\n[Контекст: сегменты ' + chunk[0].i + '–' + chunk[chunk.length - 1].i +
-          ' из ' + segments.length + '. Предыдущие уже проанализированы.]';
+      if (thisChunkIdx > 1) {
+        contextNote = '\n\n[Контекст: чанк ' + thisChunkIdx + ' из ' + totalChunks +
+          '. Сегменты ' + chunk[0].i + '–' + chunk[chunk.length - 1].i + ' из ' + segments.length + '.]';
       }
 
       var userMsg = JSON.stringify({ segments: chunk }) + contextNote;
 
-      /* Capture идентификатор чанка в замыкание — chunkIdx увеличивается
-         между await-ами, иначе все ошибки логируются с последним номером. */
-      var thisChunkIdx = chunkIdx;
       var segStart = chunk[0].i;
       var segEnd = chunk[chunk.length - 1].i;
 
@@ -815,13 +921,14 @@
           { role: 'system', content: sysPrompt },
           { role: 'user', content: userMsg }
         ],
-        /* response_format=json_object — LLM обязан вернуть валидный JSON
-           без markdown-обёрток. Провайдер игнорирует параметр если не поддерживает. */
+        /* max_tokens 12000 — на случай если кто-то всё-таки включит thinking
+           для analyze. На обычном (non-thinking) пути расходуется ~3-5K. */
         chatParams: {
-          max_tokens: 6000,
-          temperature: 0.1,
-          response_format: { type: 'json_object' }
+          max_tokens: 12000,
+          temperature: 0.1
         },
+        responseFormat: 'json_object',
+        enableThinking: policyAnalyze,
         signal: opt.signal,
         abortCheck: opt.abortCheck
       }).then(function (resp) {
@@ -834,7 +941,13 @@
               segEnd: segEnd,
               reason: 'empty response'
             });
-            return processChunk();
+            /* Phase 1.6 (6 мая 2026): был dead reference `return processChunk()`
+               после миграции на parallel pool — крашил Promise.all. Worker сам
+               подхватит следующий chunk через worker().then(worker). */
+            if (typeof console !== 'undefined' && console.warn) {
+              console.warn('[analyzeForCutsWithLLM] empty content for chunk ' + thisChunkIdx);
+            }
+            return;
           }
           var m = String(content).match(/\{[\s\S]*\}/);
           if (!m) {
@@ -844,7 +957,11 @@
               segEnd: segEnd,
               reason: 'no JSON in response'
             });
-            return processChunk();
+            if (typeof console !== 'undefined' && console.warn) {
+              console.warn('[analyzeForCutsWithLLM] no JSON match for chunk ' + thisChunkIdx +
+                ' content_len=' + content.length);
+            }
+            return;
           }
           var j = JSON.parse(m[0]);
           var labels = (j && j.labels) || [];
@@ -879,7 +996,6 @@
             message: 'Ошибка разбора чанка ' + thisChunkIdx + ': ' + String(parseErr.message || '')
           });
         }
-        return processChunk();
       }, function (err) {
         failedChunks.push({
           chunkIndex: thisChunkIdx,
@@ -893,11 +1009,32 @@
           error: String(err && err.message || err),
           message: 'Ошибка API чанка ' + thisChunkIdx + ': ' + String(err && err.message || '')
         });
-        return processChunk();
       });
     }
 
-    return processChunk().then(function () {
+    /* Phase 1.5: параллельный pool. concurrency = settings.analyzeConcurrency,
+       default 1 (sequential). 3 — реалистичный компромисс. */
+    var concurrency = (typeof settings.analyzeConcurrency === 'number' && settings.analyzeConcurrency > 0)
+      ? Math.min(8, settings.analyzeConcurrency)
+      : 1;
+
+    var queue = chunks.map(function (chunk, i) {
+      return { chunk: chunk, chunkIdx: i + 1 };
+    });
+    var nextIndex = 0;
+
+    function worker() {
+      if (nextIndex >= queue.length) return Promise.resolve();
+      var item = queue[nextIndex++];
+      return processOneChunk(item).then(worker);
+    }
+
+    var workers = [];
+    for (var w = 0; w < Math.min(concurrency, queue.length); w++) {
+      workers.push(worker());
+    }
+
+    return Promise.all(workers).then(function () {
       return _buildFinalResult(segments, preByIndex, allLabels, onProgress, chunks.length, failedChunks);
     });
   }
@@ -908,6 +1045,7 @@
     buildTopicsWithLLM: buildTopicsWithLLM,
     analyzeForCutsWithLLM: analyzeForCutsWithLLM,
     buildStructure: buildStructure,
+    isParagraphsStale: isParagraphsStale,
     /* P0-2: локальные детекторы */
     detectFillers: detectFillers,
     detectIntroOutro: detectIntroOutro,

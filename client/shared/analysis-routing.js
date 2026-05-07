@@ -117,11 +117,65 @@
       });
     }
 
+    /* HIGH #5 (6 мая 2026): если keepIntervals покрывают весь [minSec, maxSec],
+       removeIntervals === [] → проактивно сообщаем об ошибке. Иначе UI ставит
+       proposal с «вырезано 0 интервалов» — пользователь не понимает что произошло. */
+    if (removeIntervals.length === 0) {
+      return {
+        error: 'keepIntervals покрывают весь транскрипт — нечего вырезать. ' +
+          'Чтобы построить план, оставьте только нужные фрагменты в keepIntervals.'
+      };
+    }
+
     return { removeIntervals: removeIntervals };
+  }
+
+  /**
+   * HIGH (6 мая 2026): валидация хронометража keep против target.
+   *
+   * Проблема: LLM на «уложи в 40 секунд» часто возвращает 60-70с keep —
+   * не считает сумму durations. Передаём сюда, проверяем превышение, при overshoot >20%
+   * возвращаем структурированную ошибку с подсказкой → LLM пересоберёт план.
+   *
+   * @param {Array<{startSec, endSec}>} keepIntervals
+   * @param {number} targetSec — целевой хронометраж
+   * @param {number} [allowedOvershoot=1.20] — допустимое превышение (1.20 = 20%)
+   * @returns {{ok: true, keepSumSec: number}|{error: string, keepSumSec: number, overshootPct: number}}
+   */
+  function validateKeepDuration(keepIntervals, targetSec, allowedOvershoot) {
+    var allowed = typeof allowedOvershoot === 'number' && allowedOvershoot > 1 ? allowedOvershoot : 1.20;
+    if (!Array.isArray(keepIntervals) || !keepIntervals.length) {
+      return { ok: true, keepSumSec: 0 };
+    }
+    if (typeof targetSec !== 'number' || targetSec <= 0) {
+      return { ok: true, keepSumSec: 0 }; /* без target — пропускаем */
+    }
+    var sum = 0;
+    for (var i = 0; i < keepIntervals.length; i++) {
+      var iv = keepIntervals[i];
+      if (typeof iv.startSec === 'number' && typeof iv.endSec === 'number' && iv.endSec > iv.startSec) {
+        sum += iv.endSec - iv.startSec;
+      }
+    }
+    if (sum <= targetSec * allowed) {
+      return { ok: true, keepSumSec: sum };
+    }
+    var overshootPct = Math.round(((sum / targetSec) - 1) * 100);
+    return {
+      error: 'Сумма keepIntervals = ' + sum.toFixed(1) + 'с при цели ' + targetSec.toFixed(0) +
+        'с (превышение на ' + overshootPct + '%). ' +
+        'Сократи выбор: оставь топ-приоритеты (вступление + 1–2 ключевые мысли + заключение). ' +
+        'Просуммируй endSec−startSec по каждому интервалу и убедись, что итог ≤ ' +
+        targetSec.toFixed(0) + 'с (допуск +20%). ' +
+        'Передай keepIntervals заново в propose_transcript_cuts с тем же targetDurationSec.',
+      keepSumSec: sum,
+      overshootPct: overshootPct
+    };
   }
 
   global.AnalysisRouting = {
     shouldRemoveLabel: shouldRemoveLabel,
-    invertKeepToRemove: invertKeepToRemove
+    invertKeepToRemove: invertKeepToRemove,
+    validateKeepDuration: validateKeepDuration
   };
 })(typeof window !== 'undefined' ? window : this);

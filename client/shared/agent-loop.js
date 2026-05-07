@@ -210,6 +210,13 @@
         messages: messages,
         tools: tools,
         chatParams: settings.chatParams || {},
+        /* Phase 1.5 (6 мая 2026): per-role thinking — chat policy.
+           Помогает на multi-step decision making (τ²-Bench 87.4%).
+           Не-thinking модели игнорируют. */
+        enableThinking: (settings.thinkingPolicy && typeof settings.thinkingPolicy.chat === 'boolean')
+          ? settings.thinkingPolicy.chat
+          : settings.enableThinking,
+        /* response_format НЕ задаём — несовместимо с tools[] по OpenAI API контракту. */
         signal: signal,
         abortCheck: abortCheck,
         stream: !!settings.stream,

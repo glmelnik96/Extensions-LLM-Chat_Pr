@@ -1,0 +1,93 @@
+{
+  "title": "Semantic editing + jumpCuts/cutSilences differentiation + Premiere API audit",
+  "source_plan": ".omc/plans/semantic-editing-and-tools-improvements.md",
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "Premiere Pro API compliance audit",
+      "description": "Audit bridge-premiere.js and host/premiere.jsx against real CEP/ExtendScript Premiere Pro API. Document any findings.",
+      "priority": 1,
+      "passes": true,
+      "acceptanceCriteria": [
+        "Every CSInterface evalScript call in bridge-premiere.js maps to a defined function in host/premiere.jsx",
+        "Every function in host/premiere.jsx uses only real Premiere Pro ExtendScript API methods (app.project, QE, sequence.videoTracks, markers, etc.)",
+        "Marker API usage matches app.project.activeSequence.markers.createMarker / marker.type / marker.setTypeAsChapter semantics",
+        "Razor/trim operations use real track.insertClip / track.clips / qe.razor APIs",
+        "Audit report saved to .omc/research/premiere-api-audit.md with found issues and safe usage confirmation"
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Differentiate jumpCuts and cutSilences (R11-R15)",
+      "description": "Extract shared silence detector, give each pipeline distinct concept: cutSilences = hygiene (≥1s), jumpCuts = rhythm (agressive, keep breathing).",
+      "priority": 2,
+      "passes": true,
+      "acceptanceCriteria": [
+        "Shared helper detectSilenceIntervals(entry, {thresholdDb, minDuration, padding, source}) exists in deterministic-pipelines.js",
+        "jumpCuts uses threshold gating (same logic as cutSilences) — no silences from below threshold",
+        "jumpCuts supports keepBreathing parameter (default 0.05s) — cuts leave breathing gap, not zero",
+        "jumpCuts supports minSegmentDuration parameter (default 0.3s) — adjacent intervals with tiny gap between merge",
+        "UI card subtitles differentiate: cutSilences=«гигиена, ≥1с», jumpCuts=«ритм, YouTube-стиль»",
+        "Unit tests pass: npm test shows all tests green, with new cases covering keepBreathing and minSegmentDuration"
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Fix digression routing + add aggressiveness (R4)",
+      "description": "digression label must route to toRemove by default. Add aggressiveness parameter for granular control.",
+      "priority": 3,
+      "passes": true,
+      "acceptanceCriteria": [
+        "analyze_transcript_for_cuts accepts aggressiveness: 'gentle'|'normal'|'aggressive' (default 'normal')",
+        "gentle: only filler+artifact go to toRemove; intro/outro/outtake/repeat/digression stay in toKeep",
+        "normal: filler+artifact+intro+outro+outtake+repeat go to toRemove; digression stays in toKeep (current behavior preserved)",
+        "aggressive: all non-content labels (including digression) go to toRemove",
+        "Tool description in panel.js updated to document aggressiveness parameter",
+        "Unit test covers all 3 aggressiveness levels with mocked label set"
+      ]
+    },
+    {
+      "id": "US-004",
+      "title": "keepIntervals support in propose_transcript_cuts (R1)",
+      "description": "Let LLM specify what to KEEP, auto-invert to removeIntervals. Critical for «собери ролик про X» flow.",
+      "priority": 4,
+      "passes": true,
+      "acceptanceCriteria": [
+        "propose_transcript_cuts tool schema accepts keepIntervals as alternative to removeIntervals",
+        "If keepIntervals provided: executor computes removeIntervals = complement within [minSec, maxSec] of transcript",
+        "Inversion respects segment/paragraph boundaries — no cutting mid-word",
+        "If both keepIntervals and removeIntervals provided — error message to LLM",
+        "Tool description explicitly documents keepIntervals usage for assembly-style edits",
+        "Unit test: given keepIntervals [[10,20],[40,50]] on 60s transcript, removeIntervals = [[0,10],[20,40],[50,60]]"
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "Adaptive chapter min-interval + name validation (R7, R9)",
+      "description": "Chapter spacing adapts to duration; reject boilerplate names like «Часть N».",
+      "priority": 5,
+      "passes": true,
+      "acceptanceCriteria": [
+        "chapterize uses adaptive min-interval: <3min=10s, 3-10min=20s, >10min=45s (replaces hardcoded 15s)",
+        "Chapter names matching /^(Часть|Part)\\s*\\d+$|^Продолжение$|^Следующ.+ часть$/i are rejected and replaced with first 4 words of first paragraph in chapter",
+        "Fallback time-based chapters also get meaningful names (first words of nearest segment), not «Часть N»",
+        "Unit test verifies adaptive interval for 3 duration tiers",
+        "Unit test verifies name validation rejects «Часть 2», replaces with real text"
+      ]
+    },
+    {
+      "id": "US-006",
+      "title": "Update prompts.js + full regression test",
+      "description": "Wire new capabilities into prompts.js so LLM knows to use them. Full test regression.",
+      "priority": 6,
+      "passes": true,
+      "acceptanceCriteria": [
+        "prompts.js TIER1_TRANSCRIPT documents keepIntervals (R1) — «для сборки используй keepIntervals»",
+        "prompts.js TIER1_TRANSCRIPT documents aggressiveness parameter (R4) — «по умолчанию normal»",
+        "prompts.js version marker or comment updated to reflect new capabilities",
+        "npm test — all tests pass (new + existing)",
+        "No lsp diagnostics errors on modified files (client/shared/*.js, client/unified/panel.js)"
+      ]
+    }
+  ]
+}

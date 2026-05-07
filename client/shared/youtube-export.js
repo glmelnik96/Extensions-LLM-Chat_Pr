@@ -44,9 +44,47 @@
     return lines.join('\n');
   }
 
+  /**
+   * MEDIUM (6 мая 2026, audit fix): валидация требований YouTube для разметки глав.
+   * Возвращает массив warning'ов (пустой = всё ок).
+   * YouTube требования:
+   *   • Минимум 3 главы — иначе плеер не показывает разметку.
+   *   • Первый таймкод обязан быть 0:00.
+   *   • Между главами минимум 10 секунд.
+   *   • Каждая глава длится не менее 10 секунд.
+   * Эти правила НЕ блокируют формирование строки — пусть пользователь
+   * скопирует, но мы предупреждаем заранее чтобы не удивлялся «почему YouTube
+   * проигнорировал». Использовать рядом с formatChaptersForYouTube в UI.
+   */
+  function validateForYouTube(markers) {
+    var warns = [];
+    if (!Array.isArray(markers)) {
+      warns.push('markers должен быть массивом');
+      return warns;
+    }
+    if (markers.length < 3) {
+      warns.push('YouTube требует ≥3 глав для активации разметки. Сейчас: ' + markers.length + '.');
+    }
+    if (markers.length > 0) {
+      var sorted = markers.slice().sort(function (a, b) { return (a.timeSec || 0) - (b.timeSec || 0); });
+      if ((sorted[0].timeSec || 0) > 0.5) {
+        warns.push('Первая глава не на 0:00 (текущая: ' + (sorted[0].timeSec || 0).toFixed(1) + 'с). YouTube не активирует разметку без главы на 0:00.');
+      }
+      for (var i = 1; i < sorted.length; i++) {
+        var gap = (sorted[i].timeSec || 0) - (sorted[i - 1].timeSec || 0);
+        if (gap < 10) {
+          warns.push('Главы ' + i + ' и ' + (i + 1) + ' ближе 10с друг к другу (' + gap.toFixed(1) + 'с). YouTube требует мин. 10с.');
+          break; /* одного предупреждения хватит — пользователь поймёт что нужно проверить все */
+        }
+      }
+    }
+    return warns;
+  }
+
   var api = {
     formatChaptersForYouTube: formatChaptersForYouTube,
-    formatTimestamp: formatTimestamp
+    formatTimestamp: formatTimestamp,
+    validateForYouTube: validateForYouTube
   };
 
   if (typeof module !== 'undefined' && module.exports) {

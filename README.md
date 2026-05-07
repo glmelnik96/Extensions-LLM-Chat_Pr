@@ -17,7 +17,27 @@
 | AI-чат (аудио ducking) | Реализовано, не тестировалось в продакшене |
 | J/L-cuts | Отключено — ExtendScript не поддерживает unlink() |
 | Скорость клипа | Не поддерживается — нет API в Premiere Pro 2025 |
-| Автотесты | 129/129 pass |
+| Автотесты | 219/219 pass |
+| MultiCam-нарезка для подкастов | Phase 1 MVP — autopod-style, через QE DOM razor + clip.disabled |
+| PP 2026 совместимость | Стабилизировано — `_wrap` decorator + cold-start retry |
+
+## Новые проверки качества (май 2026)
+
+- **Target-duration enforcement**: при «уложи в N секунд» LLM передаёт `targetDurationSec`, плагин валидирует сумму keepIntervals (допуск +20%) → ошибка с подсказкой → LLM пересобирает план. Раньше overshoot 75% уходил молча.
+- **Stale paragraph auto-rebuild**: после ripple_delete параграфы могли разъехаться с сегментами по timestamps. `TranscriptStructure.isParagraphsStale` детектит drift >1с / out-of-range segIdxs и автоматически пересобирает структуру.
+- **Snap к paragraph boundaries**: ножи теперь snap'ят сначала к границам абзацев (паузы ≥0.5с, drift до 1.5с), потом fallback на segment-boundaries (drift 0.5с) — меньше mid-word cuts.
+- **Sequence-switch guard**: если активная секвенция переключилась между proposal и apply — блок, без удаления чужого таймлайна.
+- **Audio-only анализ**: `cutSilences`/`jumpCuts` без транскрипции — 30 сек вместо 10–15 мин Whisper.
+
+## UX-улучшения карточки proposal
+
+- 🎯 Target/Actual badge с цветовой индикацией (≤+5% green, ≤+20% amber, >+20% red)
+- Apply primary green-кнопка (раньше визуально равноценна с Cancel)
+- Autofocus на Apply, **Esc** закрывает proposal card
+- Прогресс-бар точный по чанкам в analyze, indeterminate в transcribe
+- Retry-кнопка для network errors с классификацией (auth/quota/network)
+- WCAG AA контраст, focus-visible outlines, aria-live регионы
+- Унифицированные CSS-токены `--{warning,danger,success,info}-*` вместо hard-coded hex
 
 ## Архитектура
 

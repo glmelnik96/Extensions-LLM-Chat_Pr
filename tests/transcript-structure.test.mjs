@@ -318,6 +318,100 @@ describe('TranscriptStructure.runLocalDetectors', () => {
   });
 });
 
+/* ─── isParagraphsStale (HIGH 6 мая 2026) ─── */
+describe('TranscriptStructure.isParagraphsStale', () => {
+  test('нет paragraphs → не stale (нечего перестраивать)', () => {
+    assert.strictEqual(TS.isParagraphsStale({}), false);
+    assert.strictEqual(TS.isParagraphsStale({ paragraphs: [], segments: [{ startSec: 0, endSec: 5 }] }), false);
+  });
+
+  test('нет segments → не stale', () => {
+    const entry = {
+      paragraphs: [{ startSec: 0, endSec: 5, segmentIdxs: [0] }],
+      segments: []
+    };
+    assert.strictEqual(TS.isParagraphsStale(entry), false);
+  });
+
+  test('aligned paragraphs → not stale', () => {
+    const entry = {
+      segments: [
+        { startSec: 0, endSec: 3.5 },
+        { startSec: 3.5, endSec: 8.0 },
+        { startSec: 9.0, endSec: 14.0 }
+      ],
+      paragraphs: [
+        { startSec: 0, endSec: 8.0, segmentIdxs: [0, 1] },
+        { startSec: 9.0, endSec: 14.0, segmentIdxs: [2] }
+      ]
+    };
+    assert.strictEqual(TS.isParagraphsStale(entry), false);
+  });
+
+  test('segIdx out of range → stale', () => {
+    /* Кейс из реального бага 6 мая 2026: после ripple_delete осталось 14 сегментов,
+       но paragraphs[5].segmentIdxs=[14..21] ссылаются на удалённые. */
+    const entry = {
+      segments: [
+        { startSec: 0, endSec: 3.5 },
+        { startSec: 3.5, endSec: 8.0 }
+      ],
+      paragraphs: [
+        { startSec: 0, endSec: 8.0, segmentIdxs: [0, 1] },
+        { startSec: 10, endSec: 20, segmentIdxs: [2, 3, 4] }  /* indices >= length */
+      ]
+    };
+    assert.strictEqual(TS.isParagraphsStale(entry), true);
+  });
+
+  test('drift > 1с между paragraph.startSec и segments[idxs[0]].startSec → stale', () => {
+    /* Реальный кейс: paragraph[1] утверждает 35.18-43.84, segIdxs=[6,7],
+       но фактический seg[6].startSec=34.00 — drift 1.18с → stale. */
+    const entry = {
+      segments: [
+        { startSec: 0, endSec: 34.0 },
+        { startSec: 34.0, endSec: 42.66 }
+      ],
+      paragraphs: [
+        { startSec: 0, endSec: 34.0, segmentIdxs: [0] },
+        { startSec: 35.18, endSec: 43.84, segmentIdxs: [1] }  /* drift 1.18с */
+      ]
+    };
+    assert.strictEqual(TS.isParagraphsStale(entry), true);
+  });
+
+  test('малый drift (≤1с) → not stale (допустимая погрешность округления)', () => {
+    const entry = {
+      segments: [
+        { startSec: 0.0, endSec: 5.0 },
+        { startSec: 5.5, endSec: 10.0 }
+      ],
+      paragraphs: [
+        { startSec: 0.0, endSec: 5.0, segmentIdxs: [0] },
+        { startSec: 5.6, endSec: 10.1, segmentIdxs: [1] }  /* drift 0.1с */
+      ]
+    };
+    assert.strictEqual(TS.isParagraphsStale(entry), false);
+  });
+
+  test('rebuild через buildStructure после stale-detect → not stale', () => {
+    const entry = {
+      segments: [
+        { startSec: 0, endSec: 3, text: 'Привет всем.' },
+        { startSec: 3.5, endSec: 8, text: 'Сегодня про монтаж.' }
+      ],
+      paragraphs: [
+        { startSec: 100, endSec: 200, segmentIdxs: [55, 66] }  /* мусор */
+      ],
+      audioAnalysis: { silences: [] }
+    };
+    assert.strictEqual(TS.isParagraphsStale(entry), true);
+    TS.buildStructure(entry);
+    assert.strictEqual(TS.isParagraphsStale(entry), false);
+    assert.ok(entry.paragraphs.length >= 1);
+  });
+});
+
 describe('TranscriptStructure.analyzeForCutsWithLLM + local pre-labels', () => {
   test('filler сегменты НЕ отправляются в LLM', async () => {
     let llmSegments = [];

@@ -59,24 +59,88 @@ PanelBoot.run('ИИ: монтаж', function () {
     return (cs.getExtensionPath() || '').replace(/\\/g, '/');
   }
 
-  function showErr(t) {
-    el.err.textContent = t || '';
+  /**
+   * MEDIUM #20 (6 мая 2026): расширенный showErr с опциональным retry/hint.
+   * Старая сигнатура showErr(text) — без изменений.
+   * Новая: showErr(text, { retry: fn, hint: 'string' }).
+   */
+  function showErr(t, opts) {
+    if (!el.err) return;
+    while (el.err.firstChild) el.err.removeChild(el.err.firstChild);
+    if (!t) return;
+    var span = document.createElement('span');
+    span.textContent = t;
+    el.err.appendChild(span);
+    opts = opts || {};
+    if (typeof opts.retry === 'function') {
+      el.err.appendChild(document.createTextNode(' '));
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'secondary';
+      btn.style.cssText = 'font-size:11px;padding:2px 8px;margin-left:4px;';
+      btn.textContent = '↻ Повторить';
+      btn.onclick = function () {
+        showErr(''); /* очистить */
+        try { opts.retry(); } catch (eR) {}
+      };
+      el.err.appendChild(btn);
+    }
+    if (opts.hint) {
+      var hintEl = document.createElement('div');
+      hintEl.style.cssText = 'font-size:11px;color:var(--muted);margin-top:4px;';
+      hintEl.textContent = opts.hint;
+      el.err.appendChild(hintEl);
+    }
   }
 
+  /**
+   * MEDIUM #20: классификация ошибок для адаптивных подсказок.
+   * Возвращает {kind, hint} — kind: 'network' | 'auth' | 'quota' | 'cancel' | 'other'.
+   */
+  function _classifyError(err) {
+    var msg = String(err && err.message || err || '').toLowerCase();
+    if (/abort|cancel/.test(msg)) {
+      return { kind: 'cancel', hint: 'Операция отменена пользователем.' };
+    }
+    if (/401|unauthorized|invalid api|api[ -]?key/.test(msg)) {
+      return { kind: 'auth', hint: 'Похоже, неверный API-ключ. Проверьте Settings → API key.' };
+    }
+    if (/429|rate limit|quota|exceed/.test(msg)) {
+      return { kind: 'quota', hint: 'Превышены лимиты API. Подождите минуту перед повтором.' };
+    }
+    if (/fetch|network|timeout|econnreset|enotfound|net::|socket/.test(msg)) {
+      return { kind: 'network', hint: 'Похоже, проблема с сетью. Проверь VPN/интернет и нажми «Повторить».' };
+    }
+    return { kind: 'other', hint: '' };
+  }
+
+  /**
+   * states: 'busy' (yellow), 'ok' (green) — full transcript, 'audio' (blue) —
+   * audio-only analysis, 'red' / undefined — no data.
+   * Phase 1.6 (6 мая 2026): добавлен 'audio' для UX различия audio-only от full.
+   */
   function setTranscriptLed(state) {
     var led = document.getElementById('transcript-led');
     if (!led) return;
-    var s = state === 'busy' ? 'yellow' : state === 'ok' ? 'green' : 'red';
+    var s, t, label;
+    if (state === 'busy') { s = 'yellow'; t = 'идёт'; label = 'Идёт обработка'; }
+    else if (state === 'ok') { s = 'green'; t = 'есть'; label = 'Транскрипт в кэше'; }
+    else if (state === 'audio') { s = 'blue'; t = 'аудио'; label = 'Анализ аудио (без транскрипта)'; }
+    else { s = 'red'; t = 'нет'; label = 'Нет данных'; }
     led.className = 'transcript-led transcript-led--' + s;
-    var t = state === 'ok' ? 'есть' : state === 'busy' ? 'идёт' : 'нет';
     if (el.ledText) el.ledText.textContent = t;
-    led.setAttribute(
-      'aria-label',
-      state === 'ok' ? 'Транскрипт в кэше' : state === 'busy' ? 'Идёт транскрибация' : 'Нет транскрипта'
-    );
-    /* Sync tools view LED when transcript state changes */
-    if (typeof window.toolsRefreshLed === 'function') {
-      try { window.toolsRefreshLed(); } catch (e) {}
+    led.setAttribute('aria-label', label);
+    /* HIGH #18 (6 мая 2026): event-based view sync вместо fragile coupling
+       через window.toolsRefreshLed. Любая view может subscribe'нуться. */
+    try {
+      document.dispatchEvent(new CustomEvent('omc:transcript-led-changed', {
+        detail: { state: s, label: label }
+      }));
+    } catch (eEv) {
+      /* Fallback для очень старых движков (CEP Chromium < 51 без CustomEvent constructor) */
+      if (typeof window.toolsRefreshLed === 'function') {
+        try { window.toolsRefreshLed(); } catch (e) {}
+      }
     }
   }
 
@@ -551,6 +615,10 @@ PanelBoot.run('ИИ: монтаж', function () {
                 }
               }
             },
+            targetDurationSec: {
+              type: 'number',
+              description: 'ОБЯЗАТЕЛЬНО при запросе вида «уложи в N секунд», «сделай N-секундную версию», «сократи до N сек». Целевой хронометраж результата. Плагин ПРОВЕРИТ что сумма keepIntervals ≤ target * 1.20 и вернёт ошибку с подсказкой если LLM выбрал лишнего. Без этого поля проверки нет — будь честен и передавай.'
+            },
             summary: { type: 'string' }
           },
           required: ['summary']
@@ -921,11 +989,19 @@ PanelBoot.run('ИИ: монтаж', function () {
       });
     }
     var e = found2.entry;
-    if ((!e.paragraphs || !e.paragraphs.length) && typeof TranscriptStructure !== 'undefined') {
-      try {
-        TranscriptStructure.buildStructure(e);
-        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found2.matchedKey, e);
-      } catch (eRB) {}
+    /* HIGH (6 мая 2026): Пересборка paragraphs если их нет ИЛИ они протухли
+       (segIdxs указывают на удалённые сегменты или timestamps разъехались
+       с segments после applyTranscriptCuts). Без этого LLM получает абзацы
+       с неверным временем → ножи режут не там. */
+    if (typeof TranscriptStructure !== 'undefined') {
+      var needsRebuildGS = !e.paragraphs || !e.paragraphs.length ||
+        (TranscriptStructure.isParagraphsStale && TranscriptStructure.isParagraphsStale(e));
+      if (needsRebuildGS) {
+        try {
+          TranscriptStructure.buildStructure(e);
+          ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found2.matchedKey, e);
+        } catch (eRB) {}
+      }
     }
 
     var allParagraphs = (e.paragraphs || []);
@@ -1179,31 +1255,47 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   function snapIntervalsToSegmentBoundaries(removeIntervals) {
     if (!removeIntervals || !removeIntervals.length) return removeIntervals;
-    /* Собираем сегменты из transcript кэша */
+    /* Собираем сегменты + paragraphs из transcript кэша */
     var segments = null;
+    var paragraphs = null;
     try {
       var seqKey = lastSnap && lastSnap.sequenceName ? lastSnap.sequenceName : '';
       if (seqKey) {
         var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqKey);
-        if (found && found.entry && found.entry.segments) {
-          segments = found.entry.segments;
+        if (found && found.entry) {
+          if (found.entry.segments) segments = found.entry.segments;
+          if (found.entry.paragraphs) paragraphs = found.entry.paragraphs;
         }
       }
     } catch (e) {}
     if (!segments || !segments.length) return removeIntervals;
 
-    /* Собираем все уникальные boundaries из сегментов */
-    var boundaries = [];
+    /* HIGH (6 мая 2026): два уровня boundaries.
+       Paragraph boundaries — НАСТОЯЩИЕ паузы между мыслями (>0.5с тишины).
+       Segment boundaries — Whisper-utterances (3-30с), могут оказаться внутри
+       продолжительной фразы. Сначала пытаемся snap к paragraph (большой drift),
+       если не получилось — snap к segment (короткий drift). */
+    var paragraphBoundaries = [];
+    if (paragraphs && paragraphs.length) {
+      for (var pi = 0; pi < paragraphs.length; pi++) {
+        var pa = paragraphs[pi];
+        if (typeof pa.startSec === 'number') paragraphBoundaries.push(pa.startSec);
+        if (typeof pa.endSec === 'number') paragraphBoundaries.push(pa.endSec);
+      }
+      paragraphBoundaries.sort(function (a, b) { return a - b; });
+    }
+
+    var segmentBoundaries = [];
     for (var i = 0; i < segments.length; i++) {
       var seg = segments[i];
-      if (typeof seg.startSec === 'number') boundaries.push(seg.startSec);
-      else if (typeof seg.start === 'number') boundaries.push(seg.start);
-      if (typeof seg.endSec === 'number') boundaries.push(seg.endSec);
-      else if (typeof seg.end === 'number') boundaries.push(seg.end);
+      if (typeof seg.startSec === 'number') segmentBoundaries.push(seg.startSec);
+      else if (typeof seg.start === 'number') segmentBoundaries.push(seg.start);
+      if (typeof seg.endSec === 'number') segmentBoundaries.push(seg.endSec);
+      else if (typeof seg.end === 'number') segmentBoundaries.push(seg.end);
     }
-    boundaries.sort(function (a, b) { return a - b; });
+    segmentBoundaries.sort(function (a, b) { return a - b; });
 
-    function snapTo(val, maxDrift) {
+    function snapTo(val, boundaries, maxDrift) {
       var best = val;
       var bestD = maxDrift + 1;
       for (var j = 0; j < boundaries.length; j++) {
@@ -1211,13 +1303,22 @@ PanelBoot.run('ИИ: монтаж', function () {
         if (d < bestD) { bestD = d; best = boundaries[j]; }
         if (boundaries[j] > val + maxDrift) break;
       }
-      return bestD <= maxDrift ? best : val;
+      return bestD <= maxDrift ? best : null;
     }
 
-    var MAX_DRIFT = 0.5; /* не двигаем границу больше чем на 0.5с */
+    /* paragraph drift до 1.5с — паузы реальные, разрешаем больший сдвиг.
+       segment drift 0.5с — fallback, не уезжаем глубоко в фразу. */
+    var PARA_DRIFT = 1.5;
+    var SEG_DRIFT = 0.5;
     return removeIntervals.map(function (iv) {
-      var s = snapTo(iv.startSec, MAX_DRIFT);
-      var e = snapTo(iv.endSec, MAX_DRIFT);
+      var s = paragraphBoundaries.length ? snapTo(iv.startSec, paragraphBoundaries, PARA_DRIFT) : null;
+      if (s === null) s = snapTo(iv.startSec, segmentBoundaries, SEG_DRIFT);
+      if (s === null) s = iv.startSec;
+
+      var e = paragraphBoundaries.length ? snapTo(iv.endSec, paragraphBoundaries, PARA_DRIFT) : null;
+      if (e === null) e = snapTo(iv.endSec, segmentBoundaries, SEG_DRIFT);
+      if (e === null) e = iv.endSec;
+
       if (e <= s) { e = iv.endSec; s = iv.startSec; } /* откат если snap сломал */
       return { startSec: s, endSec: e, reason: iv.reason };
     });
@@ -1372,24 +1473,35 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
   }
 
+  /**
+   * HIGH #10 (6 мая 2026): summary block helper — заменяет 7 inline-style копий.
+   * Возвращает элемент или null (если summary пуст).
+   */
+  function _proposalSummaryEl(text, variantInfo) {
+    if (!text) return null;
+    var el2 = document.createElement('div');
+    el2.className = 'proposal-summary' + (variantInfo ? ' proposal-summary--info' : '');
+    el2.textContent = String(text);
+    return el2;
+  }
+
   function renderPendingProposalCard() {
     var existing = document.getElementById('pending-proposal-card');
+    /* MEDIUM #23 (6 мая 2026): no-op guard — не пересобираем DOM если ничего не изменилось */
+    if (!_pendingProposal && !existing) return;
     if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
     if (!_pendingProposal) return;
     var kind = _pendingProposal.kind || 'transcript_cuts';
     var v = _pendingProposal.verification || {};
     var card = document.createElement('div');
     card.id = 'pending-proposal-card';
-    card.className = 'bubble tool';
-    card.style.border = '1px solid #d97706';
-    card.style.background = 'rgba(217,119,6,0.08)';
-    card.style.padding = '10px';
-    card.style.margin = '8px 0';
-    card.style.borderRadius = '6px';
+    card.className = 'bubble tool proposal-card';
+    /* HIGH #7 (6 мая 2026): a11y — карточка как dialog для скрин-ридеров */
+    card.setAttribute('role', 'region');
+    card.setAttribute('aria-label', 'План правок ожидает подтверждения');
 
     var title = document.createElement('div');
-    title.style.fontWeight = '600';
-    title.style.marginBottom = '6px';
+    title.className = 'proposal-card-title';
     var titleByKind = {
       transcript_cuts: '⚠ Требуется подтверждение: план монтажа по тексту',
       timecode_edits: '⚠ Требуется подтверждение: правки таймлайна',
@@ -1404,16 +1516,11 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     /* ── kind: timecode_edits ─────────────────────────────────────── */
     if (kind === 'timecode_edits') {
-      if (_pendingProposal.summary) {
-        var sumT = document.createElement('div');
-        sumT.style.cssText =
-          'font-size:12px;line-height:1.4;margin-bottom:8px;padding:6px 8px;border-left:3px solid #d97706;background:rgba(217,119,6,0.06);';
-        sumT.textContent = String(_pendingProposal.summary);
-        card.appendChild(sumT);
-      }
+      var sumTEl = _proposalSummaryEl(_pendingProposal.summary);
+      if (sumTEl) card.appendChild(sumTEl);
       renderDiffSection(card, _pendingProposal.snapshot, _pendingProposal.simulation);
       var opsList = document.createElement('div');
-      opsList.style.cssText = 'font-size:11px;margin-top:8px;max-height:140px;overflow-y:auto;font-family:monospace;opacity:0.85;';
+      opsList.className = 'proposal-ops-list';
       (_pendingProposal.operations || []).forEach(function (op, i) {
         var line = document.createElement('div');
         line.textContent = (i + 1) + '. ' + op.action + ' ' + JSON.stringify(_compactOp(op));
@@ -1428,16 +1535,11 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     /* ── kind: edit_plan (§2.1 unified) ───────────────────────────── */
     if (kind === 'edit_plan') {
-      if (_pendingProposal.summary) {
-        var sumE = document.createElement('div');
-        sumE.style.cssText =
-          'font-size:12px;line-height:1.4;margin-bottom:8px;padding:6px 8px;border-left:3px solid #d97706;background:rgba(217,119,6,0.06);';
-        sumE.textContent = String(_pendingProposal.summary);
-        card.appendChild(sumE);
-      }
+      var sumEEl = _proposalSummaryEl(_pendingProposal.summary);
+      if (sumEEl) card.appendChild(sumEEl);
       if (_pendingProposal.rationale) {
         var ratE = document.createElement('div');
-        ratE.style.cssText = 'font-size:11px;opacity:0.75;margin-bottom:8px;font-style:italic;';
+        ratE.className = 'proposal-rationale';
         ratE.textContent = String(_pendingProposal.rationale);
         card.appendChild(ratE);
       }
@@ -1447,13 +1549,12 @@ PanelBoot.run('ИИ: монтаж', function () {
       var rej = _pendingProposal.rejectedOpIdxs || [];
       if (rej.length) {
         var rejBox = document.createElement('div');
-        rejBox.style.cssText =
-          'font-size:11px;color:#f43f5e;background:rgba(244,63,94,0.1);padding:4px 6px;border-radius:3px;margin:6px 0;';
+        rejBox.className = 'proposal-rejected';
         rejBox.textContent = 'Отклонено нормализацией: ' + rej.length + ' ops (idx ' + rej.join(', ') + ')';
         card.appendChild(rejBox);
       }
       var opsEList = document.createElement('div');
-      opsEList.style.cssText = 'font-size:11px;margin-top:8px;max-height:160px;overflow-y:auto;font-family:monospace;opacity:0.9;';
+      opsEList.className = 'proposal-ops-list';
       normOps.forEach(function (op, i) {
         var row = document.createElement('div');
         row.style.marginBottom = '3px';
@@ -1483,13 +1584,8 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     /* ── kind: markers ────────────────────────────────────────────── */
     if (kind === 'markers') {
-      if (_pendingProposal.summary) {
-        var sumM = document.createElement('div');
-        sumM.style.cssText =
-          'font-size:12px;line-height:1.4;margin-bottom:8px;padding:6px 8px;border-left:3px solid #d97706;background:rgba(217,119,6,0.06);';
-        sumM.textContent = String(_pendingProposal.summary);
-        card.appendChild(sumM);
-      }
+      var sumMEl = _proposalSummaryEl(_pendingProposal.summary);
+      if (sumMEl) card.appendChild(sumMEl);
       var snap = _pendingProposal.snapshot || lastSnap;
       if (snap && snap.clips) {
         var totalSec = snap.sequenceEndSec || 0;
@@ -1536,9 +1632,15 @@ PanelBoot.run('ИИ: монтаж', function () {
           ytStatus.textContent = '— нет маркеров';
           return;
         }
-        /* YouTube требует минимум 3 главы для активации разметки в плеере.
-           Если меньше — копируем текст, но предупреждаем пользователя. */
-        if (markers.length < 3) {
+        /* MEDIUM (6 мая 2026): полная валидация YouTube-требований. Не блокируем
+           копирование — просто предупреждаем заранее, чтобы пользователь не удивлялся
+           «почему YouTube не показал главы». См. youtube-export.js:validateForYouTube. */
+        if (typeof YouTubeExport !== 'undefined' && YouTubeExport.validateForYouTube) {
+          var warns = YouTubeExport.validateForYouTube(markers);
+          if (warns.length > 0) {
+            ytStatus.textContent = '⚠ ' + warns[0] + ' Копирую как есть.';
+          }
+        } else if (markers.length < 3) {
           ytStatus.textContent = '⚠ YouTube нужно ≥3 глав, у тебя ' + markers.length + ' — копирую как есть';
         }
         try {
@@ -1604,7 +1706,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         }
       } catch (eDiffDk) {}
       var ivList = document.createElement('div');
-      ivList.style.cssText = 'font-size:11px;max-height:140px;overflow-y:auto;font-family:monospace;opacity:0.85;';
+      ivList.className = 'proposal-ops-list';
       (dp.intervals || []).forEach(function (iv, i) {
         var row = document.createElement('div');
         row.textContent = (i + 1) + '. ' + fmtSec(iv.startSec) + ' → ' + fmtSec(iv.endSec) + ' (' + (iv.endSec - iv.startSec).toFixed(2) + 'с)';
@@ -1648,13 +1750,10 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     /* ── kind: j_cuts ──────────────────────────────────────────────── */
     if (kind === 'j_cuts') {
-      var jSummary = document.createElement('div');
-      jSummary.style.cssText =
-        'font-size:12px;line-height:1.5;margin-bottom:8px;padding:6px 8px;border-left:3px solid #6366f1;background:rgba(99,102,241,0.08);';
-      jSummary.textContent = _pendingProposal.summary || 'J-cuts';
-      card.appendChild(jSummary);
+      var jSummary = _proposalSummaryEl(_pendingProposal.summary || 'J-cuts', /*info=*/true);
+      if (jSummary) card.appendChild(jSummary);
       var jNote = document.createElement('div');
-      jNote.style.cssText = 'font-size:11px;color:#aaa;margin-bottom:8px;';
+      jNote.style.cssText = 'font-size:11px;color:var(--muted);margin-bottom:8px;';
       jNote.textContent = 'Сдвинет inPoint/outPoint аудио-клипов на A1 относительно видео на V1. ' +
         'Требуется запас source-медиа (handle) у клипов. Откат: Cmd+Z.';
       card.appendChild(jNote);
@@ -1666,15 +1765,8 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     /* ── kind: transcript_cuts (исходный путь) ────────────────────── */
     if (_pendingProposal.summary) {
-      var sumBlock = document.createElement('div');
-      sumBlock.style.fontSize = '12px';
-      sumBlock.style.lineHeight = '1.4';
-      sumBlock.style.marginBottom = '8px';
-      sumBlock.style.padding = '6px 8px';
-      sumBlock.style.borderLeft = '3px solid #d97706';
-      sumBlock.style.background = 'rgba(217,119,6,0.06)';
-      sumBlock.textContent = String(_pendingProposal.summary);
-      card.appendChild(sumBlock);
+      var sumBlock = _proposalSummaryEl(_pendingProposal.summary);
+      if (sumBlock) card.appendChild(sumBlock);
     }
 
     var stats = document.createElement('div');
@@ -1688,6 +1780,32 @@ PanelBoot.run('ИИ: монтаж', function () {
       'Останется: ' + fmtSec(keepS) + ' из ' + fmtSec(orig) + ' (' + pct + '%) · ' +
       'фрагментов keep: ' + (v.keepCount || 0) + ' · вырезов remove: ' + (v.removeCount || 0);
     card.appendChild(stats);
+
+    /* HIGH (6 мая 2026): Target vs Actual badge.
+       Без этого «попросил 40 секунд, получил 70» неотличимо от обычного результата.
+       Колор-код: ≤target*1.05 зелёный, ≤target*1.20 жёлтый, >target*1.20 красный. */
+    var targetSec = _pendingProposal.targetDurationSec;
+    if (typeof targetSec === 'number' && targetSec > 0 && keepS > 0) {
+      var ratio = keepS / targetSec;
+      var variant, label;
+      if (ratio <= 1.05) {
+        variant = 'ok'; label = '✓ В целевой длине';
+      } else if (ratio <= 1.20) {
+        variant = 'warn'; label = '⚠ Небольшое превышение';
+      } else {
+        variant = 'bad'; label = '✗ Превышение хронометража';
+      }
+      var badge = document.createElement('div');
+      badge.className = 'proposal-target-badge proposal-target-badge--' + variant;
+      var overPct = Math.round((ratio - 1) * 100);
+      var diffStr = overPct === 0 ? 'ровно в цель'
+        : (overPct > 0 ? '+' + overPct + '%' : overPct + '%');
+      badge.textContent =
+        '🎯 Цель: ' + fmtSec(targetSec) + ' · Получилось: ' + fmtSec(keepS) +
+        ' (' + diffStr + ') · ' + label;
+      /* Вставляем ПЕРЕД stats для приоритетной видимости */
+      card.insertBefore(badge, stats);
+    }
 
     /* §2.2: diff-strip для transcript_cuts — симулируем через EditPlanSimulator */
     try {
@@ -1795,19 +1913,76 @@ PanelBoot.run('ИИ: монтаж', function () {
     btnRow.style.cssText = 'display:flex;gap:8px;margin-top:10px;';
     var applyBtn = document.createElement('button');
     applyBtn.type = 'button';
+    /* HIGH #10 (6 мая 2026): primary class — зелёный accent, выделяет primary action.
+       До этого Apply и Cancel визуально равноценны → юзер не понимает какая основная. */
+    applyBtn.className = 'primary';
     applyBtn.textContent = '✓ ' + (applyLabel || 'Применить');
     applyBtn.style.flex = '1';
-    applyBtn.onclick = function () { applyPendingProposal(); };
+    /* HIGH #7 (6 мая 2026): debounce double-clicks через flag, не только disabled.
+       Если apply async — между click'ом и assertSequenceMatch userможет успеть кликнуть второй раз. */
+    var clicked = false;
+    applyBtn.onclick = function () {
+      if (clicked) return;
+      clicked = true;
+      /* HIGH #1 (6 мая 2026): sequence-switch guard. Если активная секвенция
+         в Premiere была переключена между proposal и apply — блокируем,
+         иначе apply разрушит чужой таймлайн. */
+      applyBtn.disabled = true;
+      cancelBtn.disabled = true;
+      var pSnap = _pendingProposal && _pendingProposal.snapshot;
+      assertSequenceMatch(pSnap, function (err, ok) {
+        if (!ok) {
+          applyBtn.disabled = false;
+          cancelBtn.disabled = false;
+          clicked = false;
+          showErr(err && err.message ? err.message : 'Sequence mismatch');
+          return;
+        }
+        applyPendingProposal();
+      });
+    };
     var cancelBtn = document.createElement('button');
     cancelBtn.type = 'button';
-    cancelBtn.textContent = 'Отмена';
+    cancelBtn.textContent = 'Отмена (Esc)';
     cancelBtn.className = 'secondary';
     cancelBtn.style.flex = '0 0 auto';
     cancelBtn.onclick = function () { cancelPendingProposal(); };
     btnRow.appendChild(applyBtn);
     btnRow.appendChild(cancelBtn);
+    /* HIGH #7 (6 мая 2026): autofocus на Apply при появлении карточки.
+       requestAnimationFrame чтобы DOM успел встать (карточка уже в chat'е к этому моменту,
+       но element ещё может быть detached если вызывают до append). */
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(function () {
+        if (applyBtn.isConnected && !applyBtn.disabled) {
+          try { applyBtn.focus({ preventScroll: false }); } catch (e) { applyBtn.focus(); }
+        }
+      });
+    }
     return btnRow;
   }
+
+  /**
+   * HIGH #7 (6 мая 2026): глобальный Escape-handler для отмены pending proposal.
+   * Один listener на document — снимать не нужно (живёт всё время существования панели).
+   * Заменяет необходимость для каждой карточки слушать Escape отдельно.
+   * Уважаем фокус: если юзер в input/textarea/contenteditable — не перехватываем
+   * (там Escape может иметь другой смысл).
+   */
+  function _initGlobalEscapeHandler() {
+    if (window.__omcEscapeHandlerInstalled) return;
+    window.__omcEscapeHandlerInstalled = true;
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      if (!_pendingProposal) return;
+      var t = e.target;
+      if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' ||
+                t.isContentEditable)) return;
+      e.preventDefault();
+      cancelPendingProposal();
+    });
+  }
+  _initGlobalEscapeHandler();
 
   function _compactOp(op) {
     var keys = ['nodeId', 'startSec', 'endSec', 'timeSec', 'newStartSec', 'fromSec', 'deltaSec', 'enabled', 'clipName', 'trackType', 'trackIndex', 'muted'];
@@ -1993,7 +2168,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         clipInPointSec: tgt.inPointSec || 0,
         duckDb: prop.duckDb || -12,
         fadeSec: prop.fadeSec || 0.2,
-        onProgress: function (msg) { statusUi.show(msg, true); }
+        onProgress: function (msg) { statusUi.show(msg, true); statusUi.progress(null); }
       }).then(function (rRes) {
         statusUi.show('Импорт в проект…', true);
         PremiereBridge.importMediaFile({ path: rRes.outputPath, binName: 'AI Renders' }, function (impErr, impData) {
@@ -2031,7 +2206,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       AudioRender.renderLoudnorm({
         inputPath: ltgt.mediaPath,
         targetLufs: lufs,
-        onProgress: function (msg) { statusUi.show(msg, true); }
+        onProgress: function (msg) { statusUi.show(msg, true); statusUi.progress(null); }
       }).then(function (rR) {
         statusUi.show('Импорт в проект…', true);
         PremiereBridge.importMediaFile({ path: rR.outputPath, binName: 'AI Renders' }, function (impErr2, impData2) {
@@ -2132,6 +2307,18 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* US-004: если keepIntervals — инвертируем в removeIntervals. */
     var workingArgs = args;
     if (hasKeep) {
+      /* HIGH (6 мая 2026): проверка хронометража ДО инверсии. LLM на сборочном
+         монтаже часто игнорирует «уложи в N секунд» — сейчас проверим сумму keep
+         и вернём fix-it message чтобы LLM пересобрал план. Допустим overshoot 20%
+         (разумный буфер на снап и удлинение фраз). Делегируется в pure-функцию
+         AnalysisRouting.validateKeepDuration для testability. */
+      if (typeof AnalysisRouting !== 'undefined' && AnalysisRouting.validateKeepDuration &&
+          typeof args.targetDurationSec === 'number' && args.targetDurationSec > 0) {
+        var dRes = AnalysisRouting.validateKeepDuration(args.keepIntervals, args.targetDurationSec);
+        if (dRes && dRes.error) {
+          return Promise.resolve({ validationError: dRes.error });
+        }
+      }
       var invRes = _invertKeepToRemove(args.keepIntervals, args.sequenceKey);
       if (invRes.error) {
         return Promise.resolve({ validationError: invRes.error });
@@ -2162,7 +2349,10 @@ PanelBoot.run('ИИ: монтаж', function () {
       verification: verification,
       snapshot: lastSnap,
       createdAt: Date.now(),
-      invertedFromKeep: hasKeep
+      invertedFromKeep: hasKeep,
+      /* HIGH (6 мая 2026): сохраняем target для UI-индикации в карточке.
+         Без этого пользователь не видит «попросил 40, получил 70». */
+      targetDurationSec: typeof args.targetDurationSec === 'number' ? args.targetDurationSec : null
     };
     renderPendingProposalCard();
     return Promise.resolve({
@@ -2422,11 +2612,15 @@ PanelBoot.run('ИИ: монтаж', function () {
       });
     }
     var e = found.entry;
-    if ((!e.paragraphs || !e.paragraphs.length) && typeof TranscriptStructure !== 'undefined') {
-      try {
-        TranscriptStructure.buildStructure(e);
-        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, e);
-      } catch (eR) {}
+    if (typeof TranscriptStructure !== 'undefined') {
+      var needsRebuildFM = !e.paragraphs || !e.paragraphs.length ||
+        (TranscriptStructure.isParagraphsStale && TranscriptStructure.isParagraphsStale(e));
+      if (needsRebuildFM) {
+        try {
+          TranscriptStructure.buildStructure(e);
+          ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, e);
+        } catch (eR) {}
+      }
     }
     var moments = FindMoments.find(e, q, { k: k });
     return Promise.resolve({
@@ -2491,12 +2685,16 @@ PanelBoot.run('ИИ: монтаж', function () {
       return Promise.resolve({ error: 'У транскрипта нет сегментов. Возможно, пустая транскрибация.' });
     }
 
-    /* Строим paragraphs если нет (для структуры) */
-    if ((!e.paragraphs || !e.paragraphs.length) && typeof TranscriptStructure !== 'undefined') {
-      try {
-        TranscriptStructure.buildStructure(e);
-        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, e);
-      } catch (eB) {}
+    /* Строим paragraphs если нет ИЛИ если протухли (после edit'а) */
+    if (typeof TranscriptStructure !== 'undefined') {
+      var needsRebuildAT = !e.paragraphs || !e.paragraphs.length ||
+        (TranscriptStructure.isParagraphsStale && TranscriptStructure.isParagraphsStale(e));
+      if (needsRebuildAT) {
+        try {
+          TranscriptStructure.buildStructure(e);
+          ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, e);
+        } catch (eB) {}
+      }
     }
 
     var tasks = Array.isArray(args.tasks) ? args.tasks : null;
@@ -2544,7 +2742,20 @@ PanelBoot.run('ИИ: монтаж', function () {
         tasks: tasks,
         preLabels: preLabels,
         onProgress: function (ev) {
+          /* MEDIUM #12 (6 мая 2026): прогресс-бар по чанкам анализа.
+             chunkIndex/totalChunks → точный %, иначе indeterminate. */
           statusUi.show(ev.message || 'Анализ…', true);
+          if (ev && typeof ev.totalChunks === 'number' && ev.totalChunks > 0 &&
+              typeof ev.chunkIndex === 'number') {
+            var frac = ev.phase === 'chunk_done'
+              ? ev.chunkIndex / ev.totalChunks
+              : Math.max(0, (ev.chunkIndex - 1)) / ev.totalChunks;
+            statusUi.progress(frac * 100);
+          } else if (ev && (ev.phase === 'local_done' || ev.phase === 'done')) {
+            statusUi.progress(100);
+          } else {
+            statusUi.progress(null);
+          }
         }
       }
     ).then(function (result) {
@@ -2947,81 +3158,156 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   /* ─── Hint chips / starters / transcribe LED ─────────────────────── */
 
-  /* ── Активная категория стартеров ──────────────────────────────── */
-  var _activeStarterCat = 'timeline';
+  /* ── Активная категория стартеров (collapsible UI, 7 мая 2026 evening) ─
+     Свёрнуты по умолчанию: только chips-заголовки видны. Клик разворачивает.
+     Состояние храним в localStorage чтобы между сессиями помнило. */
+  var STARTER_CATS = [
+    { id: 'text',    label: '📝 По тексту',  panelId: 'textmontage', hintGroup: 'text' },
+    { id: 'markers', label: '🏷️ Маркеры',    panelId: 'markers',     hintGroup: 'markers' },
+    { id: 'search',  label: '🔍 Поиск',      panelId: 'search',      hintGroup: null /* нет hints */ }
+  ];
+  var _expandedCat = null; /* id развёрнутой категории, null = все свёрнуты */
+  try {
+    _expandedCat = localStorage.getItem('extllmpr_v1_expanded_cat');
+    if (_expandedCat === 'null' || _expandedCat === '') _expandedCat = null;
+  } catch (e) {}
 
-  /* Подсказки-чипы фильтруются по активной категории стартеров */
-  var CAT_GROUP_MAP = { timeline: 'timeline', text: 'text', markers: 'markers' };
+  /* Hint-chips теперь рендерятся ВНУТРИ развёрнутой категории, не отдельно */
   function rebuildHintChips() {
     if (!el.hintBox) return;
-    el.hintBox.innerHTML = '';
-    var list = typeof UiHints !== 'undefined' ? UiHints.unified : null;
-    if (!list) return;
-    var grp = CAT_GROUP_MAP[_activeStarterCat] || _activeStarterCat;
-    list.forEach(function (h) {
-      if (h.group && h.group !== grp) return; /* фильтр по категории */
-      var b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'hint-chip';
-      b.textContent = h.label;
-      b.title = h.text;
-      b.onclick = function () {
-        el.input.value = h.text;
-        el.input.focus();
-      };
-      el.hintBox.appendChild(b);
-    });
+    el.hintBox.innerHTML = ''; /* hint-box больше не используется как отдельная строка */
+  }
+
+  /**
+   * UI compact v3 (7 мая 2026 evening): collapsible-карточки категорий.
+   *
+   * Свёрнутый вид: одна строка из 3 кнопок-категорий (📝 По тексту / 🏷️ Маркеры / 🔍 Поиск).
+   * Развёрнутый вид (после клика): под выбранной категорией — её стартеры + UiHints
+   * группы. Клик по любому chip заполняет input. Клик на ту же категорию свёрнёт.
+   *
+   * Преимущества: ~28px по высоте в свёрнутом виде, hint-chips живут внутри
+   * группы (не дублируются как отдельная строка).
+   */
+  function _selectStarter(s, panelId) {
+    el.input.value = s.userPrompt || '';
+    el.input.focus();
+    if (s.systemPromptAddon) _activeSystemAddon = s.systemPromptAddon;
+  }
+
+  function _selectHint(h) {
+    el.input.value = h.text || '';
+    el.input.focus();
+  }
+
+  function _setExpandedCat(catId) {
+    _expandedCat = catId;
+    try { localStorage.setItem('extllmpr_v1_expanded_cat', catId == null ? '' : String(catId)); } catch (e) {}
+    rebuildStarters();
   }
 
   function rebuildStarters() {
-    if (!el.startersBox || typeof StartersUI === 'undefined') return;
+    if (!el.startersBox) return;
     el.startersBox.innerHTML = '';
-    /* Заголовок */
-    var title = document.createElement('div');
-    title.className = 'starters-section-title';
-    title.textContent = 'Быстрые сценарии';
-    el.startersBox.appendChild(title);
-    /* Кнопки категорий */
-    var catBar = document.createElement('div');
-    catBar.className = 'starters-cat-bar';
-    var cats = [
-      { id: 'timeline', label: 'Таймлайн', panelId: 'timecode' },
-      { id: 'text', label: 'По тексту', panelId: 'textmontage' },
-      { id: 'markers', label: 'Маркеры', panelId: 'markers' }
-    ];
-    cats.forEach(function (cat) {
-      var btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'starters-cat-btn' + (cat.id === _activeStarterCat ? ' active' : '');
-      btn.setAttribute('data-cat', cat.id);
-      btn.textContent = cat.label;
-      btn.onclick = function () {
-        _activeStarterCat = cat.id;
-        rebuildStarters();
-        rebuildHintChips();
+    if (typeof ConversationStarters === 'undefined') return;
+
+    var headerRow = document.createElement('div');
+    headerRow.className = 'starters-cats-row';
+    el.startersBox.appendChild(headerRow);
+
+    STARTER_CATS.forEach(function (cat) {
+      var catBtn = document.createElement('button');
+      catBtn.type = 'button';
+      catBtn.className = 'starters-cat' + (_expandedCat === cat.id ? ' starters-cat--open' : '');
+      catBtn.setAttribute('aria-expanded', _expandedCat === cat.id ? 'true' : 'false');
+      catBtn.setAttribute('data-cat', cat.id);
+      var arrow = _expandedCat === cat.id ? '▾' : '▸';
+      catBtn.textContent = arrow + ' ' + cat.label;
+      catBtn.onclick = function () {
+        _setExpandedCat(_expandedCat === cat.id ? null : cat.id);
       };
-      catBar.appendChild(btn);
+      headerRow.appendChild(catBtn);
     });
-    el.startersBox.appendChild(catBar);
-    /* Стартеры для выбранной категории */
-    var catPanelId = (cats.filter(function (c) { return c.id === _activeStarterCat; })[0] || cats[0]).panelId;
-    var listHolder = document.createElement('div');
-    listHolder.className = 'starters-row';
-    el.startersBox.appendChild(listHolder);
-    StartersUI.init(catPanelId, {
-      container: listHolder,
-      onUse: function (starter) {
-        el.input.value = starter.userPrompt || '';
-        el.input.focus();
-      },
-      onSystemAddon: function (addon) {
-        _activeSystemAddon = addon;
-      },
-      onError: function (msg) {
-        showErr(msg);
-        setTimeout(function () { showErr(''); }, 4000);
+
+    /* Развёрнутая панель */
+    if (!_expandedCat) return;
+    var expandedCat = STARTER_CATS.filter(function (c) { return c.id === _expandedCat; })[0];
+    if (!expandedCat) return;
+
+    var panel = document.createElement('div');
+    panel.className = 'starters-cat-panel';
+    el.startersBox.appendChild(panel);
+
+    var inner = document.createElement('div');
+    inner.className = 'starters-row starters-row--flat';
+    panel.appendChild(inner);
+
+    /* «+» кнопка — добавить свой стартер в эту категорию */
+    var addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'starter-add-btn';
+    addBtn.textContent = '+';
+    addBtn.title = 'Создать свой стартер';
+    addBtn.onclick = function () {
+      var tmp = document.createElement('div');
+      document.body.appendChild(tmp);
+      StartersUI.init(expandedCat.panelId, {
+        container: tmp,
+        onUse: function () {},
+        onError: function (msg) { showErr(msg); setTimeout(function () { showErr(''); }, 4000); }
+      });
+      var realAdd = tmp.querySelector('.starter-add-btn');
+      if (realAdd) realAdd.click();
+      setTimeout(function () { tmp.remove(); rebuildStarters(); }, 100);
+    };
+    inner.appendChild(addBtn);
+
+    /* Стартеры из этой категории */
+    var starters;
+    try { starters = ConversationStarters.getAll(expandedCat.panelId) || []; } catch (e) { starters = []; }
+    starters.forEach(function (s) {
+      var card = document.createElement('div');
+      card.className = 'starter-card';
+      card.title = s.description ? (s.name + ' — ' + s.description) : (s.userPrompt || '');
+      var nameSpan = document.createElement('span');
+      nameSpan.className = 'starter-card-name';
+      nameSpan.textContent = s.name;
+      card.appendChild(nameSpan);
+      card.onclick = function (e) {
+        if (e.target.classList && (e.target.classList.contains('starter-edit-btn') || e.target.classList.contains('starter-del-btn'))) return;
+        _selectStarter(s, expandedCat.panelId);
+      };
+      if (!s.builtin) {
+        var acts = document.createElement('span');
+        acts.className = 'starter-card-actions';
+        var delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'starter-del-btn';
+        delBtn.innerHTML = '&times;';
+        delBtn.title = 'Удалить';
+        delBtn.onclick = function (ev) {
+          ev.stopPropagation();
+          ConversationStarters.remove(expandedCat.panelId, s.id);
+          rebuildStarters();
+        };
+        acts.appendChild(delBtn);
+        card.appendChild(acts);
       }
+      inner.appendChild(card);
     });
+
+    /* UiHints (chips) той же группы — встраиваем сюда же одной row */
+    if (expandedCat.hintGroup && typeof UiHints !== 'undefined' && UiHints.unified) {
+      var hints = UiHints.unified.filter(function (h) { return h.group === expandedCat.hintGroup; });
+      hints.forEach(function (h) {
+        var chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'hint-chip starters-hint-chip';
+        chip.textContent = h.label;
+        chip.title = h.text;
+        chip.onclick = function () { _selectHint(h); };
+        inner.appendChild(chip);
+      });
+    }
   }
 
   function refreshTranscriptBanner() {
@@ -3108,9 +3394,15 @@ PanelBoot.run('ИИ: монтаж', function () {
       e.stopPropagation();
       el.moreMenu.classList.toggle('open');
     };
-    document.addEventListener('click', function (e) {
-      if (!el.moreMenu.contains(e.target)) el.moreMenu.classList.remove('open');
-    });
+    /* MEDIUM #5 (6 мая 2026): install-once guard. CEP-панели обычно живут ровно
+       одну сессию, но на reload (Cmd+R) старый listener остаётся → дубль.
+       Аналогично нашему _initGlobalEscapeHandler. */
+    if (!window.__omcMoreMenuClickInstalled) {
+      window.__omcMoreMenuClickInstalled = true;
+      document.addEventListener('click', function (e) {
+        if (el.moreMenu && !el.moreMenu.contains(e.target)) el.moreMenu.classList.remove('open');
+      });
+    }
   }
 
   var btnClrChat = document.getElementById('btn-clear-chat');
@@ -3253,7 +3545,12 @@ PanelBoot.run('ИИ: монтаж', function () {
       apiKey: settings.apiKey,
       model: settings.analysisModel || settings.chatModel,
       temperature: 0.2,
-      chatParams: { max_tokens: 4096 }
+      chatParams: { max_tokens: 4096 },
+      /* Phase 1.5 (6 мая 2026): per-role thinking — report policy. */
+      responseFormat: 'json_object',
+      enableThinking: (settings.thinkingPolicy && typeof settings.thinkingPolicy.report === 'boolean')
+        ? settings.thinkingPolicy.report
+        : settings.enableThinking
     };
 
     /* Если один чанк — один вызов */
@@ -3623,10 +3920,56 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   /* ─── Транскрибация (общая, единственная кнопка) ─────────────────── */
 
+  /* HIGH #1 (6 мая 2026): защита от sequence switch между proposal и apply.
+     Если пользователь переключил активную секвенцию в Premiere после получения
+     proposal'а — apply бы выполнился на ДРУГОЙ секвенции, разрушая её таймлайн.
+     Делаем fresh snapshot и сверяем sequenceName. Возвращаем Promise<true|false>.
+     При false — caller должен показать ошибку и НЕ применять. */
+  function assertSequenceMatch(proposalSnapshot, callback) {
+    if (!proposalSnapshot || !proposalSnapshot.sequenceName) {
+      callback(null, true); /* нет данных для сверки — пропускаем guard */
+      return;
+    }
+    var expectedName = proposalSnapshot.sequenceName;
+    PremiereBridge.getTimelineSnapshot(function (err, fresh) {
+      if (err) {
+        callback(err, false);
+        return;
+      }
+      if (!fresh || !fresh.ok) {
+        callback(new Error('Не удалось получить актуальный снимок таймлайна'), false);
+        return;
+      }
+      var freshName = fresh.sequenceName || '';
+      if (freshName !== expectedName) {
+        callback(new Error(
+          'Активная секвенция изменилась с «' + expectedName + '» на «' + freshName +
+          '». Apply отменён для безопасности. Откройте секвенцию «' + expectedName +
+          '» и попросите план заново.'
+        ), false);
+        return;
+      }
+      /* Освежаем lastSnap фактом успешной проверки. */
+      lastSnap = fresh;
+      _snapDirty = false;
+      callback(null, true);
+    });
+  }
+
+  /* P1 #4 (6 мая 2026): single source of truth для disable/enable обеих кнопок
+     транскрибации (полная + ⚡ Анализ аудио). Защита от collision двойных запусков. */
+  function setTranscribeButtonsDisabled(disabled) {
+    if (el.transcribe) el.transcribe.disabled = !!disabled;
+    var auBtns = document.querySelectorAll('[data-action="audio-only-analyze"]');
+    for (var i = 0; i < auBtns.length; i++) {
+      auBtns[i].disabled = !!disabled;
+    }
+  }
+
   async function onTranscribeTimeline() {
     showErr('');
     var settings = ContextStore.getResolvedSettings();
-    el.transcribe.disabled = true;
+    setTranscribeButtonsDisabled(true);
     el.stop.disabled = false;
     runAbort = createAbortPair();
     var ac = runAbort;
@@ -3668,6 +4011,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         },
         onProgress: function (msg) {
           statusUi.show(msg, true);
+          /* MEDIUM #12: indeterminate progress (transcribe не сообщает % готовности).
+             Хотя бы видна анимация — юзер не думает что зависло. */
+          statusUi.progress(null);
         },
         CloudRuClient: CloudRuClient
       });
@@ -3741,18 +4087,124 @@ PanelBoot.run('ИИ: монтаж', function () {
     } catch (e) {
       statusUi.hide();
       setTranscriptLed('red');
-      if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1))
+      if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1)) {
         showErr('Транскрибация остановлена.');
-      else showErr(String(e.message || e));
+      } else {
+        /* MEDIUM #20 (6 мая 2026): классифицируем ошибку и предлагаем retry для
+           сетевых ошибок. Для auth/quota retry бесполезен, показываем hint без кнопки. */
+        var cls = _classifyError(e);
+        var opts = { hint: cls.hint };
+        if (cls.kind === 'network' || cls.kind === 'other') {
+          opts.retry = function () { onTranscribeTimeline(); };
+        }
+        showErr('Транскрибация: ' + String(e.message || e), opts);
+      }
     } finally {
       if (TimelineTranscribe && TimelineTranscribe.unlinkWorkFiles) TimelineTranscribe.unlinkWorkFiles(prep);
       if (runAbort === ac) runAbort = null;
-      el.transcribe.disabled = false;
+      setTranscribeButtonsDisabled(false);
       el.stop.disabled = true;
     }
   }
 
   if (el.transcribe) el.transcribe.onclick = onTranscribeTimeline;
+
+  /* ─── Phase 1.6 (6 мая 2026): Аудио-анализ без транскрибации ────────
+   * Быстрый путь для cutSilences/jumpCuts: 30 сек вместо 10-15 мин Whisper.
+   * Записывает entry с {segments:[], audioAnalysis:{...}, mode:'audio-only'}.
+   * Match AutoPod/FireCut UX. */
+  async function onAudioOnlyAnalyze() {
+    showErr('');
+    var settings = ContextStore.getResolvedSettings();
+    setTranscribeButtonsDisabled(true);
+    el.stop.disabled = false;
+    runAbort = createAbortPair();
+    var ac = runAbort;
+    var prep = null;
+    statusUi.show('Подготовка аудио (быстрый режим)…', true);
+    setTranscriptLed('busy');
+    try {
+      prep = await new Promise(function (resolve, reject) {
+        PremiereBridge.prepareTranscribeFromTimeline(
+          {
+            extensionRoot: extensionRootForHost(),
+            exportPresetPath: settings.exportAudioPresetPath || '',
+            maxDirectTranscribeMediaSec: settings.maxDirectTranscribeMediaSec,
+            transcribeExportChunkSec: settings.transcribeExportChunkSec,
+            exportChunkExtension: settings.exportChunkExtension || 'wav'
+          },
+          function (err, data) { if (err) reject(err); else resolve(data); }
+        );
+      });
+      if (!prep || !prep.ok) throw new Error((prep && prep.error) || 'Не удалось подготовить аудио');
+
+      var snap = await new Promise(function (resolve, reject) {
+        PremiereBridge.getTimelineSnapshot(function (err, data) {
+          if (err) reject(err); else resolve(data);
+        });
+      });
+      if (!snap || !snap.ok) throw new Error((snap && snap.error) || 'Нет активной секвенции');
+      var key = snap.sequenceName || 'sequence';
+
+      var entry = await TimelineTranscribe.runAudioOnlyAnalysis(prep, function (msg) {
+        statusUi.show(msg, true);
+      });
+
+      /* Phase 1.6 (6 мая 2026, P0 #2): MERGE not REPLACE.
+         Если уже есть полный транскрипт в кеше — НЕ затираем segments/paragraphs/text.
+         Просто обновляем audioAnalysis (новые тишины с актуальным порогом). */
+      var existing = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+      var preservedSegments = 0;
+      if (existing && existing.entry && Array.isArray(existing.entry.segments) && existing.entry.segments.length > 0) {
+        /* Сохраняем существующие данные, обновляем только audioAnalysis. */
+        var merged = Object.assign({}, existing.entry, {
+          audioAnalysis: entry.audioAnalysis,
+          builtAt: entry.builtAt,
+          /* mode НЕ перезаписываем — сохраняем 'transcribe' / 'whisper' и т.д. */
+          analysisOnly: false
+        });
+        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, key, merged);
+        preservedSegments = existing.entry.segments.length;
+      } else {
+        /* Чистый кеш или предыдущий тоже audio-only — пишем как есть. */
+        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, key, entry);
+      }
+
+      var sCount = entry.audioAnalysis && entry.audioAnalysis.silences ? entry.audioAnalysis.silences.length : 0;
+      /* P1 #3 LED state: если транскрипт сохранён → 'ok' (зелёный), иначе 'audio' (синий). */
+      setTranscriptLed(preservedSegments > 0 ? 'ok' : 'audio');
+      var msg = 'Аудио-анализ готов (' + sCount + ' тишин). Доступны: Убрать тишины / Jump cuts.';
+      if (preservedSegments > 0) {
+        msg += ' Транскрипт (' + preservedSegments + ' сегм.) сохранён.';
+      }
+      statusUi.show(msg, false);
+      setTimeout(function () { statusUi.hide(); }, 4500);
+      var errMsg = 'Аудио-анализ «' + key + '»: ' + sCount + ' тишин.';
+      if (preservedSegments > 0) {
+        errMsg += ' Транскрипт сохранён (' + preservedSegments + ' сегм.).';
+      } else {
+        errMsg += ' Для филлеров/глав нужна полная транскрибация.';
+      }
+      showErr(errMsg);
+      setTimeout(function () { showErr(''); }, 6000);
+    } catch (e) {
+      statusUi.hide();
+      setTranscriptLed('red');
+      if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1))
+        showErr('Анализ остановлен.');
+      else showErr(String(e.message || e));
+    } finally {
+      if (TimelineTranscribe && TimelineTranscribe.unlinkWorkFiles) TimelineTranscribe.unlinkWorkFiles(prep);
+      if (runAbort === ac) runAbort = null;
+      setTranscribeButtonsDisabled(false);
+      el.stop.disabled = true;
+    }
+  }
+  /* Кнопка подключается через querySelector — может быть в нескольких местах. */
+  var audioOnlyBtns = document.querySelectorAll('[data-action="audio-only-analyze"]');
+  for (var aoi = 0; aoi < audioOnlyBtns.length; aoi++) {
+    audioOnlyBtns[aoi].onclick = onAudioOnlyAnalyze;
+  }
 
   /* ─── Инициализация единой панели ─────────────────────────────────── */
 
@@ -3819,7 +4271,11 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
     }
 
-    /* Expose for tab switch and cross-view sync */
+    /* HIGH #18 (6 мая 2026): подписка через event listener (заменяет fragile
+       window.toolsRefreshLed coupling). Сохраняем window.* для tab-switch + fallback. */
+    document.addEventListener('omc:transcript-led-changed', function () {
+      try { window.toolsRefreshLed(); } catch (e) {}
+    });
     window.toolsRefreshLed = function () {
       try {
         /* Try lastSnap first, then fall back to any cached transcript */
@@ -3942,7 +4398,20 @@ PanelBoot.run('ИИ: монтаж', function () {
       var applyB = document.createElement('button');
       applyB.className = 'btn-apply';
       applyB.textContent = 'Применить';
-      applyB.onclick = function () { toolsApply(); };
+      applyB.onclick = function () {
+        /* HIGH #1: sequence-switch guard. Пользователь мог переключиться на
+           другую секвенцию между proposal и apply — apply убил бы её таймлайн. */
+        applyB.disabled = true;
+        var pSnap = _toolsProposal && _toolsProposal.snapshot;
+        assertSequenceMatch(pSnap, function (err, ok) {
+          applyB.disabled = false;
+          if (!ok) {
+            toolsShowErr(err && err.message ? err.message : 'Sequence mismatch');
+            return;
+          }
+          toolsApply();
+        });
+      };
       btns.appendChild(applyB);
       var cancelB = document.createElement('button');
       cancelB.className = 'btn-cancel';

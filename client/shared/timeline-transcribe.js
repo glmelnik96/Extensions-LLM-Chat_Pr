@@ -964,6 +964,46 @@
     throw new Error('Неизвестный режим транскрибации: ' + String(prep.mode));
   }
 
+  /**
+   * Phase 1.6 (6 мая 2026): standalone audio-only analysis.
+   * Запускает ТОЛЬКО ffmpeg silencedetect + loudnorm, БЕЗ Whisper-транскрибации.
+   *
+   * Use case: пользователь хочет cutSilences или jumpCuts, но не хочет ждать
+   * 10-15 мин на Whisper. Этот путь даёт `audioAnalysis` за ~30 сек на 1ч видео.
+   *
+   * Возвращает entry-объект совместимый с deterministic-pipelines:
+   *   { segments: [], audioAnalysis: {silences, loudness, ...}, durationSec, mode: 'audio-only' }
+   *
+   * Параметры:
+   *   prep — то же что для transcribeFromPrep: {path|chunks, timelineOffsetSec, durationSec}
+   *   onProgress — callback для статусов
+   */
+  async function runAudioOnlyAnalysis(prep, onProgress) {
+    if (!prep) throw new Error('prep required');
+    var progress = typeof onProgress === 'function' ? onProgress : function () {};
+    /* Берём путь к аудио для анализа: либо prep.path (один файл), либо первый chunk. */
+    var pathForAnalysis = prep.path || (prep.chunks && prep.chunks[0] && prep.chunks[0].path);
+    if (!pathForAnalysis) throw new Error('prep.path или prep.chunks[0].path обязателен');
+    var offsetSec = typeof prep.timelineOffsetSec === 'number' ? prep.timelineOffsetSec : 0;
+
+    progress('Анализ аудио без транскрибации…');
+    var aa = await computeAudioPreprocess(pathForAnalysis, offsetSec, progress);
+    if (!aa) throw new Error('AudioPreprocess недоступен (ffmpeg?)');
+    if (aa.error) throw new Error('Ошибка анализа: ' + aa.error);
+
+    return {
+      segments: [],
+      paragraphs: [],
+      text: '',
+      audioAnalysis: aa,
+      timelineOffsetSec: offsetSec,
+      durationSec: typeof prep.durationSec === 'number' ? prep.durationSec : null,
+      mode: 'audio-only',
+      analysisOnly: true,
+      builtAt: Date.now()
+    };
+  }
+
   global.TimelineTranscribe = {
     normalizeWhisperExport: normalizeWhisperExport,
     normalizeWhisperMediaFile: normalizeWhisperMediaFile,
@@ -971,6 +1011,8 @@
     guessMime: guessMime,
     mergeSegmentLists: mergeSegmentLists,
     runFromPrep: runFromPrep,
+    runAudioOnlyAnalysis: runAudioOnlyAnalysis,
+    computeAudioPreprocess: computeAudioPreprocess,
     unlinkWorkFiles: function (prep) {
       if (typeof require === 'undefined') return;
       var fs = require('fs');

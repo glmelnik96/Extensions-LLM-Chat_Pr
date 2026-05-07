@@ -248,10 +248,10 @@
       <!-- ══ VIEW: Chat ═══════════════════════════════════════════ -->
       <div class="view-panel active" id="view-chat">
         <div class="action-bar">
-          <button type="button" id="btn-transcribe" class="secondary" title="Транскрибировать область In–Out на активной секвенции">Транскрибировать In–Out</button>
+          <button type="button" id="btn-transcribe" class="secondary" title="Транскрибировать область In–Out на активной секвенции (полный режим, ~10-15 мин на 1ч)">Транскрибировать In–Out</button>
           <span class="led-wrap" title="Кэш транскрипта для активной секвенции">
             <span id="transcript-led" class="transcript-led transcript-led--red" role="img" aria-label="Нет транскрипта"></span>
-            <span id="transcript-led-text">нет</span>
+            <span id="transcript-led-text" aria-live="polite">нет</span>
           </span>
           <span class="grow"></span>
           <button type="button" id="btn-undo" class="secondary">Откат маркеров</button>
@@ -268,16 +268,22 @@
           </div>
         </div>
 
-        <div class="err" id="err"></div>
-        <div class="status-bar" id="statusBar" hidden>
-          <span class="status-spinner" id="statusSpinner"></span>
-          <span class="status-text" id="statusText"></span>
+        <div class="err" id="err" role="alert" aria-live="assertive"></div>
+        <div class="status-bar" id="statusBar" hidden role="status" aria-live="polite">
+          <div class="status-bar-row">
+            <span class="status-spinner" id="statusSpinner"></span>
+            <span class="status-text" id="statusText"></span>
+          </div>
+          <div class="status-progress" id="statusProgress" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div class="status-progress-fill" id="statusProgressFill"></div>
+          </div>
         </div>
 
         <div class="chat" id="chat"></div>
 
         <div class="starters-section" id="starters-container"></div>
-        <div class="hint-chips" id="hint-chips"></div>
+        <!-- hint-chips объединены в starters-section (v3 collapsible UI, 7 мая 2026) -->
+        <div class="hint-chips" id="hint-chips" hidden></div>
 
         <div class="composer">
           <textarea id="input" placeholder="Опишите задачу обычными словами…"></textarea>
@@ -291,7 +297,7 @@
       <!-- ══ VIEW: Tools ══════════════════════════════════════════ -->
       <div class="view-panel" id="view-tools">
         <div class="tools-transcript-bar">
-          <button type="button" id="tools-btn-transcribe" class="secondary" style="font-size:11px;padding:4px 8px;">Транскрибировать In–Out</button>
+          <button type="button" data-action="audio-only-analyze" class="secondary" style="font-size:11px;padding:4px 8px;" title="Быстрый аудио-анализ без Whisper (~30 сек). Достаточно для «Убрать тишины» и «Jump cuts». Транскрипция (для семантического монтажа) — на вкладке «Чат».">⚡ Анализ аудио</button>
           <span class="led-wrap">
             <span id="tools-led" class="transcript-led transcript-led--red"></span>
             <span id="tools-led-text" style="font-size:10px;color:var(--muted);">нет</span>
@@ -399,8 +405,10 @@
           </div>
         </div><!-- /tools-scroll -->
 
-        <div class="status-bar" id="tools-statusBar" hidden>
-          <span class="status-text" id="tools-statusText"></span>
+        <div class="status-bar" id="tools-statusBar" hidden role="status" aria-live="polite">
+          <div class="status-bar-row">
+            <span class="status-text" id="tools-statusText"></span>
+          </div>
         </div>
       </div><!-- /view-tools -->
     </div>

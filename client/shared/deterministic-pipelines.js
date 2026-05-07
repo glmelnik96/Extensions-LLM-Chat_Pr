@@ -322,8 +322,12 @@
   async function cutSilences(ctx, params) {
     params = params || {};
     var entry = ctx.transcriptEntry;
-    if (!entry) {
-      return { ok: false, error: 'Нет транскрипта.' };
+    /* Phase 1.6 (6 мая 2026): cutSilences НЕ требует транскрипта — работает по
+       audioAnalysis.silences (ffmpeg silencedetect). Раньше gate отвергал любой
+       `!entry`, что заставляло транскрибировать ради silence removal — это в 20×
+       медленнее (Whisper 10 мин на 1ч vs ffmpeg 30 сек). Match AutoPod/FireCut UX. */
+    if (!entry || (!entry.audioAnalysis && (!entry.segments || !entry.segments.length))) {
+      return { ok: false, error: 'Нет данных. Запустите «Анализ аудио» или «Транскрибировать In-Out».' };
     }
 
     var minDuration = typeof params.minDuration === 'number' ? params.minDuration : 1.0;
@@ -539,8 +543,10 @@
   async function jumpCuts(ctx, params) {
     params = params || {};
     var entry = ctx.transcriptEntry;
-    if (!entry || !entry.segments || !entry.segments.length) {
-      return { ok: false, error: 'Нет транскрипта.' };
+    /* Phase 1.6 (6 мая 2026): jumpCuts НЕ требует транскрипта — работает по
+       audioAnalysis.silences. Match AutoPod/FireCut: amplitude-only path. */
+    if (!entry || (!entry.audioAnalysis && (!entry.segments || !entry.segments.length))) {
+      return { ok: false, error: 'Нет данных. Запустите «Анализ аудио» или «Транскрибировать In-Out».' };
     }
 
     var maxPause = typeof params.maxPause === 'number' ? params.maxPause : 0.5;
@@ -553,7 +559,7 @@
     var minSegmentDuration = typeof params.minSegmentDuration === 'number' ? params.minSegmentDuration : 0.3;
     if (minSegmentDuration < 0) minSegmentDuration = 0;
 
-    var segs = entry.segments;
+    var segs = entry.segments || [];
     var silences = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
 
     /* R13: применяем тот же gating по threshold, что и cutSilences. */

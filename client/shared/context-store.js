@@ -218,6 +218,22 @@
       var codeModel = String(d.codeModel || '').trim();
       var whisperModel = String(d.whisperModel || '').trim();
       var analysisModel = String(d.analysisModel || '').trim();
+      /* Phase 1 (май 2026): chapterModel и findMomentsModel — отдельные модели
+         для long-context reasoning. См. fm-defaults.js + memory:reference_cloudru_models. */
+      var chapterModel = String(d.chapterModel || '').trim();
+      var findMomentsModel = String(d.findMomentsModel || '').trim();
+      var enableThinking = (typeof d.enableThinking === 'boolean') ? d.enableThinking : false;
+      /* Phase 1.5: per-role thinking override. По умолчанию все роли наследуют
+         enableThinking. fm-defaults.thinkingPolicy.<role> переопределяет. */
+      var defaultPolicy = { analyze: enableThinking, chapter: enableThinking, chat: enableThinking, report: enableThinking };
+      var thinkingPolicy = (d.thinkingPolicy && typeof d.thinkingPolicy === 'object')
+        ? Object.assign({}, defaultPolicy, d.thinkingPolicy)
+        : defaultPolicy;
+      /* Phase 1.5: параллельный chunking в analyze. Default 3 — реалистичный
+         компромисс между latency и rate-limit от Cloud.ru. */
+      var analyzeConcurrency = (typeof d.analyzeConcurrency === 'number' && d.analyzeConcurrency > 0)
+        ? Math.min(8, Math.floor(d.analyzeConcurrency))
+        : 1;
       var useCode = d.useCodeModelForAgent === true;
       var agentModel = useCode && codeModel ? codeModel : chatModel;
       var off = d.transcriptTimelineOffsetSec;
@@ -237,6 +253,11 @@
         useCodeModel: useCode,
         activeAgentModel: agentModel,
         analysisModel: analysisModel || agentModel,
+        chapterModel: chapterModel || analysisModel || agentModel,
+        findMomentsModel: findMomentsModel || analysisModel || agentModel,
+        enableThinking: enableThinking,
+        thinkingPolicy: thinkingPolicy,
+        analyzeConcurrency: analyzeConcurrency,
         transcriptTimelineOffsetSec: transcriptTimelineOffsetSec,
         exportAudioPresetPath: String(d.exportAudioPresetPath || '').trim(),
         maxDirectTranscribeMediaSec:

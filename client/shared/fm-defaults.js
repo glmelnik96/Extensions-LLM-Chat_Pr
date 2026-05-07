@@ -52,9 +52,19 @@
 
     /**
      * Основная модель агента (чат + вызов инструментов).
-     * Требует Function Calling. 131K контекста — хватает для большинства задач.
+     * Phase 1.5 (май 2026): переключено с gpt-oss-120b на GLM-4.7.
+     * GLM-4.7: 200K контекст, top tool-calling (τ²-Bench 87.4%, BFCL-v3 SOTA),
+     * Interleaved Thinking перед каждым tool-call'ом улучшает multi-step reasoning.
+     * Используется для всех content-creation запросов: «почисти», «собери ролик»,
+     * «убери X», «уложи в N сек».
+     *
+     * Простые «вопросы» («что на таймлайне», «привет») роутятся на fastModel
+     * через AgentPrompts.classifyComplexity (panel.js:3575-3579) — там
+     * gpt-oss-120b остаётся, потому что дешевле и без thinking-overhead.
+     *
+     * Risk: GLM иногда даёт EN-leakage в RU output. Мониторим через smoke-test.
      */
-    chatModel: 'openai/gpt-oss-120b',
+    chatModel: 'zai-org/GLM-4.7',
 
     /**
      * Альтернатива для агента; включается флагом useCodeModelForAgent.
@@ -65,14 +75,29 @@
     useCodeModelForAgent: false,
 
     /**
-     * Модель для анализа транскрипта (analyze_transcript_for_cuts, buildTopicsWithLLM).
-     * Классифицирует абзацы: filler/intro/outro/repeat/digression.
+     * Модель для анализа транскрипта (analyze_transcript_for_cuts).
+     * Классифицирует сегменты: filler/intro/outro/repeat/digression/artifact/outtake.
      * Не требует Function Calling — достаточно Structured Output (JSON).
      *
-     * openai/gpt-oss-120b: 131K контекст, FC+SO, быстрый на Cloud.ru.
-     * Пустая строка '' — используется та же модель, что и для агента.
+     * GLM-4.7: 202K контекст, FC+SO, top-tier reasoning, free preview.
+     * Лучше gpt-oss-120b на schema adherence и cross-segment рассуждениях.
+     * Пустая строка '' — используется chatModel.
      */
-    analysisModel: 'openai/gpt-oss-120b',
+    analysisModel: 'zai-org/GLM-4.7',
+
+    /**
+     * Модель для построения глав (buildTopicsWithLLM).
+     * Получает весь транскрипт целиком (paragraphs) и определяет темы.
+     * Long-context reasoning — главный сильный бок GLM-4.7 (200K, thinking mode).
+     */
+    chapterModel: 'zai-org/GLM-4.7',
+
+    /**
+     * Модель для семантического поиска (find_moments через LLM, future use).
+     * Сейчас find-moments использует TF-IDF + stem-match, но при low-confidence
+     * fallback можем подключать LLM. GLM-4.7 — best fit для retrieval.
+     */
+    findMomentsModel: 'zai-org/GLM-4.7',
 
     /**
      * Быстрая модель для простых задач (маркеры, классификация, структура).
@@ -153,13 +178,63 @@
     /** Макс. размер одного загружаемого файла транскрипции (байт); сверка перед POST */
     maxTranscribeUploadBytes: 20971520,
 
-    /** Параметры chat.completions для основного агента */
+    /**
+     * Параметры chat.completions для основного агента.
+     *
+     * temperature: 0.1 (было 0.5) — для tool-calling нужна детерминированность.
+     * Аудит май 2026 показал: 0.5 приводит к hallucinated nodeIds, странным
+     * интервалам, markdown-обёрткам в JSON-аргументах. См. memory:
+     * project_transcript_pipeline_audit.md HIGH#2.
+     */
     chatParams: {
       max_tokens: 8000,
-      temperature: 0.5,
+      temperature: 0.1,
       presence_penalty: 0,
       top_p: 0.95
     },
+
+    /**
+     * Включать thinking mode (chain-of-thought) для моделей которые его поддерживают
+     * (GLM-4.7, GLM-4.6 через chat_template_kwargs). Для не-thinking моделей
+     * (gpt-oss-120b, Qwen3) флаг игнорируется.
+     *
+     * true — включает Interleaved Thinking для reasoning-heavy calls
+     * (analysis, chapters, find_moments). Output может вырасти в 2-5×, латентность
+     * выше, но качество cross-segment рассуждений сильно лучше.
+     *
+     * Risk: GLM иногда даёт EN-leakage в RU output. Если станет проблемой —
+     * выключить и/или перенаправить chapterModel/analysisModel на gpt-oss-120b.
+     */
+    enableThinking: true,
+
+    /**
+     * Phase 1.5 (6 мая 2026, real-call findings): per-role thinking override.
+     * Real-call test показал что thinking mode на per-chunk classification
+     * (analyze) добавляет 3-5× latency (до 5 минут на 50-сегм chunk) и приводит
+     * к network-level `fetch failed` transient'ам. Per-chunk classification —
+     * простая задача, thinking тут overkill.
+     *
+     * Поэтому отключаем thinking для analyze, оставляем для buildTopics
+     * (long-context cross-paragraph reasoning) и main agent (multi-step
+     * tool-calling из τ²-Bench 87.4%).
+     *
+     * Если поле undefined — fallback на enableThinking.
+     */
+    thinkingPolicy: {
+      analyze: false,    /* per-chunk classification — НЕ нужно thinking */
+      chapter: true,     /* whole-transcript reasoning — нужно */
+      chat: true,        /* multi-step tool-calling — нужно */
+      report: true       /* AI-отчёт по сессии — нужно */
+    },
+
+    /**
+     * Phase 1.5: параллельные analyze chunks. Сейчас analyze идёт sequentially
+     * (chunk1 → wait → chunk2 → wait), что на 1ч видео даёт 3 chunks × 60-100с = 5 мин.
+     * С параллелизмом N=3 — все 3 chunks одновременно, время = max latency = ~100с.
+     * Cross-chunk bridging при этом теряется (мы не знаем выход chunk N-1 при
+     * запуске chunk N), но bridging на синтетических повторах и так не работал.
+     */
+    analyzeConcurrency: 3,
 
     /**
      * Максимум сообщений в истории чата панели, которые отправляются в FM при каждом запросе.

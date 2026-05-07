@@ -95,12 +95,15 @@ describe('AnalysisRouting.invertKeepToRemove', () => {
     assert.equal(r.removeIntervals[0].endSec, 40);
   });
 
-  test('keep покрывает всё → removeIntervals пустой', () => {
+  test('keep покрывает всё → error «нечего вырезать» (HIGH #5 fix, 6 мая 2026)', () => {
     const r = AR.invertKeepToRemove(
       [{ startSec: 0, endSec: 60 }],
       { minSec: 0, maxSec: 60 }
     );
-    assert.equal(r.removeIntervals.length, 0);
+    /* Раньше возвращал removeIntervals: []. Теперь error — иначе UI создаст
+       proposal с «вырезано 0 интервалов» что путает пользователя. */
+    assert.ok(r.error, 'expected error field');
+    assert.match(r.error, /нечего вырезать/i);
   });
 
   test('пересекающиеся keep-интервалы → мёрджатся перед инверсией', () => {
@@ -132,13 +135,16 @@ describe('AnalysisRouting.invertKeepToRemove', () => {
     assert.ok(r.error);
   });
 
-  test('keep за пределами [min, max] → clipping', () => {
+  test('keep за пределами [min, max] → clipping → error (HIGH #5 fix, 6 мая 2026)', () => {
     const r = AR.invertKeepToRemove(
       [{ startSec: -5, endSec: 70 }],
       { minSec: 0, maxSec: 60 }
     );
-    /* keep обрезается до [0, 60] → ничего не удаляем */
-    assert.equal(r.removeIntervals.length, 0);
+    /* keep обрезается до [0, 60] → весь транскрипт оставлен → нечего вырезать.
+       Раньше возвращал removeIntervals: [], теперь error чтобы UI не показывал
+       proposal с «вырезано 0 интервалов». */
+    assert.ok(r.error, 'expected error field');
+    assert.match(r.error, /нечего вырезать/i);
   });
 
   test('выравнивание по сегментам: keep [12, 18] расширяется до границ сегментов', () => {
@@ -161,5 +167,72 @@ describe('AnalysisRouting.invertKeepToRemove', () => {
     assert.equal(r.removeIntervals[0].endSec, 10);
     assert.equal(r.removeIntervals[1].startSec, 20);
     assert.equal(r.removeIntervals[1].endSec, 60);
+  });
+});
+
+/* ─── validateKeepDuration (HIGH 6 мая 2026) ─── */
+describe('AnalysisRouting.validateKeepDuration', () => {
+  test('пустой keep → ok с 0', () => {
+    const r = AR.validateKeepDuration([], 40);
+    assert.equal(r.ok, true);
+    assert.equal(r.keepSumSec, 0);
+  });
+
+  test('без target → пропускает (ok)', () => {
+    const r = AR.validateKeepDuration([{ startSec: 0, endSec: 100 }], 0);
+    assert.equal(r.ok, true);
+  });
+
+  test('сумма ≤ target → ok', () => {
+    const r = AR.validateKeepDuration(
+      [{ startSec: 0, endSec: 20 }, { startSec: 30, endSec: 50 }],
+      40
+    );
+    assert.equal(r.ok, true);
+    assert.equal(r.keepSumSec, 40);
+  });
+
+  test('сумма ≤ target * 1.20 → ok (допуск)', () => {
+    /* 47/40 = 1.175 ≤ 1.20 */
+    const r = AR.validateKeepDuration([{ startSec: 0, endSec: 47 }], 40);
+    assert.equal(r.ok, true);
+  });
+
+  test('сумма > target * 1.20 → error с подсказкой', () => {
+    /* реальный кейс: 70с при цели 40с (overshoot 75%) */
+    const r = AR.validateKeepDuration(
+      [
+        { startSec: 0, endSec: 34 },     /* 34с */
+        { startSec: 35, endSec: 44 },    /* 9с */
+        { startSec: 45, endSec: 60 },    /* 15с */
+        { startSec: 70, endSec: 79 },    /* 9с */
+        { startSec: 108, endSec: 111 }   /* 3с */
+      ],
+      40
+    );
+    assert.ok(r.error, 'должна быть ошибка для overshoot 75%');
+    assert.equal(r.keepSumSec, 70);
+    assert.equal(r.overshootPct, 75);
+    assert.match(r.error, /70\.0с при цели 40с/);
+    assert.match(r.error, /75%/);
+  });
+
+  test('кастомный allowedOvershoot=1.10 → строже', () => {
+    /* 45/40 = 1.125 — превышение 12.5%, при cap 10% → error */
+    const r = AR.validateKeepDuration([{ startSec: 0, endSec: 45 }], 40, 1.10);
+    assert.ok(r.error);
+  });
+
+  test('некорректные интервалы (endSec ≤ startSec) — игнорируются в сумме', () => {
+    const r = AR.validateKeepDuration(
+      [
+        { startSec: 0, endSec: 10 },
+        { startSec: 20, endSec: 15 },     /* мусор */
+        { startSec: 30, endSec: 40 }
+      ],
+      40
+    );
+    assert.equal(r.ok, true);
+    assert.equal(r.keepSumSec, 20); /* 10 + 10, мусор не учтён */
   });
 });
