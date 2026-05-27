@@ -487,7 +487,9 @@
       }
       try {
         localStorage.removeItem(LS_TRANSCRIPT_LEGACY);
-      } catch (eC) {}
+      } catch (eC) {
+        console.warn('[context-store] clear legacy LS failed:', eC && eC.message);
+      }
     },
     clearAllPanelCache: function (panelId) {
       this.clearChat(panelId);
@@ -521,7 +523,9 @@
         if (opts && opts.mode) payload.mode = opts.mode;
         if (opts && opts.markerSeconds && opts.markerSeconds.length) payload.markerSeconds = opts.markerSeconds;
         localStorage.setItem(this._undoKey(panelId), JSON.stringify(payload));
-      } catch (e) {}
+      } catch (e) {
+        console.warn('[context-store] save undo state failed (LS quota?):', e && e.message);
+      }
     },
     clearLastUndoCount: function (panelId) {
       try { localStorage.removeItem(this._undoKey(panelId)); } catch (e) {}

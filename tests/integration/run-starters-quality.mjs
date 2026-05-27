@@ -278,7 +278,7 @@ const BASE_SYSTEM = [
 ].join('\n');
 
 /* ─── Agent loop runner ───────────────────────────────────────────────── */
-async function runAgent(systemPromptAddon, userPrompt, maxTurns = 6) {
+async function runAgent(systemPromptAddon, userPrompt, maxTurns = 10) {
   const messages = [
     { role: 'system', content: BASE_SYSTEM + '\n\n' + (systemPromptAddon || '') },
     { role: 'user', content: userPrompt }
@@ -453,11 +453,16 @@ async function validateStarters() {
 
   /* 6. Find Moments */
   const fm = STARTERS.find(s => s.id === 'find-topic');
-  /* Подбираем релевантный запрос из реальных данных */
+  /* Подбираем релевантный запрос из реальных данных. Используем биграммы чтобы LLM
+     не уточнял «какая стратегия?» — конкретный термин снимает неоднозначность. */
   const allText = entry.paragraphs.map(p => p.text || '').join(' ').toLowerCase();
-  const candidates = ['аналитик', 'стратеги', 'компани', 'клиент', 'команда', 'продукт'];
-  const query = candidates.find(c => allText.includes(c)) || 'аналитика';
-  const r6 = await runScenario(fm, `Найди в транскрипте все упоминания о ${query}`);
+  const candidates = [
+    'open source', 'модель машины', 'новый завод', 'команда инженеров',
+    'мировой рынок', 'российский рынок', 'инвесторы', 'аналитика рынка',
+    'клиентский опыт', 'искусственный интеллект'
+  ];
+  const query = candidates.find(c => c.split(' ').every(w => allText.includes(w))) || 'аналитика';
+  const r6 = await runScenario(fm, `Найди в транскрипте все упоминания о теме "${query}" и покажи мне таймкоды`);
   RESULTS.findMoments = { completed: !!r6.finalContent, turns: r6.turns, query };
   console.log('Quality checks:');
   const fmCall = r6.trace.find(t => t.tool === 'find_moments');

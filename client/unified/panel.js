@@ -1267,7 +1267,9 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (found.entry.paragraphs) paragraphs = found.entry.paragraphs;
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      console.warn('[panel] snapIntervals: cache read failed:', e && e.message);
+    }
     if (!segments || !segments.length) return removeIntervals;
 
     /* HIGH (6 мая 2026): два уровня boundaries.
@@ -3170,7 +3172,9 @@ PanelBoot.run('ИИ: монтаж', function () {
   try {
     _expandedCat = localStorage.getItem('extllmpr_v1_expanded_cat');
     if (_expandedCat === 'null' || _expandedCat === '') _expandedCat = null;
-  } catch (e) {}
+  } catch (e) {
+    console.warn('[panel] localStorage read for expanded_cat failed:', e && e.message);
+  }
 
   /* Hint-chips теперь рендерятся ВНУТРИ развёрнутой категории, не отдельно */
   function rebuildHintChips() {
@@ -4293,7 +4297,9 @@ PanelBoot.run('ИИ: монтаж', function () {
             return;
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('[tools] LED refresh failed:', e && e.message);
+      }
       toolsSetLed('red');
       toolsUpdateCards(false);
     };
@@ -4452,7 +4458,9 @@ PanelBoot.run('ИИ: монтаж', function () {
             try {
               var sk = lastSnap && lastSnap.sequenceName ? lastSnap.sequenceName : '';
               if (sk) ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, sk, prop.removeIntervals || []);
-            } catch (e) {}
+            } catch (e) {
+              console.warn('[tools] applyRippleDeletionsToTranscript failed:', e && e.message);
+            }
             _snapDirty = true;
             lastSnap = null; /* force chat to re-fetch snapshot */
             toolsHideProposal(area);
