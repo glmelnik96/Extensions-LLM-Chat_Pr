@@ -2,12 +2,20 @@
 
 Чеклист для валидации текущего состояния. Одна панель **ИИ: монтаж** с двумя вкладками: Чат и Инструменты.
 
-> **Версия: `2026-04-16 — semantic-editing-v2`** (см. `client/shared/prompts.js`).
-> Новое в этой версии (для быстрого чтения):
-> - US-002: jumpCuts и «Убрать тишины» чётко разведены (ритм vs гигиена).
-> - US-003: `aggressiveness` у analyze_transcript_for_cuts (gentle/normal/aggressive).
-> - US-004: `keepIntervals` в propose_transcript_cuts (сборка ролика «оставь X»).
-> - US-005: адаптивные главы (10/20/45с по длине) + запрет имён «Часть N», «Продолжение».
+> **Версия: `2026-05-07 — quality-v4 + UI v3`** (см. `client/shared/prompts.js`).
+>
+> **Изменения после `2026-04-16 — semantic-editing-v2`:**
+> - **Phase 1.6 audio-only:** ⚡ Анализ аудио без Whisper (30 сек vs 15 мин)
+> - **Target-duration enforcement:** `targetDurationSec` в propose_transcript_cuts + cap +20%
+> - **Stale paragraphs auto-rebuild:** после ripple_delete параграфы пересобираются автоматически
+> - **Snap к paragraph boundaries:** drift 1.5с → fallback segments 0.5с
+> - **MultiCam Phase 1 MVP** для подкастов (clip.disabled через QE DOM)
+> - **UI overhaul Сценарий B:** target/actual badge, progress bar, retry, focus management
+> - **UI compact v3:** collapsible-карточки категорий (По тексту / Маркеры / Поиск)
+> - **6 валидированных стартеров** с system-promptами (Story Cutter, Уложить в N, Чистка речи, YouTube-главы, Хайлайты, Найти про…)
+> - **Highlights cycling fix:** max 1 find_moments, 19× быстрее на 1ч контенте
+> - **PP 2026 stabilization:** _wrap decorator + cold-start retry
+> - **Previous (semantic-editing-v2):** US-002 (jumpCuts vs cutSilences), US-003 (aggressiveness), US-004 (keepIntervals), US-005 (адаптивные главы)
 
 ## Подготовка
 
@@ -251,6 +259,90 @@
 
 ---
 
+---
+
+## 7. Май 2026 фичи (смоук-чеки)
+
+### 7.1. ⚡ Audio-only анализ (Phase 1.6)
+
+| # | Шаг | Ожидание | OK |
+|---|------|----------|-----|
+| 1 | Tools view → видна кнопка «⚡ Анализ аудио» | Кнопка present, transcribe in Chat header (не дублируется) | [ ] |
+| 2 | Нажать «⚡ Анализ аудио» без транскрипта | Бежит ffmpeg silencedetect + loudnorm, ~30 сек на 1ч video | [ ] |
+| 3 | LED становится синим (transcript-led--blue) | Indicator различает audio-only state от full transcript | [ ] |
+| 4 | После audio-only → Tools → «Убрать тишины» | Работает БЕЗ Whisper, использует ffmpeg silences | [ ] |
+| 5 | После audio-only → Tools → «Jump cuts» | Работает на audio-only данных | [ ] |
+| 6 | Если есть full transcript → нажать ⚡ | MERGE: segments/paragraphs сохраняются, обновляется только audioAnalysis | [ ] |
+
+### 7.2. Target-duration enforcement
+
+| # | Шаг | Ожидание | OK |
+|---|------|----------|-----|
+| 1 | В чате: «собери монтаж на 40 секунд» | LLM передаёт `targetDurationSec: 40` | [ ] |
+| 2 | Карточка proposal | 🎯 Target/Actual badge виден (green/amber/red) | [ ] |
+| 3 | Если сумма keep ≤ target*1.05 | Badge зелёный «✓ В целевой длине» | [ ] |
+| 4 | Если сумма ≤ target*1.20 | Badge жёлтый «⚠ Небольшое превышение» | [ ] |
+| 5 | Если сумма > target*1.20 | LLM получает validationError с подсказкой, пересобирает план | [ ] |
+| 6 | После пересборки сумма попадает в [target*0.7, target*1.20] | Карточка зелёная или жёлтая | [ ] |
+
+### 7.3. Stale paragraphs auto-rebuild
+
+| # | Шаг | Ожидание | OK |
+|---|------|----------|-----|
+| 1 | Транскрибировать → применить любой propose_transcript_cuts | Ripple delete, editedAfterTranscribe=true | [ ] |
+| 2 | После apply: в чате «что на таймлайне?» | Видит обновлённые paragraphs (не stale) | [ ] |
+| 3 | DevTools Console: при следующем get_transcript_structure | Если paragraphs устарели — лог `[panel] snapIntervals: cache read failed` НЕ появляется | [ ] |
+| 4 | Cmd+Z → опять «что на таймлайне?» | Видит исходные paragraphs (rebuilt после отката) | [ ] |
+
+### 7.4. UI v3 — collapsible categories
+
+| # | Шаг | Ожидание | OK |
+|---|------|----------|-----|
+| 1 | Открыть чат с пустой историей | Видна 1 строка «Быстрые сценарии»: ▸📝 По тексту / ▸🏷️ Маркеры / ▸🔍 Поиск | [ ] |
+| 2 | Кликнуть «📝 По тексту» | Раскрывается панель с 3 стартерами + 2 hint-chips | [ ] |
+| 3 | Кликнуть «🏷️ Маркеры» | Закрывается предыдущая, раскрываются YouTube-главы + Хайлайты | [ ] |
+| 4 | Кликнуть на стартер «Story Cutter» | userPrompt в input, system-prompt подгружен | [ ] |
+| 5 | Закрыть и переоткрыть панель | Открытая категория восстанавливается из localStorage | [ ] |
+| 6 | Tab → focus идёт на категории → Enter раскрывает | Keyboard навигация работает (focus-visible) | [ ] |
+
+### 7.5. UX-улучшения карточки proposal
+
+| # | Шаг | Ожидание | OK |
+|---|------|----------|-----|
+| 1 | Любой propose_* → видна карточка | Apply primary зелёная (раньше синяя как Cancel) | [ ] |
+| 2 | Tab из input → focus идёт на Apply первой | autofocus на Apply | [ ] |
+| 3 | Escape | Закрывает карточку (cancelPendingProposal) | [ ] |
+| 4 | Cancel button подпись | «Отмена (Esc)» | [ ] |
+| 5 | Применить → нажать Apply быстро 2 раза | Второй клик игнорируется (debounce) | [ ] |
+| 6 | Во время analyze | Progress bar показывает точный % по chunk'ам | [ ] |
+| 7 | Во время transcribe | Progress bar в indeterminate анимации | [ ] |
+| 8 | Имитировать network error (выключить сеть) | Видна кнопка «↻ Повторить» + hint про VPN | [ ] |
+| 9 | Имитировать 401 (испортить apiKey) | Hint про Settings, БЕЗ retry-кнопки | [ ] |
+
+### 7.6. MultiCam Phase 1 MVP (для подкастов)
+
+| # | Шаг | Ожидание | OK |
+|---|------|----------|-----|
+| 1 | Подготовить multicam-секвенцию (V1 + V2 stacked, A1 общая) | Готово к тесту | [ ] |
+| 2 | В чате: «нарежь как подкаст, ведущий говорит — показываем его» | LLM вызывает propose_multicam_plan | [ ] |
+| 3 | Карточка плана | Видны intervals на V1/V2 с clip.disabled | [ ] |
+| 4 | Apply | QE DOM razor + clip.disabled применены, undo group закрывается | [ ] |
+| 5 | Cmd+Z | Полный откат | [ ] |
+| 6 | Если сменить активную секвенцию между proposal и apply | Sequence-switch guard блокирует apply | [ ] |
+
+### 7.7. Стартеры (6 валидированных)
+
+| # | Стартер | Тест | OK |
+|---|---------|------|-----|
+| 1 | **Story Cutter** | «Собери монтаж» → propose_transcript_cuts | [ ] |
+| 2 | **Уложить в N секунд** | «Собери ролик 60 секунд» → targetDurationSec=60 в propose | [ ] |
+| 3 | **Чистка речи** | «Убери паразитов» → analyze + propose с paddingSec 0.3 | [ ] |
+| 4 | **YouTube-главы** | «Расставь главы» → propose_markers type=chapter, 0:00 первый | [ ] |
+| 5 | **Хайлайты** | «Поставь хайлайты» → MAX 1 find_moments → propose_markers type=comment (НЕ зацикливается на 1ч+) | [ ] |
+| 6 | **Найти про…** | «Найди упоминания о X» → find_moments, БЕЗ propose_transcript_cuts | [ ] |
+
+---
+
 ## Результаты
 
 | Блок | Пройдено | Провалено | Пропущено |
@@ -261,6 +353,7 @@
 | 4. Сервисные | / | / | / |
 | 5. Edge cases | / | / | / |
 | 6. PP API smoke | / | / | / |
+| 7. Май 2026 фичи | / | / | / |
 | **ИТОГО** | / | / | / |
 
 Дата: ___________

@@ -1,7 +1,10 @@
 # Артефакты разработки
 
 Консолидированный документ: lessons learned, known issues, аудит, roadmap.
-Обновлено: 2026-04-13.
+Обновлено: 2026-05-07.
+
+> Для быстрого онбординга агента — см. [HANDOFF.md](../HANDOFF.md) в корне.
+> Хронология milestone'ов — [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -55,6 +58,26 @@ CEP Node.js не наследует пользовательский PATH.
 `s.split(/\s+/)[0]` превращал «My Sequence» в «My» → cache miss → все AI-операции сломаны.
 **Решение:** удалять только known suffixes (dur=, clips=, in=, out=), не трогая пробелы.
 
+### 1.13. LLM overshoot на «уложи в N сек» (40с → 70с +75%)
+LLM игнорировал target duration — нет арифметической валидации в prompt и нет runtime-проверки.
+**Решение:** `targetDurationSec` параметр в schema + `validateKeepDuration` с +20% cap. При overshoot → structured error с подсказкой, LLM пересобирает.
+
+### 1.14. Stale paragraphs после ripple_delete (mid-word cuts)
+После `applyTranscriptCuts` segments ремаплятся, paragraphs остаются в старых координатах. Drift до 5.5с между `paragraph.endSec` и `segments[idxs[-1]].endSec` → LLM работает по неверным timestamps.
+**Решение:** `isParagraphsStale()` детект (drift >1с или out-of-range segIdxs) + auto-rebuild в 3 точках входа.
+
+### 1.15. PP 2026 cold-start race
+ExtendScript не успевает прогреться к первому `evalScript`, возвращает `EvalScript error.`
+**Решение:** `_wrap()` decorator + retry с exponential backoff (0/300/900мс) в `bridge-premiere.js`. Optimistic try/catch вместо pre-check `typeof JSON.stringify === 'function'`.
+
+### 1.16. Highlights cycling на длинных контентах
+LLM в режиме «Хайлайты» на 1ч контенте делал 42 `find_moments` вызова с вариациями тех же запросов, не доходил до `propose_markers` (3/4 quality fail).
+**Решение:** ХАРД-ЛИМИТ max 1 `find_moments` в system-prompt, разделение «общий запрос» vs «узкий», явный `propose_markers обязателен`. Результат: 23/23 pass, 19× быстрее.
+
+### 1.17. video-use prompt-инжиниринг не транслируется на наш ASR
+Phrase-packed view дал 14% сжатия (не 10×), `buildEditorBrief` ломал tool-use паттерн, protected zones no-op без `(laugh)` тегов в Whisper.
+**Решение:** откатить инфраструктуру, оставить research в vault. Возвращаться после ASR upgrade на event-tagging.
+
 ---
 
 ## 2. Known Issues (текущие)
@@ -81,45 +104,62 @@ CEP Node.js не наследует пользовательский PATH.
 
 ### Пробелы в тестовом покрытии
 
-Автотесты (129 штук) покрывают: валидаторы, pipelines, prompts, search, simulator, transcript structure.
+Автотесты (**247 штук** unit + **23/23 LLM quality checks** на 1ч подкасте через Cloud.ru API) покрывают: валидаторы, pipelines, prompts logic, search, simulator, transcript structure, conversation starters scenarios, multicam plan, YouTube export, analysis routing (включая `validateKeepDuration` и `isParagraphsStale`).
 
 **Не покрыто автотестами** (только ручные):
-- `host/premiere.jsx` — snapshot, razor, markers, export
+- `host/premiere.jsx` — snapshot, razor, markers, export (ExtendScript не запускается из Node)
 - Whisper/FM API timeouts и non-JSON ответы
 - A/V pair sync после серии правок
 - Intent classification edge cases
-- Audio ducking + LUFS normalization (код есть, не тестировался в продакшене)
+
+**Hot zones без unit-тестов** (backlog 5-7ч):
+- `client/shared/cloudru-client.js` — HTTP retry, SSE parsing
+- `client/shared/agent-loop.js` — orchestration, cycle detection
+- `client/shared/prompts.js` — tiered logic, intent classification
 
 ---
 
 ## 3. Аудит компонентов
 
-### Подтверждённо работает (2026-04-13)
+### Подтверждённо работает (2026-05-07, после Phase 1.5/1.6/1.7 + UI overhaul + scenarios validation)
 
 | Компонент | Статус | Примечания |
 |-----------|--------|------------|
-| Транскрибация clip_queue | OK | Параллельные чанки, cache, auto audio analysis |
+| Транскрибация clip_queue | OK | Параллельные чанки, cache, auto audio analysis, retry 5×, timeout 300с |
+| **Audio-only анализ** (Phase 1.6) | OK | ffmpeg без Whisper, 30 сек на 1ч vs 10-15 мин |
 | cutSilences (hybrid) | OK | Transcript gaps + ffmpeg, threshold slider |
 | cutFillers (v2) | OK | Path A + Path B, strict/expanded |
-| jumpCuts (hybrid) | OK | Transcript gaps + ffmpeg, min 0.1s |
-| chapterize | OK | LLM topics + time-based fallback + maxChapters |
+| jumpCuts (hybrid) | OK | Transcript gaps + ffmpeg, min 0.1s, дыхание, min-сегмент |
+| chapterize | OK | LLM topics + time-based fallback + maxChapters + min-interval адаптивный |
+| **MultiCam Phase 1 MVP** | OK | QE DOM razor + clip.disabled, sequence-switch guard, undo leak fix |
 | AI chat: timeline edits | OK | propose_edit_plan, remove_clip, ripple, trim |
-| AI chat: transcript cuts | OK | analyze + propose, one-pass principle |
-| AI chat: markers | OK | propose_markers |
+| AI chat: transcript cuts | OK | analyze + propose, one-pass principle, **`targetDurationSec` validation +20% cap** |
+| AI chat: markers | OK | propose_markers, **6 валидированных стартеров** (23/23 LLM checks) |
 | Snapshot caching | OK | Force refresh per message, dirty flag |
 | Session export (JSON) | OK | ~/.extensions_llm_chat_pr/sessions/ |
 | AI report generation | OK | Cloud.ru FM analysis, chunked logs |
-| Two-model routing | OK | classifyComplexity → fast/full model |
+| **Per-call model routing** | OK | chatModel/analysisModel/chapterModel/findMomentsModel/fastModel + thinkingPolicy |
+| **GLM-4.7 + thinkingPolicy** | OK | GLM-4.7-Flash 27% быстрее full с тем же качеством |
 | Deterministic slash-commands | OK | /cut_fillers, /cut_silences, /jump_cuts, /chapterize |
+| **isParagraphsStale auto-rebuild** | OK | Детект drift >1с / out-of-range segIdxs после ripple_delete |
+| **Snap к paragraph boundaries** | OK | drift 1.5с → fallback к segments (drift 0.5с) |
+| **YouTube chapters export** | OK | formatChaptersForYouTube + validateForYouTube |
+| **PP 2026 совместимость** | OK | `_wrap` decorator + cold-start retry (0/300/900мс) |
+| **UI: collapsible categories** | OK | 3 категории (По тексту / Маркеры / Поиск), state в localStorage |
+| **UI: target/actual badge** | OK | Green/amber/red по overshoot ratio |
+| **UI: progress bar** | OK | Точный % в analyze, indeterminate в transcribe |
+| **UI: WCAG AA контраст + focus-visible** | OK | aria-live, role=alert/status/progressbar |
+| **UI: retry on network errors** | OK | _classifyError() → network/auth/quota/cancel |
 
 ### С оговорками
 
 | Компонент | Проблема |
 |-----------|----------|
-| Audio ducking | Код написан, не тестировался end-to-end |
+| Audio ducking | Код написан, не тестировался end-to-end в продакшене |
 | LUFS normalization | Код написан, не тестировался end-to-end |
 | move_clip | Linked A/V иногда рассинхронизируется |
 | Transcript LED | Обновление с задержкой до следующего cache-refresh |
+| Highlights на 1ч+ контентах | После fix 2026-05-07: 3 tool calls вместо 42 (раньше зацикливался), но ещё нужен реальный production smoke с разными темами |
 
 ---
 
@@ -147,18 +187,44 @@ CEP Node.js не наследует пользовательский PATH.
 - [x] One-pass editing principle in prompts
 - [x] Session export + AI report generation
 
-### В плане (P2)
+### Выполнено (P0–P1) — продолжение (май 2026)
 
+- [x] OpenShorts integration (paddingSec 0.3, YouTube chapters export)
+- [x] PP 2026 stabilization (`_wrap` decorator + cold-start retry)
+- [x] MultiCam Phase 1 MVP для подкастов
+- [x] Install hardening (INSTALL.md, health-check)
+- [x] Phase 1 quality fixes (few-shot, temperature 0.1, response_format, cross-chunk bridging)
+- [x] GLM-4.7 per-call model routing + thinkingPolicy
+- [x] Parallel chunking в analyzeForCutsWithLLM (concurrency=3)
+- [x] Production validation на 1ч подкасте (1255 segs / 297 paragraphs)
+- [x] Audio-only path (30 сек vs 15 мин Whisper для cutSilences/jumpCuts)
+- [x] Sequence-switch guard на apply paths
+- [x] Target-duration enforcement (+20% cap, validateKeepDuration)
+- [x] Stale paragraphs auto-rebuild (isParagraphsStale + drift detect)
+- [x] Snap к paragraph boundaries (drift 1.5с → fallback segments 0.5с)
+- [x] UI overhaul Сценарий B (CSS-токены, focus management, progress bar, retry, event-based view sync)
+- [x] UI compact v3 collapsible categories
+- [x] Scenarios validation tests (real LLM, 23/23 pass)
+- [x] Highlights cycling fix (max 1 find_moments, 19× быстрее)
+- [x] HANDOFF.md + CHANGELOG.md
+- [x] README/MANUAL_TESTS/DEV_ARTIFACTS актуализированы
+
+### В плане (P2) — текущее backlog
+
+- [ ] Unit tests для cloudru-client.js / agent-loop.js / prompts.js (5-7ч)
+- [ ] ffmpeg path detection через FM_DEFAULTS с OS detection (15 мин)
 - [ ] Per-project/sequence chat memory
 - [ ] B-roll marker hints
-- [ ] Health-check перед крупными правками
-- [ ] Drag-and-drop clip из timeline
-- [ ] Captions/subtitles из Whisper сегментов
+- [ ] Captions/subtitles из Whisper сегментов (SRT/VTT export)
+- [ ] Split panel.js на 4-5 модулей по ответственности (8-10ч)
+- [ ] Extract functions >100 LoC в hot zones (4-6ч)
+- [ ] MultiCam Phase 1.5: ffmpeg astats per-channel pipeline
+- [ ] MultiCam: проверка clip.disabled на linked V↔A парах
 
 ### Дальний план (P3)
 
 - [ ] Structured output / JSON mode от FM
-- [ ] UXP compatibility layer (для move_clip, span-markers, unlink)
+- [ ] UXP compatibility layer (для move_clip, span-markers, unlink) — ExtendScript EOL сентябрь 2026
 - [ ] Integration tests (ExtendScript → Premiere)
 - [ ] Color grading через Lumetri
 - [ ] Export presets
@@ -166,6 +232,13 @@ CEP Node.js не наследует пользовательский PATH.
 - [ ] RLHF-lite из accept/reject решений
 - [ ] Project-specific dictionary
 - [ ] Session quality metrics
+- [ ] Drag-and-drop clip из timeline
+
+### Research-only / parked
+
+- DaVinci Resolve миграция — research зафиксирован (180-240ч effort, parked до бизнес-причины)
+- video-use идеи (phrase-packed view, archetypes, protected zones) — не дают benefit'а без ASR upgrade
+- UXP migration — research в vault, ждёт официальной EOL ExtendScript
 
 ### Исключено
 
@@ -174,3 +247,5 @@ CEP Node.js не наследует пользовательский PATH.
 - Visual keyframe analysis — требует vision model
 - Voice input — нет инфраструктуры
 - Auto B-roll selection — заменено на B-roll marker hints
+- J/L-cuts — ExtendScript не поддерживает unlink()
+- Speed/Duration — нет API в PP 2025/2026

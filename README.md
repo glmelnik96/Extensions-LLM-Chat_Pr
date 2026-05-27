@@ -1,7 +1,9 @@
 # Extensions-LLM-Chat_Pr
 
-ИИ-ассистент видеомонтажа для **Adobe Premiere Pro 2025** (CEP 12).
-Единая панель с AI-чатом и детерминированными инструментами. Бэкенд — **Cloud.ru Foundation Models**.
+ИИ-ассистент видеомонтажа для **Adobe Premiere Pro 2024+** (CEP 12, проверено на 24/25/26).
+Единая панель с AI-чатом и детерминированными инструментами. Бэкенд — **Cloud.ru Foundation Models** (GLM-4.7 + Whisper-large-v3).
+
+> **🤖 Работаешь над проектом как агент?** Сначала прочитай [HANDOFF.md](HANDOFF.md) — там всё необходимое: что работает, где hot zones, как тестировать, чего НЕ трогать. ~5 минут чтения.
 
 ## Текущее состояние
 
@@ -17,7 +19,7 @@
 | AI-чат (аудио ducking) | Реализовано, не тестировалось в продакшене |
 | J/L-cuts | Отключено — ExtendScript не поддерживает unlink() |
 | Скорость клипа | Не поддерживается — нет API в Premiere Pro 2025 |
-| Автотесты | 219/219 pass |
+| Автотесты | 247/247 unit + 23/23 LLM quality checks на 1ч подкасте |
 | MultiCam-нарезка для подкастов | Phase 1 MVP — autopod-style, через QE DOM razor + clip.disabled |
 | PP 2026 совместимость | Стабилизировано — `_wrap` decorator + cold-start retry |
 
@@ -259,7 +261,7 @@ var FM_SECRETS = { apiKey: 'ваш-ключ-cloud-ru' };
 ## Тесты
 
 ```bash
-npm test   # 129 тестов: валидаторы, pipelines, prompts, search, simulator
+npm test   # 247 тестов: валидаторы, pipelines, prompts, search, simulator, scenarios
 ```
 
 Интеграция с Premiere — ручная проверка по чеклисту `docs/MANUAL_TESTS.md`.
@@ -290,11 +292,14 @@ npm test   # 129 тестов: валидаторы, pipelines, prompts, search,
 ├── host/
 │   ├── premiere.jsx               — ExtendScript: snapshot, razor, markers, export
 │   └── presets/                   — .epr пресет для аудио-экспорта
-├── tests/                         — 129 автотестов (node --test)
+├── tests/                         — 247 автотестов (node --test) + integration на Cloud.ru
 └── docs/                          — документация
 ```
 
 ## Документация
 
-- [docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md) — чеклист ручного тестирования
-- [docs/DEV_ARTIFACTS.md](docs/DEV_ARTIFACTS.md) — артефакты разработки: lessons learned, known issues, roadmap, audit
+- **[HANDOFF.md](HANDOFF.md)** — входная точка для агентов (что работает, hot zones, conventions, как тестировать)
+- [INSTALL.md](INSTALL.md) — пошаговая установка (macOS / Windows) + Troubleshooting
+- [docs/CHANGELOG.md](docs/CHANGELOG.md) — хронология milestone'ов
+- [docs/DEV_ARTIFACTS.md](docs/DEV_ARTIFACTS.md) — артефакты разработки: lessons learned (17 ловушек), known issues, roadmap, audit компонентов
+- [docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md) — чеклист ручного тестирования в Premiere
