@@ -43,6 +43,21 @@ PanelBoot.run('ИИ: монтаж', function () {
   var lastSnap = null;
   var _snapDirty = true; /* Dirty flag: true = нужно перезапросить snapshot */
   var runAbort = null;
+  /* Единая очередь операций: одна async-операция (чат/транскрибация/анализ) за раз.
+     Защита от гонок — раньше параллельный запуск перетирал runAbort и пускал две
+     цепочки против общего состояния (ExtendScript-мост, ContextStore). */
+  var opQueue = (typeof OperationQueue !== 'undefined') ? OperationQueue.create() : null;
+  function beginOperation(label) {
+    if (!opQueue) return true; /* модуль не загружен — деградируем к старому поведению */
+    if (!opQueue.tryBegin(label)) {
+      showErr('Идёт обработка — дождитесь завершения или нажмите «Стоп».');
+      return false;
+    }
+    return true;
+  }
+  function endOperation() {
+    if (opQueue) opQueue.end();
+  }
   var _activeSystemAddon = null;
   var _pendingProposal = null;
 
@@ -238,11 +253,17 @@ PanelBoot.run('ИИ: монтаж', function () {
     if (hasNode) {
       try {
         var cp = require('child_process');
-        var checkPaths = [
-          '/opt/homebrew/bin/ffmpeg',
-          '/usr/local/bin/ffmpeg',
-          '/usr/bin/ffmpeg'
-        ];
+        var isWin = (typeof process !== 'undefined' && process.platform === 'win32');
+        var checkPaths = isWin
+          ? [
+              'C:\\ffmpeg\\bin\\ffmpeg.exe',
+              'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe'
+            ]
+          : [
+              '/opt/homebrew/bin/ffmpeg',
+              '/usr/local/bin/ffmpeg',
+              '/usr/bin/ffmpeg'
+            ];
         var fs = require('fs');
         var ffmpegFound = null;
         for (var i = 0; i < checkPaths.length; i++) {
@@ -251,9 +272,9 @@ PanelBoot.run('ИИ: монтаж', function () {
           } catch (eFs) {}
         }
         if (!ffmpegFound) {
-          /* Попробуем через which */
+          /* Попробуем через which/where (зависит от платформы) */
           try {
-            var w = cp.execSync('which ffmpeg 2>/dev/null', { timeout: 1500, encoding: 'utf8' }).trim();
+            var w = cp.execSync(isWin ? 'where ffmpeg' : 'which ffmpeg 2>/dev/null', { timeout: 1500, encoding: 'utf8' }).trim().split('\n')[0].trim();
             if (w) ffmpegFound = w;
           } catch (eW) {}
         }
@@ -261,7 +282,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           issues.push({
             title: 'ffmpeg не найден в PATH',
             fix: 'Транскрибация и audio analysis работать не будут. Установи и проверь:',
-            code: 'brew install ffmpeg && which ffmpeg'
+            code: isWin ? 'where ffmpeg' : 'brew install ffmpeg && which ffmpeg'
           });
         }
       } catch (eR) {
@@ -3701,6 +3722,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   async function onSend() {
     var text = el.input.value.trim();
     if (!text) return;
+    if (!beginOperation('send')) return;
     showErr('');
     el.input.value = '';
     var settings = ContextStore.getResolvedSettings();
@@ -3753,6 +3775,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           else showErr(String(e.message || e));
         } finally {
           if (runAbort === acFast) runAbort = null;
+          endOperation();
           el.send.disabled = false;
           el.stop.disabled = true;
         }
@@ -3821,6 +3844,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           else showErr(String(ePipe.message || ePipe));
         } finally {
           if (runAbort === acPipe) runAbort = null;
+          endOperation();
           el.send.disabled = false;
           el.stop.disabled = true;
         }
@@ -3912,6 +3936,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       else showErr(String(e.message || e));
     } finally {
       if (runAbort === ac) runAbort = null;
+      endOperation();
       el.send.disabled = false;
       el.stop.disabled = true;
     }
@@ -3971,6 +3996,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   }
 
   async function onTranscribeTimeline() {
+    if (!beginOperation('transcribe')) return;
     showErr('');
     var settings = ContextStore.getResolvedSettings();
     setTranscribeButtonsDisabled(true);
@@ -4106,6 +4132,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     } finally {
       if (TimelineTranscribe && TimelineTranscribe.unlinkWorkFiles) TimelineTranscribe.unlinkWorkFiles(prep);
       if (runAbort === ac) runAbort = null;
+      endOperation();
       setTranscribeButtonsDisabled(false);
       el.stop.disabled = true;
     }
@@ -4118,6 +4145,7 @@ PanelBoot.run('ИИ: монтаж', function () {
    * Записывает entry с {segments:[], audioAnalysis:{...}, mode:'audio-only'}.
    * Match AutoPod/FireCut UX. */
   async function onAudioOnlyAnalyze() {
+    if (!beginOperation('audio-only')) return;
     showErr('');
     var settings = ContextStore.getResolvedSettings();
     setTranscribeButtonsDisabled(true);
@@ -4200,6 +4228,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     } finally {
       if (TimelineTranscribe && TimelineTranscribe.unlinkWorkFiles) TimelineTranscribe.unlinkWorkFiles(prep);
       if (runAbort === ac) runAbort = null;
+      endOperation();
       setTranscribeButtonsDisabled(false);
       el.stop.disabled = true;
     }

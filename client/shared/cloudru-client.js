@@ -403,4 +403,14 @@
       return data;
     }
   };
+
+  /* Export for testing (pure helpers + SSE parser) */
+  global._cloudRuInternals = {
+    normalizeBase: normalizeBase,
+    apiV1Root: apiV1Root,
+    parseJsonResponse: parseJsonResponse,
+    isPayloadTooLarge: isPayloadTooLarge,
+    isRetryable: isRetryable,
+    parseSSEStream: parseSSEStream
+  };
 })(window);
