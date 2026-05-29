@@ -21,7 +21,8 @@
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
+import { homedir } from 'node:os';
 import vm from 'node:vm';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -76,7 +77,7 @@ if (!ctx.FM_SECRETS || !ctx.FM_SECRETS.apiKey) {
 
 /* ─── Load real cache ──────────────────────────────────────────────────── */
 
-const cachePath = '/Users/gmmelnikov/.extensions_llm_chat_pr/_llm_transcript_cache.json';
+const cachePath = join(homedir(), '.extensions_llm_chat_pr', '_llm_transcript_cache.json');
 const cache = JSON.parse(readFileSync(cachePath, 'utf8'));
 const seqKey = Object.keys(cache)[0];
 const entry = cache[seqKey];

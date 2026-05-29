@@ -14,7 +14,8 @@
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
+import { homedir } from 'node:os';
 import vm from 'node:vm';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -35,7 +36,7 @@ vm.createContext(ctx);
 });
 
 /* Picks the entry with most segments — assumes that's our 1-hour podcast. */
-const cache = JSON.parse(readFileSync('/Users/gmmelnikov/.extensions_llm_chat_pr/_llm_transcript_cache.json', 'utf8'));
+const cache = JSON.parse(readFileSync(join(homedir(), '.extensions_llm_chat_pr', '_llm_transcript_cache.json'), 'utf8'));
 const keys = Object.keys(cache);
 let bestKey = null, bestCount = 0;
 for (const k of keys) {

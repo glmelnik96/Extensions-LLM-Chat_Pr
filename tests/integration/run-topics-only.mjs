@@ -1,7 +1,8 @@
 /* Quick: только buildTopics на production-кеше — после max_tokens fix. */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
+import { homedir } from 'node:os';
 import vm from 'node:vm';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,7 +22,7 @@ vm.createContext(ctx);
   vm.runInContext(readFileSync(resolve(SHARED, f), 'utf8'), ctx, { filename: f });
 });
 
-const cache = JSON.parse(readFileSync('/Users/gmmelnikov/.extensions_llm_chat_pr/_llm_transcript_cache.json', 'utf8'));
+const cache = JSON.parse(readFileSync(join(homedir(), '.extensions_llm_chat_pr', '_llm_transcript_cache.json'), 'utf8'));
 const entry = cache[Object.keys(cache)[0]];
 const paragraphs = entry.paragraphs.map(p => ({
   startSec: p.startSec || p.start, endSec: p.endSec || p.end, text: p.text || ''
