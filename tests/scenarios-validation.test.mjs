@@ -105,7 +105,6 @@ FIXTURES.push({ name: 'short-1min', entry: buildSyntheticEntry(60) });
 FIXTURES.push({ name: 'medium-10min', entry: buildSyntheticEntry(600) });
 FIXTURES.push({ name: 'long-1h', entry: buildSyntheticEntry(3600) });
 
-const entry = cacheEntry || FIXTURES[0].entry;
 /* Берём максимум из segments + paragraphs — на реальном кэше после ripple_delete
    segments могут быть короче чем paragraphs (stale), это валидный edge case. */
 function _maxEnd(arr) {
@@ -116,6 +115,16 @@ function _maxEnd(arr) {
   }
   return m;
 }
+
+/* Реальный кэш используем как основной entry только если он содержательный.
+   Smoke-кэш после install-теста бывает 1 абзац на ~8с — на нём структурные сценарии
+   («выбери каждый 2-й абзац», «уложи в 50%») вырожденны: нечего удалять / ничего не влезает.
+   Реальный кэш всё равно прогоняется в общем цикле по FIXTURES ниже. */
+function _isRichEntry(e) {
+  return !!e && Array.isArray(e.paragraphs) && e.paragraphs.length >= 4
+    && Math.max(_maxEnd(e.segments), _maxEnd(e.paragraphs)) >= 60;
+}
+const entry = _isRichEntry(cacheEntry) ? cacheEntry : buildSyntheticEntry(600);
 const totalDur = Math.max(_maxEnd(entry.segments), _maxEnd(entry.paragraphs)) || 60;
 
 describe('Scenario validation: real transcript cache', () => {

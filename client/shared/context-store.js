@@ -183,14 +183,22 @@
       .replace(/\s+/g, ' ');
   }
 
+  /**
+   * file:/// URL (CEP cs.getExtensionPath / getSystemPath) → нативный путь.
+   * Снимает «file://», декодирует %xx (например %20→пробел), нормализует обратные слэши.
+   * Windows: file:///C:/… после снятия «file://» оставляет лишний ведущий «/» перед буквой
+   * диска (/C:/… → join даёт «\C:\…» — битый путь) — убираем его. POSIX (/Users/foo) — слэш сохраняем.
+   */
+  function fileUrlToNativePath(s) {
+    s = String(s || '').replace(/^file:\/\//, '');
+    try { s = decodeURIComponent(s); } catch (eD) {}
+    s = s.replace(/\\/g, '/').replace(/^\/([A-Za-z]:)/, '$1').trim();
+    return s || null;
+  }
+
   global.ContextStore = {
     setExtensionRoot: function (absPath) {
-      var s = String(absPath || '');
-      /* CEP cs.getExtensionPath() может вернуть file:/// URL с %20 вместо пробелов.
-         file:///Users/foo → /Users/foo — стрипаем только «file://», оставляя корневой «/». */
-      s = s.replace(/^file:\/\//, '');
-      try { s = decodeURIComponent(s); } catch (eD) {}
-      _extensionRoot = s.replace(/\\/g, '/').trim() || null;
+      _extensionRoot = fileUrlToNativePath(absPath);
     },
 
     /**
@@ -201,9 +209,7 @@
       if (!userDataDirAbs || typeof require === 'undefined') return;
       try {
         var path = require('path');
-        var base = String(userDataDirAbs || '').replace(/^file:\/\//, '');
-        try { base = decodeURIComponent(base); } catch (eDD) {}
-        base = base.replace(/\\/g, '/').trim();
+        var base = fileUrlToNativePath(userDataDirAbs);
         if (!base) return;
         _transcriptUserDataFile = path.join(base, 'com.extensionsllm.chatpr', '_llm_transcript_cache.json');
       } catch (eU) {}
