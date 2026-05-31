@@ -307,3 +307,44 @@ describe('MulticamPlan.buildSwitchPlan', () => {
     assert.ok(Math.abs(r.stats.perTrackSeconds["2"] - 3) < 0.1);
   });
 });
+
+describe('MulticamPlan.framesFromRmsTimelines', () => {
+  test('aligns two equal-length timelines onto a 0.05s grid', () => {
+    const timelines = [
+      [{ t: 0.05, rms: -10 }, { t: 0.10, rms: -11 }, { t: 0.15, rms: -12 }],
+      [{ t: 0.05, rms: -40 }, { t: 0.10, rms: -41 }, { t: 0.15, rms: -42 }]
+    ];
+    const frames = MP.framesFromRmsTimelines(timelines, 0.05);
+    assert.equal(frames.length, 3);
+    assert.deepEqual([...frames[0].rmsByTrack], [-10, -40]);
+    assert.deepEqual([...frames[1].rmsByTrack], [-11, -41]);
+    assert.deepEqual([...frames[2].rmsByTrack], [-12, -42]);
+    assert.ok(Math.abs(frames[0].tStart - 0) < 1e-9);
+    assert.ok(Math.abs(frames[0].tEnd - 0.05) < 1e-9);
+  });
+
+  test('holds the last known value when a track has fewer samples', () => {
+    const timelines = [
+      [{ t: 0.05, rms: -10 }, { t: 0.10, rms: -10 }, { t: 0.15, rms: -10 }],
+      [{ t: 0.05, rms: -40 }] // shorter — should hold -40
+    ];
+    const frames = MP.framesFromRmsTimelines(timelines, 0.05);
+    assert.equal(frames.length, 3);
+    assert.deepEqual([...frames[2].rmsByTrack], [-10, -40]);
+  });
+
+  test('uses the quiet floor for a fully empty track timeline', () => {
+    const timelines = [
+      [{ t: 0.05, rms: -10 }],
+      [] // no data → floor -120
+    ];
+    const frames = MP.framesFromRmsTimelines(timelines, 0.05);
+    assert.equal(frames.length, 1);
+    assert.deepEqual([...frames[0].rmsByTrack], [-10, -120]);
+  });
+
+  test('returns empty array for empty input', () => {
+    assert.equal(MP.framesFromRmsTimelines([], 0.05).length, 0);
+    assert.equal(MP.framesFromRmsTimelines(null, 0.05).length, 0);
+  });
+});

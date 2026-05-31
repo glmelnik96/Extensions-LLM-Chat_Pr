@@ -294,9 +294,59 @@
     };
   }
 
+  /**
+   * Выровнять N per-track RMS-таймлайнов ([{t, rms}], отсортированы по t)
+   * на общую сетку кадров шириной frameSec.
+   * Значение трека в кадре = последний sample с t <= tEnd кадра (step-hold);
+   * до первого sample — floorDb (тихо). Кол-во кадров — по самому длинному треку.
+   *
+   * Возвращает audioFrames в формате buildSwitchPlan:
+   *   [{tStart, tEnd, rmsByTrack:[r0_dB, r1_dB, ...]}]
+   */
+  function framesFromRmsTimelines(timelines, frameSec, opts) {
+    if (!timelines || !timelines.length) return [];
+    opts = opts || {};
+    var floorDb = typeof opts.floorDb === 'number' ? opts.floorDb : -120;
+    var fs = frameSec > 0 ? frameSec : 0.05;
+    var eps = 1e-6;
+
+    var maxT = 0;
+    for (var ti = 0; ti < timelines.length; ti++) {
+      var tl = timelines[ti];
+      if (tl && tl.length) {
+        var lastT = tl[tl.length - 1].t;
+        if (typeof lastT === 'number' && lastT > maxT) maxT = lastT;
+      }
+    }
+    var frameCount = Math.max(1, Math.round(maxT / fs));
+
+    var ptr = [];
+    var lastVal = [];
+    for (var p = 0; p < timelines.length; p++) { ptr[p] = 0; lastVal[p] = floorDb; }
+
+    var frames = [];
+    for (var fi = 0; fi < frameCount; fi++) {
+      var tStart = fi * fs;
+      var tEnd = tStart + fs;
+      var rmsByTrack = [];
+      for (var k = 0; k < timelines.length; k++) {
+        var tlk = timelines[k] || [];
+        while (ptr[k] < tlk.length && tlk[ptr[k]].t <= tEnd + eps) {
+          var v = tlk[ptr[k]].rms;
+          if (typeof v === 'number' && !isNaN(v)) lastVal[k] = v;
+          ptr[k]++;
+        }
+        rmsByTrack.push(lastVal[k]);
+      }
+      frames.push({ tStart: tStart, tEnd: tEnd, rmsByTrack: rmsByTrack });
+    }
+    return frames;
+  }
+
   var api = {
     DEFAULTS: DEFAULTS,
     buildSwitchPlan: buildSwitchPlan,
+    framesFromRmsTimelines: framesFromRmsTimelines,
     /* Экспортируем internals для unit-тестов */
     _decideActiveMic: decideActiveMic,
     _micToVideoTrack: micToVideoTrack,
