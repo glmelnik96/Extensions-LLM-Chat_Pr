@@ -4641,20 +4641,22 @@ PanelBoot.run('ИИ: монтаж', function () {
           onStatus: function (msg) { toolsStatusUi.show(msg, true); },
           abortCheck: function () { return false; },
           rmsExtractor: async function (innerCtx, mapping, p) {
-            var fs = typeof p.frameSec === 'number' ? p.frameSec : 0.05;
+            var windowSec = typeof p.frameSec === 'number' ? p.frameSec : 0.05;
             var allClips = snap.clips || [];
             var timelines = [];
             for (var si = 0; si < mapping.speakers.length; si++) {
               var aIdx = mapping.speakers[si].audioTrack;
               var clip = null;
               for (var ci = 0; ci < allClips.length; ci++) {
+                // Берём первый клип на дорожке: ожидается один синхронизированный мик-клип на дорожку.
+                // Дорожки с несколькими клипами (перезапуск микрофона) не поддерживаются — берётся первый.
                 if (allClips[ci].trackType === 'audio' && allClips[ci].trackIndex === aIdx) { clip = allClips[ci]; break; }
               }
               var mediaPath = clip && clip.mediaPath;
               if (!mediaPath) {
                 throw new Error('Аудиодорожка ' + (aIdx + 1) + ': нет файла на диске (нужен один синхронизированный клип на дорожку).');
               }
-              var tl = await AudioPreprocess.computeRmsTimeline(mediaPath, { windowSec: fs });
+              var tl = await AudioPreprocess.computeRmsTimeline(mediaPath, { windowSec: windowSec });
               timelines.push(tl);
             }
             return { timelines: timelines };
