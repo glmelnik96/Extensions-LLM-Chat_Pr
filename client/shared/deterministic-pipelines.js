@@ -1056,6 +1056,88 @@
     return out;
   }
 
+  /**
+   * MultiCam Phase 2A: реальный детект говорящего через per-track RMS.
+   * ctx.rmsExtractor(ctx, mapping, params) → Promise<{timelines:[[{t,rms}],...]}>
+   *   по одному [{t,rms}] на mic-дорожку спикера, в порядке mapping.speakers.
+   * Чистый план строит MulticamPlan.buildSwitchPlan (тот же контракт, что и Phase 1).
+   */
+  async function multicamFromAudio(ctx, params) {
+    params = params || {};
+    var snap = ctx && ctx.snapshot;
+    if (!snap || !snap.ok) {
+      return { ok: false, error: 'Нет снимка таймлайна.' };
+    }
+    var vTracks = (snap.tracks || []).filter(function (t) { return t.type === 'video'; });
+    var aTracks = (snap.tracks || []).filter(function (t) { return t.type === 'audio'; });
+    if (vTracks.length < 3) {
+      return { ok: false, error: 'Нужно ≥3 видеодорожки (V1=wide, V2/V3=гости). Найдено ' + vTracks.length + '.' };
+    }
+    if (aTracks.length < 2) {
+      return { ok: false, error: 'Нужно ≥2 аудиодорожки. Найдено ' + aTracks.length + '.' };
+    }
+    if (typeof ctx.rmsExtractor !== 'function') {
+      return { ok: false, error: 'Нет источника аудио (rmsExtractor). Установите ffmpeg.' };
+    }
+
+    var mapping = {
+      wideVideoTrack: 0,
+      speakers: [
+        { audioTrack: 0, videoTrack: 1, label: 'Гость 1' },
+        { audioTrack: 1, videoTrack: 2, label: 'Гость 2' }
+      ]
+    };
+
+    var extracted;
+    try {
+      extracted = await ctx.rmsExtractor(ctx, mapping, params);
+    } catch (e) {
+      return { ok: false, error: 'Ошибка анализа аудио: ' + String(e && e.message || e) };
+    }
+    var timelines = extracted && extracted.timelines;
+    if (!timelines || !timelines.length) {
+      return { ok: false, error: 'Не удалось извлечь аудио-RMS дорожек.' };
+    }
+
+    var frameSec = typeof params.frameSec === 'number' ? params.frameSec : 0.05;
+    var frames = MulticamPlan.framesFromRmsTimelines(timelines, frameSec);
+    if (!frames.length) {
+      return { ok: false, error: 'Пустой аудио-анализ.' };
+    }
+
+    var planParams = {
+      frameSec: frameSec,
+      minHoldSec: typeof params.minHoldSec === 'number' ? params.minHoldSec : 1.5,
+      bleedMarginDb: typeof params.bleedMarginDb === 'number' ? params.bleedMarginDb : 6,
+      silenceThresholdDb: typeof params.silenceThresholdDb === 'number' ? params.silenceThresholdDb : -35
+    };
+    var built = MulticamPlan.buildSwitchPlan(frames, mapping, planParams, params.silences || null);
+    if (!built.segments || !built.segments.length) {
+      return { ok: false, error: 'Не удалось построить план переключений.' };
+    }
+
+    var perTrack = built.stats && built.stats.perTrackSeconds || {};
+    var plan = {
+      version: 1,
+      rangeSec: [built.segments[0].tStart, built.segments[built.segments.length - 1].tEnd],
+      mapping: mapping,
+      params: { mode: (params.mode === 'delete' ? 'delete' : 'disable') },
+      segments: built.segments
+    };
+
+    return {
+      ok: true,
+      proposal: {
+        kind: 'multicam_cuts',
+        plan: plan,
+        summary: 'Авто-MultiCam (по голосу): ' + built.segments.length + ' сегментов, ' +
+          built.switchCount + ' переключений. V1: ' + ((perTrack['0'] || 0).toFixed(1)) +
+          'с, V2: ' + ((perTrack['1'] || 0).toFixed(1)) + 'с, V3: ' + ((perTrack['2'] || 0).toFixed(1)) + 'с.',
+        stats: { perTrackSeconds: perTrack, switchCount: built.switchCount }
+      }
+    };
+  }
+
   global.DeterministicPipelines = {
     cutFillers: cutFillers,
     cutSilences: cutSilences,
@@ -1063,6 +1145,7 @@
     jumpCuts: jumpCuts,
     jCuts: jCuts,
     multicamFromTranscript: multicamFromTranscript,
+    multicamFromAudio: multicamFromAudio,
     detectSilenceIntervals: detectSilenceIntervals,
     parsePipelineCommand: parsePipelineCommand,
     _mergeIntervals: _mergeIntervals,

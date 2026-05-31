@@ -1,4 +1,4 @@
-import { test, describe } from 'node:test';
+import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadDeterministicPipelines } from './load-deterministic-pipelines.mjs';
 
@@ -882,5 +882,68 @@ describe('DeterministicPipelines._silencesFromSegmentGaps', () => {
       { startSec: 3, endSec: 6 }
     ];
     assert.equal(DP._silencesFromSegmentGaps(segs, 0.5).length, 0);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * multicamFromAudio
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('DeterministicPipelines.multicamFromAudio', () => {
+  function snap3v2a() {
+    return {
+      ok: true,
+      sequenceName: 'seq',
+      tracks: [
+        { type: 'video', index: 0 }, { type: 'video', index: 1 }, { type: 'video', index: 2 },
+        { type: 'audio', index: 0 }, { type: 'audio', index: 1 }
+      ]
+    };
+  }
+
+  it('switches to the louder mic per frame', async () => {
+    // Track A (speaker 0) loud for first 2s, Track B (speaker 1) loud for next 2s.
+    const fs = 0.05;
+    const loud = -10, quiet = -50;
+    const tlA = [], tlB = [];
+    for (let i = 1; i <= 80; i++) {
+      const t = +(i * fs).toFixed(3);
+      tlA.push({ t, rms: i <= 40 ? loud : quiet });
+      tlB.push({ t, rms: i <= 40 ? quiet : loud });
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [tlA, tlB] })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.equal(res.proposal.kind, 'multicam_cuts');
+    const segs = res.proposal.plan.segments;
+    // First segment should be speaker-0 video (track 1), a later one speaker-1 video (track 2).
+    assert.equal(segs[0].activeVideoTrack, 1);
+    assert.ok(segs.some(s => s.activeVideoTrack === 2));
+    // Plan contract intact for the host:
+    assert.equal(res.proposal.plan.mapping.wideVideoTrack, 0);
+    assert.equal(res.proposal.plan.params.mode, 'disable');
+  });
+
+  it('errors when fewer than 3 video tracks', async () => {
+    const ctx = {
+      snapshot: { ok: true, tracks: [{ type: 'video', index: 0 }, { type: 'audio', index: 0 }] },
+      rmsExtractor: () => Promise.resolve({ timelines: [[]] })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, false);
+    assert.match(res.error, /3 видеодорожк/);
+  });
+
+  it('errors when extractor yields no timelines', async () => {
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [] })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, false);
+    assert.match(res.error, /аудио/i);
   });
 });

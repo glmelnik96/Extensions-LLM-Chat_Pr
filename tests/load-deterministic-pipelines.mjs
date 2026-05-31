@@ -33,7 +33,7 @@ export function loadDeterministicPipelines(opts) {
   /* Stub CloudRuClient */
   const CloudRuClient = opts.CloudRuClient || null;
 
-  vm.runInNewContext(src, {
+  const sandbox = {
     root,
     console,
     Promise,
@@ -52,7 +52,17 @@ export function loadDeterministicPipelines(opts) {
     undefined,
     TranscriptStructure,
     CloudRuClient
-  }, { filename: 'deterministic-pipelines.js' });
+  };
+  const ctx = vm.createContext(sandbox);
+
+  /* multicamFromAudio вызывает MulticamPlan.{framesFromRmsTimelines,buildSwitchPlan}.
+     Грузим multicam-plan.js в ТОТ ЖЕ контекст ДО deterministic-pipelines.js.
+     IIFE multicam-plan присваивает global.MulticamPlan (global здесь === sandbox). */
+  const mcPath = path.join(__dirname, '..', 'client', 'shared', 'multicam-plan.js');
+  const mcSrc = fs.readFileSync(mcPath, 'utf8');
+  vm.runInContext(mcSrc, ctx, { filename: 'multicam-plan.js' });
+
+  vm.runInContext(src, ctx, { filename: 'deterministic-pipelines.js' });
 
   if (!root.DeterministicPipelines) {
     throw new Error('DeterministicPipelines not attached to root');
