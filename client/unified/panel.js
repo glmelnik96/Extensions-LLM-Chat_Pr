@@ -4613,7 +4613,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           proposalId = 'proposal-jcuts';
           break;
         case 'multicam':
-          pipelineFn = DeterministicPipelines.multicamFromTranscript;
+          pipelineFn = DeterministicPipelines.multicamFromAudio;
           proposalId = 'proposal-multicam';
           break;
         default:
@@ -4639,7 +4639,26 @@ PanelBoot.run('ИИ: монтаж', function () {
           snapshot: snap,
           transcriptEntry: entry,
           onStatus: function (msg) { toolsStatusUi.show(msg, true); },
-          abortCheck: function () { return false; }
+          abortCheck: function () { return false; },
+          rmsExtractor: async function (innerCtx, mapping, p) {
+            var fs = typeof p.frameSec === 'number' ? p.frameSec : 0.05;
+            var allClips = snap.clips || [];
+            var timelines = [];
+            for (var si = 0; si < mapping.speakers.length; si++) {
+              var aIdx = mapping.speakers[si].audioTrack;
+              var clip = null;
+              for (var ci = 0; ci < allClips.length; ci++) {
+                if (allClips[ci].trackType === 'audio' && allClips[ci].trackIndex === aIdx) { clip = allClips[ci]; break; }
+              }
+              var mediaPath = clip && clip.mediaPath;
+              if (!mediaPath) {
+                throw new Error('Аудиодорожка ' + (aIdx + 1) + ': нет файла на диске (нужен один синхронизированный клип на дорожку).');
+              }
+              var tl = await AudioPreprocess.computeRmsTimeline(mediaPath, { windowSec: fs });
+              timelines.push(tl);
+            }
+            return { timelines: timelines };
+          }
         };
 
         var result = await pipelineFn(ctx, params);
