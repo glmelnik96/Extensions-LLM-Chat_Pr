@@ -1070,23 +1070,23 @@
     }
     var vTracks = (snap.tracks || []).filter(function (t) { return t.type === 'video'; });
     var aTracks = (snap.tracks || []).filter(function (t) { return t.type === 'audio'; });
-    if (vTracks.length < 3) {
-      return { ok: false, error: 'Нужно ≥3 видеодорожки (V1=wide, V2/V3=гости). Найдено ' + vTracks.length + '.' };
+    var MAX_SPEAKERS = 4;
+    if (vTracks.length < 2) {
+      return { ok: false, error: 'Нужно ≥2 видеодорожки (V1=wide + ≥1 гость). Найдено ' + vTracks.length + '.' };
     }
-    if (aTracks.length < 2) {
-      return { ok: false, error: 'Нужно ≥2 аудиодорожки. Найдено ' + aTracks.length + '.' };
+    if (aTracks.length < 1) {
+      return { ok: false, error: 'Нужно ≥1 аудиодорожки (mic). Найдено ' + aTracks.length + '.' };
     }
     if (typeof ctx.rmsExtractor !== 'function') {
       return { ok: false, error: 'Нет источника аудио (rmsExtractor). Установите ffmpeg.' };
     }
 
-    var mapping = {
-      wideVideoTrack: 0,
-      speakers: [
-        { audioTrack: 0, videoTrack: 1, label: 'Гость 1' },
-        { audioTrack: 1, videoTrack: 2, label: 'Гость 2' }
-      ]
-    };
+    var speakerCount = Math.min(aTracks.length, vTracks.length - 1, MAX_SPEAKERS);
+    var speakers = [];
+    for (var spi = 0; spi < speakerCount; spi++) {
+      speakers.push({ audioTrack: spi, videoTrack: spi + 1, label: 'Гость ' + (spi + 1) });
+    }
+    var mapping = { wideVideoTrack: 0, speakers: speakers };
 
     var extracted;
     try {
@@ -1131,8 +1131,7 @@
         kind: 'multicam_cuts',
         plan: plan,
         summary: 'Авто-MultiCam (по голосу): ' + built.segments.length + ' сегментов, ' +
-          built.switchCount + ' переключений. V1: ' + ((perTrack['0'] || 0).toFixed(1)) +
-          'с, V2: ' + ((perTrack['1'] || 0).toFixed(1)) + 'с, V3: ' + ((perTrack['2'] || 0).toFixed(1)) + 'с.',
+          built.switchCount + ' переключений. Спикеров: ' + speakerCount + '.',
         stats: { perTrackSeconds: perTrack, switchCount: built.switchCount }
       }
     };

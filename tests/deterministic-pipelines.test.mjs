@@ -927,14 +927,83 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     assert.equal(res.proposal.plan.params.mode, 'disable');
   });
 
-  it('errors when fewer than 3 video tracks', async () => {
+  it('errors when fewer than 2 video tracks (need wide + ≥1 speaker)', async () => {
     const ctx = {
       snapshot: { ok: true, tracks: [{ type: 'video', index: 0 }, { type: 'audio', index: 0 }] },
       rmsExtractor: () => Promise.resolve({ timelines: [[]] })
     };
     const res = await DP.multicamFromAudio(ctx, {});
     assert.equal(res.ok, false);
-    assert.match(res.error, /3 видеодорожк/);
+    assert.match(res.error, /2 видеодорожк/);
+  });
+
+  function snapNvMa(nV, nA) {
+    const tracks = [];
+    for (let i = 0; i < nV; i++) tracks.push({ type: 'video', index: i });
+    for (let i = 0; i < nA; i++) tracks.push({ type: 'audio', index: i });
+    return { ok: true, sequenceName: 'seq', tracks };
+  }
+  function fakeTimelines(nSpeakers, durSec, loudIndex) {
+    // Каждый трек имеет одинаковую длину, активный спикер = loudIndex
+    const fs = 0.05;
+    const total = Math.round(durSec / fs);
+    const out = [];
+    for (let s = 0; s < nSpeakers; s++) {
+      const tl = [];
+      for (let i = 1; i <= total; i++) {
+        tl.push({ t: +(i * fs).toFixed(3), rms: s === loudIndex ? -10 : -50 });
+      }
+      out.push(tl);
+    }
+    return out;
+  }
+
+  it('builds 4-speaker mapping from 5V+4A snapshot', async () => {
+    const ctx = {
+      snapshot: snapNvMa(5, 4),
+      rmsExtractor: () => Promise.resolve({ timelines: fakeTimelines(4, 4, 2) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    const m = res.proposal.plan.mapping;
+    assert.equal(m.wideVideoTrack, 0);
+    assert.equal(m.speakers.length, 4);
+    // Спикеры создаются внутри vm-контекста loader'а — нормализуем массив в realm теста.
+    assert.deepEqual(Array.from(m.speakers.map(s => s.videoTrack)), [1, 2, 3, 4]);
+    assert.deepEqual(Array.from(m.speakers.map(s => s.audioTrack)), [0, 1, 2, 3]);
+    // Голос на спикере 2 (audioTrack=2, videoTrack=3) — какой-то сегмент должен быть на V3.
+    assert.ok(res.proposal.plan.segments.some(s => s.activeVideoTrack === 3));
+  });
+
+  it('builds 2-speaker mapping from 3V+2A snapshot (regression)', async () => {
+    const ctx = {
+      snapshot: snapNvMa(3, 2),
+      rmsExtractor: () => Promise.resolve({ timelines: fakeTimelines(2, 4, 0) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.equal(res.proposal.plan.mapping.speakers.length, 2);
+  });
+
+  it('caps speakerCount at 4 when 6V+5A', async () => {
+    const ctx = {
+      snapshot: snapNvMa(6, 5),
+      rmsExtractor: () => Promise.resolve({ timelines: fakeTimelines(4, 4, 0) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.equal(res.proposal.plan.mapping.speakers.length, 4);
+  });
+
+  it('builds 1-speaker mapping from 2V+1A snapshot', async () => {
+    const ctx = {
+      snapshot: snapNvMa(2, 1),
+      rmsExtractor: () => Promise.resolve({ timelines: fakeTimelines(1, 4, 0) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.equal(res.proposal.plan.mapping.speakers.length, 1);
+    assert.equal(res.proposal.plan.mapping.speakers[0].videoTrack, 1);
   });
 
   it('errors when extractor yields no timelines', async () => {
