@@ -1116,7 +1116,7 @@
       return { ok: false, error: 'Не удалось построить план переключений.' };
     }
 
-    var perTrack = built.stats && built.stats.perTrackSeconds || {};
+    var perTrack = (built.stats && built.stats.perTrackSeconds) || {};
     var plan = {
       version: 1,
       rangeSec: [built.segments[0].tStart, built.segments[built.segments.length - 1].tEnd],

@@ -53,6 +53,7 @@ export function loadDeterministicPipelines(opts) {
     TranscriptStructure,
     CloudRuClient
   };
+  sandbox.global = sandbox;
   const ctx = vm.createContext(sandbox);
 
   /* multicamFromAudio вызывает MulticamPlan.{framesFromRmsTimelines,buildSwitchPlan}.

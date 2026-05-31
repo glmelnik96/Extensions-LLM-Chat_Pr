@@ -903,11 +903,11 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
 
   it('switches to the louder mic per frame', async () => {
     // Track A (speaker 0) loud for first 2s, Track B (speaker 1) loud for next 2s.
-    const fs = 0.05;
+    const frameSec = 0.05;
     const loud = -10, quiet = -50;
     const tlA = [], tlB = [];
     for (let i = 1; i <= 80; i++) {
-      const t = +(i * fs).toFixed(3);
+      const t = +(i * frameSec).toFixed(3);
       tlA.push({ t, rms: i <= 40 ? loud : quiet });
       tlB.push({ t, rms: i <= 40 ? quiet : loud });
     }
@@ -945,5 +945,23 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     const res = await DP.multicamFromAudio(ctx, {});
     assert.equal(res.ok, false);
     assert.match(res.error, /аудио/i);
+  });
+
+  it('errors when rmsExtractor throws', async () => {
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.reject(new Error('ffmpeg not found'))
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, false);
+    assert.match(res.error, /Ошибка анализа аудио/);
+    assert.match(res.error, /ffmpeg not found/);
+  });
+
+  it('errors when rmsExtractor is not provided', async () => {
+    const ctx = { snapshot: snap3v2a() };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, false);
+    assert.match(res.error, /rmsExtractor/);
   });
 });
