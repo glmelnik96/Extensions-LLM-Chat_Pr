@@ -505,9 +505,8 @@
     _snapToSpeechOnset: snapToSpeechOnset
   };
 
-  if (typeof module !== 'undefined' && module.exports) {
-    module.exports = api;
-  } else {
-    global.MulticamPlan = api;
-  }
+  /* CEP с --enable-nodejs имеет `module` в browser-context, поэтому CommonJS-fallback
+     ломал бы window.MulticamPlan. Привязываемся к global напрямую — vm-loader тестов
+     передаёт ctx как global и читает ctx.MulticamPlan. */
+  global.MulticamPlan = api;
 })(typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : this));
