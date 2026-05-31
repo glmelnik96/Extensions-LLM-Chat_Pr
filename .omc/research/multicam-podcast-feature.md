@@ -177,10 +177,49 @@ EXTEND tool-validators.js
 | **AutoPod** ($29/мес) | Amplitude-based, 10 cams/10 mics | Industry standard, $29/мес |
 | **FireCut** | Loudest-track-wins + variation injection | 2 алгоритма Original/Rapid, mode disable/delete |
 | **Hey Eddie** | Standalone preprocessor → XML/EDL | Standalone, не плагин |
-| **Wraith** (Phantom Editor) | AutoPod alternative | min/max camera time |
+| **Wraith** (Phantom Editor) | ML speaker-ID per-mic, conversation-pattern | min/max/variations/frame-offset, $118 lifetime |
 | **Premiere Assistant** (Adobe нативный, 25.2) | Transcript + Sensei | Бесплатно встроено |
 
 Все, кроме Adobe-native, используют **тот же базовый алгоритм** что мы планируем.
+
+---
+
+## Wraith Multi-Cam Editor — глубокий разбор (2026-05-31)
+
+Плагин Premiere Pro от **Phantom Editor** (suite 13+ инструментов). Позиционируется как ведущая **AutoPod-альтернатива 2026** для видеоподкастов. $118 единоразово (lifetime) или в подписке Phantom. Win/Mac, 4.9/5 (89 отзывов).
+
+### Алгоритм и вход
+- **Вход:** отдельная аудиодорожка на каждого спикера (НЕ mixed-track — требование, как у AutoPod и у нас). До **8 камер / 8 спикеров**.
+- **Детекция:** не чистый amplitude-trigger, а **ML speaker-identification model** («model identifies the correct speaker», заявлено ~99.9% точности в v1.2.4) + анализ **conversation patterns** → «человекоподобные» решения. Лучше обрабатывает overlap, чем volume-threshold AutoPod.
+- **Overlap:** при одновременной речи автоматически переключается на **«All Speakers» камеру** (wide/group), если она назначена.
+- **Бенчмарк:** ~1 ч / 3 камеры → **~1м24с** (против ~2 мин AutoPod).
+- **Workflow:** импорт → 1 клик (анализ+синк до 8 камер) → авто-switching → manual override → экспорт.
+
+### Параметры пользователя (6 контролов)
+| Контрол | Назначение |
+|---|---|
+| **Max Camera Duration** | лимит на один ракурс (анти-«залипание») |
+| **Max All-Speakers Duration** | лимит длительности wide/group |
+| **Min Camera Duration** | анти-дёрганье (мин. shot) |
+| **Sensitivity (dB)** | порог детекции голоса; −40 = high (тихий подкаст), −20 = low (шумная среда) |
+| **Variations** | естественная непредсказуемость ритма реза |
+| **Frame Offset** | синк реза к первому слогу спикера |
+
+### Gap-анализ против нашего `client/shared/multicam-plan.js`
+| Параметр Wraith | У нас | Статус |
+|---|---|---|
+| Min Camera Duration | `minHoldSec` (1.5с) + `enforceMinHold` | ✅ есть |
+| Sensitivity (dB) | `silenceThresholdDb` (−35) + `bleedMarginDb` | ✅ есть |
+| Max Camera Duration | — | ❌ нет (в research = «T_max_hold») |
+| Max All-Speakers (wide) Duration | — | ❌ нет |
+| Variations | — | ❌ нет (детерминированный ритм) |
+| Frame Offset (атака слога) | snap к **silence**-границам (`snapToSilences`) | ⚠️ другое (рез в паузу, не на слог) |
+| Overlap → wide | `wideOnOverlap` (margin-based) | ✅ есть, но проще (без conversation-pattern) |
+
+### ⚠️ Критическая реальность кодбейса (на 2026-05-31)
+Грамотный `multicam-plan.js` (per-track RMS, gain-sharing, min-hold, snap) **существует и покрыт unit-тестами, но НЕ подключён к shipped-пути**. Реально работающий executor зовёт `DeterministicPipelines.multicamFromTranscript`, который **просто чередует V2/V3 по индексу абзаца (`pi % 2`)** + wide на паузах ≥1с — **без какого-либо детекта говорящего**. Извлечение per-track RMS через ffmpeg `astats` (Phase 1.5) — невыполненный TODO (`docs/DEV_ARTIFACTS.md`).
+
+**Вывод:** разрыv с Wraith больше, чем казалось. Чтобы догнать «AutoPod-base», нужно сперва соединить уже написанный RMS-модуль с реальным per-track astats и executor'ом; и только потом добавлять 3 фичи ритм-полировки Wraith (max-hold/wide-injection, variations, frame-offset на слог). План реализации — `.omc/plans/multicam-phase2-wraith-parity.md`.
 
 ---
 
@@ -195,6 +234,10 @@ EXTEND tool-validators.js
 - [ffmpeg astats docs](https://ayosec.github.io/ffmpeg-filters-docs/8.0/Filters/Audio/astats.html)
 - [Premiere Pro 25.2 AI features (Adobe blog)](https://blog.adobe.com/en/publish/2025/04/02/introducing-new-ai-powered-features-workflow-enhancements-premiere-pro-after-effects)
 - [Auphonic Crossgate / mic bleed removal](https://podcastengineeringschool.com/crossgate-feature-in-auphonic-multitrack/)
+- [Wraith Multi-Cam Editor — product](https://phantomeditor.video/products/Wraith)
+- [Wraith — how-to](https://phantomeditor.video/blog/How-to-use-Wraith-Multi-Camera-Editor)
+- [Wraith vs AutoPod (2026)](https://phantomeditor.video/blog/best-autopod-alternative-2026-multicam-editing-premiere-pro)
+- [Wraith v1.2.4 update (sensitivity, All-Speakers)](https://phantomeditor.video/blog/wraith-multi-cam-editor-update-v1-2-4)
 
 ---
 
