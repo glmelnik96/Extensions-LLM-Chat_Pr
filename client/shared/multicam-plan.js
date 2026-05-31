@@ -29,7 +29,9 @@
     smoothingWindow: 5,         /* EMA-окно в кадрах (5 × 50мс = 250мс) */
     wideOnOverlap: true,
     wideOnSilence: true,
-    wideVideoTrack: 0           /* индекс wide-дорожки */
+    wideVideoTrack: 0,          /* индекс wide-дорожки */
+    maxHoldSec: 8,
+    maxAllSpeakersSec: 4
   };
 
   /**
@@ -270,6 +272,9 @@
     segments = enforceMinHold(segments, p.minHoldSec);
     segments = mergeAdjacentSame(segments);
 
+    /* Шаг 4b: enforce max-hold (Wraith Max Camera Duration) */
+    segments = enforceMaxHold(segments, p, mapping.wideVideoTrack);
+
     /* Шаг 5: snap к silence-границам */
     if (silences && silences.length && p.snapWindowSec > 0) {
       segments = snapToSilences(segments, silences, p.snapWindowSec);
@@ -349,6 +354,57 @@
     return frames;
   }
 
+  /**
+   * Разбивает длинные сегменты одной камеры (не-wide), вставляя короткий
+   * wide-bridge между кусками — анти-монотонность Wraith «Max Camera Duration».
+   * maxHoldSec — макс длительность куска одной камеры (default 8с, 0 = выкл).
+   * maxAllSpeakersSec — верхний потолок длительности wide-bridge (default 4с).
+   * wideVideoTrack — индекс wide-дорожки (нужен для маркировки вставок).
+   *
+   * Wide-сегменты сами не делим в этой функции (обрезка длинных wide — отдельная мера).
+   */
+  function enforceMaxHold(segments, params, wideVideoTrack) {
+    var p = params || {};
+    var maxHold = typeof p.maxHoldSec === 'number' ? p.maxHoldSec : 0;
+    if (!segments || !segments.length || maxHold <= 0) return (segments || []).slice();
+    var maxAllSpk = typeof p.maxAllSpeakersSec === 'number' ? p.maxAllSpeakersSec : 4;
+    var bridgeSec = Math.min(maxHold / 4, maxAllSpk);
+    if (bridgeSec <= 0) bridgeSec = Math.min(1, maxHold / 4);
+    // Быстрый путь: ни одного сегмента не нужно делить — возвращаем slice()
+    // входа, чтобы сохранить prototype-chain (важно для vm-loaded тестов).
+    var anyToSplit = false;
+    for (var qi = 0; qi < segments.length; qi++) {
+      var qs = segments[qi];
+      if (qs.activeVideoTrack !== wideVideoTrack && (qs.tEnd - qs.tStart) > maxHold + bridgeSec) {
+        anyToSplit = true; break;
+      }
+    }
+    if (!anyToSplit) return segments.slice();
+    var out = [];
+    for (var i = 0; i < segments.length; i++) {
+      var s = segments[i];
+      var dur = s.tEnd - s.tStart;
+      // Wide и достаточно короткие — без изменений.
+      if (s.activeVideoTrack === wideVideoTrack || dur <= maxHold + bridgeSec) {
+        out.push({ tStart: s.tStart, tEnd: s.tEnd, activeVideoTrack: s.activeVideoTrack });
+        continue;
+      }
+      // Сколько wide-вставок? n = floor((dur - maxHold) / (maxHold + bridgeSec)) + 1
+      var n = Math.floor((dur - maxHold) / (maxHold + bridgeSec)) + 1;
+      // Расставляем равномерно: chunkLen = (dur - n*bridgeSec) / (n+1).
+      var chunkLen = (dur - n * bridgeSec) / (n + 1);
+      var t = s.tStart;
+      for (var k = 0; k < n; k++) {
+        out.push({ tStart: t, tEnd: t + chunkLen, activeVideoTrack: s.activeVideoTrack });
+        out.push({ tStart: t + chunkLen, tEnd: t + chunkLen + bridgeSec, activeVideoTrack: wideVideoTrack });
+        t = t + chunkLen + bridgeSec;
+      }
+      // Последний кусок — оставшаяся длина.
+      out.push({ tStart: t, tEnd: s.tEnd, activeVideoTrack: s.activeVideoTrack });
+    }
+    return out;
+  }
+
   var api = {
     DEFAULTS: DEFAULTS,
     buildSwitchPlan: buildSwitchPlan,
@@ -360,7 +416,8 @@
     _labelsToSegments: labelsToSegments,
     _enforceMinHold: enforceMinHold,
     _mergeAdjacentSame: mergeAdjacentSame,
-    _snapToSilences: snapToSilences
+    _snapToSilences: snapToSilences,
+    _enforceMaxHold: enforceMaxHold
   };
 
   if (typeof module !== 'undefined' && module.exports) {

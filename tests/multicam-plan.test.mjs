@@ -348,3 +348,52 @@ describe('MulticamPlan.framesFromRmsTimelines', () => {
     assert.equal(MP.framesFromRmsTimelines(null, 0.05).length, 0);
   });
 });
+
+describe('MulticamPlan._enforceMaxHold', () => {
+  const wide = 0;
+  it('splits a 20s mono segment into chunks ≤ maxHoldSec with wide bridges', () => {
+    const segs = [{ tStart: 0, tEnd: 20, activeVideoTrack: 1 }];
+    const out = MP._enforceMaxHold(segs, { maxHoldSec: 8, maxAllSpeakersSec: 4 }, wide);
+    // Должно быть как минимум 1 wide-инжект.
+    assert.ok(out.some(s => s.activeVideoTrack === wide));
+    // Все не-wide сегменты ≤ maxHoldSec.
+    out.filter(s => s.activeVideoTrack !== wide).forEach(s => {
+      assert.ok((s.tEnd - s.tStart) <= 8 + 1e-9, 'chunk too long: ' + (s.tEnd - s.tStart));
+    });
+    // Не-wide track тот же (1).
+    out.filter(s => s.activeVideoTrack !== wide).forEach(s => {
+      assert.equal(s.activeVideoTrack, 1);
+    });
+    // Покрытие времени: суммарная длительность == 20с (с точностью до eps).
+    const total = out.reduce((acc, s) => acc + (s.tEnd - s.tStart), 0);
+    assert.ok(Math.abs(total - 20) < 1e-6, 'total duration drifted: ' + total);
+    // Границы строго возрастают.
+    for (let i = 1; i < out.length; i++) {
+      assert.ok(out[i].tStart >= out[i - 1].tEnd - 1e-9);
+    }
+  });
+
+  it('does not touch short segments', () => {
+    const segs = [
+      { tStart: 0, tEnd: 3, activeVideoTrack: 1 },
+      { tStart: 3, tEnd: 7, activeVideoTrack: 2 },
+      { tStart: 7, tEnd: 10, activeVideoTrack: 1 }
+    ];
+    const out = MP._enforceMaxHold(segs, { maxHoldSec: 8, maxAllSpeakersSec: 4 }, wide);
+    assert.deepEqual(out, segs);
+  });
+
+  it('is no-op when maxHoldSec is 0 or absent', () => {
+    const segs = [{ tStart: 0, tEnd: 20, activeVideoTrack: 1 }];
+    assert.deepEqual(MP._enforceMaxHold(segs, { maxHoldSec: 0 }, wide), segs);
+    assert.deepEqual(MP._enforceMaxHold(segs, {}, wide), segs);
+  });
+
+  it('does not split wide segments themselves', () => {
+    const segs = [{ tStart: 0, tEnd: 20, activeVideoTrack: wide }];
+    const out = MP._enforceMaxHold(segs, { maxHoldSec: 8, maxAllSpeakersSec: 4 }, wide);
+    // wide остаётся одним куском
+    assert.equal(out.length, 1);
+    assert.equal(out[0].activeVideoTrack, wide);
+  });
+});
