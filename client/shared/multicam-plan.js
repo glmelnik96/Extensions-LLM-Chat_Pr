@@ -31,7 +31,9 @@
     wideOnSilence: true,
     wideVideoTrack: 0,          /* индекс wide-дорожки */
     maxHoldSec: 8,
-    maxAllSpeakersSec: 4
+    maxAllSpeakersSec: 4,
+    variationsJitterSec: 0,
+    variationsSeed: 1
   };
 
   /**
@@ -275,6 +277,11 @@
     /* Шаг 4b: enforce max-hold (Wraith Max Camera Duration) */
     segments = enforceMaxHold(segments, p, mapping.wideVideoTrack);
 
+    /* Шаг 4c: variations (анти-монотонность, seeded) */
+    if (p.variationsJitterSec > 0) {
+      segments = applyVariations(segments, p.variationsJitterSec, p.variationsSeed);
+    }
+
     /* Шаг 5: snap к silence-границам */
     if (silences && silences.length && p.snapWindowSec > 0) {
       segments = snapToSilences(segments, silences, p.snapWindowSec);
@@ -405,6 +412,48 @@
     return out;
   }
 
+  /**
+   * Простой PRNG mulberry32 для детерминированных variations (Phase 2B).
+   * seed → unsigned int32; результат: () => float ∈ [0, 1).
+   */
+  function _seededRng(seed) {
+    var s = (seed >>> 0) || 1;
+    return function () {
+      s = (s + 0x6D2B79F5) >>> 0;
+      var t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /**
+   * Анти-монотонность: сдвигает каждую границу между сегментами в [-jitterSec, +jitterSec]
+   * детерминированно из seed. Гарантирует, что граница не пересечёт середину
+   * соседнего сегмента (чтобы сегмент не схлопнулся).
+   */
+  function applyVariations(segments, jitterSec, seed) {
+    if (!segments || segments.length <= 1) return (segments || []).slice();
+    if (!jitterSec || jitterSec <= 0) {
+      // Быстрый путь: jitter=0 — возвращаем slice() входа, чтобы сохранить
+      // prototype-chain (важно для vm-loaded тестов и deepEqual).
+      return segments.slice();
+    }
+    var rand = _seededRng(seed || 1);
+    var out = segments.map(function (s) { return { tStart: s.tStart, tEnd: s.tEnd, activeVideoTrack: s.activeVideoTrack }; });
+    for (var i = 0; i < out.length - 1; i++) {
+      var delta = (rand() * 2 - 1) * jitterSec;
+      var newBoundary = out[i].tEnd + delta;
+      var minB = (out[i].tStart + out[i].tEnd) / 2 + 1e-6;
+      var maxB = (out[i + 1].tStart + out[i + 1].tEnd) / 2 - 1e-6;
+      if (newBoundary < minB) newBoundary = minB;
+      if (newBoundary > maxB) newBoundary = maxB;
+      out[i].tEnd = newBoundary;
+      out[i + 1].tStart = newBoundary;
+    }
+    return out;
+  }
+
   var api = {
     DEFAULTS: DEFAULTS,
     buildSwitchPlan: buildSwitchPlan,
@@ -417,7 +466,8 @@
     _enforceMinHold: enforceMinHold,
     _mergeAdjacentSame: mergeAdjacentSame,
     _snapToSilences: snapToSilences,
-    _enforceMaxHold: enforceMaxHold
+    _enforceMaxHold: enforceMaxHold,
+    _applyVariations: applyVariations
   };
 
   if (typeof module !== 'undefined' && module.exports) {

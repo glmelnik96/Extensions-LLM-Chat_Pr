@@ -397,3 +397,50 @@ describe('MulticamPlan._enforceMaxHold', () => {
     assert.equal(out[0].activeVideoTrack, wide);
   });
 });
+
+describe('MulticamPlan._applyVariations', () => {
+  function mkSegs() {
+    return [
+      { tStart: 0, tEnd: 5, activeVideoTrack: 1 },
+      { tStart: 5, tEnd: 10, activeVideoTrack: 2 },
+      { tStart: 10, tEnd: 15, activeVideoTrack: 1 }
+    ];
+  }
+
+  it('is no-op when jitterSec is 0', () => {
+    const segs = mkSegs();
+    const out = MP._applyVariations(segs, 0, 42);
+    assert.deepEqual(out, segs);
+  });
+
+  it('produces deterministic results for the same seed', () => {
+    const a = MP._applyVariations(mkSegs(), 0.5, 42);
+    const b = MP._applyVariations(mkSegs(), 0.5, 42);
+    assert.deepEqual(a, b);
+  });
+
+  it('produces different boundaries for different seeds', () => {
+    const a = MP._applyVariations(mkSegs(), 0.5, 1);
+    const b = MP._applyVariations(mkSegs(), 0.5, 999);
+    // Хотя бы одна граница должна отличаться.
+    const aBoundaries = a.slice(0, -1).map(s => s.tEnd);
+    const bBoundaries = b.slice(0, -1).map(s => s.tEnd);
+    assert.notDeepEqual(aBoundaries, bBoundaries);
+  });
+
+  it('keeps boundaries within ±jitterSec of original', () => {
+    const segs = mkSegs();
+    const out = MP._applyVariations(segs, 0.5, 7);
+    for (let i = 0; i < segs.length - 1; i++) {
+      const drift = Math.abs(out[i].tEnd - segs[i].tEnd);
+      assert.ok(drift <= 0.5 + 1e-9, 'drift exceeded jitter: ' + drift);
+    }
+  });
+
+  it('does not collapse a segment past the midpoint of its neighbor', () => {
+    const segs = mkSegs();
+    const out = MP._applyVariations(segs, 100, 5); // абсурдно большой jitter
+    // Все сегменты остаются положительной длины.
+    out.forEach(s => assert.ok(s.tEnd > s.tStart, 'collapsed: ' + JSON.stringify(s)));
+  });
+});
