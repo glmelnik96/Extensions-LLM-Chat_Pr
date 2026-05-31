@@ -444,3 +444,35 @@ describe('MulticamPlan._applyVariations', () => {
     out.forEach(s => assert.ok(s.tEnd > s.tStart, 'collapsed: ' + JSON.stringify(s)));
   });
 });
+
+describe('MulticamPlan._snapToSpeechOnset', () => {
+  function mkSegs() {
+    return [
+      { tStart: 0, tEnd: 5, activeVideoTrack: 1 },
+      { tStart: 5, tEnd: 10, activeVideoTrack: 2 }
+    ];
+  }
+
+  it('snaps boundary to the nearest onset within window', () => {
+    const out = MP._snapToSpeechOnset(mkSegs(), [4.8, 7.0], 0.5, 0);
+    assert.ok(Math.abs(out[0].tEnd - 4.8) < 1e-9, 'got tEnd=' + out[0].tEnd);
+    assert.equal(out[0].tEnd, out[1].tStart);
+  });
+
+  it('applies frame offset to the snap point', () => {
+    const out = MP._snapToSpeechOnset(mkSegs(), [4.8], 0.5, -0.1);
+    assert.ok(Math.abs(out[0].tEnd - (4.8 - 0.1)) < 1e-9);
+  });
+
+  it('leaves boundary unchanged when no onset in window', () => {
+    const out = MP._snapToSpeechOnset(mkSegs(), [2.0, 8.0], 0.5, 0);
+    assert.equal(out[0].tEnd, 5);
+  });
+
+  it('is no-op for empty/null onsets or zero window', () => {
+    const segs = mkSegs();
+    assert.deepEqual(MP._snapToSpeechOnset(segs, [], 0.5, 0), segs);
+    assert.deepEqual(MP._snapToSpeechOnset(segs, null, 0.5, 0), segs);
+    assert.deepEqual(MP._snapToSpeechOnset(segs, [4.8], 0, 0), segs);
+  });
+});

@@ -33,7 +33,8 @@
     maxHoldSec: 8,
     maxAllSpeakersSec: 4,
     variationsJitterSec: 0,
-    variationsSeed: 1
+    variationsSeed: 1,
+    frameOffsetSec: 0
   };
 
   /**
@@ -282,8 +283,10 @@
       segments = applyVariations(segments, p.variationsJitterSec, p.variationsSeed);
     }
 
-    /* Шаг 5: snap к silence-границам */
-    if (silences && silences.length && p.snapWindowSec > 0) {
+    /* Шаг 5: snap границ — приоритет onset'ам речи, fallback на silence */
+    if (p.speechOnsets && p.speechOnsets.length && p.snapWindowSec > 0) {
+      segments = snapToSpeechOnset(segments, p.speechOnsets, p.snapWindowSec, p.frameOffsetSec || 0);
+    } else if (silences && silences.length && p.snapWindowSec > 0) {
       segments = snapToSilences(segments, silences, p.snapWindowSec);
     }
 
@@ -454,6 +457,37 @@
     return out;
   }
 
+  /**
+   * Снап границы к ближайшему началу речи (onset) в окне ±windowSec,
+   * со смещением offsetSec («frame offset» в терминологии Wraith).
+   * Если onset'ов в окне нет — граница не двигается.
+   */
+  function snapToSpeechOnset(segments, onsets, windowSec, offsetSec) {
+    if (!segments || segments.length <= 1) return (segments || []).slice();
+    if (!onsets || !onsets.length || !windowSec || windowSec <= 0) {
+      // Быстрый путь: no-op — возвращаем slice() входа, чтобы сохранить
+      // prototype-chain (важно для vm-loaded тестов и deepEqual).
+      return segments.slice();
+    }
+    var os = typeof offsetSec === 'number' ? offsetSec : 0;
+    var out = segments.map(function (s) { return { tStart: s.tStart, tEnd: s.tEnd, activeVideoTrack: s.activeVideoTrack }; });
+    for (var i = 0; i < out.length - 1; i++) {
+      var boundary = out[i].tEnd;
+      var bestOnset = null;
+      var bestDist = windowSec + 1;
+      for (var j = 0; j < onsets.length; j++) {
+        var d = Math.abs(onsets[j] - boundary);
+        if (d < bestDist && d <= windowSec) { bestDist = d; bestOnset = onsets[j]; }
+      }
+      if (bestOnset !== null) {
+        var newB = bestOnset + os;
+        out[i].tEnd = newB;
+        out[i + 1].tStart = newB;
+      }
+    }
+    return out;
+  }
+
   var api = {
     DEFAULTS: DEFAULTS,
     buildSwitchPlan: buildSwitchPlan,
@@ -467,7 +501,8 @@
     _mergeAdjacentSame: mergeAdjacentSame,
     _snapToSilences: snapToSilences,
     _enforceMaxHold: enforceMaxHold,
-    _applyVariations: applyVariations
+    _applyVariations: applyVariations,
+    _snapToSpeechOnset: snapToSpeechOnset
   };
 
   if (typeof module !== 'undefined' && module.exports) {
