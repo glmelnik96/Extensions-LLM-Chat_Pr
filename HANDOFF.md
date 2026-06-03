@@ -228,6 +228,13 @@ node tests/integration/run-glm47-production.mjs
 - **2026-05-07:** video-use research + откат (3 идеи не дали benefit'а на нашем ASR)
 - **2026-05-07:** Highlights cycling fix (42 find_moments → 3 tool calls, 19× быстрее), README test count fix, 6 silent catches → console.warn
 - **2026-05-07:** DaVinci Resolve migration research → parked
+- **2026-05-?? — 2026-06-03:** MultiCam Phase 2A — audio-driven speaker detection
+  - `framesFromRmsTimelines` RMS-grid aligner, `multicamFromAudio` пайплайн
+  - `enforceMaxHold` (wide bridge на долгих mono-сегментах), `applyVariations` (seeded jitter), `snapToSpeechOnset`
+  - generalize до N speakers (max 4)
+  - Tools dispatch wired в panel.js на audio-driven detection
+  - Fix runtime: `MulticamPlan` экспорт напрямую в `window` (CEP `--enable-nodejs` ломал CommonJS-fallback)
+  - **Status:** код в working state, тесты зелёные. Phase 2B manual test в Premiere — pending
 - **2026-06-04:** Phase 2 model migration — GLM-5.1 (агент/анализ/findMoments) + DeepSeek-V4-Pro (главы/код), `max_tokens` 8000→16000. См. [`.omc/research/2026-06-04-cloudru-new-models-evaluation.md`](.omc/research/2026-06-04-cloudru-new-models-evaluation.md)
 
 ---

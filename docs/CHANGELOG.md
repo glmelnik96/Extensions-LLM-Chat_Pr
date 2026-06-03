@@ -6,6 +6,32 @@
 
 ---
 
+## 2026-05 → 2026-06-03 — MultiCam Phase 2A (audio-driven speaker detection)
+
+Расширение MultiCam от Phase 1 (2 говорящих, ручная разметка) к audio-driven автоматике.
+
+### Что добавлено
+- `framesFromRmsTimelines` — выравнивает RMS-таймлайны на единую сетку для cross-track сравнения
+- `multicamFromAudio` — пайплайн от аудио-чанков до камера-плана (cuts list)
+- `enforceMaxHold` — вставляет wide-bridge при долгом удержании одной камеры (anti-monotony)
+- `applyVariations` — seeded boundary jitter (вариативность без потери детерминизма)
+- `snapToSpeechOnset` — сдвиг cut'ов к ближайшей атаке речи следующего спикера
+- Generalize до N speakers (max 4) — было 2-only
+- Tools dispatch в `panel.js` теперь дёргает audio-driven путь
+
+### Runtime fix
+- `MulticamPlan` экспорт сломан в CEP с `--enable-nodejs`: `module` определён в browser-context, CommonJS-fallback перехватывал `window.MulticamPlan = api`.
+- Решение: убран CommonJS-branch, прямой `global.MulticamPlan = api`. Тесты vm-loader уже читают оба варианта (`ctx.MulticamPlan || ctx.module.exports`).
+
+### Status
+- Все unit-тесты зелёные (330/330)
+- Manual end-to-end test в Premiere — pending (Phase 2B)
+- Phase 2C (mapping UI + sliders) — план в `.omc/plans/`
+
+→ См. `.omc/plans/multicam-phase-2b-*.md` и `.omc/research/multicam-podcast-feature.md`
+
+---
+
 ## 2026-06-04 — Phase 2: миграция на GLM-5.1 + DeepSeek-V4-Pro
 
 ### Распределение ролей
