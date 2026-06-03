@@ -3,46 +3,66 @@
  * Панели Premiere не содержат полей настроек API/моделей.
  *
  * ═══════════════════════════════════════════════════════════════════════
- * КАТАЛОГ МОДЕЛЕЙ Cloud.ru Foundation Models (апрель 2026)
+ * КАТАЛОГ МОДЕЛЕЙ Cloud.ru Foundation Models (июнь 2026 — Phase 2)
  * ═══════════════════════════════════════════════════════════════════════
  *
  * ┌─────────────────────────────────────────┬────────┬──────────┬──────────┬────┬────┐
  * │ Модель                                  │Контекст│ Input ₽/M│Output ₽/M│ FC │ SO │
  * ├─────────────────────────────────────────┼────────┼──────────┼──────────┼────┼────┤
+ * │ deepseek-ai/DeepSeek-V4-Pro      NEW    │ 1048K  │  183.00  │   732.00 │ ✓  │ ✓  │
+ * │ zai-org/GLM-5.1                  NEW    │  202K  │  198.86  │   829.60 │ ✓  │ ✓  │
+ * │ moonshotai/Kimi-K2.6             NEW    │  262K  │  175.68  │   725.90 │ ✓  │ ✓  │
  * │ openai/gpt-oss-120b                     │  131K  │   15.86  │    61.00 │ ✓  │ ✓  │
  * │ Qwen/Qwen3-Coder-Next          Preview  │  262K  │  FREE    │   FREE   │ ✓  │ ✓  │
  * │ Qwen/Qwen3-Coder-480B-A35B-Instruct    │  262K  │   48.80  │    97.60 │ ✓  │ ✓  │
  * │ Qwen/Qwen3-235B-A22B-Instruct-2507     │  262K  │   20.74  │    61.00 │ ✓  │ ✓  │
  * │ Qwen/Qwen3-Next-80B-A3B-Instruct       │  262K  │   13.42  │   130.54 │ ✓  │ ✓  │
  * │ zai-org/GLM-4.7                 Preview  │  202K  │  FREE    │   FREE   │ ✓  │ ✓  │
- * │ zai-org/GLM-4.7-Flash          Preview  │  202K  │  FREE    │   FREE   │ ✓  │ ✓  │
  * │ zai-org/GLM-4.6                         │  202K  │   67.10  │   268.40 │ ✓  │ ✓  │
- * │ MiniMax/MiniMax-M2                      │  196K  │   40.26  │   158.60 │ ✓  │ ✓  │
- * │ t-tech/T-pro-it-2.1            Preview  │   40K  │  FREE    │   FREE   │ ✓  │ ✓  │
- * │ t-tech/T-pro-it-2.0                     │   40K  │   26.84  │    52.46 │ ✓  │ ✓  │
- * │ t-tech/T-lite-it-2.1           Preview  │   40K  │  FREE    │   FREE   │    │ ✓  │
- * │ t-tech/T-lite-it-1.0                    │   32K  │    1.76  │     3.51 │    │ ✓  │
- * │ t-tech/T-pro-it-1.0                     │   32K  │   63.44  │   126.88 │    │ ✓  │
  * └─────────────────────────────────────────┴────────┴──────────┴──────────┴────┴────┘
  *
  * FC = Function Calling, SO = Structured Output
- * FREE = бесплатно на момент Preview
  *
- * РЕКОМЕНДАЦИИ ПО РОЛЯМ:
+ * ═══════════════════════════════════════════════════════════════════════
+ * РЕЗУЛЬТАТЫ ЖИВЫХ ТЕСТОВ (4 июня 2026, .omc/research/...):
+ * ═══════════════════════════════════════════════════════════════════════
  *
- * chatModel (основной агент — нужен FC + SO + надёжность):
- *   • openai/gpt-oss-120b      — проверен, стабильный, 131K контекста
- *   • Qwen/Qwen3-Coder-Next    — 262K, бесплатный (Preview), хорош для кода
- *   • zai-org/GLM-4.7           — 202K, бесплатный (Preview), хорош для русского
+ * TEST A — Structured JSON классификация сегментов (thinking=False):
+ *   • GLM-5.1:        3.65s, 6/6 segments, JSON OK
+ *   • Kimi-K2.6:     18.39s, JSON FAIL (thinking burnt все 2000 tokens)
+ *   • DeepSeek-V4:    6.32s, 6/6 segments, JSON OK
  *
- * analysisModel (анализ транскрипта — нужен SO, желательно FC, большой контекст):
- *   • zai-org/GLM-4.7-Flash     — 202K, бесплатный, быстрый — ЛУЧШИЙ для анализа
- *   • t-tech/T-pro-it-2.1       — 40K, бесплатный (Preview), хватает для чанков
- *   • Qwen/Qwen3-Next-80B-A3B   — 262K, дёшево на вход, FC+SO
+ * TEST B — Главы для подкаста (long-context reasoning, thinking=True):
+ *   • GLM-5.1:       22.80s, 5 глав, 0 EN-leak (отличное качество)
+ *   • Kimi-K2.6:     24.12s, 5 глав, 0 EN-leak
+ *   • DeepSeek-V4:    3.14s, 6 глав, 0 EN-leak (быстрее в 7×, чуть гранулярнее)
  *
- * codeModel (альтернатива агента для code-задач):
- *   • Qwen/Qwen3-Coder-Next     — 262K, бесплатный, оптимизирован для кода
- *   • Qwen/Qwen3-Coder-480B-A35B-Instruct — 262K, платный, топ-качество
+ * TEST C — Multi-step агент tool-calling:
+ *   • Все три вызывают get_timeline_snapshot корректно. GLM/Kimi быстрее.
+ *
+ * TEST D (критично) — Long-input probe (14K tokens):
+ *   • GLM-5.1 + thinking=True : ОШИБКА (NoneType, content=null — сжёг бюджет)
+ *   • GLM-5.1 + thinking=False: 0.67s OK
+ *   • DeepSeek-V4: 1.58s OK без танцев с thinking
+ *
+ * COMPAT — DeepSeek-V4 молча игнорирует chat_template_kwargs.enable_thinking
+ *   (без ошибки) — наш единый передатчик thinking-флага безопасен.
+ *
+ * Kimi-K2.6 не уважает chat_template_kwargs.enable_thinking (мы пробовали:
+ * один и тот же тайминг 6.36s/6.65s). Используем Kimi только там, где
+ * thinking приемлем. Альтернатива — adapter под Moonshot-нативный
+ * extra_body.enable_thinking; пока не требуется.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * РАСПРЕДЕЛЕНИЕ РОЛЕЙ (Phase 2, 4 июня 2026):
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * chatModel        → zai-org/GLM-5.1            (202K, thinking=true, top FC)
+ * analysisModel    → zai-org/GLM-5.1            (thinking=false ВАЖНО, см. policy)
+ * chapterModel     → deepseek-ai/DeepSeek-V4-Pro (1M контекст, 7× быстрее, ru OK)
+ * findMomentsModel → zai-org/GLM-5.1            (thinking=false)
+ * codeModel        → deepseek-ai/DeepSeek-V4-Pro (1M контекст под кодовые ризонинги)
+ * fastModel        → openai/gpt-oss-120b        (без изменений, дёшево/быстро)
  * ═══════════════════════════════════════════════════════════════════════
  */
 (function (global) {
@@ -52,25 +72,23 @@
 
     /**
      * Основная модель агента (чат + вызов инструментов).
-     * Phase 1.5 (май 2026): переключено с gpt-oss-120b на GLM-4.7.
-     * GLM-4.7: 200K контекст, top tool-calling (τ²-Bench 87.4%, BFCL-v3 SOTA),
-     * Interleaved Thinking перед каждым tool-call'ом улучшает multi-step reasoning.
-     * Используется для всех content-creation запросов: «почисти», «собери ролик»,
-     * «убери X», «уложи в N сек».
+     * Phase 2 (4 июня 2026): GLM-4.7 → GLM-5.1.
+     * GLM-5.1: 202K контекст, top tool-calling, Interleaved Thinking.
+     * В тестах (TEST C) корректно вызывает tools и с thinking=True (3.58s),
+     * и с thinking=False (1.16s) — оставляем true для multi-step reasoning.
+     * Цена 198.86₽/M in / 829.60₽/M out — приоритет качества над лимитами.
      *
      * Простые «вопросы» («что на таймлайне», «привет») роутятся на fastModel
-     * через AgentPrompts.classifyComplexity (panel.js:3575-3579) — там
-     * gpt-oss-120b остаётся, потому что дешевле и без thinking-overhead.
-     *
-     * Risk: GLM иногда даёт EN-leakage в RU output. Мониторим через smoke-test.
+     * через AgentPrompts.classifyComplexity (panel.js:3575-3579).
      */
-    chatModel: 'zai-org/GLM-4.7',
+    chatModel: 'zai-org/GLM-5.1',
 
     /**
      * Альтернатива для агента; включается флагом useCodeModelForAgent.
-     * 262K контекст, бесплатный Preview, оптимизирован для кода.
+     * Phase 2: Qwen3-Coder-Next → DeepSeek-V4-Pro (1M контекст под кодовые
+     * ризонинги, native tool-calling, без проблем с большим input).
      */
-    codeModel: 'Qwen/Qwen3-Coder-Next',
+    codeModel: 'deepseek-ai/DeepSeek-V4-Pro',
     /** true — агент использует codeModel, false — chatModel */
     useCodeModelForAgent: false,
 
@@ -79,25 +97,30 @@
      * Классифицирует сегменты: filler/intro/outro/repeat/digression/artifact/outtake.
      * Не требует Function Calling — достаточно Structured Output (JSON).
      *
-     * GLM-4.7: 202K контекст, FC+SO, top-tier reasoning, free preview.
-     * Лучше gpt-oss-120b на schema adherence и cross-segment рассуждениях.
-     * Пустая строка '' — используется chatModel.
+     * Phase 2: GLM-5.1. КРИТИЧНО — thinkingPolicy.analyze = false (см. TEST D:
+     * GLM-5.1 + default thinking на 14K input → NoneType, content=null).
+     * При thinking=false справляется за 3.65s, JSON schema OK.
      */
-    analysisModel: 'zai-org/GLM-4.7',
+    analysisModel: 'zai-org/GLM-5.1',
 
     /**
      * Модель для построения глав (buildTopicsWithLLM).
      * Получает весь транскрипт целиком (paragraphs) и определяет темы.
-     * Long-context reasoning — главный сильный бок GLM-4.7 (200K, thinking mode).
+     *
+     * Phase 2: GLM-4.7 → DeepSeek-V4-Pro. TEST B показал DeepSeek 3.14s vs
+     * GLM-5.1 22.80s на той же задаче (≈7× быстрее), качество глав на русском
+     * сопоставимое, 0 EN-leak. 1M контекст позволяет обрабатывать целые
+     * 4-часовые подкасты без чанкования. Native thinking не требуется —
+     * DeepSeek и так держит long-context reasoning.
      */
-    chapterModel: 'zai-org/GLM-4.7',
+    chapterModel: 'deepseek-ai/DeepSeek-V4-Pro',
 
     /**
      * Модель для семантического поиска (find_moments через LLM, future use).
      * Сейчас find-moments использует TF-IDF + stem-match, но при low-confidence
-     * fallback можем подключать LLM. GLM-4.7 — best fit для retrieval.
+     * fallback подключаем LLM. Phase 2: GLM-5.1 (thinking=false, см. policy).
      */
-    findMomentsModel: 'zai-org/GLM-4.7',
+    findMomentsModel: 'zai-org/GLM-5.1',
 
     /**
      * Быстрая модель для простых задач (маркеры, классификация, структура).
@@ -187,7 +210,7 @@
      * project_transcript_pipeline_audit.md HIGH#2.
      */
     chatParams: {
-      max_tokens: 8000,
+      max_tokens: 16000,
       temperature: 0.1,
       presence_penalty: 0,
       top_p: 0.95
@@ -195,34 +218,36 @@
 
     /**
      * Включать thinking mode (chain-of-thought) для моделей которые его поддерживают
-     * (GLM-4.7, GLM-4.6 через chat_template_kwargs). Для не-thinking моделей
-     * (gpt-oss-120b, Qwen3) флаг игнорируется.
+     * (GLM-5.1, GLM-4.7, GLM-4.6 через chat_template_kwargs.enable_thinking).
+     * Для не-thinking моделей (gpt-oss-120b, Qwen3) — флаг игнорируется.
+     * DeepSeek-V4-Pro молча игнорирует chat_template_kwargs (compat-test 4 июня).
      *
-     * true — включает Interleaved Thinking для reasoning-heavy calls
-     * (analysis, chapters, find_moments). Output может вырасти в 2-5×, латентность
-     * выше, но качество cross-segment рассуждений сильно лучше.
-     *
-     * Risk: GLM иногда даёт EN-leakage в RU output. Если станет проблемой —
-     * выключить и/или перенаправить chapterModel/analysisModel на gpt-oss-120b.
+     * Kimi-K2.6 не уважает наш формат флага — требует нативный Moonshot
+     * extra_body.enable_thinking (без обёртки). Adapter пока не реализован,
+     * Kimi не назначен ни на одну роль.
      */
     enableThinking: true,
 
     /**
-     * Phase 1.5 (6 мая 2026, real-call findings): per-role thinking override.
-     * Real-call test показал что thinking mode на per-chunk classification
-     * (analyze) добавляет 3-5× latency (до 5 минут на 50-сегм chunk) и приводит
-     * к network-level `fetch failed` transient'ам. Per-chunk classification —
-     * простая задача, thinking тут overkill.
+     * Phase 2 (4 июня 2026, live tests TEST A/D findings): per-role thinking.
      *
-     * Поэтому отключаем thinking для analyze, оставляем для buildTopics
-     * (long-context cross-paragraph reasoning) и main agent (multi-step
-     * tool-calling из τ²-Bench 87.4%).
+     * analyze=false — КРИТИЧНО для GLM-5.1: на длинных input (≥10K tokens)
+     * с включённым thinking модель сжигает весь бюджет в reasoning_content
+     * и возвращает content=null (SDK падает с NoneType). С thinking=false
+     * та же задача — 0.67s на 10K input. См. TEST D.
+     *
+     * chapter — теперь крутится на DeepSeek-V4-Pro, который thinking-флаг
+     * игнорирует. Оставляем true для совместимости, если chapterModel
+     * вручную переключат обратно на GLM.
+     *
+     * chat — multi-step tool-calling (TEST C, 3.58s для GLM-5.1). Оставляем.
+     * report — long-form ризонинг по сессии. Оставляем true.
      *
      * Если поле undefined — fallback на enableThinking.
      */
     thinkingPolicy: {
-      analyze: false,    /* per-chunk classification — НЕ нужно thinking */
-      chapter: true,     /* whole-transcript reasoning — нужно */
+      analyze: false,    /* GLM-5.1: иначе NoneType на больших input */
+      chapter: true,     /* DeepSeek-V4-Pro игнорирует флаг, безопасно */
       chat: true,        /* multi-step tool-calling — нужно */
       report: true       /* AI-отчёт по сессии — нужно */
     },

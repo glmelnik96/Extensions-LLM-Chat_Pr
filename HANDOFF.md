@@ -3,7 +3,7 @@
 > Это **первый файл, который должен прочитать любой агент** перед началом работы над проектом.
 > Цель — за 5 минут понять: что это, как устроено, где hot zones, как тестировать, чего НЕ трогать.
 
-**Последнее обновление:** 2026-05-07 · **Статус:** production-ready · **Тесты:** 247/247 unit + 23/23 LLM quality на 1ч подкасте
+**Последнее обновление:** 2026-06-04 · **Статус:** production-ready · **Тесты:** 330/330 unit + 23/23 LLM quality на 1ч подкасте
 
 ---
 
@@ -11,12 +11,12 @@
 
 **Extensions-LLM-Chat_Pr** — AI-ассистент видеомонтажа для Adobe Premiere Pro 2024+ (CEP 12 extension).
 
-Пользователь общается с агентом в чате внутри панели Premiere: «убери паразитов», «уложи в 60 секунд», «поставь YouTube-главы». Агент (Cloud.ru GLM-4.7) читает транскрипт, строит план razor+ripple_delete, показывает карточку «Применить/Отмена», выполняет.
+Пользователь общается с агентом в чате внутри панели Premiere: «убери паразитов», «уложи в 60 секунд», «поставь YouTube-главы». Агент (Cloud.ru GLM-5.1) читает транскрипт, строит план razor+ripple_delete, показывает карточку «Применить/Отмена», выполняет.
 
 Также есть детерминированные кнопки в вкладке «Инструменты»: тишины, паразиты, jump cuts, главы.
 
 **Backend:**
-- LLM: Cloud.ru Foundation Models (GLM-4.7 default, gpt-oss-120b fallback)
+- LLM: Cloud.ru Foundation Models (GLM-5.1 для агента/анализа, DeepSeek-V4-Pro для глав/кода, gpt-oss-120b для routing)
 - ASR: Whisper Large v3 через Cloud.ru (+ опциональный whisper.cpp local)
 - Audio analysis: ffmpeg (silencedetect, loudnorm)
 - Host: ExtendScript (CEP 12) для Premiere DOM + QE DOM
@@ -228,6 +228,7 @@ node tests/integration/run-glm47-production.mjs
 - **2026-05-07:** video-use research + откат (3 идеи не дали benefit'а на нашем ASR)
 - **2026-05-07:** Highlights cycling fix (42 find_moments → 3 tool calls, 19× быстрее), README test count fix, 6 silent catches → console.warn
 - **2026-05-07:** DaVinci Resolve migration research → parked
+- **2026-06-04:** Phase 2 model migration — GLM-5.1 (агент/анализ/findMoments) + DeepSeek-V4-Pro (главы/код), `max_tokens` 8000→16000. См. [`.omc/research/2026-06-04-cloudru-new-models-evaluation.md`](.omc/research/2026-06-04-cloudru-new-models-evaluation.md)
 
 ---
 

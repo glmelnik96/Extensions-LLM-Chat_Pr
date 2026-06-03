@@ -6,6 +6,37 @@
 
 ---
 
+## 2026-06-04 — Phase 2: миграция на GLM-5.1 + DeepSeek-V4-Pro
+
+### Распределение ролей
+- `chatModel`        : `zai-org/GLM-4.7` → `zai-org/GLM-5.1`
+- `analysisModel`    : `zai-org/GLM-4.7` → `zai-org/GLM-5.1` (thinking=false обязателен)
+- `chapterModel`     : `zai-org/GLM-4.7` → `deepseek-ai/DeepSeek-V4-Pro` (1M контекст)
+- `findMomentsModel` : `zai-org/GLM-4.7` → `zai-org/GLM-5.1`
+- `codeModel`        : `Qwen/Qwen3-Coder-Next` → `deepseek-ai/DeepSeek-V4-Pro`
+- `fastModel`        : `openai/gpt-oss-120b` (без изменений)
+- `chatParams.max_tokens` : 8000 → **16000**
+
+### Что дало (живые тесты против Cloud.ru, 4 июня)
+- **Главы:** DeepSeek-V4 — **3.14s vs 22.80s у GLM** (≈7× быстрее) при сопоставимом качестве, 0 EN-leak
+- **Анализ JSON:** GLM-5.1 с thinking=false — 3.65s, 6/6 сегментов корректно
+- **Tool-calling:** GLM-5.1 — 1.16–3.58s на multi-step (vs 16.45s у DeepSeek)
+- **Long-input (10K tokens):** GLM-5.1 + thinking=false — 0.67s; ранее с GLM-4.7 + default thinking падало на NoneType
+
+### Критичное предупреждение
+- **GLM-5.1 + thinking=True на input ≥10K tokens** → `NoneType` (модель сжигает весь бюджет в reasoning_content)
+- Поэтому `thinkingPolicy.analyze = false` зафиксировано в комментариях
+- Kimi-K2.6 протестирован, но не назначен: не уважает `chat_template_kwargs.enable_thinking`
+
+### Что НЕ менялось
+- Промпты (`agent-prompts.js`, `agent-system-prompt.js`) — совместимы as-is
+- `cloudru-client.js` — текущий формат thinking-флага работает для GLM, безопасно игнорируется DeepSeek
+- Пайплайн analyze→chapter→agent — структура та же
+
+→ [`.omc/research/2026-06-04-cloudru-new-models-evaluation.md`](../.omc/research/2026-06-04-cloudru-new-models-evaluation.md) — полный отчёт с таблицами тестов
+
+---
+
 ## 2026-05-07 — Stability, cleanup и research-сессии
 
 ### Highlights cycling fix (production stability)

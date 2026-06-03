@@ -1,7 +1,7 @@
 # Extensions-LLM-Chat_Pr
 
 ИИ-ассистент видеомонтажа для **Adobe Premiere Pro 2024+** (CEP 12, проверено на 24/25/26).
-Единая панель с AI-чатом и детерминированными инструментами. Бэкенд — **Cloud.ru Foundation Models** (GLM-4.7 + Whisper-large-v3).
+Единая панель с AI-чатом и детерминированными инструментами. Бэкенд — **Cloud.ru Foundation Models** (GLM-5.1 + DeepSeek-V4-Pro + Whisper-large-v3).
 
 > **🤖 Работаешь над проектом как агент?** Сначала прочитай [HANDOFF.md](HANDOFF.md) — там всё необходимое: что работает, где hot zones, как тестировать, чего НЕ трогать. ~5 минут чтения.
 
@@ -210,13 +210,18 @@ cp client/shared/fm-secrets.example.js client/shared/fm-secrets.js
 
 | Поле | Значение | Описание |
 |------|----------|----------|
-| `chatModel` | `openai/gpt-oss-120b` | Основная модель агента (131K контекст) |
-| `codeModel` | `Qwen/Qwen3-Coder-Next` | Альтернатива для кода (262K) |
-| `analysisModel` | `openai/gpt-oss-120b` | Анализ транскрипта |
-| `fastModel` | `openai/gpt-oss-120b` | Простые задачи (routing) |
+| `chatModel` | `zai-org/GLM-5.1` | Основной агент + tool-calling (202K контекст, thinking on) |
+| `analysisModel` | `zai-org/GLM-5.1` | Анализ транскрипта (thinking off — обязательно для >10K input) |
+| `chapterModel` | `deepseek-ai/DeepSeek-V4-Pro` | Главы / long-context reasoning (1M контекст, 7× быстрее GLM) |
+| `findMomentsModel` | `zai-org/GLM-5.1` | Семантический поиск моментов |
+| `codeModel` | `deepseek-ai/DeepSeek-V4-Pro` | Альтернатива агента для кода (1M контекст) |
+| `fastModel` | `openai/gpt-oss-120b` | Routing / простые intent'ы (131K, дёшево) |
 | `whisperModel` | `openai/whisper-large-v3` | Транскрибация |
+| `chatParams.max_tokens` | `16000` | Бюджет ответа на один call |
 | `transcribeExportChunkSec` | `90` | Длина чанка (сек) |
 | `maxTranscribeUploadBytes` | `20971520` | Макс. размер загрузки (20 МБ) |
+
+Распределение обосновано живыми тестами 4 июня 2026 — см. [`.omc/research/2026-06-04-cloudru-new-models-evaluation.md`](.omc/research/2026-06-04-cloudru-new-models-evaluation.md).
 
 **`client/shared/fm-secrets.js`** — API-ключ (не в Git):
 ```js
