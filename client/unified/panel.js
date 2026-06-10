@@ -1347,6 +1347,40 @@ PanelBoot.run('ИИ: монтаж', function () {
     });
   }
 
+  /**
+   * P1-2 (10 июня 2026): merge перекрывающихся removeIntervals.
+   * Host (premiere.jsx:1590) применяет интервалы справа-налево БЕЗ merge —
+   * перекрытие приводит к двойному вырезанию уже сдвинутого материала и
+   * расхождению с transcript-кэшем (ContextStore merge'ит перекрытия).
+   * Snap к границам сегментов сам может СОЗДАТЬ перекрытия из соседних
+   * интервалов, поэтому merge обязателен ПОСЛЕ snap'а.
+   * Epsilon 0.05с — как в DeterministicPipelines._mergeIntervals.
+   */
+  function mergeRemoveIntervals(intervals) {
+    if (!intervals || intervals.length < 2) return intervals;
+    var sorted = intervals.slice().sort(function (a, b) { return a.startSec - b.startSec; });
+    var EPS = 0.05;
+    var out = [sorted[0]];
+    for (var i = 1; i < sorted.length; i++) {
+      var cur = sorted[i];
+      var last = out[out.length - 1];
+      if (cur.startSec <= last.endSec + EPS) {
+        var reason = last.reason || '';
+        if (cur.reason && cur.reason !== last.reason) {
+          reason = reason ? reason + '; ' + cur.reason : cur.reason;
+        }
+        out[out.length - 1] = {
+          startSec: last.startSec,
+          endSec: Math.max(last.endSec, cur.endSec),
+          reason: reason
+        };
+      } else {
+        out.push(cur);
+      }
+    }
+    return out;
+  }
+
   function computeVerification(removeList) {
     /* sequenceEndSec может быть 0 — вычисляем реальную длительность из клипов */
     var seqEnd = lastSnap && lastSnap.sequenceEndSec ? lastSnap.sequenceEndSec : 0;
@@ -2410,8 +2444,8 @@ PanelBoot.run('ИИ: монтаж', function () {
     var paddingSec = typeof args.paddingSec === 'number' ? Math.max(0, args.paddingSec) : 0.3;
     var paddedIntervals = _padRemoveIntervals(workingArgs.removeIntervals || [], paddingSec);
 
-    /* Snap к границам сегментов для предотвращения обрезки слов */
-    var snappedIntervals = snapIntervalsToSegmentBoundaries(paddedIntervals);
+    /* Snap к границам сегментов для предотвращения обрезки слов + merge перекрытий */
+    var snappedIntervals = mergeRemoveIntervals(snapIntervalsToSegmentBoundaries(paddedIntervals));
     var verification = computeVerification(snappedIntervals);
     _pendingProposal = {
       kind: 'transcript_cuts',
@@ -2730,15 +2764,25 @@ PanelBoot.run('ИИ: монтаж', function () {
      клик пользователя ждёт его promise, а не запускает второй анализ. */
   var _analysisInFlight = {}; /* { [seqKey|tasksKey]: Promise<rawResult> } */
 
-  function labelsCacheKey(seqKey, tasks) {
-    var tk = tasks ? tasks.slice().sort().join(',') : '*';
-    return seqKey + '|' + tk;
+  /* P0-1 (10 июня 2026): версия правок транскрипта в ключе кэша.
+     applyRippleDeletionsToTranscript и markTranscriptStale пушат editHistory —
+     после любого сдвига таймкодов editVer растёт, и старые метки/результаты
+     (со старыми таймкодами) никогда не читаются. Также закрывает гонку:
+     in-flight анализ, завершившийся ПОСЛЕ ripple, запишет результат под
+     старым ключом и не будет отдан. TTL 30 мин чистит память. */
+  function transcriptEditVersion(entry) {
+    return (entry && entry.editHistory && entry.editHistory.length) || 0;
   }
 
-  function analysisCacheKey(seqKey, tasks, aggressiveness) {
+  function labelsCacheKey(seqKey, tasks, editVer) {
+    var tk = tasks ? tasks.slice().sort().join(',') : '*';
+    return seqKey + '|v' + (editVer || 0) + '|' + tk;
+  }
+
+  function analysisCacheKey(seqKey, tasks, aggressiveness, editVer) {
     var tk = tasks ? tasks.slice().sort().join(',') : '*';
     var ag = aggressiveness || 'normal';
-    return seqKey + '|' + tk + '|' + ag;
+    return seqKey + '|v' + (editVer || 0) + '|' + tk + '|' + ag;
   }
 
   /**
@@ -2792,8 +2836,9 @@ PanelBoot.run('ИИ: монтаж', function () {
     var aggressiveness = args.aggressiveness === 'gentle' || args.aggressiveness === 'aggressive'
       ? args.aggressiveness : 'normal';
 
-    /* Проверяем кэш анализа */
-    var cKey = analysisCacheKey(found.matchedKey, tasks, aggressiveness);
+    /* Проверяем кэш анализа (editVer — см. P0-1 выше) */
+    var editVer = transcriptEditVersion(e);
+    var cKey = analysisCacheKey(found.matchedKey, tasks, aggressiveness, editVer);
     if (!forceRefresh && _analysisCache[cKey] && (Date.now() - _analysisCache[cKey].timestamp < ANALYSIS_CACHE_TTL)) {
       if (!quiet) {
         statusUi.show('Анализ из кэша (повторный запрос)', false);
@@ -2808,7 +2853,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* UI-2: уровень 2 — сырые LLM-метки (без aggressiveness в ключе).
        Смена слайдера gentle↔normal↔aggressive = мгновенный re-filter,
        НЕ повторный LLM-анализ. */
-    var lKey = labelsCacheKey(found.matchedKey, tasks);
+    var lKey = labelsCacheKey(found.matchedKey, tasks, editVer);
     if (!forceRefresh && _labelsCache[lKey] && (Date.now() - _labelsCache[lKey].timestamp < ANALYSIS_CACHE_TTL)) {
       if (!quiet) {
         statusUi.show('Метки из кэша → фильтрация «' + aggressiveness + '» без повторного анализа', false);
@@ -3151,9 +3196,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         resolve({ validationError: vr.error });
         return;
       }
-      /* Snap к границам сегментов */
+      /* Snap к границам сегментов + merge перекрытий (host не merge'ит) */
       args = Object.assign({}, args, {
-        removeIntervals: snapIntervalsToSegmentBoundaries(args.removeIntervals || [])
+        removeIntervals: mergeRemoveIntervals(snapIntervalsToSegmentBoundaries(args.removeIntervals || []))
       });
       var verification = computeVerification(args.removeIntervals);
       PremiereBridge.applyTranscriptCuts(args, function (err, data) {
@@ -3258,7 +3303,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   /* Живой пузырь стриминга: создаётся на первом chunk'е, обновляется
      накопленным текстом, удаляется при финальном renderMessages. */
   var _streamBubble = null;
-  function updateStreamBubble(accumulated) {
+  function ensureStreamBubble() {
     if (!_streamBubble || !_streamBubble.parentNode) {
       _streamBubble = document.createElement('div');
       _streamBubble.className = 'bubble assistant streaming';
@@ -3270,14 +3315,47 @@ PanelBoot.run('ИИ: монтаж', function () {
       sBody.className = 'bubble-body';
       _streamBubble.appendChild(sBody);
       el.chat.appendChild(_streamBubble);
+      if (chatNearBottom()) el.chat.scrollTop = el.chat.scrollHeight;
     }
+    return _streamBubble;
+  }
+  function updateStreamBubble(accumulated) {
+    ensureStreamBubble();
     var wasNear = chatNearBottom();
     setBubbleBody(_streamBubble.querySelector('.bubble-body'), 'assistant', accumulated);
     if (wasNear) el.chat.scrollTop = el.chat.scrollHeight;
   }
   function removeStreamBubble() {
+    stopWaitIndicator();
     if (_streamBubble && _streamBubble.parentNode) _streamBubble.parentNode.removeChild(_streamBubble);
     _streamBubble = null;
+  }
+
+  /* ETA-индикатор (10 июня 2026): GLM-5.1 с thinking может «молчать» 30+ сек.
+     Показываем в пузыре live-таймер «думает… Nс» + ожидаемое время из
+     AgentLoopStats (EMA прошлых ответов модели), чтобы пользователь не думал,
+     что панель зависла. */
+  var _waitTicker = null;
+  function startWaitIndicator(model, etaMs) {
+    stopWaitIndicator();
+    ensureStreamBubble();
+    var roleEl = _streamBubble.querySelector('.role');
+    var startTs = Date.now();
+    var etaTxt = etaMs ? ' · обычно ~' + Math.max(1, Math.round(etaMs / 1000)) + 'с' : '';
+    function tick() {
+      if (!_streamBubble || !roleEl) return;
+      var sec = Math.round((Date.now() - startTs) / 1000);
+      roleEl.textContent = 'assistant · модель думает… ' + sec + 'с' + etaTxt;
+    }
+    tick();
+    _waitTicker = setInterval(tick, 1000);
+  }
+  function stopWaitIndicator(roleText) {
+    if (_waitTicker) { clearInterval(_waitTicker); _waitTicker = null; }
+    if (roleText && _streamBubble) {
+      var r = _streamBubble.querySelector('.role');
+      if (r) r.textContent = roleText;
+    }
   }
 
   function renderMessages(msgs) {
@@ -4089,8 +4167,14 @@ PanelBoot.run('ИИ: монтаж', function () {
         },
         onStatus: function (ev) {
           statusUi.show(ev.message || ev.name || '…', true);
+          /* ETA: запрос к модели ушёл — таймер «думает… Nс (обычно ~Mс)» */
+          if (ev.phase === 'llm') startWaitIndicator(ev.model, ev.etaMs);
           /* UI-волна: стриминг-чанки → живой пузырь (раньше выбрасывались) */
-          if (ev.phase === 'streaming' && ev.accumulated) updateStreamBubble(ev.accumulated);
+          if (ev.phase === 'streaming' && ev.accumulated) {
+            stopWaitIndicator('assistant · печатает…');
+            updateStreamBubble(ev.accumulated);
+          }
+          if (ev.phase === 'tool') stopWaitIndicator('assistant · инструмент: ' + (ev.name || '…'));
         }
       });
       statusUi.show('Готово', false);
@@ -4499,9 +4583,13 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     function toolsSetLed(state) {
       if (!toolsLed) return;
-      toolsLed.className = 'transcript-led transcript-led--' + (state === 'ok' ? 'green' : state === 'busy' ? 'yellow' : 'red');
+      /* P0-2 (10 июня 2026): третье состояние 'audio' (синий) — есть аудиоанализ
+         без транскрипта: «Тишина» и «MultiCam» уже доступны. */
+      toolsLed.className = 'transcript-led transcript-led--' +
+        (state === 'ok' ? 'green' : state === 'busy' ? 'yellow' : state === 'audio' ? 'blue' : 'red');
       if (toolsLedText) {
-        toolsLedText.textContent = state === 'ok' ? 'готов' : state === 'busy' ? 'идёт…' : 'нет';
+        toolsLedText.textContent =
+          state === 'ok' ? 'готов' : state === 'busy' ? 'идёт…' : state === 'audio' ? 'только аудио' : 'нет';
       }
     }
 
@@ -4511,6 +4599,8 @@ PanelBoot.run('ИИ: монтаж', function () {
       try { window.toolsRefreshLed(); } catch (e) {}
     });
     window.toolsRefreshLed = function () {
+      var hasTranscript = false;
+      var hasAudio = false;
       try {
         /* Try lastSnap first, then fall back to any cached transcript */
         var seqName = (lastSnap && lastSnap.sequenceName) || '';
@@ -4521,24 +4611,34 @@ PanelBoot.run('ИИ: монтаж', function () {
         }
         if (seqName) {
           var f = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName);
-          if (f && f.entry && f.entry.segments && f.entry.segments.length) {
-            toolsSetLed('ok');
-            toolsUpdateCards(true);
-            return;
+          if (f && f.entry) {
+            hasTranscript = !!(f.entry.segments && f.entry.segments.length);
+            /* P0-2: аудиоанализ (ffmpeg) без Whisper достаточен для «Тишины» */
+            hasAudio = hasTranscript || !!f.entry.audioAnalysis;
           }
         }
       } catch (e) {
         console.warn('[tools] LED refresh failed:', e && e.message);
       }
-      toolsSetLed('red');
-      toolsUpdateCards(false);
+      toolsSetLed(hasTranscript ? 'ok' : hasAudio ? 'audio' : 'red');
+      toolsUpdateCards(hasTranscript, hasAudio);
     };
 
-    function toolsUpdateCards(hasTranscript) {
+    /* P0-2 (10 июня 2026): карточки по реальным требованиям пайплайнов.
+       .needs-transcript — нужны Whisper-сегменты (паразиты, jump cuts, главы);
+       .needs-audio — достаточно audioAnalysis ИЛИ транскрипта («Тишина»);
+       MultiCam без класса — ему нужен только снимок таймлайна + ffmpeg. */
+    function toolsUpdateCards(hasTranscript, hasAudio) {
+      var i;
       var cards = document.querySelectorAll('.tool-card.needs-transcript');
-      for (var i = 0; i < cards.length; i++) {
+      for (i = 0; i < cards.length; i++) {
         if (hasTranscript) cards[i].classList.remove('disabled');
         else cards[i].classList.add('disabled');
+      }
+      var audioCards = document.querySelectorAll('.tool-card.needs-audio');
+      for (i = 0; i < audioCards.length; i++) {
+        if (hasAudio) audioCards[i].classList.remove('disabled');
+        else audioCards[i].classList.add('disabled');
       }
     }
 
@@ -4603,12 +4703,12 @@ PanelBoot.run('ИИ: монтаж', function () {
       upd();
     })();
 
-    /* Порог тишины: показываем «-X dB» */
+    /* «Тише речи на»: дельта от средней громкости речи, показываем «X dB» */
     (function () {
       var s = document.getElementById('sil-thresh');
       var v = document.getElementById('sil-thresh-val');
       if (!s || !v) return;
-      function upd() { v.textContent = '-' + s.value + ' dB'; }
+      function upd() { v.textContent = s.value + ' dB'; }
       s.addEventListener('input', upd);
       upd();
     })();

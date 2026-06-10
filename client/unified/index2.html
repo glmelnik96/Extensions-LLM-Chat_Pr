@@ -309,7 +309,8 @@
 
         <div class="tools-scroll" id="tools-scroll">
           <!-- 1. Cut Silences -->
-          <div class="tool-card needs-transcript" id="card-silences">
+          <!-- P0-2: достаточно аудиоанализа (ffmpeg) — транскрипт не обязателен -->
+          <div class="tool-card needs-audio" id="card-silences">
             <div class="tool-card-title">🔇 Убрать тишины</div>
             <div class="tool-card-desc">Гигиена звука: убирает явные паузы ≥1с, сохраняет естественный ритм речи.</div>
             <div class="param-row">
@@ -317,10 +318,12 @@
               <input type="range" id="sil-min" min="0.3" max="3.0" step="0.1" value="1.0" />
               <span class="param-val" id="sil-min-val">1.0с</span>
             </div>
-            <div class="param-row">
-              <span class="param-label">Порог тишины</span>
+            <!-- P1-1: честная подпись — значение НЕ абсолютный dBFS-порог,
+                 а дельта от измеренной громкости речи (порог = inputI − N dB) -->
+            <div class="param-row" title="Тишина = всё, что на N dB тише средней громкости речи (порог адаптируется к записи автоматически)">
+              <span class="param-label">Тише речи на</span>
               <input type="range" id="sil-thresh" min="3" max="30" step="1" value="10" />
-              <span class="param-val" id="sil-thresh-val">-10 dB</span>
+              <span class="param-val" id="sil-thresh-val">10 dB</span>
             </div>
             <div class="param-row">
               <span class="param-label">Padding</span>
@@ -383,12 +386,13 @@
           </div>
 
           <!-- 5. Авто-MultiCam (Phase 1 MVP) -->
-          <div class="tool-card needs-transcript" id="card-multicam">
+          <!-- P0-2: транскрипт НЕ нужен — нужен только снимок таймлайна + ffmpeg (RMS) -->
+          <div class="tool-card" id="card-multicam">
             <div class="tool-card-title">🎥 Авто-MultiCam (β)</div>
             <div class="tool-card-desc">
-              Подкаст-нарезка: 3 видеодорожки (V1 wide, V2 гость 1, V3 гость 2)
-              + 2 аудиодорожки (A1, A2) → автопереключение по говорящему через
-              сегменты транскрипта. Phase 1 MVP, hardcoded mapping.
+              Подкаст-нарезка: V1 wide + V2..Vn гости, A1..An микрофоны →
+              автопереключение по RMS-громкости микрофонов (ffmpeg, без
+              транскрипции). Razor + отключение неактивных клипов.
             </div>
             <div class="param-row">
               <span class="param-label">Мин. план</span>

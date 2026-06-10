@@ -47,5 +47,9 @@ export function loadAgentLoop(mockCloudRuClient) {
   if (!root._agentLoopInternals) {
     throw new Error('_agentLoopInternals not attached to root');
   }
-  return { internals: root._agentLoopInternals, runAgentLoop: root.runAgentLoop };
+  return {
+    internals: root._agentLoopInternals,
+    runAgentLoop: root.runAgentLoop,
+    AgentLoopStats: root.AgentLoopStats
+  };
 }

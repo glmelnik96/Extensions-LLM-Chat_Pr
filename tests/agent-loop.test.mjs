@@ -288,3 +288,80 @@ describe('runAgentLoop (mock CloudRuClient)', () => {
     assert.ok(/Достигнут лимит шагов/.test(last.content));
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * AgentLoopStats — ETA per-model (EMA времени до первого ответа)
+ * ═══════════════════════════════════════════════════════════════ */
+describe('agent-loop.AgentLoopStats (ETA)', () => {
+  test('нет данных → expectedLatencyMs возвращает null', () => {
+    const { AgentLoopStats } = loadAgentLoop();
+    assert.equal(AgentLoopStats.expectedLatencyMs('glm-5.1'), null);
+  });
+
+  test('первый замер → значение как есть; повторные → EMA 0.7/0.3', () => {
+    const { AgentLoopStats } = loadAgentLoop();
+    AgentLoopStats.recordModelLatency('m', 1000);
+    assert.equal(AgentLoopStats.expectedLatencyMs('m'), 1000);
+    AgentLoopStats.recordModelLatency('m', 2000);
+    assert.equal(AgentLoopStats.expectedLatencyMs('m'), 1300); // 1000*0.7 + 2000*0.3
+  });
+
+  test('сиды из live-замеров: GLM-5.1 c thinking ~45с, без — 1.5с', () => {
+    const { AgentLoopStats } = loadAgentLoop();
+    assert.equal(AgentLoopStats.expectedLatencyMs('zai-org/GLM-5.1#think'), 45000);
+    assert.equal(AgentLoopStats.expectedLatencyMs('zai-org/GLM-5.1'), 1500);
+    assert.equal(AgentLoopStats.expectedLatencyMs('openai/gpt-oss-120b'), 1500);
+  });
+
+  test('мусорные входы игнорируются', () => {
+    const { AgentLoopStats } = loadAgentLoop();
+    AgentLoopStats.recordModelLatency('', 500);
+    AgentLoopStats.recordModelLatency('m', -5);
+    AgentLoopStats.recordModelLatency('m', NaN);
+    AgentLoopStats.recordModelLatency(null, 500);
+    assert.equal(AgentLoopStats.expectedLatencyMs('m'), null);
+  });
+
+  test('runAgentLoop без стриминга записывает латентность модели', async () => {
+    let resolveCall;
+    const client = {
+      chatCompletions: () => new Promise((res) => { resolveCall = res; })
+    };
+    const { runAgentLoop, AgentLoopStats } = loadAgentLoop(client);
+    const p = runAgentLoop({
+      settings: { activeAgentModel: 'test-model' },
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [],
+      toolExecutors: {}
+    });
+    // даём запросу «повисеть» >0мс, затем отвечаем
+    await new Promise((r) => setTimeout(r, 15));
+    resolveCall({ choices: [{ message: { content: 'ok' } }] });
+    await p;
+    const eta = AgentLoopStats.expectedLatencyMs('test-model');
+    assert.ok(typeof eta === 'number' && eta >= 10, 'ETA должна быть записана (' + eta + ')');
+  });
+
+  test('onStatus phase=llm содержит model и etaMs после первого замера', async () => {
+    const client = {
+      chatCompletions: async () => ({ choices: [{ message: { content: 'ok' } }] })
+    };
+    const { runAgentLoop } = loadAgentLoop(client);
+    const events = [];
+    const opts = {
+      settings: { activeAgentModel: 'm2' },
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [],
+      toolExecutors: {},
+      onStatus: (ev) => events.push(ev)
+    };
+    await runAgentLoop(opts);          // первый прогон — пишет латентность
+    await runAgentLoop(opts);          // второй — должен отдать etaMs
+    const llmEvents = events.filter((e) => e.phase === 'llm');
+    assert.equal(llmEvents[0].model, 'm2');
+    assert.equal(llmEvents[0].etaMs, null);
+    const second = llmEvents[llmEvents.length - 1];
+    assert.ok(typeof second.etaMs === 'number' && second.etaMs >= 0);
+    assert.ok(/Запрос к FM: m2/.test(second.message));
+  });
+});

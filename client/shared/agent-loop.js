@@ -23,6 +23,51 @@
     return '';
   }
 
+  /* ─── ETA (10 июня 2026): ожидаемое время ответа модели ─────────────
+   * GLM-5.1 с thinking может «молчать» 30+ секунд — пользователь думает,
+   * что зависло. Меряем время до ПЕРВОГО видимого ответа (первый content-чанк
+   * при стриминге, либо весь запрос без стриминга) per-model, сглаживаем EMA
+   * (α=0.3) и персистим в localStorage, чтобы оценка переживала перезапуск. */
+  var ETA_LS_KEY = 'fmEtaByModel';
+  /* Сиды из live-замеров TTFT 10 июня 2026 (Cloud.ru, стриминг):
+     GLM-5.1 thinking=ON — 46-48с до первого content-токена(!),
+     thinking=OFF — 0.3-0.8с, gpt-oss-120b / DeepSeek-V4-Pro — ~0.4с.
+     EMA постепенно заместит сиды реальными значениями пользователя. */
+  var SEED_ETA = {
+    'zai-org/GLM-5.1#think': 45000,
+    'zai-org/GLM-5.1': 1500,
+    'openai/gpt-oss-120b': 1500,
+    'deepseek-ai/DeepSeek-V4-Pro': 1500
+  };
+  var _etaByModel = (function () {
+    try {
+      var raw = global.localStorage && global.localStorage.getItem(ETA_LS_KEY);
+      var parsed = raw ? JSON.parse(raw) : null;
+      return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (e) { return {}; }
+  })();
+  function recordModelLatency(model, ms) {
+    if (!model || typeof ms !== 'number' || !(ms >= 0)) return;
+    ms = Math.max(1, ms);
+    var prev = _etaByModel[model];
+    _etaByModel[model] = (typeof prev === 'number' && prev > 0)
+      ? Math.round(prev * 0.7 + ms * 0.3)
+      : Math.round(ms);
+    try {
+      if (global.localStorage) global.localStorage.setItem(ETA_LS_KEY, JSON.stringify(_etaByModel));
+    } catch (e2) {}
+  }
+  function expectedLatencyMs(model) {
+    var v = _etaByModel[model];
+    if (typeof v === 'number' && v > 0) return v;
+    var seed = SEED_ETA[model];
+    return (typeof seed === 'number') ? seed : null;
+  }
+  global.AgentLoopStats = {
+    recordModelLatency: recordModelLatency,
+    expectedLatencyMs: expectedLatencyMs
+  };
+
   function throwIfAborted(signal, abortCheck) {
     if (signal && signal.aborted) {
       var err = new Error('Остановлено');
@@ -183,6 +228,12 @@
     var step = 0;
     var lastAssistantText = '';
     var model = settings.activeAgentModel || settings.chatModel;
+    /* ETA-ключ учитывает thinking: GLM-5.1 с thinking ждёт первый токен ~45с,
+       без — <1с. Это разные «модели» с точки зрения ожидания пользователя. */
+    var chatThinking = (settings.thinkingPolicy && typeof settings.thinkingPolicy.chat === 'boolean')
+      ? settings.thinkingPolicy.chat
+      : settings.enableThinking;
+    var etaKey = model + (chatThinking ? '#think' : '');
 
     /* Cycle detection: хэши последних tool_calls */
     var callHashes = [];
@@ -191,17 +242,23 @@
       throwIfAborted(signal, abortCheck);
       step++;
       messages = trimHistory(messages, maxHistory);
+      var etaMs = expectedLatencyMs(etaKey);
+      var reqStart = Date.now();
+      var firstVisibleTs = 0;
       onStatus({
         phase: 'llm',
         step: step,
         maxSteps: maxSteps,
+        model: model,
+        etaMs: etaMs,
         message:
           'Очередь агента: шаг ' +
           step +
           ' из ' +
           maxSteps +
           ' (лимит на сообщение). Запрос к FM: ' +
-          model
+          model +
+          (etaMs ? ' (обычно ~' + Math.max(1, Math.round(etaMs / 1000)) + 'с)' : '')
       });
       var data = await CloudRuClient.chatCompletions({
         baseUrl: settings.baseUrl,
@@ -213,9 +270,7 @@
         /* Phase 1.5 (6 мая 2026): per-role thinking — chat policy.
            Помогает на multi-step decision making (τ²-Bench 87.4%).
            Не-thinking модели игнорируют. */
-        enableThinking: (settings.thinkingPolicy && typeof settings.thinkingPolicy.chat === 'boolean')
-          ? settings.thinkingPolicy.chat
-          : settings.enableThinking,
+        enableThinking: chatThinking,
         /* response_format НЕ задаём — несовместимо с tools[] по OpenAI API контракту. */
         signal: signal,
         abortCheck: abortCheck,
@@ -229,6 +284,10 @@
           var acc = '';
           return function (delta) {
             if (delta.content) {
+              if (!firstVisibleTs) {
+                firstVisibleTs = Date.now();
+                recordModelLatency(etaKey, firstVisibleTs - reqStart);
+              }
               acc += delta.content;
               var now = Date.now();
               if (now - lastChunkTs < THROTTLE_MS) return;
@@ -246,6 +305,9 @@
         })()
       });
       throwIfAborted(signal, abortCheck);
+      /* Без стриминга (или ответ без content-чанков, только tool_calls):
+         «видимый ответ» = весь запрос целиком. */
+      if (!firstVisibleTs) recordModelLatency(etaKey, Date.now() - reqStart);
       var choice = data.choices && data.choices[0];
       if (!choice) throw new Error('Пустой ответ модели');
 
