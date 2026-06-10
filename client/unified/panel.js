@@ -2070,6 +2070,11 @@ PanelBoot.run('ИИ: монтаж', function () {
             showErr('Ошибка применения EditPlan: ' + String(errE.message || errE));
             return;
           }
+          if (dataE && dataE.ok === false) {
+            statusUi.hide();
+            showErr('EditPlan НЕ применён: ' + describeHostFailure(dataE));
+            return;
+          }
           PremiereBridge.getTimelineSnapshot(function (snapErrE, snapDataE) {
             if (!snapErrE && snapDataE && snapDataE.ok) lastSnap = snapDataE;
             try {
@@ -2127,6 +2132,11 @@ PanelBoot.run('ИИ: монтаж', function () {
             showErr('Ошибка применения правок: ' + String(err.message || err));
             return;
           }
+          if (data && data.ok === false) {
+            statusUi.hide();
+            showErr('Правки НЕ применены: ' + describeHostFailure(data));
+            return;
+          }
           PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
             if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
             statusUi.show('Готово', false);
@@ -2137,7 +2147,8 @@ PanelBoot.run('ИИ: монтаж', function () {
               role: 'assistant',
               content:
                 'Правки применены. ' +
-                (s ? ('Удалено: ' + s.removedCount + ', обрезано: ' + s.trimmedCount + ', перемещено: ' + s.movedCount + '. Длительность: ' + s.durationBeforeSec + ' → ' + s.durationAfterSec + 'с.') : '')
+                (s ? ('Удалено: ' + s.removedCount + ', обрезано: ' + s.trimmedCount + ', перемещено: ' + s.movedCount + '. Длительность: ' + s.durationBeforeSec + ' → ' + s.durationAfterSec + 'с.') : '') +
+                describeHostWarnings(data)
             });
             ContextStore.setMessages(panelId, msgs);
             renderMessages(msgs);
@@ -2168,7 +2179,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         var msgs = ContextStore.getMessages(panelId);
         msgs.push({
           role: 'assistant',
-          content: 'Маркеры созданы: ' + ((data && data.created && data.created.length) || 0) + '.'
+          content: 'Маркеры созданы: ' + ((data && data.created && data.created.length) || 0) + '.' +
+            describeHostWarnings(data)
         });
         ContextStore.setMessages(panelId, msgs);
         renderMessages(msgs);
@@ -2268,6 +2280,13 @@ PanelBoot.run('ИИ: монтаж', function () {
           showErr('Ошибка применения монтажа: ' + String(err.message || err));
           return;
         }
+        /* Host-контракт (10 июня 2026): ok:false приходит как data, не err —
+           locked-дорожки или полный отказ razor. НЕ пишем «применено». */
+        if (data && data.ok === false) {
+          statusUi.hide();
+          showErr('Монтаж НЕ применён: ' + describeHostFailure(data));
+          return;
+        }
         PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
           if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
           try {
@@ -2286,13 +2305,44 @@ PanelBoot.run('ИИ: монтаж', function () {
               (prop.verification ? prop.verification.removeCount : '?') +
               ' интервал(ов), осталось ' +
               (prop.verification ? fmtSec(prop.verification.totalKeepSec) : '?') +
-              '. Кэш транскрипта пересчитан под новый таймлайн.'
+              '. Кэш транскрипта пересчитан под новый таймлайн.' +
+              describeHostWarnings(data)
           });
           ContextStore.setMessages(panelId, msgs);
           renderMessages(msgs);
         });
       }
     );
+  }
+
+  /* ── Host-контракт (10 июня 2026): человекочитаемые ошибки/предупреждения ──
+     Хост теперь возвращает appliedCount/failedCount/failedReasons/lockedTracks/
+     maxDriftMs/driftWarnings. Раньше частичные сбои терялись молча. */
+  function describeHostFailure(data) {
+    if (!data) return 'неизвестная ошибка хоста';
+    var parts = [String(data.error || 'операция не применилась')];
+    if (data.lockedTracks && data.lockedTracks.length) {
+      parts.push('Заблокированы: ' + data.lockedTracks.join(', '));
+    }
+    if (data.failedReasons && data.failedReasons.length) {
+      parts.push('Причины: ' + data.failedReasons.join('; '));
+    }
+    return parts.join('. ');
+  }
+
+  function describeHostWarnings(data) {
+    if (!data) return '';
+    var warns = [];
+    if (typeof data.failedCount === 'number' && data.failedCount > 0) {
+      warns.push('⚠ ' + data.failedCount + ' операци(й) не применились' +
+        (data.failedReasons && data.failedReasons.length ? ': ' + data.failedReasons.join('; ') : '') +
+        ' — проверьте таймлайн визуально');
+    }
+    if (typeof data.driftWarnings === 'number' && data.driftWarnings > 0) {
+      warns.push('⚠ ' + data.driftWarnings + ' маркер(ов) сместились (макс. ' +
+        (data.maxDriftMs || '?') + ' мс)');
+    }
+    return warns.length ? '\n' + warns.join('\n') : '';
   }
 
   function cancelPendingProposal() {
@@ -3116,7 +3166,49 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   /* ─── Render history ────────────────────────────────────────────── */
 
+  /* UI-волна (10 июня 2026): smart scroll — не дёргаем чат вниз, если
+     пользователь прокрутил вверх читать историю (аудит: «forced scroll»). */
+  function chatNearBottom() {
+    return (el.chat.scrollHeight - el.chat.scrollTop - el.chat.clientHeight) < 60;
+  }
+
+  /* Безопасный markdown для пузырей ассистента; для остальных — textContent. */
+  function setBubbleBody(bodyEl, role, text) {
+    if (role === 'assistant' && window.MarkdownLite && text) {
+      bodyEl.innerHTML = MarkdownLite.render(text);
+    } else {
+      bodyEl.textContent = text || '';
+    }
+  }
+
+  /* Живой пузырь стриминга: создаётся на первом chunk'е, обновляется
+     накопленным текстом, удаляется при финальном renderMessages. */
+  var _streamBubble = null;
+  function updateStreamBubble(accumulated) {
+    if (!_streamBubble || !_streamBubble.parentNode) {
+      _streamBubble = document.createElement('div');
+      _streamBubble.className = 'bubble assistant streaming';
+      var sRole = document.createElement('div');
+      sRole.className = 'role';
+      sRole.textContent = 'assistant · печатает…';
+      _streamBubble.appendChild(sRole);
+      var sBody = document.createElement('div');
+      sBody.className = 'bubble-body';
+      _streamBubble.appendChild(sBody);
+      el.chat.appendChild(_streamBubble);
+    }
+    var wasNear = chatNearBottom();
+    setBubbleBody(_streamBubble.querySelector('.bubble-body'), 'assistant', accumulated);
+    if (wasNear) el.chat.scrollTop = el.chat.scrollHeight;
+  }
+  function removeStreamBubble() {
+    if (_streamBubble && _streamBubble.parentNode) _streamBubble.parentNode.removeChild(_streamBubble);
+    _streamBubble = null;
+  }
+
   function renderMessages(msgs) {
+    var wasNearBottom = chatNearBottom();
+    removeStreamBubble();
     el.chat.innerHTML = '';
     msgs.forEach(function (m) {
       if (m.role === 'system') return;
@@ -3163,7 +3255,7 @@ PanelBoot.run('ИИ: монтаж', function () {
 
       var body = document.createElement('div');
       body.className = 'bubble-body';
-      body.textContent =
+      var bodyText =
         m.content ||
         (m.tool_calls
           ? JSON.stringify(
@@ -3172,11 +3264,18 @@ PanelBoot.run('ИИ: монтаж', function () {
               })
             )
           : '');
+      /* Markdown — только для развёрнутых ответов ассистента (не tool-результатов) */
+      setBubbleBody(body, collapsible ? 'tool' : m.role, bodyText);
       div.appendChild(body);
       el.chat.appendChild(div);
     });
     if (_pendingProposal) renderPendingProposalCard();
-    el.chat.scrollTop = el.chat.scrollHeight;
+    /* Скроллим вниз только если пользователь и так был внизу,
+       либо последнее сообщение — его собственное (только что отправил). */
+    var lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
+    if (wasNearBottom || (lastMsg && lastMsg.role === 'user')) {
+      el.chat.scrollTop = el.chat.scrollHeight;
+    }
   }
 
   /* ─── Hint chips / starters / transcribe LED ─────────────────────── */
@@ -3916,6 +4015,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         },
         onStatus: function (ev) {
           statusUi.show(ev.message || ev.name || '…', true);
+          /* UI-волна: стриминг-чанки → живой пузырь (раньше выбрасывались) */
+          if (ev.phase === 'streaming' && ev.accumulated) updateStreamBubble(ev.accumulated);
         }
       });
       statusUi.show('Готово', false);
@@ -3935,6 +4036,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         showErr('Остановлено (запрос к API FM прерван).');
       else showErr(String(e.message || e));
     } finally {
+      removeStreamBubble(); /* успех → renderMessages уже всё показал; ошибка → не оставляем «печатает…» */
       if (runAbort === ac) runAbort = null;
       endOperation();
       el.send.disabled = false;
@@ -4480,10 +4582,15 @@ PanelBoot.run('ИИ: монтаж', function () {
         toolsDisableRun(true);
         PremiereBridge.applyTranscriptCuts(
           { removeIntervals: prop.removeIntervals, summary: prop.summary },
-          function (err) {
+          function (err, dataTC) {
             toolsDisableRun(false);
             toolsStatusUi.hide();
             if (err) { toolsShowErr('Ошибка: ' + String(err.message || err)); return; }
+            /* Host-контракт: ok:false (locked-дорожки и т.п.) приходит как data */
+            if (dataTC && dataTC.ok === false) {
+              toolsShowErr('НЕ применено: ' + describeHostFailure(dataTC));
+              return;
+            }
             try {
               var sk = lastSnap && lastSnap.sequenceName ? lastSnap.sequenceName : '';
               if (sk) ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, sk, prop.removeIntervals || []);

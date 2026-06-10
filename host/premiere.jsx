@@ -280,16 +280,120 @@ $._EXT_PRM_._collectIntersecting = function (seq, t0, t1) {
 };
 
 /**
+ * Точный FPS активной секвенции как float — БЕЗ округления.
+ * Округление ломает NTSC: 29.97 → 30 даёт дрейф razor-таймкода ~3.6 с на часе.
+ * Порядок источников: seq.timebase (тики на кадр, 254016000000 тиков/сек) →
+ * seq.getSettings().videoFrameRate.seconds (длительность кадра) → fallback 25.
+ */
+$._EXT_PRM_._sequenceFps = function (seq) {
+  try {
+    var tb = parseFloat(seq.timebase);
+    if (tb > 0) return 254016000000 / tb;
+  } catch (eT) {}
+  try {
+    var st = seq.getSettings();
+    if (st && st.videoFrameRate) {
+      var frSec = st.videoFrameRate.seconds;
+      if (typeof frSec === 'number' && frSec > 0) return 1 / frSec;
+    }
+  } catch (eS) {}
+  return 25;
+};
+
+/**
+ * Учёт неудачной razor/remove/trim-операции в stats
+ * (см. _applyOneTimelineInterval, applyTranscriptCuts, applyMulticamCuts).
+ * stats = { applied: Number, failed: Number, reasons: [String] }.
+ * reasons — уникальные сообщения, максимум 5, чтобы не раздувать ответ хоста.
+ */
+$._EXT_PRM_._statFail = function (stats, e) {
+  if (!stats) return;
+  stats.failed++;
+  var msg = String(e && e.message ? e.message : e);
+  if (stats.reasons.length >= 5) return;
+  for (var ri = 0; ri < stats.reasons.length; ri++) {
+    if (stats.reasons[ri] === msg) return;
+  }
+  stats.reasons.push(msg);
+};
+
+/**
+ * Заблокирована ли дорожка. Канон API: Track.isLocked() — метод (как isMuted()).
+ * Pre-check через typeof ненадёжен в ExtendScript (может вернуть 'unknown'),
+ * поэтому optimistic try/catch: сначала вызов метода, затем property-вариант.
+ * Если API отсутствует (старые сборки) — считаем НЕ заблокированной (не блокируем работу).
+ */
+$._EXT_PRM_._trackIsLocked = function (track) {
+  if (!track) return false;
+  try { return track.isLocked() === true; } catch (eL0) {}
+  try { return track.isLocked === true; } catch (eL1) {}
+  return false;
+};
+
+/**
+ * Список заблокированных дорожек активной секвенции.
+ * videoIdxList: массив индексов видеодорожек (0-based) — проверяем только их
+ *   (для applyMulticamCuts, который аудио не трогает);
+ * null/undefined → проверяем ВСЕ видео- и аудиодорожки.
+ * Возвращает массив человекочитаемых меток: ['V1', 'A2', ...].
+ */
+$._EXT_PRM_._findLockedTracks = function (seq, videoIdxList) {
+  var locked = [];
+  var vi, ai, idx;
+  if (videoIdxList) {
+    for (vi = 0; vi < videoIdxList.length; vi++) {
+      idx = videoIdxList[vi];
+      if (typeof idx !== 'number' || idx < 0 || idx >= seq.videoTracks.numTracks) continue;
+      if ($._EXT_PRM_._trackIsLocked(seq.videoTracks[idx])) locked.push('V' + (idx + 1));
+    }
+    return locked;
+  }
+  for (vi = 0; vi < seq.videoTracks.numTracks; vi++) {
+    if ($._EXT_PRM_._trackIsLocked(seq.videoTracks[vi])) locked.push('V' + (vi + 1));
+  }
+  for (ai = 0; ai < seq.audioTracks.numTracks; ai++) {
+    if ($._EXT_PRM_._trackIsLocked(seq.audioTracks[ai])) locked.push('A' + (ai + 1));
+  }
+  return locked;
+};
+
+/**
  * Конвертация секунд в таймкод HH:MM:SS;FF для QE DOM razor().
+ * fps может быть дробным (NTSC 29.97 / 59.94) — индекс кадра считаем по ТОЧНОМУ
+ * fps, а строку собираем как SMPTE drop-frame (стандартный алгоритм Heidelberger:
+ * первые dropFrames номеров кадров каждой минуты пропускаются, кроме каждой 10-й).
+ * Для целых fps (24/25/30/50/60) поведение идентично прежнему (non-drop).
+ * 23.976 — по стандарту non-drop: общая ветка с номиналом 24.
  */
 $._EXT_PRM_._secToTimecode = function (sec, fps) {
-  if (!fps || fps <= 0) fps = 24;
-  var totalFrames = Math.round(sec * fps);
-  var ff = totalFrames % fps;
-  var ss = Math.floor(totalFrames / fps) % 60;
-  var mm = Math.floor(totalFrames / (fps * 60)) % 60;
-  var hh = Math.floor(totalFrames / (fps * 3600));
+  if (!fps || fps <= 0) fps = 25;
   function pad(n) { return n < 10 ? '0' + n : '' + n; }
+  /* Индекс кадра — по точному (возможно дробному) fps. Главное исправление:
+     раньше fps округлялся до целого и на 29.97 razor дрейфовал. */
+  var totalFrames = Math.round(sec * fps);
+  if (totalFrames < 0) totalFrames = 0;
+  var nominal = Math.round(fps);
+  if (nominal < 1) nominal = 1;
+  var isFractional = Math.abs(fps - nominal) > 0.001;
+  if (isFractional && (nominal === 30 || nominal === 60)) {
+    /* SMPTE drop-frame: переводим реальный индекс кадра в "номинальный"
+       номер кадра с учётом пропусков. */
+    var dropFrames = Math.round(fps * 0.066666);     /* 2 для 29.97, 4 для 59.94 */
+    var framesPer10Min = Math.round(fps * 600);      /* 17982 / 35964 */
+    var framesPerMinute = nominal * 60 - dropFrames; /* 1798 / 3596 */
+    var d10 = Math.floor(totalFrames / framesPer10Min);
+    var m10 = totalFrames % framesPer10Min;
+    if (m10 > dropFrames) {
+      totalFrames += dropFrames * 9 * d10 +
+        dropFrames * Math.floor((m10 - dropFrames) / framesPerMinute);
+    } else {
+      totalFrames += dropFrames * 9 * d10;
+    }
+  }
+  var ff = totalFrames % nominal;
+  var ss = Math.floor(totalFrames / nominal) % 60;
+  var mm = Math.floor(totalFrames / (nominal * 60)) % 60;
+  var hh = Math.floor(totalFrames / (nominal * 3600));
   return pad(hh) + ':' + pad(mm) + ':' + pad(ss) + ';' + pad(ff);
 };
 
@@ -301,17 +405,16 @@ $._EXT_PRM_._secToTimecode = function (sec, fps) {
  * Если QE DOM недоступен — fallback на trim outPoint/inPoint (lift только для полного удаления клипа в интервале).
  * Никогда не используем insertClip (он создаёт дубликаты).
  */
-$._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
+$._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple, stats) {
   var doRipple = ripple !== false;
   var ripFlag = doRipple ? 1 : 0;
   var eps = $._EXT_PRM_._EPS;
+  /* stats: счётчик применённых/неудачных razor/remove/trim (см. _statFail).
+     Если вызывающий не передал — локальный объект, чтобы код ниже не ветвился. */
+  if (!stats) stats = { applied: 0, failed: 0, reasons: [] };
 
-  /* --- Определяем FPS для таймкода QE --- */
-  var fps = 24;
-  try {
-    var tb = parseFloat(seq.timebase);
-    if (tb > 0) fps = Math.round(254016000000 / tb);
-  } catch (eF) {}
+  /* --- Определяем FPS для таймкода QE (точный float — NTSC-safe) --- */
+  var fps = $._EXT_PRM_._sequenceFps(seq);
 
   /* --- Пробуем QE DOM razor (как AutoPod) --- */
   var qeAvailable = false;
@@ -340,54 +443,55 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
     for (vi = 0; vi < numV; vi++) {
       try {
         var vt = qeSeq.getVideoTrackAt(vi);
-        try { vt.razor(tc0, true, true); $._EXT_PRM_._bump(); } catch (eVR0) {}
-        try { vt.razor(tc1, true, true); $._EXT_PRM_._bump(); } catch (eVR1) {}
-      } catch (eVR) {}
+        try { vt.razor(tc0, true, true); $._EXT_PRM_._bump(); stats.applied++; } catch (eVR0) { $._EXT_PRM_._statFail(stats, eVR0); }
+        try { vt.razor(tc1, true, true); $._EXT_PRM_._bump(); stats.applied++; } catch (eVR1) { $._EXT_PRM_._statFail(stats, eVR1); }
+      } catch (eVR) { $._EXT_PRM_._statFail(stats, eVR); }
     }
     for (ai = 0; ai < numA; ai++) {
       try {
         var at = qeSeq.getAudioTrackAt(ai);
-        try { at.razor(tc0, true, true); $._EXT_PRM_._bump(); } catch (eAR0) {}
-        try { at.razor(tc1, true, true); $._EXT_PRM_._bump(); } catch (eAR1) {}
-      } catch (eAR) {}
+        try { at.razor(tc0, true, true); $._EXT_PRM_._bump(); stats.applied++; } catch (eAR0) { $._EXT_PRM_._statFail(stats, eAR0); }
+        try { at.razor(tc1, true, true); $._EXT_PRM_._bump(); stats.applied++; } catch (eAR1) { $._EXT_PRM_._statFail(stats, eAR1); }
+      } catch (eAR) { $._EXT_PRM_._statFail(stats, eAR); }
     }
 
-    /* Теперь находим и удаляем все клипы, которые попадают в [t0,t1] */
-    /* Итерируем в обратном порядке чтобы индексы не сбивались при удалении */
+    /* Теперь находим и удаляем все клипы, попавшие целиком в [t0,t1].
+     *
+     * Оптимизация (вместо реверс-скана ВСЕХ клипов дорожки): клипы на дорожке
+     * упорядочены по времени, поэтому собираем кандидатов одним прямым проходом
+     * с ранним выходом при start >= t1 (дальше только более поздние клипы),
+     * затем удаляем собранное справа налево — ripple-сдвиг от удаления не
+     * затрагивает клипы ЛЕВЕЕ удаляемого, ссылки остаются валидными.
+     *
+     * Полный кэш клипов МЕЖДУ интервалами невозможен: razor пересоздаёт
+     * коллекцию clips (split рождает новые TrackItem'ы), поэтому скан
+     * выполняется заново на каждый интервал, но ограничен окном [0..t1]. */
     var removed = 0;
-    for (vi = 0; vi < seq.videoTracks.numTracks; vi++) {
-      var vTrack = seq.videoTracks[vi];
-      for (var j = vTrack.clips.numItems - 1; j >= 0; j--) {
+    function purgeTrack(curTrack) {
+      var doomed = [];
+      var jj, cnd, cs2, ce2;
+      for (jj = 0; jj < curTrack.clips.numItems; jj++) {
         try {
-          var c = vTrack.clips[j];
-          if (!c) continue;
-          var cs = c.start.seconds;
-          var ce = c.end.seconds;
+          cnd = curTrack.clips[jj];
+          if (!cnd) continue;
+          cs2 = cnd.start.seconds;
+          if (cs2 >= t1 + eps) break; /* дорожка упорядочена — дальше только позже */
+          ce2 = cnd.end.seconds;
           /* Клип целиком внутри [t0, t1] (с допуском eps) */
-          if (cs >= t0 - eps && ce <= t1 + eps) {
-            c.remove(ripFlag, 1);
-            $._EXT_PRM_._bump();
-            removed++;
-          }
-        } catch (eVC) {}
+          if (cs2 >= t0 - eps && ce2 <= t1 + eps) doomed.push(cnd);
+        } catch (eScan) {}
       }
-    }
-    for (ai = 0; ai < seq.audioTracks.numTracks; ai++) {
-      var aTrack = seq.audioTracks[ai];
-      for (var k = aTrack.clips.numItems - 1; k >= 0; k--) {
+      for (jj = doomed.length - 1; jj >= 0; jj--) {
         try {
-          var ac = aTrack.clips[k];
-          if (!ac) continue;
-          var as2 = ac.start.seconds;
-          var ae = ac.end.seconds;
-          if (as2 >= t0 - eps && ae <= t1 + eps) {
-            ac.remove(ripFlag, 1);
-            $._EXT_PRM_._bump();
-            removed++;
-          }
-        } catch (eAC) {}
+          doomed[jj].remove(ripFlag, 1);
+          $._EXT_PRM_._bump();
+          removed++;
+          stats.applied++;
+        } catch (eRem) { $._EXT_PRM_._statFail(stats, eRem); }
       }
     }
+    for (vi = 0; vi < seq.videoTracks.numTracks; vi++) purgeTrack(seq.videoTracks[vi]);
+    for (ai = 0; ai < seq.audioTracks.numTracks; ai++) purgeTrack(seq.audioTracks[ai]);
     log.push({ op: doRipple ? 'qe_razor_delete' : 'qe_razor_lift', t0: t0, t1: t1, removed: removed, ripple: doRipple });
     return;
   }
@@ -420,7 +524,7 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
 
     /* Case 1: клип целиком внутри [t0,t1] → удалить (ripple или lift) */
     if (i0 <= s + eps && i1 >= e - eps) {
-      try { clip.remove(ripFlag, 1); $._EXT_PRM_._bump(); } catch (eR) {}
+      try { clip.remove(ripFlag, 1); $._EXT_PRM_._bump(); stats.applied++; } catch (eR) { $._EXT_PRM_._statFail(stats, eR); }
       log.push({ op: doRipple ? 'remove_clip_ripple' : 'remove_clip_lift', nodeId: String(clip.nodeId) });
       continue;
     }
@@ -429,6 +533,7 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
     if (i0 <= s + eps && i1 < e - eps) {
       clip.inPoint.seconds = srcIn + (i1 - s); $._EXT_PRM_._bump();
       if (Math.abs(clip.start.seconds - i1) > eps) { clip.start.seconds = i1; $._EXT_PRM_._bump(); }
+      stats.applied++;
       log.push({ op: 'trim_prefix', nodeId: String(clip.nodeId), newStartSec: i1 });
       continue;
     }
@@ -437,6 +542,7 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
     if (i0 > s + eps && i1 >= e - eps) {
       clip.outPoint.seconds = srcIn + (i0 - s); $._EXT_PRM_._bump();
       if (Math.abs(clip.end.seconds - i0) > eps) { clip.end.seconds = i0; $._EXT_PRM_._bump(); }
+      stats.applied++;
       log.push({ op: 'trim_suffix', nodeId: String(clip.nodeId), newEndSec: i0 });
       continue;
     }
@@ -445,6 +551,7 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple) {
     if (i0 > s + eps && i1 < e - eps) {
       clip.outPoint.seconds = srcIn + (i0 - s); $._EXT_PRM_._bump();
       if (Math.abs(clip.end.seconds - i0) > eps) { clip.end.seconds = i0; $._EXT_PRM_._bump(); }
+      stats.applied++;
       log.push({ op: 'trim_suffix_no_split', nodeId: String(clip.nodeId), newEndSec: i0,
         warn: 'QE DOM недоступен — правая часть клипа после ' + i1.toFixed(2) + ' с потеряна. Включите QE DOM.' });
       continue;
@@ -935,12 +1042,40 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
     }
     var seq = app.project.activeSequence;
     var plan = JSON.parse(jsonPlan);
+
+    /* Preflight: если план содержит интервальные операции (razor+remove на ВСЕХ
+       дорожках) — заранее проверяем locked-дорожки. Razor/remove на заблокированной
+       дорожке молча не сработает → ripple рассинхронизирует дорожки между собой.
+       Точечные операции (set_playhead, mute_track и т.п.) не блокируем. */
+    var opsPre = plan.operations || [];
+    var hasRangeOps = false;
+    for (var pi = 0; pi < opsPre.length; pi++) {
+      var aPre = opsPre[pi] ? (opsPre[pi].action || opsPre[pi].kind || opsPre[pi].type) : null;
+      if (aPre === 'ripple_delete_range' || aPre === 'ripple_delete_range_all_tracks' ||
+          aPre === 'lift_delete_range' || aPre === 'lift_delete_range_all_tracks') {
+        hasRangeOps = true;
+        break;
+      }
+    }
+    if (hasRangeOps) {
+      var lockedTE = $._EXT_PRM_._findLockedTracks(seq, null);
+      if (lockedTE.length) {
+        return JSON.stringify({
+          ok: false,
+          error: 'Заблокированы дорожки: ' + lockedTE.join(', ') + ' — разблокируйте и повторите',
+          lockedTracks: lockedTE
+        });
+      }
+    }
+
     if (typeof app.beginUndoGroup === 'function') {
       app.beginUndoGroup('ИИ: таймкоды');
       undoOpened = true;
     }
     $._EXT_PRM_._resetOps();
     var ops = plan.operations || [];
+    /* Сводный счётчик razor/remove/trim по всем интервальным операциям плана. */
+    var rangeStats = { applied: 0, failed: 0, reasons: [] };
     var results = [];
     var i,
       op,
@@ -963,7 +1098,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           continue;
         }
         var lgR = [];
-        $._EXT_PRM_._applyOneTimelineInterval(seq, op.startSec, op.endSec, lgR, true);
+        $._EXT_PRM_._applyOneTimelineInterval(seq, op.startSec, op.endSec, lgR, true, rangeStats);
         results.push({ op: a, ok: true, log: lgR });
         continue;
       }
@@ -978,7 +1113,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           continue;
         }
         var lgL = [];
-        $._EXT_PRM_._applyOneTimelineInterval(seq, op.startSec, op.endSec, lgL, false);
+        $._EXT_PRM_._applyOneTimelineInterval(seq, op.startSec, op.endSec, lgL, false, rangeStats);
         results.push({ op: a, ok: true, log: lgL });
         continue;
       }
@@ -1392,7 +1527,29 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
       results.push({ op: a || '?', ok: false, error: 'Неизвестное действие' });
     }
 
-    return JSON.stringify({ ok: true, results: results, undoSteps: $._EXT_PRM_._opCounter, hostVersion: $._EXT_PRM_.version });
+    /* Если БЫЛИ интервальные операции и НИ ОДИН razor/remove не прошёл —
+       таймлайн фактически не изменился, честно отвечаем ok:false. */
+    if (hasRangeOps && rangeStats.failed > 0 && rangeStats.applied === 0) {
+      return JSON.stringify({
+        ok: false,
+        error: 'ни одна операция не применилась — проверьте, не заблокированы ли дорожки',
+        results: results,
+        appliedCount: 0,
+        failedCount: rangeStats.failed,
+        failedReasons: rangeStats.reasons,
+        undoSteps: $._EXT_PRM_._opCounter,
+        hostVersion: $._EXT_PRM_.version
+      });
+    }
+    return JSON.stringify({
+      ok: true,
+      results: results,
+      appliedCount: rangeStats.applied,
+      failedCount: rangeStats.failed,
+      failedReasons: rangeStats.reasons,
+      undoSteps: $._EXT_PRM_._opCounter,
+      hostVersion: $._EXT_PRM_.version
+    });
   } catch (e) {
     return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e), undoSteps: $._EXT_PRM_._opCounter });
   } finally {
@@ -1412,6 +1569,18 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
     }
     var seq = app.project.activeSequence;
     var cuts = JSON.parse(jsonCuts);
+
+    /* Preflight: заблокированные дорожки. Razor/remove на locked-дорожке молча
+       не сработает → рассинхрон видео/аудио. Не трогаем таймлайн вообще. */
+    var lockedTC = $._EXT_PRM_._findLockedTracks(seq, null);
+    if (lockedTC.length) {
+      return JSON.stringify({
+        ok: false,
+        error: 'Заблокированы дорожки: ' + lockedTC.join(', ') + ' — разблокируйте и повторите',
+        lockedTracks: lockedTC
+      });
+    }
+
     if (typeof app.beginUndoGroup === 'function') {
       app.beginUndoGroup('ИИ: монтаж по тексту');
       undoOpened = true;
@@ -1422,6 +1591,8 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       return y.startSec - x.startSec;
     });
     var allLog = [];
+    /* Сводный счётчик razor/remove/trim по всем интервалам (см. _statFail). */
+    var stats = { applied: 0, failed: 0, reasons: [] };
     var k,
       iv,
       lg;
@@ -1430,12 +1601,30 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') continue;
       if (iv.endSec <= iv.startSec) continue;
       lg = [];
-      $._EXT_PRM_._applyOneTimelineInterval(seq, iv.startSec, iv.endSec, lg, true);
+      $._EXT_PRM_._applyOneTimelineInterval(seq, iv.startSec, iv.endSec, lg, true, stats);
       allLog.push({ interval: iv, log: lg });
+    }
+    /* Все операции провалились (например, дорожки заблокировали после preflight,
+       или QE отказал) — честный ok:false вместо тихого «успеха». */
+    if (stats.failed > 0 && stats.applied === 0) {
+      return JSON.stringify({
+        ok: false,
+        error: 'ни одна операция не применилась — проверьте, не заблокированы ли дорожки',
+        appliedIntervals: sorted.length,
+        appliedCount: 0,
+        failedCount: stats.failed,
+        failedReasons: stats.reasons,
+        details: allLog,
+        undoSteps: $._EXT_PRM_._opCounter,
+        hostVersion: $._EXT_PRM_.version
+      });
     }
     return JSON.stringify({
       ok: true,
       appliedIntervals: sorted.length,
+      appliedCount: stats.applied,
+      failedCount: stats.failed,
+      failedReasons: stats.reasons,
       details: allLog,
       undoSteps: $._EXT_PRM_._opCounter,
       hostVersion: $._EXT_PRM_.version
@@ -1663,9 +1852,18 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
     var anyDrift = false;
     var anySpanRequested = false;
     var anySpanApplied = false;
+    /* Агрегация дрейфа: максимальный (мс) и число маркеров с дрейфом > 100 мс.
+       Раньше per-marker drift вычислялся и терялся — UI не видел проблему. */
+    var maxDriftSec = 0;
+    var driftWarnings = 0;
     var createdSeconds = [];
     for (var cd = 0; cd < created.length; cd++) {
-      if (created[cd].driftSec !== null && created[cd].driftSec > 1.0) anyDrift = true;
+      var dsc = created[cd].driftSec;
+      if (dsc !== null && dsc !== undefined && !isNaN(dsc)) {
+        if (dsc > maxDriftSec) maxDriftSec = dsc;
+        if (dsc > 0.1) driftWarnings++;
+        if (dsc > 1.0) anyDrift = true;
+      }
       if (created[cd].spanRequested) anySpanRequested = true;
       if (created[cd].spanApplied) anySpanApplied = true;
       var ks = created[cd].verifiedSec !== null && created[cd].verifiedSec !== undefined
@@ -1682,6 +1880,8 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
       failedCount: failed.length,
       undoSteps: $._EXT_PRM_._opCounter,
       undoMode: 'markers',
+      maxDriftMs: Math.round(maxDriftSec * 1000),
+      driftWarnings: driftWarnings,
       driftWarning: anyDrift ? 'Некоторые маркеры сместились более чем на 1 с от запрошенной позиции — проверьте визуально' : null,
       spanNotSupported: spanNotSupported,
       spanNotice: spanNotSupported
@@ -2284,12 +2484,20 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     }
   }
 
-  /* FPS для QE razor таймкода. */
-  var fps = 24;
-  try {
-    var tb = parseFloat(seq.timebase);
-    if (tb > 0) fps = Math.round(254016000000 / tb);
-  } catch (eF) {}
+  /* Preflight: заблокированные управляемые дорожки. Razor на locked-дорожке
+     молча не сработает → план «порежется» частично и сегменты разъедутся. */
+  var lockedMC = $._EXT_PRM_._findLockedTracks(seq, managedTracks);
+  if (lockedMC.length) {
+    if (undoOpened) try { app.endUndoGroup(); } catch (eEUL) {}
+    return JSON.stringify({
+      ok: false,
+      error: 'Заблокированы дорожки: ' + lockedMC.join(', ') + ' — разблокируйте и повторите',
+      lockedTracks: lockedMC
+    });
+  }
+
+  /* FPS для QE razor таймкода — точный float (NTSC-safe, см. _sequenceFps). */
+  var fps = $._EXT_PRM_._sequenceFps(seq);
 
   /* QE razor доступен? */
   var qeAvailable = false;
@@ -2317,6 +2525,8 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
   var segmentsApplied = 0;
   var disabledCount = 0;
   var deletedCount = 0;
+  /* Счётчик неудачных razor/remove — раньше ошибки глотались молча. */
+  var mcStats = { applied: 0, failed: 0, reasons: [] };
   try {
     /* Шаг 1: razor на ВСЕХ внутренних границах сегментов. */
     var cutTimes = [];
@@ -2342,9 +2552,9 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
         try {
           var qVT = qeSeq.getVideoTrackAt(trackIdx);
           if (qVT) {
-            try { qVT.razor(tc, true, true); $._EXT_PRM_._bump(); cutsApplied++; } catch (eRZ) {}
+            try { qVT.razor(tc, true, true); $._EXT_PRM_._bump(); cutsApplied++; } catch (eRZ) { $._EXT_PRM_._statFail(mcStats, eRZ); }
           }
-        } catch (eGT) {}
+        } catch (eGT) { $._EXT_PRM_._statFail(mcStats, eGT); }
       }
     }
 
@@ -2379,11 +2589,11 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
               } else {
                 /* Неактивная — disable или удалить. */
                 if (mode === 'delete') {
-                  try { clip.remove(0, 0); $._EXT_PRM_._bump(); deletedCount++; } catch (eRm) {}
+                  try { clip.remove(0, 0); $._EXT_PRM_._bump(); deletedCount++; } catch (eRm) { $._EXT_PRM_._statFail(mcStats, eRm); }
                 } else {
                   try {
                     if (!clip.disabled) { clip.disabled = true; $._EXT_PRM_._bump(); disabledCount++; }
-                  } catch (eDi) {}
+                  } catch (eDi) { $._EXT_PRM_._statFail(mcStats, eDi); }
                 }
               }
             }
@@ -2397,14 +2607,29 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     if (undoOpened) try { app.endUndoGroup(); } catch (eEU2) {}
   }
 
+  /* Razor хотел резать, но НИ ОДИН cut не прошёл — план не применился. */
+  if (mcStats.failed > 0 && cutsApplied === 0 && deletedCount === 0 && disabledCount === 0) {
+    return JSON.stringify({
+      ok: false,
+      error: 'ни одна операция MultiCam не применилась: ' + (mcStats.reasons[0] || 'причина неизвестна'),
+      cutsApplied: 0,
+      cutsFailed: mcStats.failed,
+      failedReasons: mcStats.reasons,
+      fpsUsed: fps,
+      undoSteps: $._EXT_PRM_._opCounter
+    });
+  }
   return JSON.stringify({
     ok: true,
     cutsApplied: cutsApplied,
+    cutsFailed: mcStats.failed,
+    failedReasons: mcStats.reasons,
     segmentsApplied: segmentsApplied,
     disabledCount: disabledCount,
     deletedCount: deletedCount,
     mode: mode,
     managedTracks: managedTracks,
+    fpsUsed: fps,
     undoSteps: $._EXT_PRM_._opCounter
   });
 };

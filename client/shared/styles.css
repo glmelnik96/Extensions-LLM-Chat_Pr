@@ -364,6 +364,44 @@ button.hint-chip:hover {
   color: var(--text);
   border-color: var(--muted);
 }
+/* ── Markdown-lite внутри пузырей ассистента (UI-волна, 10 июня 2026) ── */
+.bubble.assistant .bubble-body {
+  white-space: normal; /* перевод строк обрабатывает MarkdownLite, не pre-wrap */
+}
+.md-line { min-height: 1.2em; }
+.md-gap { height: 8px; }
+.md-h { font-weight: 600; margin: 6px 0 2px; }
+.md-h1 { font-size: 14px; }
+.md-h2 { font-size: 13px; }
+.md-h3 { font-size: 12px; }
+.md-ul { margin: 2px 0 4px; padding-left: 18px; }
+.md-ul li { margin-bottom: 2px; }
+.md-code {
+  font-family: Consolas, Menlo, monospace;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+.md-pre {
+  font-family: Consolas, Menlo, monospace;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 6px 8px;
+  border-radius: 4px;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 4px 0;
+}
+/* Живой пузырь стриминга — мигающий маркер «печатает» */
+.bubble.streaming .role::after {
+  content: '▍';
+  animation: stream-blink 1s steps(2) infinite;
+  color: var(--accent, #4a9eff);
+}
+@keyframes stream-blink {
+  to { opacity: 0; }
+}
 .composer {
   padding: 10px;
   border-top: 1px solid var(--border);

@@ -1034,3 +1034,84 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     assert.match(res.error, /rmsExtractor/);
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * snapIntervalsToFrame (аудит 2026-06-09: кадровая точность резов)
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('DeterministicPipelines.snapIntervalsToFrame', () => {
+  it('start — вниз, end — вверх к границе кадра (25 fps)', () => {
+    const out = DP.snapIntervalsToFrame([{ startSec: 1.03, endSec: 2.01 }], 25);
+    assert.equal(out.length, 1);
+    assert.ok(Math.abs(out[0].startSec - 1.0) < 1e-9, 'start 1.03 → 1.00');
+    assert.ok(Math.abs(out[0].endSec - 2.04) < 1e-9, 'end 2.01 → 2.04');
+  });
+
+  it('значения уже на границе кадра не меняются', () => {
+    const out = DP.snapIntervalsToFrame([{ startSec: 1.0, endSec: 2.0 }], 25);
+    assert.ok(Math.abs(out[0].startSec - 1.0) < 1e-9);
+    assert.ok(Math.abs(out[0].endSec - 2.0) < 1e-9);
+  });
+
+  it('float-погрешность не сдвигает на лишний кадр (EPS-защита)', () => {
+    /* 0.04*3 = 0.12000000000000001 — без EPS ceil дал бы лишний кадр */
+    const out = DP.snapIntervalsToFrame([{ startSec: 0.04 * 3, endSec: 0.04 * 10 }], 25);
+    assert.ok(Math.abs(out[0].startSec - 0.12) < 1e-9);
+    assert.ok(Math.abs(out[0].endSec - 0.4) < 1e-9);
+  });
+
+  it('дробный fps (29.97 NTSC)', () => {
+    const fps = 29.97;
+    const out = DP.snapIntervalsToFrame([{ startSec: 1.5, endSec: 3.2 }], fps);
+    const sFrames = out[0].startSec * fps;
+    const eFrames = out[0].endSec * fps;
+    assert.ok(Math.abs(sFrames - Math.round(sFrames)) < 1e-6, 'start кратен кадру');
+    assert.ok(Math.abs(eFrames - Math.round(eFrames)) < 1e-6, 'end кратен кадру');
+    assert.ok(out[0].startSec <= 1.5 && out[0].endSec >= 3.2, 'интервал только расширяется');
+  });
+
+  it('микро-интервал расширяется до полного кадра (floor/ceil)', () => {
+    const out = DP.snapIntervalsToFrame([{ startSec: 1.001, endSec: 1.002 }], 25);
+    assert.equal(out.length, 1);
+    assert.ok(Math.abs(out[0].startSec - 1.0) < 1e-9);
+    assert.ok(Math.abs(out[0].endSec - 1.04) < 1e-9);
+  });
+
+  it('нулевой интервал отбрасывается', () => {
+    const out = DP.snapIntervalsToFrame([{ startSec: 1.0, endSec: 1.0 }], 25);
+    assert.equal(out.length, 0);
+  });
+
+  it('прочие свойства интервала сохраняются', () => {
+    const out = DP.snapIntervalsToFrame([{ startSec: 1.03, endSec: 2.01, reason: 'тишина', label: 'silence' }], 25);
+    assert.equal(out[0].reason, 'тишина');
+    assert.equal(out[0].label, 'silence');
+  });
+
+  it('start не уходит ниже нуля', () => {
+    const out = DP.snapIntervalsToFrame([{ startSec: -0.01, endSec: 0.5 }], 25);
+    assert.equal(out[0].startSec, 0);
+  });
+
+  it('невалидный fps → исходные интервалы без изменений', () => {
+    const src = [{ startSec: 1.03, endSec: 2.01 }];
+    [0, NaN, undefined].forEach((bad) => {
+      const out = DP.snapIntervalsToFrame(src, bad);
+      assert.equal(out.length, 1);
+      assert.equal(out[0].startSec, 1.03);
+      assert.equal(out[0].endSec, 2.01);
+    });
+  });
+
+  it('не мутирует исходный массив', () => {
+    const src = [{ startSec: 1.03, endSec: 2.01 }];
+    DP.snapIntervalsToFrame(src, 25);
+    assert.equal(src[0].startSec, 1.03);
+    assert.equal(src[0].endSec, 2.01);
+  });
+
+  it('мусорные элементы пропускаются, non-array → []', () => {
+    assert.equal(DP.snapIntervalsToFrame([null, { startSec: 'x', endSec: 2 }, { startSec: 1, endSec: 2 }], 25).length, 1);
+    assert.equal(DP.snapIntervalsToFrame(null, 25).length, 0);
+  });
+});

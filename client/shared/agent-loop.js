@@ -223,8 +223,13 @@
         onChunk: (function () {
           var lastChunkTs = 0;
           var THROTTLE_MS = 150;
+          /* UI-волна (10 июня 2026): накапливаем ПОЛНЫЙ текст до throttle —
+             раньше дельты между эмитами просто терялись, и собрать связный
+             текст на стороне UI было невозможно. */
+          var acc = '';
           return function (delta) {
             if (delta.content) {
+              acc += delta.content;
               var now = Date.now();
               if (now - lastChunkTs < THROTTLE_MS) return;
               lastChunkTs = now;
@@ -233,7 +238,8 @@
                 step: step,
                 maxSteps: maxSteps,
                 message: 'Шаг ' + step + '/' + maxSteps + ' · получаю ответ…',
-                chunk: delta.content
+                chunk: delta.content,
+                accumulated: acc
               });
             }
           };

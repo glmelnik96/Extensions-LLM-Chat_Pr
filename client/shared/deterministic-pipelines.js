@@ -823,6 +823,42 @@
     return result;
   }
 
+  /**
+   * Снэппинг интервалов к границам кадров (аудит 2026-06-09, HIGH quality).
+   *
+   * Проблема: интервалы идут float-секундами, округление к кадру происходит
+   * только в _secToTimecode на хосте → дрейф 1-3 кадра, накапливается на ripple.
+   *
+   * Правило: startSec — ВНИЗ (floor), endSec — ВВЕРХ (ceil) к границе кадра:
+   * вырез никогда не оставляет частичный кадр мусора по краям. После снэппинга
+   * фильтруем схлопнувшиеся интервалы (< 1 кадра).
+   *
+   * fps может быть дробным (29.97 NTSC). Прочие свойства интервалов сохраняются.
+   * Возвращает НОВЫЙ массив; при невалидном fps — исходные интервалы как есть.
+   */
+  function snapIntervalsToFrame(intervals, fps) {
+    if (!Array.isArray(intervals)) return [];
+    if (typeof fps !== 'number' || !isFinite(fps) || fps <= 0) return intervals.slice();
+    var frameDur = 1 / fps;
+    var EPS = 1e-6;
+    var out = [];
+    for (var i = 0; i < intervals.length; i++) {
+      var iv = intervals[i];
+      if (!iv || typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') continue;
+      var snapped = {};
+      for (var k in iv) {
+        if (Object.prototype.hasOwnProperty.call(iv, k)) snapped[k] = iv[k];
+      }
+      snapped.startSec = Math.floor(iv.startSec * fps + EPS) / fps;
+      snapped.endSec = Math.ceil(iv.endSec * fps - EPS) / fps;
+      if (snapped.startSec < 0) snapped.startSec = 0;
+      /* Схлопнувшийся интервал (< 1 кадра) — пропускаем */
+      if (snapped.endSec - snapped.startSec < frameDur - EPS) continue;
+      out.push(snapped);
+    }
+    return out;
+  }
+
   function _mergeIntervals(intervals) {
     if (!intervals.length) return intervals;
     intervals.sort(function (a, b) { return a.startSec - b.startSec; });
@@ -1147,6 +1183,7 @@
     multicamFromAudio: multicamFromAudio,
     detectSilenceIntervals: detectSilenceIntervals,
     parsePipelineCommand: parsePipelineCommand,
+    snapIntervalsToFrame: snapIntervalsToFrame,
     _mergeIntervals: _mergeIntervals,
     _silencesFromSegmentGaps: _silencesFromSegmentGaps,
     _buildSimpleParagraphs: _buildSimpleParagraphs

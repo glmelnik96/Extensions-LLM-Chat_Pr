@@ -44,6 +44,7 @@
   }
 
   var CLOUD_CONCURRENCY = 20; /* Cloud.ru поддерживает до 20 параллельных запросов */
+  var FFMPEG_CONCURRENCY = 4; /* Локальные ffmpeg-процессы: нарезка чанков и аудиоанализ */
 
   function normalizeWhisperExport(data, timelineOffsetSec) {
     var off = typeof timelineOffsetSec === 'number' && !isNaN(timelineOffsetSec) ? timelineOffsetSec : 0;
@@ -223,13 +224,20 @@
   }
 
   /**
-   * Нарезать [srcStartSec .. srcStartSec+totalSpanSec] исходника на короткие WAV-чанки
-   * через ffmpeg (16 kHz mono PCM, ~1.92 МБ за 60 с) — минует 413 без .epr-пресета.
+   * Нарезать [srcStartSec .. srcStartSec+totalSpanSec] исходника на короткие аудио-чанки
+   * через ffmpeg — минует 413 без .epr-пресета.
+   *
+   * format: 'mp3' (libmp3lame 64k mono 16kHz, ~0.5 МБ/мин — быстрее upload) или
+   *         'wav' (16 kHz mono PCM, ~1.92 МБ/мин). При недоступном libmp3lame —
+   *         прозрачный fallback на WAV.
+   *
+   * Аудит 2026-06-09: нарезка распараллелена (FFMPEG_CONCURRENCY процессов вместо
+   * последовательной рекурсии) — на 1 ч видео экономит минуты до первого upload.
    *
    * Возвращает [{path, durationSec, offsetInSpanSec}], где offsetInSpanSec — смещение
    * от начала запрошенного диапазона (для перевода в координаты таймлайна).
    */
-  function extractAudioChunksWithFfmpeg(inputPath, srcStartSec, totalSpanSec, chunkSec, progress) {
+  function extractAudioChunksWithFfmpeg(inputPath, srcStartSec, totalSpanSec, chunkSec, progress, format) {
     if (typeof require === 'undefined') {
       return Promise.reject(new Error('Node.js недоступен для ffmpeg'));
     }
@@ -249,43 +257,52 @@
     var step = Math.max(15, chunkSec || 90);
     var totalChunks = Math.max(1, Math.ceil(totalSpanSec / step));
 
-    var chunks = [];
-    var idx = 0;
-    function nextChunk() {
-      if (idx >= totalChunks) return Promise.resolve(chunks);
-      var offset = idx * step;
-      var dur = Math.min(step, totalSpanSec - offset);
-      if (dur <= 0.05) return Promise.resolve(chunks);
-      var outPath = path.join(os.tmpdir(), '_llm_chunk_' + base + '_' + stamp + '_' + idx + '.wav');
-      if (progress) progress('Извлечение аудио (ffmpeg) ' + (idx + 1) + '/' + totalChunks + '…');
-      var args = [
-        '-ss', String(srcStartSec + offset),
-        '-t', String(dur),
-        '-i', inputPath,
-        '-vn',
-        '-acodec', 'pcm_s16le',
-        '-ar', '16000',
-        '-ac', '1',
-        '-y',
-        outPath
-      ];
-      return new Promise(function (resolve, reject) {
-        execFile(ffmpegBin, args, { timeout: 300000 }, function (err) {
-          if (err) {
-            reject(new Error('ffmpeg error (chunk ' + idx + '): ' + String(err.message || err)));
-            return;
-          }
-          if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 1024) {
-            reject(new Error('ffmpeg создал пустой чанк ' + idx + ' (' + outPath + ')'));
-            return;
-          }
-          chunks.push({ path: outPath, durationSec: dur, offsetInSpanSec: offset });
-          idx++;
-          resolve(nextChunk());
-        });
+    function extractAll(fmt) {
+      var ext = fmt === 'mp3' ? 'mp3' : 'wav';
+      var codecArgs = fmt === 'mp3'
+        ? ['-acodec', 'libmp3lame', '-b:a', '64k']
+        : ['-acodec', 'pcm_s16le'];
+      var done = 0;
+      var tasks = [];
+      for (var i = 0; i < totalChunks; i++) {
+        (function (idx) {
+          var offset = idx * step;
+          var dur = Math.min(step, totalSpanSec - offset);
+          if (dur <= 0.05) return;
+          var outPath = path.join(os.tmpdir(), '_llm_chunk_' + base + '_' + stamp + '_' + idx + '.' + ext);
+          tasks.push(function () {
+            var args = ['-ss', String(srcStartSec + offset), '-t', String(dur), '-i', inputPath, '-vn']
+              .concat(codecArgs)
+              .concat(['-ar', '16000', '-ac', '1', '-y', outPath]);
+            return new Promise(function (resolve, reject) {
+              execFile(ffmpegBin, args, { timeout: 300000 }, function (err) {
+                if (err) {
+                  reject(new Error('ffmpeg error (chunk ' + idx + '): ' + String(err.message || err)));
+                  return;
+                }
+                if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 1024) {
+                  reject(new Error('ffmpeg создал пустой чанк ' + idx + ' (' + outPath + ')'));
+                  return;
+                }
+                done++;
+                if (progress) progress('Извлечение аудио (ffmpeg) ' + done + '/' + totalChunks + '…');
+                resolve({ path: outPath, durationSec: dur, offsetInSpanSec: offset });
+              });
+            });
+          });
+        })(i);
+      }
+      /* promisePool сохраняет порядок результатов = порядок чанков */
+      return promisePool(tasks, FFMPEG_CONCURRENCY);
+    }
+
+    if (format === 'mp3') {
+      return extractAll('mp3').catch(function (errMp3) {
+        if (progress) progress('MP3-кодек недоступен — fallback на WAV (' + String((errMp3 && errMp3.message) || errMp3).slice(0, 80) + ')');
+        return extractAll('wav');
       });
     }
-    return nextChunk();
+    return extractAll('wav');
   }
 
   function unlinkChunkList(list) {
@@ -360,6 +377,45 @@
     } catch (eP) {
       return { error: String(eP && eP.message || eP) };
     }
+  }
+
+  /**
+   * Аудиоанализ (silencedetect + loudnorm) списка чанков ПАРАЛЛЕЛЬНО
+   * (FFMPEG_CONCURRENCY процессов). Аудит 2026-06-09: раньше чанки
+   * анализировались последовательно — 40 × 5-8 с ≈ 4-6 мин на 1 ч видео.
+   *
+   * items: [{path, timelineOffsetSec}]. Ошибки отдельных чанков глотаются
+   * (как и раньше) — silences просто не добавляются.
+   * loudness/threshold берутся из первого (по порядку) успешного чанка.
+   */
+  async function analyzeChunksInParallel(items, progress) {
+    var list = (items || []).filter(function (c) { return c && c.path; });
+    var tasks = list.map(function (c) {
+      return function () {
+        return computeAudioPreprocess(c.path, c.timelineOffsetSec, null)
+          .catch(function () { return null; });
+      };
+    });
+    var results = await promisePool(tasks, FFMPEG_CONCURRENCY);
+    var allSil = [];
+    var firstLoud = null;
+    var firstThresh = null;
+    for (var i = 0; i < results.length; i++) {
+      var aa = results[i];
+      if (!aa || aa.error) continue;
+      if (Array.isArray(aa.silences)) allSil = allSil.concat(aa.silences);
+      if (!firstLoud && aa.loudness) firstLoud = aa.loudness;
+      if (firstThresh == null && aa.silenceThresholdUsed != null) firstThresh = aa.silenceThresholdUsed;
+    }
+    allSil.sort(function (a, b) { return a.startSec - b.startSec; });
+    if (progress) progress('Анализ аудио: ' + results.length + ' чанков готово');
+    return {
+      silences: allSil,
+      loudness: firstLoud,
+      silencesError: null,
+      loudnessError: null,
+      silenceThresholdUsed: firstThresh
+    };
   }
 
   /**
@@ -452,6 +508,10 @@
           : 24 * 1024 * 1024);
     if (progress) progress('Бэкенд транскрибации: ' + backend + (isLocal ? ' (локально, оффлайн)' : ' (Cloud.ru)'));
 
+    /* Формат ffmpeg-чанков: cloud → mp3 (меньше upload, см. fm-defaults
+       transcribeChunkFormat), whisper.cpp → всегда wav (whisper-cli ждёт PCM). */
+    var chunkFmt = isLocal ? 'wav' : (settings.transcribeChunkFormat === 'wav' ? 'wav' : 'mp3');
+
     function beforeAwait() {
       throwIfAborted(signal, abortCheck);
     }
@@ -512,33 +572,10 @@
          Раньше анализировался только первый чанк — тишины в остальных терялись. */
       var audioAnalysisChunks = null;
       try {
-        var allSilCh = [];
-        var firstLoudCh = null;
-        var firstThreshCh = null;
-        for (var ach = 0; ach < prep.chunks.length; ach++) {
-          var ch = prep.chunks[ach];
-          if (!ch || !ch.path) continue;
-          try {
-            var aaCh = await computeAudioPreprocess(ch.path, ch.timelineOffsetSec, progress);
-            if (aaCh && Array.isArray(aaCh.silences)) {
-              allSilCh = allSilCh.concat(aaCh.silences);
-            }
-            if (!firstLoudCh && aaCh && aaCh.loudness) {
-              firstLoudCh = aaCh.loudness;
-            }
-            if (firstThreshCh == null && aaCh && aaCh.silenceThresholdUsed != null) {
-              firstThreshCh = aaCh.silenceThresholdUsed;
-            }
-          } catch (eChA) {}
-        }
-        allSilCh.sort(function (a, b) { return a.startSec - b.startSec; });
-        audioAnalysisChunks = {
-          silences: allSilCh,
-          loudness: firstLoudCh,
-          silencesError: null,
-          loudnessError: null,
-          silenceThresholdUsed: firstThreshCh
-        };
+        audioAnalysisChunks = await analyzeChunksInParallel(
+          prep.chunks.map(function (c) { return { path: c && c.path, timelineOffsetSec: c && c.timelineOffsetSec }; }),
+          progress
+        );
       } catch (eAC) {}
       return {
         raw: { chunks: prep.chunks.length },
@@ -568,7 +605,7 @@
         /* Надёжный расчёт: для PCM 16kHz mono WAV ~32000 B/s; для MP3 ~16000 B/s */
         var estBytesPerSec = String(prep.path || '').match(/\.wav$/i) ? 32000 : 16000;
         spanSecW = Math.max(30, Math.ceil(szW / estBytesPerSec));
-        var ewChunks = await extractAudioChunksWithFfmpeg(prep.path, 0, spanSecW, chunkSecW, progress);
+        var ewChunks = await extractAudioChunksWithFfmpeg(prep.path, 0, spanSecW, chunkSecW, progress, chunkFmt);
         var combinedW = [];
         var textAccW = '';
         var wOff = typeof prep.timelineOffsetSec === 'number' ? prep.timelineOffsetSec : 0;
@@ -580,7 +617,7 @@
             return function () {
               return backendTranscribe(settings, {
                 path: wch.path,
-                fileName: 'export_chunk_' + wci + '.wav',
+                fileName: 'export_chunk_' + wci + '.' + (String(wch.path || '').replace(/^.*\./, '') || 'wav'),
                 signal: signal,
                 onProgress: function () {},
                 CloudRuClient: CC,
@@ -656,7 +693,7 @@
         if (needChunkQ) {
           /* Нарезаем нужный диапазон через ffmpeg на короткие WAV-чанки */
           beforeAwait();
-          var qChunks = await extractAudioChunksWithFfmpeg(pathQ, srcStartQ, spanQ, chunkSecCfgQ, progress);
+          var qChunks = await extractAudioChunksWithFfmpeg(pathQ, srcStartQ, spanQ, chunkSecCfgQ, progress, chunkFmt);
           /* Сохраняем чанки для аудиоанализа (НЕ удаляем пока!) */
           for (var qci2 = 0; qci2 < qChunks.length; qci2++) {
             allChunksForAnalysis.push({
@@ -671,7 +708,7 @@
             return function () {
               return backendTranscribe(settings, {
                 path: qch.path,
-                fileName: 'clip_' + qi + '_chunk_' + qci + '.wav',
+                fileName: 'clip_' + qi + '_chunk_' + qci + '.' + (String(qch.path || '').replace(/^.*\./, '') || 'wav'),
                 signal: signal,
                 onProgress: function () {},
                 CloudRuClient: CC,
@@ -726,38 +763,8 @@
        * а offset уже в координатах таймлайна. */
       var audioAnalysisCQ = null;
       try {
-        var allSilences = [];
-        var firstLoudness = null;
-        var firstThreshCQ = null;
         progress('Анализ аудио (silencedetect на ' + allChunksForAnalysis.length + ' чанков)…');
-        for (var aq = 0; aq < allChunksForAnalysis.length; aq++) {
-          var chunkForAA = allChunksForAnalysis[aq];
-          if (!chunkForAA || !chunkForAA.path) continue;
-          try {
-            var aaQ = await computeAudioPreprocess(
-              chunkForAA.path,
-              chunkForAA.timelineOffsetSec,
-              progress
-            );
-            if (aaQ && Array.isArray(aaQ.silences)) {
-              allSilences = allSilences.concat(aaQ.silences);
-            }
-            if (!firstLoudness && aaQ && aaQ.loudness) {
-              firstLoudness = aaQ.loudness;
-            }
-            if (firstThreshCQ == null && aaQ && aaQ.silenceThresholdUsed != null) {
-              firstThreshCQ = aaQ.silenceThresholdUsed;
-            }
-          } catch (eChunkAA) {}
-        }
-        allSilences.sort(function (a, b) { return a.startSec - b.startSec; });
-        audioAnalysisCQ = {
-          silences: allSilences,
-          loudness: firstLoudness,
-          silencesError: null,
-          loudnessError: null,
-          silenceThresholdUsed: firstThreshCQ
-        };
+        audioAnalysisCQ = await analyzeChunksInParallel(allChunksForAnalysis, progress);
       } catch (eACQ) {}
 
       /* Удаляем ВСЕ временные файлы (чанки) ПОСЛЕ аудиоанализа */
@@ -806,7 +813,7 @@
       if (needChunkM) {
         beforeAwait();
         progress('Извлечение аудио чанками через ffmpeg (минует 413)…');
-        var mChunks = await extractAudioChunksWithFfmpeg(prep.path, srcStartM, spanSecM, chunkSecCfgM, progress);
+        var mChunks = await extractAudioChunksWithFfmpeg(prep.path, srcStartM, spanSecM, chunkSecCfgM, progress, chunkFmt);
         var combinedM = [];
         var textAccM = '';
         try {
@@ -818,7 +825,7 @@
             return function () {
               return backendTranscribe(settings, {
                 path: mch.path,
-                fileName: 'mediafile_chunk_' + mci + '.wav',
+                fileName: 'mediafile_chunk_' + mci + '.' + (String(mch.path || '').replace(/^.*\./, '') || 'wav'),
                 signal: signal,
                 onProgress: function () {},
                 CloudRuClient: CC,
@@ -840,21 +847,10 @@
           /* Анализ всех ffmpeg-чанков — silences + loudness */
           var audioAnalysisM = null;
           try {
-            var allSilM = [];
-            var firstLoudM = null;
-            var firstThreshM = null;
-            for (var amci = 0; amci < mChunks.length; amci++) {
-              var mck = mChunks[amci];
-              if (!mck || !mck.path) continue;
-              try {
-                var aaMck = await computeAudioPreprocess(mck.path, prep.workInSec + (mck.offsetInSpanSec || 0), progress);
-                if (aaMck && Array.isArray(aaMck.silences)) allSilM = allSilM.concat(aaMck.silences);
-                if (!firstLoudM && aaMck && aaMck.loudness) firstLoudM = aaMck.loudness;
-                if (firstThreshM == null && aaMck && aaMck.silenceThresholdUsed != null) firstThreshM = aaMck.silenceThresholdUsed;
-              } catch (eMckA) {}
-            }
-            allSilM.sort(function (a, b) { return a.startSec - b.startSec; });
-            audioAnalysisM = { silences: allSilM, loudness: firstLoudM, silencesError: null, loudnessError: null, silenceThresholdUsed: firstThreshM };
+            audioAnalysisM = await analyzeChunksInParallel(
+              mChunks.map(function (c) { return { path: c && c.path, timelineOffsetSec: prep.workInSec + ((c && c.offsetInSpanSec) || 0) }; }),
+              progress
+            );
           } catch (eAMC) {}
           return {
             raw: { ffmpegChunks: mChunks.length },
@@ -888,7 +884,7 @@
           var chunkSecFB = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
             ? settings.transcribeExportChunkSec : 90;
           var spanFB = Math.max(30, Math.ceil(szM / 32000));
-          var fbChunks = await extractAudioChunksWithFfmpeg(ffmpegTmpM, 0, spanFB, chunkSecFB, progress);
+          var fbChunks = await extractAudioChunksWithFfmpeg(ffmpegTmpM, 0, spanFB, chunkSecFB, progress, chunkFmt);
           try {
             var fbDone = 0;
             progress('Транскрибация: отправляю ' + fbChunks.length + ' фрагментов параллельно…');
@@ -896,7 +892,7 @@
               return function () {
                 return backendTranscribe(settings, {
                   path: fbc.path,
-                  fileName: 'media_fb_' + fbi + '.wav',
+                  fileName: 'media_fb_' + fbi + '.' + (String(fbc.path || '').replace(/^.*\./, '') || 'wav'),
                   signal: signal,
                   onProgress: function () {},
                   CloudRuClient: CC,

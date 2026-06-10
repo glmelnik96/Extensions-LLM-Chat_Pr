@@ -193,10 +193,22 @@
     /**
      * Длина одного аудио-чанка (сек) при транскрибации.
      * Используется и для экспорта через .epr, и для авто-нарезки через ffmpeg
-     * (когда .epr не задан и In–Out длиннее ~1.5×chunk). При 16 kHz mono PCM
-     * 90 с ≈ 2.9 МБ — гарантированно < 20 МБ лимита API.
+     * (когда .epr не задан и In–Out длиннее ~1.5×chunk).
+     *
+     * Аудит 2026-06-09: 90 → 180. При CLOUD_CONCURRENCY=20 часовое видео
+     * (40×90с = 2 волны) превращается в 20×180с = 1 волну → ~2× быстрее.
+     * Размеры: 180 с WAV (16 kHz mono PCM) ≈ 5.8 МБ, MP3 64k ≈ 1.4 МБ —
+     * с запасом < 20 МБ лимита API.
      */
-    transcribeExportChunkSec: 90,
+    transcribeExportChunkSec: 180,
+
+    /**
+     * Формат ffmpeg-чанков для облачной транскрибации: 'mp3' | 'wav'.
+     * MP3 (libmp3lame 64k mono 16kHz) — в ~4 раза меньше WAV → быстрее upload.
+     * Точность Whisper-large-v3 на речи 64k mono не страдает (смоук-тест 2026-06-09).
+     * 'wav' — запасной вариант, если в сборке ffmpeg нет libmp3lame.
+     */
+    transcribeChunkFormat: 'mp3',
 
     /** Макс. размер одного загружаемого файла транскрипции (байт); сверка перед POST */
     maxTranscribeUploadBytes: 20971520,
@@ -258,8 +270,12 @@
      * С параллелизмом N=3 — все 3 chunks одновременно, время = max latency = ~100с.
      * Cross-chunk bridging при этом теряется (мы не знаем выход chunk N-1 при
      * запуске chunk N), но bridging на синтетических повторах и так не работал.
+     *
+     * Аудит 2026-06-09: 3 → 6. Cloud.ru стабильно держит 20 параллельных
+     * (CLOUD_CONCURRENCY в timeline-transcribe.js); 6 analyze-чанков — с запасом.
+     * Эффект: −40-100 с на анализе 1 ч видео.
      */
-    analyzeConcurrency: 3,
+    analyzeConcurrency: 6,
 
     /**
      * Максимум сообщений в истории чата панели, которые отправляются в FM при каждом запросе.
@@ -273,10 +289,16 @@
      */
     maxAgentSteps: 24,
 
-    /** Поля multipart для /v1/audio/transcriptions */
+    /**
+     * Поля multipart для /v1/audio/transcriptions.
+     * temperature 0.1 (было 0.5, аудит 2026-06-09): ASR — детерминированная
+     * задача; 0.5 давала случайные вариации границ слов и filler-детекта
+     * между прогонами. 0.1 (не 0.0) — сохраняем редкие RU-произносительные
+     * варианты без полного жадного декодинга.
+     */
     transcribeParams: {
       language: 'ru',
-      temperature: '0.5',
+      temperature: '0.1',
       response_format: 'verbose_json'
     }
   };
