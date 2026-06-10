@@ -2720,6 +2720,21 @@ PanelBoot.run('ИИ: монтаж', function () {
   var _analysisCache = {};
   var ANALYSIS_CACHE_TTL = 1800000; /* 30 мин */
 
+  /* UI-2 (10 июня 2026, аудит 4.4): двухуровневый кэш. LLM-метки от
+     aggressiveness НЕ зависят — кэшируем сырой результат analyzeForCutsWithLLM
+     отдельно (ключ БЕЗ aggressiveness), фильтрация _shouldRemoveLabel дешёвая
+     и выполняется на каждый запрос. Раньше normal→gentle = cache miss =
+     повторный 3-5-минутный LLM-анализ. */
+  var _labelsCache = {}; /* { [seqKey|tasksKey]: {raw, timestamp} } */
+  /* Дедупликация параллельных LLM-анализов: если фоновый прекомпьют уже идёт,
+     клик пользователя ждёт его promise, а не запускает второй анализ. */
+  var _analysisInFlight = {}; /* { [seqKey|tasksKey]: Promise<rawResult> } */
+
+  function labelsCacheKey(seqKey, tasks) {
+    var tk = tasks ? tasks.slice().sort().join(',') : '*';
+    return seqKey + '|' + tk;
+  }
+
   function analysisCacheKey(seqKey, tasks, aggressiveness) {
     var tk = tasks ? tasks.slice().sort().join(',') : '*';
     var ag = aggressiveness || 'normal';
@@ -2772,19 +2787,52 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     var tasks = Array.isArray(args.tasks) ? args.tasks : null;
     var forceRefresh = args.forceRefresh === true;
+    /* UI-2 (аудит 4.1): фоновый прекомпьют не трогает статус-бар пользователя */
+    var quiet = args._background === true;
     var aggressiveness = args.aggressiveness === 'gentle' || args.aggressiveness === 'aggressive'
       ? args.aggressiveness : 'normal';
 
     /* Проверяем кэш анализа */
     var cKey = analysisCacheKey(found.matchedKey, tasks, aggressiveness);
     if (!forceRefresh && _analysisCache[cKey] && (Date.now() - _analysisCache[cKey].timestamp < ANALYSIS_CACHE_TTL)) {
-      statusUi.show('Анализ из кэша (повторный запрос)', false);
-      setTimeout(function () { statusUi.hide(); }, 800);
+      if (!quiet) {
+        statusUi.show('Анализ из кэша (повторный запрос)', false);
+        setTimeout(function () { statusUi.hide(); }, 800);
+      }
       return Promise.resolve(_analysisCache[cKey].result);
     }
 
     var settings = ContextStore.getResolvedSettings ? ContextStore.getResolvedSettings() : {};
     var segments = e.segments;
+
+    /* UI-2: уровень 2 — сырые LLM-метки (без aggressiveness в ключе).
+       Смена слайдера gentle↔normal↔aggressive = мгновенный re-filter,
+       НЕ повторный LLM-анализ. */
+    var lKey = labelsCacheKey(found.matchedKey, tasks);
+    if (!forceRefresh && _labelsCache[lKey] && (Date.now() - _labelsCache[lKey].timestamp < ANALYSIS_CACHE_TTL)) {
+      if (!quiet) {
+        statusUi.show('Метки из кэша → фильтрация «' + aggressiveness + '» без повторного анализа', false);
+        setTimeout(function () { statusUi.hide(); }, 1200);
+      }
+      var refiltered = _buildAnalysisResponse(_labelsCache[lKey].raw, segments, aggressiveness, found.matchedKey, settings, quiet);
+      _analysisCache[cKey] = { result: refiltered, timestamp: Date.now() };
+      return Promise.resolve(refiltered);
+    }
+
+    /* Дедуп: анализ с этим же ключом уже идёт (например, фоновый прекомпьют) —
+       не запускаем второй LLM-проход, ждём общий promise сырых меток. */
+    if (!forceRefresh && _analysisInFlight[lKey]) {
+      if (!quiet) statusUi.show('Анализ уже идёт (фоновый прекомпьют) — подключаемся к нему…', true);
+      return _analysisInFlight[lKey].then(function (raw) {
+        var re = _buildAnalysisResponse(raw, segments, aggressiveness, found.matchedKey, settings, quiet);
+        _analysisCache[cKey] = { result: re, timestamp: Date.now() };
+        if (!quiet) {
+          statusUi.show('Анализ завершён: удалить ' + re.toRemove.length + ' из ' + raw.totalSegments + ' сегментов', false);
+          setTimeout(function () { statusUi.hide(); }, 2000);
+        }
+        return re;
+      });
+    }
 
     /* Подготавливаем сегменты для анализа */
     var segmentsForAnalysis = segments.map(function (s, i) {
@@ -2800,12 +2848,12 @@ PanelBoot.run('ИИ: монтаж', function () {
     var preLabels = null;
     if (e.preAnalysis && e.preAnalysis.labels && e.preAnalysis.labels.length) {
       preLabels = e.preAnalysis.labels;
-      statusUi.show('Используем ' + preLabels.length + ' pre-computed меток + LLM для остальных (' + segmentsForAnalysis.length + ' сегментов)…', true);
+      if (!quiet) statusUi.show('Используем ' + preLabels.length + ' pre-computed меток + LLM для остальных (' + segmentsForAnalysis.length + ' сегментов)…', true);
     } else {
-      statusUi.show('Запуск анализа транскрипта (' + segmentsForAnalysis.length + ' сегментов)…', true);
+      if (!quiet) statusUi.show('Запуск анализа транскрипта (' + segmentsForAnalysis.length + ' сегментов)…', true);
     }
 
-    return TranscriptStructure.analyzeForCutsWithLLM(
+    var rawPromise = TranscriptStructure.analyzeForCutsWithLLM(
       segmentsForAnalysis,
       {
         settings: settings,
@@ -2817,6 +2865,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         onProgress: function (ev) {
           /* MEDIUM #12 (6 мая 2026): прогресс-бар по чанкам анализа.
              chunkIndex/totalChunks → точный %, иначе indeterminate. */
+          if (quiet) return;
           statusUi.show(ev.message || 'Анализ…', true);
           if (ev && typeof ev.totalChunks === 'number' && ev.totalChunks > 0 &&
               typeof ev.chunkIndex === 'number') {
@@ -2832,11 +2881,43 @@ PanelBoot.run('ИИ: монтаж', function () {
         }
       }
     ).then(function (result) {
-      /* Формируем удобный ответ для агента — на уровне сегментов */
-      var toRemove = [];
-      var toKeep = [];
-      for (var ri = 0; ri < result.labels.length; ri++) {
-        var lb = result.labels[ri];
+      /* UI-2: сырые метки → кэш уровня 2 (re-filter слайдером без LLM) */
+      _labelsCache[lKey] = { raw: result, timestamp: Date.now() };
+      return result;
+    });
+
+    _analysisInFlight[lKey] = rawPromise;
+    rawPromise.then(
+      function () { delete _analysisInFlight[lKey]; },
+      function () { delete _analysisInFlight[lKey]; }
+    );
+
+    return rawPromise.then(function (result) {
+      var finalResult = _buildAnalysisResponse(result, segments, aggressiveness, found.matchedKey, settings, quiet);
+
+      /* Сохраняем в кэш уровня 1 (готовый ответ для конкретного aggressiveness) */
+      _analysisCache[cKey] = { result: finalResult, timestamp: Date.now() };
+
+      if (!quiet) {
+        statusUi.show('Анализ завершён: удалить ' + finalResult.toRemove.length + ' из ' + result.totalSegments + ' сегментов', false);
+        setTimeout(function () { statusUi.hide(); }, 2000);
+      }
+
+      return finalResult;
+    });
+  }
+
+  /**
+   * Пост-обработка сырого результата analyzeForCutsWithLLM → ответ для агента.
+   * Вынесено из execAnalyzeTranscriptForCuts (UI-2), чтобы повторная фильтрация
+   * по другому aggressiveness шла из _labelsCache без LLM-вызова.
+   */
+  function _buildAnalysisResponse(result, segments, aggressiveness, sequenceKey, settings, quiet) {
+    /* Формируем удобный ответ для агента — на уровне сегментов */
+    var toRemove = [];
+    var toKeep = [];
+    for (var ri = 0; ri < result.labels.length; ri++) {
+      var lb = result.labels[ri];
         var seg = segments[lb.i];
         if (!seg) continue;
         var startSec = typeof seg.startSec === 'number' ? seg.startSec : (seg.start || 0);
@@ -2893,7 +2974,7 @@ PanelBoot.run('ИИ: монтаж', function () {
          что для missedSegments получил content по умолчанию (не настоящую метку). */
       var failedChunks = Array.isArray(result.failedChunks) ? result.failedChunks : [];
       var missedSegments = typeof result.missedSegments === 'number' ? result.missedSegments : 0;
-      if (failedChunks.length > 0 && typeof statusUi !== 'undefined') {
+      if (failedChunks.length > 0 && !quiet && typeof statusUi !== 'undefined') {
         statusUi.show(
           '⚠ Анализ: ' + failedChunks.length + ' чанк(ов) не разобрано (~' + missedSegments +
           ' сегм. помечены как content по умолчанию). Предложение может быть неточным.',
@@ -2903,7 +2984,7 @@ PanelBoot.run('ИИ: монтаж', function () {
 
       var finalResult = {
         ok: true,
-        sequenceKey: found.matchedKey,
+        sequenceKey: sequenceKey,
         totalSegments: result.totalSegments,
         chunksUsed: result.chunks,
         analysisModel: settings.analysisModel || settings.activeAgentModel || settings.chatModel,
@@ -2923,14 +3004,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           : 'Анализ не нашёл сегментов для удаления. Транскрипт чистый.'
       };
 
-      /* Сохраняем в кэш */
-      _analysisCache[cKey] = { result: finalResult, timestamp: Date.now() };
-
-      statusUi.show('Анализ завершён: удалить ' + toRemove.length + ' из ' + result.totalSegments + ' сегментов', false);
-      setTimeout(function () { statusUi.hide(); }, 2000);
-
       return finalResult;
-    });
   }
 
   function _findClipInSnap(nodeId) {
@@ -4143,9 +4217,15 @@ PanelBoot.run('ИИ: монтаж', function () {
         },
         onProgress: function (msg) {
           statusUi.show(msg, true);
-          /* MEDIUM #12: indeterminate progress (transcribe не сообщает % готовности).
-             Хотя бы видна анимация — юзер не думает что зависло. */
-          statusUi.progress(null);
+          /* UI-2 (аудит 4.2): сообщения transcribe уже содержат «N/M»
+             («Транскрибация: 3/8 готово…», «Извлечение аудио 2/6…») —
+             парсим и показываем реальный %, а не вечный спиннер. */
+          var mNM = /(\d+)\s*\/\s*(\d+)/.exec(String(msg || ''));
+          if (mNM && Number(mNM[2]) > 0) {
+            statusUi.progress(Math.min(100, (Number(mNM[1]) / Number(mNM[2])) * 100));
+          } else {
+            statusUi.progress(null);
+          }
         },
         CloudRuClient: CloudRuClient
       });
@@ -4200,6 +4280,25 @@ PanelBoot.run('ИИ: монтаж', function () {
           statusUi.show('Локальный анализ: ' + localResult.labels.length + ' меток', false);
         }
       } catch (eLA) {}
+
+      /* UI-2 (аудит 4.1): фоновый прекомпьют полного LLM-анализа.
+         setTimeout — чтобы выйти из finally этой операции (runAbort уже null,
+         фоновый анализ не привязан к остановленному abort-контроллеру).
+         Дедуп через _analysisInFlight: клик «Убрать паразиты» во время
+         прекомпьюта подключится к нему, а не запустит второй анализ. */
+      try {
+        if (settings.backgroundPrecompute !== false && norm.segments && norm.segments.length) {
+          setTimeout(function () {
+            execAnalyzeTranscriptForCuts({ sequenceKey: key, _background: true }).then(function (r) {
+              if (r && r.ok && opQueue && !opQueue.isBusy()) {
+                statusUi.show('Фоновый анализ готов: ' + (r.removeIntervals ? r.removeIntervals.length : 0) +
+                  ' интервалов-кандидатов (кэш 30 мин, кнопки Tools ответят мгновенно)', false);
+                setTimeout(function () { statusUi.hide(); }, 4000);
+              }
+            }, function () { /* фоновый — молча */ });
+          }, 3000);
+        }
+      } catch (ePre) {}
 
       var again = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
       if (!again.entry) {
@@ -4462,6 +4561,34 @@ PanelBoot.run('ИИ: монтаж', function () {
     bindSlider('jmp-pause', 'jmp-pause-val', 'с');
     bindSlider('jmp-minseg', 'jmp-minseg-val', 'с');
     bindSlider('jcut-offset', 'jcut-offset-val', '');
+    bindSlider('mc-minhold', 'mc-minhold-val', 'с');
+    bindSlider('mc-maxhold', 'mc-maxhold-val', 'с');
+
+    /* MultiCam: «X dB», «-X dB», вариативность 0 = «выкл» */
+    (function () {
+      var s = document.getElementById('mc-margin');
+      var v = document.getElementById('mc-margin-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = s.value + ' dB'; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+    (function () {
+      var s = document.getElementById('mc-silence');
+      var v = document.getElementById('mc-silence-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = '-' + s.value + ' dB'; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+    (function () {
+      var s = document.getElementById('mc-jitter');
+      var v = document.getElementById('mc-jitter-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = s.value === '0' ? 'выкл' : s.value + 'с'; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
 
     /* jmp-breath: показываем миллисекунды для читаемости (0.05с → «50мс») */
     (function () {
@@ -4721,6 +4848,17 @@ PanelBoot.run('ИИ: монтаж', function () {
           break;
         case 'multicam':
           pipelineFn = DeterministicPipelines.multicamFromAudio;
+          /* UI-2 / Phase 2B: слайдеры параметров плана переключений */
+          var mcMinHoldEl = document.getElementById('mc-minhold');
+          if (mcMinHoldEl) params.minHoldSec = parseFloat(mcMinHoldEl.value);
+          var mcMaxHoldEl = document.getElementById('mc-maxhold');
+          if (mcMaxHoldEl) params.maxHoldSec = parseFloat(mcMaxHoldEl.value);
+          var mcMarginEl = document.getElementById('mc-margin');
+          if (mcMarginEl) params.bleedMarginDb = parseInt(mcMarginEl.value, 10);
+          var mcSilenceEl = document.getElementById('mc-silence');
+          if (mcSilenceEl) params.silenceThresholdDb = -parseInt(mcSilenceEl.value, 10);
+          var mcJitterEl = document.getElementById('mc-jitter');
+          if (mcJitterEl) params.variationsJitterSec = parseFloat(mcJitterEl.value);
           proposalId = 'proposal-multicam';
           break;
         default:

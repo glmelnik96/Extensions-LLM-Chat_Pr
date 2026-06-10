@@ -927,6 +927,36 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     assert.equal(res.proposal.plan.params.mode, 'disable');
   });
 
+  it('пробрасывает Phase 2B параметры: maxHoldSec → больше cutaway, variationsJitterSec → сдвиг границ', async () => {
+    // Один спикер говорит непрерывно 20с — без maxHold это был бы один длинный план.
+    const frameSec = 0.05;
+    const tlA = [], tlB = [];
+    for (let i = 1; i <= 400; i++) {
+      const t = +(i * frameSec).toFixed(3);
+      tlA.push({ t, rms: -10 });
+      tlB.push({ t, rms: -50 });
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [tlA, tlB] })
+    };
+    const base = await DP.multicamFromAudio(ctx, {});            // DEFAULTS: maxHoldSec=8
+    const capped = await DP.multicamFromAudio(ctx, { maxHoldSec: 3 });
+    assert.equal(base.ok, true);
+    assert.equal(capped.ok, true);
+    assert.ok(
+      capped.proposal.plan.segments.length > base.proposal.plan.segments.length,
+      'maxHoldSec=3 должен дать больше сегментов, чем дефолтные 8с'
+    );
+
+    // Jitter (seeded) сдвигает границы относительно прогона без jitter.
+    const j0 = await DP.multicamFromAudio(ctx, { maxHoldSec: 3, variationsJitterSec: 0 });
+    const j1 = await DP.multicamFromAudio(ctx, { maxHoldSec: 3, variationsJitterSec: 0.4, variationsSeed: 7 });
+    const bounds0 = j0.proposal.plan.segments.map(s => s.tStart).join(',');
+    const bounds1 = j1.proposal.plan.segments.map(s => s.tStart).join(',');
+    assert.notEqual(bounds0, bounds1, 'variationsJitterSec должен изменить границы сегментов');
+  });
+
   it('errors when fewer than 2 video tracks (need wide + ≥1 speaker)', async () => {
     const ctx = {
       snapshot: { ok: true, tracks: [{ type: 'video', index: 0 }, { type: 'audio', index: 0 }] },

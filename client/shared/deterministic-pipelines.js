@@ -1147,6 +1147,13 @@
       bleedMarginDb: typeof params.bleedMarginDb === 'number' ? params.bleedMarginDb : 6,
       silenceThresholdDb: typeof params.silenceThresholdDb === 'number' ? params.silenceThresholdDb : -35
     };
+    /* Phase 2B: опциональные параметры — отдаём только если заданы,
+       иначе buildSwitchPlan возьмёт свои DEFAULTS */
+    if (typeof params.maxHoldSec === 'number') planParams.maxHoldSec = params.maxHoldSec;
+    if (typeof params.maxAllSpeakersSec === 'number') planParams.maxAllSpeakersSec = params.maxAllSpeakersSec;
+    if (typeof params.variationsJitterSec === 'number') planParams.variationsJitterSec = params.variationsJitterSec;
+    if (typeof params.variationsSeed === 'number') planParams.variationsSeed = params.variationsSeed;
+    if (Array.isArray(params.speechOnsets)) planParams.speechOnsets = params.speechOnsets;
     var built = MulticamPlan.buildSwitchPlan(frames, mapping, planParams, params.silences || null);
     if (!built.segments || !built.segments.length) {
       return { ok: false, error: 'Не удалось построить план переключений.' };
