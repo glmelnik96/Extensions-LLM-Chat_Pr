@@ -1131,6 +1131,59 @@
   }
 
   /**
+   * Детект «плоских» дорожек: live-находка 11 июня 2026 — реальный микрофонный
+   * WAV с лимитером/шумом держал RMS в коридоре <1 дБ (p10–p99), всегда
+   * «побеждал» в детекте говорящего, и второй спикер не получал ни секунды.
+   * Дорожка без динамики бесполезна для свитчера — честно предупреждаем.
+   * Возвращает массив индексов дорожек со спредом p10–p90 < minSpreadDb.
+   */
+  function _detectFlatAudio(timelines, minSpreadDb) {
+    var minSpread = typeof minSpreadDb === 'number' ? minSpreadDb : 3.0;
+    var flat = [];
+    if (!timelines) return flat;
+    for (var i = 0; i < timelines.length; i++) {
+      var tl = timelines[i] || [];
+      var vals = [];
+      for (var k = 0; k < tl.length; k++) {
+        var v = tl[k] && tl[k].rms;
+        if (typeof v === 'number' && isFinite(v)) vals.push(v);
+      }
+      if (vals.length < 20) continue; /* слишком мало данных для вывода */
+      vals.sort(function (a, b) { return a - b; });
+      var p10 = vals[Math.floor(vals.length * 0.1)];
+      var p90 = vals[Math.floor(vals.length * 0.9)];
+      if (p90 - p10 < minSpread) flat.push(i);
+    }
+    return flat;
+  }
+
+  /**
+   * Перевод RMS-таймлайна из media-time в sequence-time по геометрии клипа.
+   * Live-находка 11 июня 2026: computeRmsTimeline анализирует ВЕСЬ файл с
+   * media t=0, а клип на таймлайне обычно подрезан (в реальном проекте
+   * inPoint был 658с у микрофонных WAV и 473с у камер) — без ремапа план
+   * переключений строится по чужому участку звука и выходит за конец
+   * секвенции. Кадры вне используемого окна клипа отбрасываются.
+   * clip: {startSec, endSec, inPointSec} из getTimelineSnapshot.
+   */
+  function remapRmsToSequenceTime(timeline, clip) {
+    if (!timeline || !timeline.length || !clip) return timeline || [];
+    var inPt = typeof clip.inPointSec === 'number' ? clip.inPointSec : 0;
+    var start = typeof clip.startSec === 'number' ? clip.startSec : 0;
+    var end = typeof clip.endSec === 'number' ? clip.endSec : Infinity;
+    var span = end - start;
+    var out = [];
+    for (var i = 0; i < timeline.length; i++) {
+      var f = timeline[i];
+      if (!f || typeof f.t !== 'number') continue;
+      var t = f.t - inPt;
+      if (t < 0 || t > span) continue;
+      out.push({ t: t + start, rms: f.rms });
+    }
+    return out;
+  }
+
+  /**
    * MultiCam Phase 2A: реальный детект говорящего через per-track RMS.
    * ctx.rmsExtractor(ctx, mapping, params) → Promise<{timelines:[[{t,rms}],...]}>
    *   по одному [{t,rms}] на mic-дорожку спикера, в порядке mapping.speakers.
@@ -1172,10 +1225,31 @@
     if (!timelines || !timelines.length) {
       return { ok: false, error: 'Не удалось извлечь аудио-RMS дорожек.' };
     }
+    var mediaPaths = extracted.mediaPaths || [];
+
+    /* Честная ошибка вместо вырожденного плана: пустой RMS-таймлайн значит,
+       что аудио не извлеклось (live-находка 11 июня 2026: ffmpeg молча отдаёт
+       0 кадров на BRAW — без этой проверки строился план «1 сегмент,
+       0 переключений» на весь таймлайн). */
+    var emptyTracks = [];
+    for (var eti = 0; eti < timelines.length; eti++) {
+      if (!timelines[eti] || !timelines[eti].length) {
+        emptyTracks.push(mediaPaths[eti]
+          ? String(mediaPaths[eti]).split(/[\\\/]/).pop()
+          : 'дорожка A' + (eti + 1));
+      }
+    }
+    if (emptyTracks.length) {
+      return {
+        ok: false,
+        error: 'Аудио-анализ не дал ни одного кадра RMS: ' + emptyTracks.join(', ') +
+          '. Формат может не поддерживаться ffmpeg (например BRAW). ' +
+          'Нужны дорожки с раздельными микрофонными записями (WAV/MP4).'
+      };
+    }
 
     /* B1-7: pre-flight варнинги — не блокируем, но честно предупреждаем */
     var warnings = [];
-    var mediaPaths = extracted.mediaPaths || [];
     for (var dpi = 0; dpi < mediaPaths.length; dpi++) {
       for (var dpj = dpi + 1; dpj < mediaPaths.length; dpj++) {
         if (mediaPaths[dpi] && mediaPaths[dpi] === mediaPaths[dpj]) {
@@ -1188,6 +1262,14 @@
       for (var shp = 0; shp < sharedPairs.length; shp++) {
         warnings.push('Дорожки A' + (sharedPairs[shp][0] + 1) + ' и A' + (sharedPairs[shp][1] + 1) + ' звучат почти идентично (общий звук/микс?). Свитчер по голосу будет ненадёжен.');
       }
+    }
+    var flatTracks = _detectFlatAudio(timelines, 3.0);
+    for (var flt = 0; flt < flatTracks.length; flt++) {
+      var fSpeaker = speakers[flatTracks[flt]];
+      warnings.push('Микрофон спикера ' + (flatTracks[flt] + 1) +
+        (fSpeaker ? ' (A' + (fSpeaker.audioTrack + 1) + ')' : '') +
+        ' почти без динамики (разброс RMS < 3 дБ — лимитер или шум?). ' +
+        'Детект говорящего по нему ненадёжен: спикер может всегда «побеждать» или никогда не включаться.');
     }
 
     var frameSec = typeof params.frameSec === 'number' ? params.frameSec : 0.05;
@@ -1245,11 +1327,13 @@
     jCuts: jCuts,
     multicamFromTranscript: multicamFromTranscript,
     multicamFromAudio: multicamFromAudio,
+    remapRmsToSequenceTime: remapRmsToSequenceTime,
     detectSilenceIntervals: detectSilenceIntervals,
     parsePipelineCommand: parsePipelineCommand,
     snapIntervalsToFrame: snapIntervalsToFrame,
     _mergeIntervals: _mergeIntervals,
     _detectSharedAudio: _detectSharedAudio,
+    _detectFlatAudio: _detectFlatAudio,
     _silencesFromSegmentGaps: _silencesFromSegmentGaps,
     _buildSimpleParagraphs: _buildSimpleParagraphs
   };

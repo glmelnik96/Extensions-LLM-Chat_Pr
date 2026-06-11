@@ -1521,9 +1521,22 @@ PanelBoot.run('ИИ: монтаж', function () {
       var labelA = document.createElement('div');
       labelA.style.cssText = 'font-size:10px;color:#888;margin-top:4px;';
       var s = simulation.summary || {};
+      /* Live-находка 11 июня 2026: s.durationAfterSec — это СУММА длительностей
+         клипов по всем дорожкам (на 8-дорожечной секвенции карточка показывала
+         «было 9:58 → станет 57:14»). Для «станет» считаем длину таймлайна —
+         max endSec включённых клипов, в тех же единицах, что и «было». */
+      var beforeEndSec = snapshot.sequenceEndSec || 0;
+      snapshot.clips.forEach(function (c) {
+        if (c.endSec > beforeEndSec) beforeEndSec = c.endSec;
+      });
+      var afterEndSec = 0;
+      simulation.clips.forEach(function (c) {
+        if (!c.disabled && c.endSec > afterEndSec) afterEndSec = c.endSec;
+      });
+      var deltaTimeline = Math.round((afterEndSec - beforeEndSec) * 100) / 100;
       labelA.textContent =
-        'станет — ' + s.clipsAfter + ' клип(ов), ' + fmtSec(s.durationAfterSec) +
-        ' (Δ ' + (s.deltaSec >= 0 ? '+' : '') + s.deltaSec + 'с) · ' +
+        'станет — ' + s.clipsAfter + ' клип(ов), ' + fmtSec(afterEndSec) +
+        ' (Δ ' + (deltaTimeline >= 0 ? '+' : '') + deltaTimeline + 'с) · ' +
         'remove ' + s.removedCount + ' · trim ' + s.trimmedCount + ' · move ' + s.movedCount;
       card.appendChild(labelA);
       card.appendChild(renderTimelineStrip(afterClips, { totalSec: totalSec }));
@@ -2419,7 +2432,18 @@ PanelBoot.run('ИИ: монтаж', function () {
       lines.push('• Осталось по плану: ' + fmtSec(v.totalKeepSec));
     }
     lines.push('• Кэш транскрипта пересчитан под новый таймлайн');
-    lines.push('• Откат: Cmd+Z / Ctrl+Z в таймлайне Premiere');
+    /* Live-находка 11 июня 2026: если B2-9 checkpoint создал бэкап-секвенцию,
+       советуем кнопку отката, а не только Cmd+Z (надёжнее на ripple-cuts). */
+    var undoMode = null;
+    try {
+      var lu = ContextStore.getLastUndo && ContextStore.getLastUndo(TRANSCRIPT_PID);
+      undoMode = lu && lu.mode;
+    } catch (eU) {}
+    if (undoMode === 'sequence_backup') {
+      lines.push('• Откат: кнопка «⏪ Откатить» (бэкап-секвенция) или Cmd+Z / Ctrl+Z');
+    } else {
+      lines.push('• Откат: Cmd+Z / Ctrl+Z в таймлайне Premiere');
+    }
     var hw = describeHostWarnings(data);
     return lines.join('\n') + hw;
   }
@@ -5250,6 +5274,10 @@ PanelBoot.run('ИИ: монтаж', function () {
                 throw new Error('Аудиодорожка ' + (aIdx + 1) + ': нет файла на диске (нужен один синхронизированный клип на дорожку).');
               }
               var tl = await AudioPreprocess.computeRmsTimeline(mediaPath, { windowSec: windowSec });
+              /* media-time → sequence-time: клип на таймлайне подрезан (inPoint),
+                 а RMS считается по всему файлу — без ремапа план уезжает
+                 на величину inPoint и выходит за конец секвенции. */
+              tl = DeterministicPipelines.remapRmsToSequenceTime(tl, clip);
               timelines.push(tl);
               mediaPaths.push(mediaPath);
             }

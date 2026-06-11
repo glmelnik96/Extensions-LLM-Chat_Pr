@@ -967,6 +967,91 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     assert.match(res.error, /2 видеодорожк/);
   });
 
+  it('_detectFlatAudio: ловит дорожку без динамики, не трогает живую речь', () => {
+    const flat = [], speech = [];
+    for (let i = 0; i < 200; i++) {
+      flat.push({ t: i * 0.05, rms: -27.5 + (i % 3) * 0.2 });          // спред ~0.4 дБ
+      speech.push({ t: i * 0.05, rms: i % 10 < 5 ? -15 : -45 });       // спред 30 дБ
+    }
+    const norm = (v) => JSON.parse(JSON.stringify(v));
+    assert.deepEqual(norm(DP._detectFlatAudio([speech, flat], 3.0)), [1]);
+    assert.deepEqual(norm(DP._detectFlatAudio([speech, speech], 3.0)), []);
+    // < 20 кадров — недостаточно данных, не флагуем
+    assert.deepEqual(norm(DP._detectFlatAudio([flat.slice(0, 10)], 3.0)), []);
+  });
+
+  it('multicamFromAudio: варнинг про плоский микрофон (live-находка: лимитер всегда «побеждает»)', async () => {
+    const fs = 0.05;
+    const speech = [], flat = [];
+    for (let i = 1; i <= 200; i++) {
+      const t = +(i * fs).toFixed(3);
+      speech.push({ t, rms: i % 10 < 5 ? -15 : -45 });
+      flat.push({ t, rms: -27.5 });
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [speech, flat] })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.ok(
+      res.proposal.warnings.some((w) => w.includes('без динамики')),
+      'ожидали варнинг про плоскую дорожку: ' + JSON.stringify(res.proposal.warnings)
+    );
+    assert.ok(
+      res.proposal.warnings.some((w) => w.includes('спикера 2') && w.includes('(A2)')),
+      'варнинг должен называть спикера и дорожку: ' + JSON.stringify(res.proposal.warnings)
+    );
+  });
+
+  it('remapRmsToSequenceTime: сдвигает media-time на inPoint и отбрасывает кадры вне окна клипа', () => {
+    // Файл 0–100с, клип на таймлайне 10–40с использует media 50–80с (inPoint=50).
+    const tl = [];
+    for (let i = 0; i <= 1000; i++) tl.push({ t: +(i * 0.1).toFixed(3), rms: -20 - (i % 5) });
+    const norm = (v) => JSON.parse(JSON.stringify(v));
+    const out = norm(DP.remapRmsToSequenceTime(tl, { startSec: 10, endSec: 40, inPointSec: 50 }));
+    assert.ok(out.length > 0);
+    assert.ok(out[0].t >= 10 - 1e-6, 'первый кадр не раньше startSec: ' + out[0].t);
+    assert.ok(out[out.length - 1].t <= 40 + 1e-6, 'последний кадр не позже endSec: ' + out[out.length - 1].t);
+    // media t=50 (rms по формуле -20 - (500 % 5) = -20) → sequence t=10
+    assert.equal(out[0].t, 10);
+    assert.equal(out[0].rms, -20);
+    // Кадров ровно на окно 30с при шаге 0.1 (301 точка включая границы)
+    assert.equal(out.length, 301);
+  });
+
+  it('remapRmsToSequenceTime: inPoint за пределами файла → пусто (поймает честная ошибка пустого RMS)', () => {
+    const tl = [{ t: 0, rms: -20 }, { t: 0.1, rms: -21 }];
+    const out = DP.remapRmsToSequenceTime(tl, { startSec: 0, endSec: 10, inPointSec: 500 });
+    assert.equal(out.length, 0);
+  });
+
+  it('честная ошибка при пустых RMS-таймлайнах (live-находка: ffmpeg молча отдаёт 0 кадров на BRAW)', async () => {
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({
+        timelines: [[], []],
+        mediaPaths: ['D:/footage/A048_04142200_C019.braw', 'D:/footage/1096_04060212_C001.braw']
+      })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, false, 'пустой RMS не должен давать вырожденный план «1 сегмент, 0 переключений»');
+    assert.ok(res.error.includes('A048_04142200_C019.braw'), 'ошибка должна называть файл: ' + res.error);
+    assert.ok(res.error.includes('BRAW'), 'ошибка должна подсказывать про формат: ' + res.error);
+  });
+
+  it('честная ошибка: пустая дорожка без mediaPath называется по номеру', async () => {
+    const okTl = [];
+    for (let i = 1; i <= 80; i++) okTl.push({ t: +(i * 0.05).toFixed(3), rms: -10 });
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [okTl, []] })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, false);
+    assert.ok(res.error.includes('дорожка A2'), 'ожидали «дорожка A2» в: ' + res.error);
+  });
+
   function snapNvMa(nV, nA) {
     const tracks = [];
     for (let i = 0; i < nV; i++) tracks.push({ type: 'video', index: i });
