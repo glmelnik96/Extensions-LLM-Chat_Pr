@@ -1148,6 +1148,93 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     assert.equal(res.ok, false);
     assert.match(res.error, /rmsExtractor/);
   });
+
+  /* ── Кастомный маппинг дорожек (AutoPod-паттерн, live-запрос 12 июня 2026) ── */
+
+  it('_normalizeMulticamMapping: валидный маппинг нормализуется, лейблы дозаполняются', () => {
+    const r = DP._normalizeMulticamMapping(
+      { wideVideoTrack: 0, speakers: [{ audioTrack: 3, videoTrack: 1 }, { audioTrack: 4, videoTrack: 2, label: 'Ведущий' }] },
+      3, 5, 4
+    );
+    assert.equal(r.ok, true);
+    assert.equal(r.mapping.wideVideoTrack, 0);
+    assert.deepEqual(Array.from(r.mapping.speakers.map(s => s.audioTrack)), [3, 4]);
+    assert.deepEqual(Array.from(r.mapping.speakers.map(s => s.videoTrack)), [1, 2]);
+    assert.equal(r.mapping.speakers[0].label, 'Гость 1');
+    assert.equal(r.mapping.speakers[1].label, 'Ведущий');
+  });
+
+  it('_normalizeMulticamMapping: внятные ошибки на каждый класс невалидности', () => {
+    const cases = [
+      [{ wideVideoTrack: 6, speakers: [{ audioTrack: 0, videoTrack: 1 }] }, /Общий план/],
+      [{ wideVideoTrack: 0, speakers: [] }, /ни один спикер/],
+      [{ wideVideoTrack: 0, speakers: [{ audioTrack: 9, videoTrack: 1 }] }, /аудиодорожки с индексом 9/],
+      [{ wideVideoTrack: 0, speakers: [{ audioTrack: 0, videoTrack: 0 }] }, /занята общим планом/],
+      [{ wideVideoTrack: 0, speakers: [{ audioTrack: 0, videoTrack: 1 }, { audioTrack: 1, videoTrack: 1 }] }, /одну видеодорожку V2/],
+      [{ wideVideoTrack: 0, speakers: [{ audioTrack: 0, videoTrack: 1 }, { audioTrack: 0, videoTrack: 2 }] }, /одну аудиодорожку A1/],
+      [{ wideVideoTrack: 0, speakers: [1, 2, 3, 4, 5].map(i => ({ audioTrack: i - 1, videoTrack: i })) }, /Максимум спикеров/]
+    ];
+    for (const [raw, re] of cases) {
+      const r = DP._normalizeMulticamMapping(raw, 6, 5, 4);
+      assert.equal(r.ok, false, 'ожидали ошибку для ' + JSON.stringify(raw));
+      assert.match(r.error, re);
+    }
+  });
+
+  it('multicamFromAudio: params.mapping переопределяет авто-схему — экстрактор и план видят кастомные дорожки', async () => {
+    // 3V+5A: микрофоны на A4/A5 (индексы 3/4), как в реальном проекте с BRAW-звуком на A1–A3.
+    let seenMapping = null;
+    const ctx = {
+      snapshot: snapNvMa(3, 5),
+      rmsExtractor: (c, mapping) => {
+        seenMapping = JSON.parse(JSON.stringify(mapping));
+        return Promise.resolve({ timelines: fakeTimelines(2, 4, 1) });
+      }
+    };
+    const res = await DP.multicamFromAudio(ctx, {
+      mapping: { wideVideoTrack: 0, speakers: [{ audioTrack: 3, videoTrack: 1 }, { audioTrack: 4, videoTrack: 2 }] }
+    });
+    assert.equal(res.ok, true);
+    assert.deepEqual(seenMapping.speakers.map(s => s.audioTrack), [3, 4],
+      'rmsExtractor должен получить кастомные аудиодорожки');
+    assert.deepEqual(Array.from(res.proposal.plan.mapping.speakers.map(s => s.audioTrack)), [3, 4]);
+    // Голос у спикера 2 (A5 → V3): план должен включать V3.
+    assert.ok(res.proposal.plan.segments.some(s => s.activeVideoTrack === 2));
+    assert.ok(res.proposal.summary.includes('Спикеров: 2'));
+  });
+
+  it('multicamFromAudio: невалидный params.mapping → честная ошибка до анализа аудио', async () => {
+    let extractorCalled = false;
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => { extractorCalled = true; return Promise.resolve({ timelines: [] }); }
+    };
+    const res = await DP.multicamFromAudio(ctx, {
+      mapping: { wideVideoTrack: 0, speakers: [{ audioTrack: 7, videoTrack: 1 }] }
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.error, /аудиодорожки с индексом 7/);
+    assert.equal(extractorCalled, false, 'до анализа аудио дело дойти не должно');
+  });
+
+  it('multicamFromAudio: варнинги называют РЕАЛЬНЫЕ номера дорожек при кастомном маппинге', async () => {
+    // Спикеры на A4/A5 слушают один файл — варнинг должен сказать «A4 и A5», а не «A1 и A2».
+    const ctx = {
+      snapshot: snapNvMa(3, 5),
+      rmsExtractor: () => Promise.resolve({
+        timelines: fakeTimelines(2, 4, 0),
+        mediaPaths: ['D:/audio/mix.wav', 'D:/audio/mix.wav']
+      })
+    };
+    const res = await DP.multicamFromAudio(ctx, {
+      mapping: { wideVideoTrack: 0, speakers: [{ audioTrack: 3, videoTrack: 1 }, { audioTrack: 4, videoTrack: 2 }] }
+    });
+    assert.equal(res.ok, true);
+    assert.ok(
+      res.proposal.warnings.some(w => w.includes('A4 и A5')),
+      'ожидали реальные номера дорожек: ' + JSON.stringify(res.proposal.warnings)
+    );
+  });
 });
 
 /* ═══════════════════════════════════════════════════════════════

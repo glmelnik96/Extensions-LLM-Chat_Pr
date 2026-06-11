@@ -1184,9 +1184,66 @@
   }
 
   /**
+   * Кастомный маппинг дорожек по спикерам (AutoPod-паттерн «теги дорожек»,
+   * live-запрос 12 июня 2026): авто-схема «V1 wide, A(i)→V(i+1)» ломается,
+   * когда микрофоны не на первых аудиодорожках (камерный звук BRAW) или
+   * аудио не засинхронено с порядком видео — свитчер включает молчащего
+   * спикера. raw: {wideVideoTrack, speakers:[{audioTrack, videoTrack, label?}]},
+   * индексы 0-based. Возвращает {ok, mapping} либо {ok:false, error}.
+   */
+  function _normalizeMulticamMapping(raw, vCount, aCount, maxSpeakers) {
+    function isIdx(v, max) { return typeof v === 'number' && isFinite(v) && v % 1 === 0 && v >= 0 && v < max; }
+    if (!raw || typeof raw !== 'object') {
+      return { ok: false, error: 'Маппинг дорожек не задан.' };
+    }
+    var wide = raw.wideVideoTrack;
+    if (!isIdx(wide, vCount)) {
+      return { ok: false, error: 'Общий план: нет видеодорожки с индексом ' + String(wide) + ' (видеодорожек: ' + vCount + ').' };
+    }
+    var src = raw.speakers;
+    if (!src || !src.length) {
+      return { ok: false, error: 'Не выбран ни один спикер.' };
+    }
+    if (src.length > maxSpeakers) {
+      return { ok: false, error: 'Максимум спикеров: ' + maxSpeakers + ', выбрано ' + src.length + '.' };
+    }
+    var speakers = [];
+    var usedV = {};
+    var usedA = {};
+    for (var i = 0; i < src.length; i++) {
+      var sp = src[i] || {};
+      if (!isIdx(sp.audioTrack, aCount)) {
+        return { ok: false, error: 'Спикер ' + (i + 1) + ': нет аудиодорожки с индексом ' + String(sp.audioTrack) + ' (аудиодорожек: ' + aCount + ').' };
+      }
+      if (!isIdx(sp.videoTrack, vCount)) {
+        return { ok: false, error: 'Спикер ' + (i + 1) + ': нет видеодорожки с индексом ' + String(sp.videoTrack) + ' (видеодорожек: ' + vCount + ').' };
+      }
+      if (sp.videoTrack === wide) {
+        return { ok: false, error: 'Спикер ' + (i + 1) + ': видеодорожка V' + (sp.videoTrack + 1) + ' уже занята общим планом.' };
+      }
+      if (typeof usedV[sp.videoTrack] === 'number') {
+        return { ok: false, error: 'Спикеры ' + (usedV[sp.videoTrack] + 1) + ' и ' + (i + 1) + ' назначены на одну видеодорожку V' + (sp.videoTrack + 1) + '.' };
+      }
+      if (typeof usedA[sp.audioTrack] === 'number') {
+        return { ok: false, error: 'Спикеры ' + (usedA[sp.audioTrack] + 1) + ' и ' + (i + 1) + ' слушают одну аудиодорожку A' + (sp.audioTrack + 1) + ' — детект по голосу их не различит.' };
+      }
+      usedV[sp.videoTrack] = i;
+      usedA[sp.audioTrack] = i;
+      speakers.push({
+        audioTrack: sp.audioTrack,
+        videoTrack: sp.videoTrack,
+        label: sp.label || ('Гость ' + (i + 1))
+      });
+    }
+    return { ok: true, mapping: { wideVideoTrack: wide, speakers: speakers } };
+  }
+
+  /**
    * MultiCam Phase 2A: реальный детект говорящего через per-track RMS.
    * ctx.rmsExtractor(ctx, mapping, params) → Promise<{timelines:[[{t,rms}],...]}>
    *   по одному [{t,rms}] на mic-дорожку спикера, в порядке mapping.speakers.
+   * params.mapping — опциональный кастомный выбор дорожек (см.
+   * _normalizeMulticamMapping); без него — авто-схема «V1 wide, A(i)→V(i+1)».
    * Чистый план строит MulticamPlan.buildSwitchPlan (тот же контракт, что и Phase 1).
    */
   async function multicamFromAudio(ctx, params) {
@@ -1208,12 +1265,22 @@
       return { ok: false, error: 'Нет источника аудио (rmsExtractor). Установите ffmpeg.' };
     }
 
-    var speakerCount = Math.min(aTracks.length, vTracks.length - 1, MAX_SPEAKERS);
-    var speakers = [];
-    for (var spi = 0; spi < speakerCount; spi++) {
-      speakers.push({ audioTrack: spi, videoTrack: spi + 1, label: 'Гость ' + (spi + 1) });
+    var mapping;
+    if (params.mapping) {
+      /* Кастомный выбор дорожек из UI — валидируем против реальной секвенции. */
+      var nm = _normalizeMulticamMapping(params.mapping, vTracks.length, aTracks.length, MAX_SPEAKERS);
+      if (!nm.ok) return { ok: false, error: nm.error };
+      mapping = nm.mapping;
+    } else {
+      var autoCount = Math.min(aTracks.length, vTracks.length - 1, MAX_SPEAKERS);
+      var autoSpeakers = [];
+      for (var spi = 0; spi < autoCount; spi++) {
+        autoSpeakers.push({ audioTrack: spi, videoTrack: spi + 1, label: 'Гость ' + (spi + 1) });
+      }
+      mapping = { wideVideoTrack: 0, speakers: autoSpeakers };
     }
-    var mapping = { wideVideoTrack: 0, speakers: speakers };
+    var speakers = mapping.speakers;
+    var speakerCount = speakers.length;
 
     var extracted;
     try {
@@ -1236,7 +1303,7 @@
       if (!timelines[eti] || !timelines[eti].length) {
         emptyTracks.push(mediaPaths[eti]
           ? String(mediaPaths[eti]).split(/[\\\/]/).pop()
-          : 'дорожка A' + (eti + 1));
+          : 'дорожка A' + ((speakers[eti] ? speakers[eti].audioTrack : eti) + 1));
       }
     }
     if (emptyTracks.length) {
@@ -1248,19 +1315,25 @@
       };
     }
 
-    /* B1-7: pre-flight варнинги — не блокируем, но честно предупреждаем */
+    /* B1-7: pre-flight варнинги — не блокируем, но честно предупреждаем.
+       Подписи дорожек берём из mapping: при кастомном выборе индекс спикера
+       не совпадает с индексом аудиодорожки. */
+    function aLabel(speakerIdx) {
+      var s = speakers[speakerIdx];
+      return 'A' + ((s ? s.audioTrack : speakerIdx) + 1);
+    }
     var warnings = [];
     for (var dpi = 0; dpi < mediaPaths.length; dpi++) {
       for (var dpj = dpi + 1; dpj < mediaPaths.length; dpj++) {
         if (mediaPaths[dpi] && mediaPaths[dpi] === mediaPaths[dpj]) {
-          warnings.push('Дорожки A' + (dpi + 1) + ' и A' + (dpj + 1) + ' указывают на ОДИН файл — переключение по голосу не сработает. Нужны раздельные микрофонные записи.');
+          warnings.push('Дорожки ' + aLabel(dpi) + ' и ' + aLabel(dpj) + ' указывают на ОДИН файл — переключение по голосу не сработает. Нужны раздельные микрофонные записи.');
         }
       }
     }
     if (!warnings.length) {
       var sharedPairs = _detectSharedAudio(timelines, 1.0);
       for (var shp = 0; shp < sharedPairs.length; shp++) {
-        warnings.push('Дорожки A' + (sharedPairs[shp][0] + 1) + ' и A' + (sharedPairs[shp][1] + 1) + ' звучат почти идентично (общий звук/микс?). Свитчер по голосу будет ненадёжен.');
+        warnings.push('Дорожки ' + aLabel(sharedPairs[shp][0]) + ' и ' + aLabel(sharedPairs[shp][1]) + ' звучат почти идентично (общий звук/микс?). Свитчер по голосу будет ненадёжен.');
       }
     }
     var flatTracks = _detectFlatAudio(timelines, 3.0);
@@ -1328,6 +1401,7 @@
     multicamFromTranscript: multicamFromTranscript,
     multicamFromAudio: multicamFromAudio,
     remapRmsToSequenceTime: remapRmsToSequenceTime,
+    _normalizeMulticamMapping: _normalizeMulticamMapping,
     detectSilenceIntervals: detectSilenceIntervals,
     parsePipelineCommand: parsePipelineCommand,
     snapIntervalsToFrame: snapIntervalsToFrame,

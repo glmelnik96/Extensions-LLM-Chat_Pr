@@ -4883,6 +4883,125 @@ PanelBoot.run('ИИ: монтаж', function () {
       upd();
     })();
 
+    /* Кастомный выбор дорожек по спикерам (AutoPod-паттерн «теги дорожек»,
+       12 июня 2026): авто-схема «V1 wide, A1→V2…» включает молчащего спикера,
+       когда микрофоны не на первых аудиодорожках (камерный звук BRAW) или
+       аудио не засинхронено с порядком видео. Режим «Вручную» читает снимок
+       таймлайна и даёт выбрать wide-дорожку и пары «микрофон → камера»
+       с именами файлов, чтобы дорожки были отличимы. */
+    function toolsMcReadMapping() {
+      var mode = document.getElementById('mc-map-mode');
+      if (!mode || mode.value !== 'custom') return null;
+      var wideSel = document.getElementById('mc-wide');
+      if (!wideSel) return null; /* селекты ещё не отрендерены — авто */
+      var speakers = [];
+      var rows = document.querySelectorAll('#mc-mapping .mc-speaker-row');
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].style.display === 'none') continue; /* свёрнуто счётчиком «Спикеров» */
+        var aSel = rows[i].querySelector('.mc-sp-audio');
+        var vSel = rows[i].querySelector('.mc-sp-video');
+        if (!aSel || !vSel) continue;
+        speakers.push({
+          audioTrack: parseInt(aSel.value, 10),
+          videoTrack: parseInt(vSel.value, 10),
+          label: 'Гость ' + (i + 1)
+        });
+      }
+      return { wideVideoTrack: parseInt(wideSel.value, 10), speakers: speakers };
+    }
+
+    (function () {
+      var mode = document.getElementById('mc-map-mode');
+      var box = document.getElementById('mc-mapping');
+      if (!mode || !box) return;
+
+      function esc(s) {
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      }
+      /* Подпись дорожки: «A4 · ZOOM0002_Tr2.wav» — имя первого клипа/файла,
+         чтобы отличать микрофонные WAV от камерного звука. */
+      function trackOption(prefix, t, clips, selected) {
+        var name = '';
+        for (var i = 0; i < clips.length; i++) {
+          var c = clips[i];
+          if (c.trackType !== t.type || c.trackIndex !== t.index) continue;
+          name = (c.mediaPath ? String(c.mediaPath).split(/[\\\/]/).pop() : '') || c.name || '';
+          break;
+        }
+        var label = prefix + (t.index + 1) + (name ? ' · ' + name : ' · (пусто)');
+        return '<option value="' + t.index + '"' + (selected ? ' selected' : '') + '>' + esc(label) + '</option>';
+      }
+
+      function render(snap) {
+        var tracks = snap.tracks || [];
+        var clips = snap.clips || [];
+        var vTracks = tracks.filter(function (t) { return t.type === 'video'; });
+        var aTracks = tracks.filter(function (t) { return t.type === 'audio'; });
+        if (vTracks.length < 2 || aTracks.length < 1) {
+          box.innerHTML = '<div style="color:#f59e0b;">Нужно ≥2 видеодорожки и ≥1 аудио. Найдено: ' +
+            vTracks.length + ' видео, ' + aTracks.length + ' аудио.</div>';
+          return;
+        }
+        var maxSpeakers = Math.min(aTracks.length, vTracks.length - 1, 4);
+        var html = '<div class="param-row"><span class="param-label">Общий план</span>' +
+          '<select id="mc-wide" style="flex:1;min-width:0;">';
+        for (var wv = 0; wv < vTracks.length; wv++) {
+          html += trackOption('V', vTracks[wv], clips, wv === 0);
+        }
+        html += '</select></div>';
+        html += '<div class="param-row"><span class="param-label">Спикеров</span>' +
+          '<select id="mc-spcount" style="flex:1;min-width:0;">';
+        for (var sc = 1; sc <= maxSpeakers; sc++) {
+          html += '<option value="' + sc + '"' + (sc === maxSpeakers ? ' selected' : '') + '>' + sc + '</option>';
+        }
+        html += '</select></div>';
+        for (var sp = 0; sp < maxSpeakers; sp++) {
+          html += '<div class="param-row mc-speaker-row" data-speaker="' + sp + '">' +
+            '<span class="param-label">Спикер ' + (sp + 1) + '</span>' +
+            '<select class="mc-sp-audio" title="Микрофон спикера" style="flex:1;min-width:0;">';
+          for (var sa = 0; sa < aTracks.length; sa++) {
+            html += trackOption('A', aTracks[sa], clips, sa === sp);
+          }
+          html += '</select><span style="opacity:.6;">→</span>' +
+            '<select class="mc-sp-video" title="Камера спикера" style="flex:1;min-width:0;">';
+          for (var sv = 0; sv < vTracks.length; sv++) {
+            html += trackOption('V', vTracks[sv], clips, sv === sp + 1);
+          }
+          html += '</select></div>';
+        }
+        box.innerHTML = html;
+        var cnt = document.getElementById('mc-spcount');
+        function updRows() {
+          var n = parseInt(cnt.value, 10);
+          var rows = box.querySelectorAll('.mc-speaker-row');
+          for (var i = 0; i < rows.length; i++) {
+            rows[i].style.display = i < n ? '' : 'none';
+          }
+        }
+        cnt.addEventListener('change', updRows);
+        updRows();
+      }
+
+      mode.addEventListener('change', function () {
+        if (mode.value !== 'custom') {
+          box.style.display = 'none';
+          box.innerHTML = '';
+          return;
+        }
+        box.style.display = '';
+        box.innerHTML = '<div style="opacity:.7;">Читаю дорожки таймлайна…</div>';
+        execGetSnapshot(true).then(function (snap) {
+          if (!snap || !snap.ok) {
+            box.innerHTML = '<div style="color:#f59e0b;">Не удалось получить снимок таймлайна.</div>';
+            return;
+          }
+          render(snap);
+        }, function (err) {
+          box.innerHTML = '<div style="color:#f59e0b;">' + String(err && err.message || err) + '</div>';
+        });
+      });
+    })();
+
     /* B1-4/B1-6 (10 июня 2026): пресеты шоу для MultiCam (AutoPod-паттерн
        «конфигурации»). Встроенные «спокойный/динамичный» + один пользовательский
        слот в localStorage. Выбор пресета двигает слайдеры (и триггерит input,
@@ -5230,6 +5349,9 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (mcSilenceEl) params.silenceThresholdDb = -parseInt(mcSilenceEl.value, 10);
           var mcJitterEl = document.getElementById('mc-jitter');
           if (mcJitterEl) params.variationsJitterSec = parseFloat(mcJitterEl.value);
+          /* Кастомный выбор дорожек: null = авто-схема пайплайна */
+          var mcMapping = toolsMcReadMapping();
+          if (mcMapping) params.mapping = mcMapping;
           proposalId = 'proposal-multicam';
           break;
         default:
