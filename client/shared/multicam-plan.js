@@ -29,6 +29,7 @@
     smoothingWindow: 5,         /* EMA-окно в кадрах (5 × 50мс = 250мс) */
     wideOnOverlap: true,
     wideOnSilence: true,
+    overlapWideMinSec: 1.0,     /* кросс-ток: уходим в wide только если перебивка длится ≥ N сек */
     wideVideoTrack: 0,          /* индекс wide-дорожки */
     maxHoldSec: 8,
     maxAllSpeakersSec: 4,
@@ -64,6 +65,49 @@
     if (loud[0].db - loud[1].db >= marginDb) return loud[0].idx;
     /* Overlap. */
     return -2;
+  }
+
+  /**
+   * B2-10 (10 июня 2026): политика кросс-токов.
+   * Короткая перебивка («ага», смех, до minFrames кадров) НЕ должна уводить
+   * в wide — остаёмся на текущем спикере. Только устойчивый кросс-ток
+   * (≥ overlapWideMinSec) переключает на wide. Закрывает главный публичный
+   * фейл AutoPod: пинг-понг камер на перекрывающейся речи.
+   *
+   * micLabels: per-frame результат decideActiveMic (≥0 спикер, -1 тишина, -2 overlap).
+   * Короткие runs из -2 заменяем на спикера ПЕРЕД перебивкой (он «держит» план);
+   * если перед runs нет спикера (старт записи) — на спикера после.
+   */
+  function resolveShortOverlaps(micLabels, minFrames) {
+    if (!micLabels || micLabels.length === 0 || minFrames <= 1) {
+      return micLabels ? micLabels.slice() : micLabels;
+    }
+    var out = micLabels.slice();
+    var i = 0;
+    while (i < out.length) {
+      if (out[i] !== -2) { i++; continue; }
+      var runStart = i;
+      while (i < out.length && out[i] === -2) i++;
+      var runLen = i - runStart;
+      if (runLen >= minFrames) continue; /* устойчивый кросс-ток — wide легитимен */
+      /* Спикер перед перебивкой... */
+      var repl = -2;
+      for (var b = runStart - 1; b >= 0; b--) {
+        if (out[b] >= 0) { repl = out[b]; break; }
+        if (out[b] === -2) break; /* соседний длинный overlap — не тянем через него */
+      }
+      /* ...иначе спикер после */
+      if (repl < 0) {
+        for (var a = i; a < micLabels.length; a++) {
+          if (micLabels[a] >= 0) { repl = micLabels[a]; break; }
+          if (micLabels[a] === -2) break;
+        }
+      }
+      if (repl >= 0) {
+        for (var r = runStart; r < runStart + runLen; r++) out[r] = repl;
+      }
+    }
+    return out;
   }
 
   /**
@@ -258,11 +302,19 @@
     }
 
     /* Шаг 1: per-frame активный mic */
+    var micLabels = new Array(audioFrames.length);
+    for (var mi = 0; mi < audioFrames.length; mi++) {
+      micLabels[mi] = decideActiveMic(audioFrames[mi].rmsByTrack, p.silenceThresholdDb, p.bleedMarginDb);
+    }
+
+    /* Шаг 1b: политика кросс-токов — короткая перебивка не уводит в wide */
+    if (p.overlapWideMinSec > 0) {
+      micLabels = resolveShortOverlaps(micLabels, Math.round(p.overlapWideMinSec / p.frameSec));
+    }
+
     var labels = new Array(audioFrames.length);
     for (var i = 0; i < audioFrames.length; i++) {
-      var f = audioFrames[i];
-      var activeMic = decideActiveMic(f.rmsByTrack, p.silenceThresholdDb, p.bleedMarginDb);
-      labels[i] = micToVideoTrack(activeMic, mapping, p);
+      labels[i] = micToVideoTrack(micLabels[i], mapping, p);
     }
 
     /* Шаг 2: smoothing */
@@ -494,6 +546,7 @@
     framesFromRmsTimelines: framesFromRmsTimelines,
     /* Экспортируем internals для unit-тестов */
     _decideActiveMic: decideActiveMic,
+    _resolveShortOverlaps: resolveShortOverlaps,
     _micToVideoTrack: micToVideoTrack,
     _smoothLabels: smoothLabels,
     _labelsToSegments: labelsToSegments,

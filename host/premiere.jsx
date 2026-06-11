@@ -2405,6 +2405,100 @@ $._EXT_PRM_.getClipMediaPath = function (nodeId) {
 };
 
 /**
+ * B1-1 (2026-06-11): переместить плейхед активной секвенции на заданную секунду.
+ * Используется кликабельными таймкодами в карточках предложений панели.
+ */
+$._EXT_PRM_.setPlayheadSec = function (timeSec) {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var sec = Number(timeSec);
+    if (isNaN(sec) || sec < 0) {
+      return JSON.stringify({ ok: false, error: 'Нужен timeSec (число >= 0)' });
+    }
+    var seq = app.project.activeSequence;
+    var t = new Time();
+    t.seconds = sec;
+    seq.setPlayerPosition(t.ticks);
+    return JSON.stringify({ ok: true, timeSec: sec });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
+ * B2-9 (2026-06-11, заимствовано из Descript Underlord v2 «checkpoint»):
+ * Бэкап активной секвенции перед разрушительным apply.
+ * Sequence.clone() дублирует секвенцию; новую находим по diff sequenceID
+ * (clone() ничего не возвращает), переименовываем с меткой времени.
+ * Revert = activateSequenceById(backupId) — пользователь продолжает работу
+ * в нетронутой копии (программный undo ripple-удалений невозможен).
+ */
+$._EXT_PRM_.backupActiveSequence = function () {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+    if (typeof seq.clone !== 'function') {
+      return JSON.stringify({ ok: false, error: 'Sequence.clone() недоступен в этой версии Premiere' });
+    }
+    var seqs = app.project.sequences;
+    var before = {};
+    for (var i = 0; i < seqs.numSequences; i++) {
+      before[String(seqs[i].sequenceID)] = 1;
+    }
+    seq.clone();
+    seqs = app.project.sequences;
+    var created = null;
+    for (var j = 0; j < seqs.numSequences; j++) {
+      if (!before[String(seqs[j].sequenceID)]) { created = seqs[j]; break; }
+    }
+    if (!created) {
+      return JSON.stringify({ ok: false, error: 'clone() не создал новую секвенцию' });
+    }
+    var d = new Date();
+    var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+    var stamp = p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+    try { created.name = String(seq.name) + ' [бэкап ' + stamp + ']'; } catch (eN) {}
+    /* clone() может сделать копию активной — возвращаем фокус на оригинал */
+    try {
+      if (app.project.activeSequence &&
+          String(app.project.activeSequence.sequenceID) !== String(seq.sequenceID)) {
+        app.project.activeSequence = seq;
+      }
+    } catch (eA) {}
+    return JSON.stringify({
+      ok: true,
+      backupId: String(created.sequenceID),
+      backupName: String(created.name || ''),
+      originalName: String(seq.name || '')
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/** B2-9: активировать секвенцию по sequenceID (Revert на бэкап). */
+$._EXT_PRM_.activateSequenceById = function (seqId) {
+  try {
+    if (!app.project) return JSON.stringify({ ok: false, error: 'Нет проекта' });
+    var want = String(seqId);
+    var seqs = app.project.sequences;
+    for (var i = 0; i < seqs.numSequences; i++) {
+      if (String(seqs[i].sequenceID) === want) {
+        app.project.activeSequence = seqs[i];
+        return JSON.stringify({ ok: true, name: String(seqs[i].name || '') });
+      }
+    }
+    return JSON.stringify({ ok: false, error: 'Секвенция не найдена: ' + want });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
  * Phase 1 (PP-26 stabilization, 2026-04-29):
  * Декорируем все экспортируемые функции через _wrap. Каждый необработанный
  * exception теперь попадёт в bridge как структурированный JSON
@@ -2646,7 +2740,10 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     'removeMarkersBySeconds',
     'importMediaFile',
     'getClipMediaPath',
-    'applyMulticamCuts'
+    'applyMulticamCuts',
+    'setPlayheadSec',
+    'backupActiveSequence',
+    'activateSequenceById'
   ];
   for (var i = 0; i < EXPORTED.length; i++) {
     var name = EXPORTED[i];

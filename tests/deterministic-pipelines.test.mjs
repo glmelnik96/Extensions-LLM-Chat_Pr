@@ -1145,3 +1145,77 @@ describe('DeterministicPipelines.snapIntervalsToFrame', () => {
     assert.equal(DP.snapIntervalsToFrame(null, 25).length, 0);
   });
 });
+
+/* ──────────────────────────────────────────────────────────────
+ * _detectSharedAudio (B1-7: pre-flight варнинг «общий звук»)
+ * ────────────────────────────────────────────────────────────── */
+describe('DeterministicPipelines._detectSharedAudio', () => {
+  function tl(fn, n = 30) {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push({ t: i * 0.05, rms: fn(i) });
+    return out;
+  }
+
+  /* vm-контекст возвращает массивы чужого realm — нормализуем для deepEqual */
+  const norm = (v) => JSON.parse(JSON.stringify(v));
+
+  it('flags near-identical RMS profiles as a shared-audio pair', () => {
+    const a = tl(i => -20 + Math.sin(i) * 5);
+    const b = tl(i => -20 + Math.sin(i) * 5 + 0.3); // почти копия (Δ 0.3 dB)
+    const pairs = norm(DP._detectSharedAudio([a, b], 1.0));
+    assert.deepEqual(pairs, [[0, 1]]);
+  });
+
+  it('does not flag genuinely different tracks', () => {
+    const a = tl(i => (i % 10 < 5 ? -12 : -50)); // спикер A говорит первую половину
+    const b = tl(i => (i % 10 < 5 ? -50 : -12)); // спикер B — вторую
+    assert.deepEqual(norm(DP._detectSharedAudio([a, b], 1.0)), []);
+  });
+
+  it('requires >= 20 comparable samples', () => {
+    const a = tl(() => -20, 10);
+    const b = tl(() => -20, 10);
+    assert.deepEqual(norm(DP._detectSharedAudio([a, b], 1.0)), [], 'мало данных — не флагуем');
+  });
+
+  it('returns [] for < 2 timelines or empty input', () => {
+    assert.deepEqual(norm(DP._detectSharedAudio([tl(() => -20)], 1.0)), []);
+    assert.deepEqual(norm(DP._detectSharedAudio([], 1.0)), []);
+    assert.deepEqual(norm(DP._detectSharedAudio(null, 1.0)), []);
+  });
+
+  it('checks all pairs of 3 tracks', () => {
+    const a = tl(() => -20);
+    const b = tl(() => -20.2);
+    const c = tl(i => (i % 2 ? -10 : -45));
+    const pairs = norm(DP._detectSharedAudio([a, b, c], 1.0));
+    assert.deepEqual(pairs, [[0, 1]], 'только дублирующая пара');
+  });
+});
+
+/* ──────────────────────────────────────────────────────────────
+ * parsePipelineCommand — русские алиасы (B1-8)
+ * ────────────────────────────────────────────────────────────── */
+describe('DeterministicPipelines.parsePipelineCommand (русские алиасы)', () => {
+  it('maps /паразиты, /тишины, /главы, /джампкаты to pipelines', () => {
+    for (const cmd of ['/паразиты', '/тишины', '/главы', '/джампкаты']) {
+      const r = DP.parsePipelineCommand(cmd);
+      assert.ok(r && typeof r.pipeline === 'function', cmd + ' должен распознаваться');
+    }
+  });
+
+  it('passes params with russian alias', () => {
+    const r = DP.parsePipelineCommand('/тишины minDuration=2.0');
+    assert.ok(r);
+    assert.equal(r.params.minDuration, 2.0);
+  });
+
+  it('is case-insensitive for cyrillic', () => {
+    const r = DP.parsePipelineCommand('/Паразиты');
+    assert.ok(r && typeof r.pipeline === 'function');
+  });
+
+  it('returns null for unknown slash command', () => {
+    assert.equal(DP.parsePipelineCommand('/несуществует'), null);
+  });
+});

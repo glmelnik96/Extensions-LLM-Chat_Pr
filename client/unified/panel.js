@@ -1542,6 +1542,28 @@ PanelBoot.run('ИИ: монтаж', function () {
     return el2;
   }
 
+  /**
+   * B1-1 (заимствовано из Chat Video Pro): кликабельный таймкод.
+   * Клик → плейхед Premiere прыгает на timeSec (host setPlayheadSec).
+   * Пользователь проверяет КАЖДЫЙ вырез на месте, не листая таймлайн вручную.
+   */
+  function _tcJumpEl(timeSec, labelText) {
+    var sp = document.createElement('span');
+    sp.textContent = labelText || fmtSec(timeSec);
+    sp.style.cssText = 'cursor:pointer;text-decoration:underline dotted;color:#60a5fa;';
+    sp.title = 'Перейти к ' + fmtSec(timeSec) + ' на таймлайне';
+    sp.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      if (!window.PremiereBridge || !PremiereBridge.setPlayhead) return;
+      PremiereBridge.setPlayhead(timeSec, function (err, data) {
+        if (err || (data && data.ok === false)) {
+          console.warn('[tc-jump] setPlayhead failed:', err || (data && data.error));
+        }
+      });
+    });
+    return sp;
+  }
+
   function renderPendingProposalCard() {
     var existing = document.getElementById('pending-proposal-card');
     /* MEDIUM #23 (6 мая 2026): no-op guard — не пересобираем DOM если ничего не изменилось */
@@ -1658,7 +1680,10 @@ PanelBoot.run('ИИ: монтаж', function () {
       (_pendingProposal.markers || []).forEach(function (m, i) {
         var row = document.createElement('div');
         row.style.cssText = 'padding:2px 0;';
-        row.textContent = (i + 1) + '. [' + fmtSec(m.timeSec) + '] ' + (m.name || '');
+        /* B1-1: клик по таймкоду маркера → плейхед */
+        row.appendChild(document.createTextNode((i + 1) + '. ['));
+        row.appendChild(_tcJumpEl(m.timeSec));
+        row.appendChild(document.createTextNode('] ' + (m.name || '')));
         if (m.comment) {
           var c2 = document.createElement('div');
           c2.style.cssText = 'padding-left:14px;opacity:0.7;font-style:italic;';
@@ -1766,7 +1791,12 @@ PanelBoot.run('ИИ: монтаж', function () {
       ivList.className = 'proposal-ops-list';
       (dp.intervals || []).forEach(function (iv, i) {
         var row = document.createElement('div');
-        row.textContent = (i + 1) + '. ' + fmtSec(iv.startSec) + ' → ' + fmtSec(iv.endSec) + ' (' + (iv.endSec - iv.startSec).toFixed(2) + 'с)';
+        /* B1-1: клик по таймкоду интервала речи → плейхед */
+        row.appendChild(document.createTextNode((i + 1) + '. '));
+        row.appendChild(_tcJumpEl(iv.startSec));
+        row.appendChild(document.createTextNode(' → '));
+        row.appendChild(_tcJumpEl(iv.endSec));
+        row.appendChild(document.createTextNode(' (' + (iv.endSec - iv.startSec).toFixed(2) + 'с)'));
         ivList.appendChild(row);
       });
       card.appendChild(ivList);
@@ -1904,9 +1934,12 @@ PanelBoot.run('ИИ: монтаж', function () {
         var head = document.createElement('div');
         head.style.fontFamily = 'monospace';
         head.style.opacity = '0.8';
-        head.textContent =
-          (idx + 1) + '. [' + fmtSec(iv.startSec) + '–' + fmtSec(iv.endSec) + '] · ' +
-          (iv.endSec - iv.startSec).toFixed(1) + 'с';
+        /* B1-1: таймкоды кликабельны — прыжок плейхеда к началу/концу фрагмента */
+        head.appendChild(document.createTextNode((idx + 1) + '. ['));
+        head.appendChild(_tcJumpEl(iv.startSec));
+        head.appendChild(document.createTextNode('–'));
+        head.appendChild(_tcJumpEl(iv.endSec));
+        head.appendChild(document.createTextNode('] · ' + (iv.endSec - iv.startSec).toFixed(1) + 'с'));
         row.appendChild(head);
         var qq = _findQuote(keepQuotes, iv.startSec);
         if (qq && qq.quote) {
@@ -1936,9 +1969,12 @@ PanelBoot.run('ИИ: монтаж', function () {
         var head = document.createElement('div');
         head.style.fontFamily = 'monospace';
         head.style.opacity = '0.8';
-        head.textContent =
-          (idx + 1) + '. [' + fmtSec(iv.startSec) + '–' + fmtSec(iv.endSec) + '] · ' +
-          (iv.endSec - iv.startSec).toFixed(1) + 'с';
+        /* B1-1: таймкоды кликабельны — прыжок плейхеда к началу/концу выреза */
+        head.appendChild(document.createTextNode((idx + 1) + '. ['));
+        head.appendChild(_tcJumpEl(iv.startSec));
+        head.appendChild(document.createTextNode('–'));
+        head.appendChild(_tcJumpEl(iv.endSec));
+        head.appendChild(document.createTextNode('] · ' + (iv.endSec - iv.startSec).toFixed(1) + 'с'));
         row.appendChild(head);
         var rq = _findQuote(rmQuotes, iv.startSec);
         var quoteText = rq && rq.quote ? String(rq.quote) : '';
@@ -2096,6 +2132,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         showErr('EditPlan пуст после нормализации.');
         return;
       }
+      /* B2-9: checkpoint перед атомарным apply */
+      _makeSequenceCheckpoint('EditPlan', function () {
       PremiereBridge.applyTimecodeEdits(
         { operations: normOpsE, summary: prop.summary || '' },
         function (errE, dataE) {
@@ -2153,11 +2191,14 @@ PanelBoot.run('ИИ: монтаж', function () {
           });
         }
       );
+      }); /* конец _makeSequenceCheckpoint */
       return;
     }
 
     if (kind === 'timecode_edits') {
       statusUi.show('Применяю правки таймлайна…', true);
+      /* B2-9: checkpoint перед правками таймлайна */
+      _makeSequenceCheckpoint('правки таймлайна', function () {
       PremiereBridge.applyTimecodeEdits(
         { operations: prop.operations, summary: prop.summary },
         function (err, data) {
@@ -2189,6 +2230,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           });
         }
       );
+      }); /* конец _makeSequenceCheckpoint */
       return;
     }
 
@@ -2306,6 +2348,8 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     /* default: transcript_cuts (исходный путь) */
     statusUi.show('Применяю монтаж…', true);
+    /* B2-9: checkpoint — клон секвенции перед ripple-удалениями */
+    _makeSequenceCheckpoint('монтаж по тексту', function () {
     PremiereBridge.applyTranscriptCuts(
       { removeIntervals: prop.removeIntervals, summary: prop.summary },
       function (err, data) {
@@ -2334,19 +2378,50 @@ PanelBoot.run('ИИ: монтаж', function () {
           var msgs = ContextStore.getMessages(panelId);
           msgs.push({
             role: 'assistant',
-            content:
-              'Монтаж применён по подтверждённому плану. Вырезано ' +
-              (prop.verification ? prop.verification.removeCount : '?') +
-              ' интервал(ов), осталось ' +
-              (prop.verification ? fmtSec(prop.verification.totalKeepSec) : '?') +
-              '. Кэш транскрипта пересчитан под новый таймлайн.' +
-              describeHostWarnings(data)
+            content: _buildApplySummary(prop, data, snapData)
           });
           ContextStore.setMessages(panelId, msgs);
           renderMessages(msgs);
         });
       }
     );
+    }); /* конец _makeSequenceCheckpoint */
+  }
+
+  /**
+   * B1-5 (заимствовано из Descript agent_response): структурированное резюме
+   * после apply — план vs факт. Сверяем предсказанную длительность (verification)
+   * с фактическим снапшотом ПОСЛЕ применения. Расхождение >2с — явный варнинг,
+   * иначе пользователь не узнает что host применил не всё.
+   */
+  function _buildApplySummary(prop, data, snapData) {
+    var v = prop.verification || {};
+    var lines = ['✂ Монтаж применён.'];
+    if (typeof v.removeCount === 'number') {
+      var cutSec = (v.originalDurationSec || 0) - (v.totalKeepSec || 0);
+      lines.push('• Вырезано: ' + v.removeCount + ' интервал(ов), −' + fmtSec(cutSec > 0 ? cutSec : 0));
+    }
+    /* Факт: длительность из свежего снапшота */
+    var actualSec = null;
+    if (snapData && snapData.ok && snapData.clips) {
+      actualSec = snapData.sequenceEndSec || 0;
+      for (var ci = 0; ci < snapData.clips.length; ci++) {
+        if (snapData.clips[ci].endSec > actualSec) actualSec = snapData.clips[ci].endSec;
+      }
+    }
+    if (typeof v.originalDurationSec === 'number' && actualSec !== null) {
+      lines.push('• Длительность: ' + fmtSec(v.originalDurationSec) + ' → ' + fmtSec(actualSec));
+      if (typeof v.totalKeepSec === 'number' && Math.abs(actualSec - v.totalKeepSec) > 2) {
+        lines.push('⚠ Факт (' + fmtSec(actualSec) + ') расходится с планом (' +
+          fmtSec(v.totalKeepSec) + ') — проверьте таймлайн визуально');
+      }
+    } else if (typeof v.totalKeepSec === 'number') {
+      lines.push('• Осталось по плану: ' + fmtSec(v.totalKeepSec));
+    }
+    lines.push('• Кэш транскрипта пересчитан под новый таймлайн');
+    lines.push('• Откат: Cmd+Z / Ctrl+Z в таймлайне Premiere');
+    var hw = describeHostWarnings(data);
+    return lines.join('\n') + hw;
   }
 
   /* ── Host-контракт (10 июня 2026): человекочитаемые ошибки/предупреждения ──
@@ -2377,6 +2452,33 @@ PanelBoot.run('ИИ: монтаж', function () {
         (data.maxDriftMs || '?') + ' мс)');
     }
     return warns.length ? '\n' + warns.join('\n') : '';
+  }
+
+  /**
+   * B2-9 (заимствовано из Descript Underlord v2): checkpoint перед разрушительным
+   * apply. Клонирует активную секвенцию (host backupActiveSequence), сохраняет
+   * backupId в lastUndo → кнопка отката переключается в режим «Откатить монтаж».
+   * Не блокирует apply: бэкап не удался → продолжаем (Cmd+Z остаётся).
+   * cb(backupInfo|null) вызывается ВСЕГДА.
+   */
+  function _makeSequenceCheckpoint(label, cb) {
+    if (!window.PremiereBridge || !PremiereBridge.backupActiveSequence) { cb(null); return; }
+    PremiereBridge.backupActiveSequence(function (err, data) {
+      if (err || !data || !data.ok) {
+        console.warn('[checkpoint] бэкап секвенции не создан:', (err && err.message) || (data && data.error));
+        cb(null);
+        return;
+      }
+      try {
+        ContextStore.setLastUndo(active.panelId, 1, label || 'монтаж', data.originalName || '', {
+          mode: 'sequence_backup',
+          backupId: data.backupId,
+          backupName: data.backupName
+        });
+        refreshUndoButton();
+      } catch (eSB) {}
+      cb(data);
+    });
   }
 
   function cancelPendingProposal() {
@@ -3201,6 +3303,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         removeIntervals: mergeRemoveIntervals(snapIntervalsToSegmentBoundaries(args.removeIntervals || []))
       });
       var verification = computeVerification(args.removeIntervals);
+      /* B2-9: checkpoint и на агентском пути apply */
+      _makeSequenceCheckpoint('монтаж по тексту (агент)', function () {
       PremiereBridge.applyTranscriptCuts(args, function (err, data) {
         if (err) {
           reject(err);
@@ -3225,6 +3329,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           resolve(data);
         });
       });
+      }); /* конец _makeSequenceCheckpoint */
     });
   }
 
@@ -3628,6 +3733,12 @@ PanelBoot.run('ИИ: монтаж', function () {
         'Откатить ' + u.count + ' маркер' + (u.count === 1 ? '' : u.count >= 2 && u.count <= 4 ? 'а' : 'ов');
       btnUndo.title = 'Удалить добавленные маркеры через markers.deleteMarker';
       btnUndo.disabled = false;
+    } else if (u && u.count > 0 && u.mode === 'sequence_backup' && u.backupId) {
+      /* B2-9: Revert на бэкап-секвенцию (checkpoint перед apply) */
+      btnUndo.textContent = '⏪ Откатить: ' + (u.label || 'монтаж');
+      btnUndo.title = 'Открыть бэкап-секвенцию «' + (u.backupName || '') +
+        '» с состоянием ДО применения. Изменённая секвенция останется в проекте.';
+      btnUndo.disabled = false;
     } else {
       btnUndo.textContent = 'Откат маркеров';
       btnUndo.title = 'Нет маркеров для отката';
@@ -3637,6 +3748,24 @@ PanelBoot.run('ИИ: монтаж', function () {
   if (btnUndo) {
     btnUndo.onclick = function () {
       var u = ContextStore.getLastUndo(active.panelId);
+      /* B2-9: Revert — активировать бэкап-секвенцию */
+      if (u && u.count > 0 && u.mode === 'sequence_backup' && u.backupId) {
+        PremiereBridge.activateSequenceById(u.backupId, function (errB, dataB) {
+          if (errB || !dataB || !dataB.ok) {
+            showErr('Откат не удался: ' + String((errB && errB.message) || (dataB && dataB.error) || 'бэкап не найден'));
+            setTimeout(function () { showErr(''); }, 3500);
+            return;
+          }
+          _snapDirty = true;
+          lastSnap = null;
+          showErr('Открыта бэкап-секвенция «' + (dataB.name || u.backupName || '') +
+            '» — состояние до монтажа. Изменённая версия осталась в проекте.');
+          ContextStore.clearLastUndoCount(active.panelId);
+          refreshUndoButton();
+          setTimeout(function () { showErr(''); }, 5000);
+        });
+        return;
+      }
       if (!u || !u.count || u.mode !== 'markers' || !u.markerSeconds || !u.markerSeconds.length) return;
       PremiereBridge.removeMarkersBySeconds(u.markerSeconds, function (err, data) {
         if (err) {
@@ -3970,9 +4099,29 @@ PanelBoot.run('ИИ: монтаж', function () {
     return { startSec: Math.min(a, b), endSec: Math.max(a, b), ripple: ripple };
   }
 
+  /* B1-8 (заимствовано из CVP): слэш-команды-промпты. Детерминированные
+     пайплайны (/паразиты, /тишины, /главы…) парсит DeterministicPipelines;
+     эти команды — шорткаты к LLM-запросам, разворачиваются в полный промпт. */
+  var SLASH_PROMPTS = {
+    '/top5': 'Найди топ-5 самых сильных моментов на таймлайне по транскрипту. ' +
+      'Для каждого: таймкоды, цитата, почему цепляет. Ничего не применяй — только список.',
+    '/клип': 'Собери из таймлайна короткий клип-хайлайт до 60 секунд: выбери самые сильные ' +
+      'моменты по транскрипту и предложи план вырезов через propose_transcript_cuts.'
+  };
+
+  function expandSlashPrompt(text) {
+    if (text[0] !== '/') return text;
+    var sp = text.indexOf(' ');
+    var cmd = (sp === -1 ? text : text.slice(0, sp)).toLowerCase();
+    var rest = sp === -1 ? '' : text.slice(sp + 1).trim();
+    if (!SLASH_PROMPTS[cmd]) return text;
+    return SLASH_PROMPTS[cmd] + (rest ? ' Доп. пожелание: ' + rest : '');
+  }
+
   async function onSend() {
     var text = el.input.value.trim();
     if (!text) return;
+    text = expandSlashPrompt(text);
     if (!beginOperation('send')) return;
     showErr('');
     el.input.value = '';
@@ -4206,6 +4355,26 @@ PanelBoot.run('ИИ: монтаж', function () {
   el.input.onkeydown = function (e) {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) onSend();
   };
+
+  /* B1-8: подсказка по слэш-командам при вводе «/» в начале поля */
+  (function initSlashHint() {
+    if (!el.input || !el.input.parentNode) return;
+    var hint = document.createElement('div');
+    hint.id = 'slash-hint';
+    hint.style.cssText =
+      'display:none;font-size:10px;color:#888;line-height:1.5;padding:4px 6px;' +
+      'background:rgba(99,102,241,0.08);border-radius:4px;margin-bottom:4px;';
+    hint.textContent =
+      'Команды: /паразиты · /тишины · /главы · /джампкаты · /j_cuts · /l_cuts · /top5 · /клип';
+    el.input.parentNode.insertBefore(hint, el.input);
+    el.input.addEventListener('input', function () {
+      var v = el.input.value;
+      hint.style.display = (v && v[0] === '/' && v.indexOf(' ') === -1) ? 'block' : 'none';
+    });
+    el.input.addEventListener('blur', function () {
+      setTimeout(function () { hint.style.display = 'none'; }, 200);
+    });
+  })();
 
   /* ─── Транскрибация (общая, единственная кнопка) ─────────────────── */
 
@@ -4690,6 +4859,69 @@ PanelBoot.run('ИИ: монтаж', function () {
       upd();
     })();
 
+    /* B1-4/B1-6 (10 июня 2026): пресеты шоу для MultiCam (AutoPod-паттерн
+       «конфигурации»). Встроенные «спокойный/динамичный» + один пользовательский
+       слот в localStorage. Выбор пресета двигает слайдеры (и триггерит input,
+       чтобы обновились подписи значений). */
+    (function () {
+      var sel = document.getElementById('mc-preset');
+      var saveBtn = document.getElementById('mc-preset-save');
+      if (!sel) return;
+      var MC_SLIDERS = ['mc-minhold', 'mc-maxhold', 'mc-margin', 'mc-silence', 'mc-jitter'];
+      var BUILTIN = {
+        /* Спокойный: интервью/лекция — длинные планы, реже переключения */
+        calm: { 'mc-minhold': 2.5, 'mc-maxhold': 12, 'mc-margin': 6, 'mc-silence': 35, 'mc-jitter': 0 },
+        /* Динамичный: подкаст/шоу — короткие планы, лёгкая вариативность */
+        dynamic: { 'mc-minhold': 1.0, 'mc-maxhold': 6, 'mc-margin': 5, 'mc-silence': 35, 'mc-jitter': 0.2 }
+      };
+      var LS_KEY = 'mcShowPreset';
+      function applyValues(vals) {
+        for (var i = 0; i < MC_SLIDERS.length; i++) {
+          var id = MC_SLIDERS[i];
+          var s = document.getElementById(id);
+          if (!s || typeof vals[id] === 'undefined') continue;
+          s.value = String(vals[id]);
+          s.dispatchEvent(new Event('input'));
+        }
+      }
+      sel.addEventListener('change', function () {
+        if (sel.value === 'calm' || sel.value === 'dynamic') {
+          applyValues(BUILTIN[sel.value]);
+        } else if (sel.value === 'saved') {
+          try {
+            var raw = localStorage.getItem(LS_KEY);
+            if (raw) applyValues(JSON.parse(raw));
+            else toolsShowErr('«Мой пресет» пуст — настройте слайдеры и нажмите 💾.');
+          } catch (e) {
+            console.warn('[tools] mc preset load failed:', e && e.message);
+          }
+        }
+      });
+      if (saveBtn) {
+        saveBtn.addEventListener('click', function () {
+          var vals = {};
+          for (var i = 0; i < MC_SLIDERS.length; i++) {
+            var s = document.getElementById(MC_SLIDERS[i]);
+            if (s) vals[MC_SLIDERS[i]] = parseFloat(s.value);
+          }
+          try {
+            localStorage.setItem(LS_KEY, JSON.stringify(vals));
+            sel.value = 'saved';
+            toolsStatusUi.show('Пресет сохранён.', false);
+            setTimeout(function () { toolsStatusUi.hide(); }, 1500);
+          } catch (e2) {
+            toolsShowErr('Не удалось сохранить пресет: ' + (e2.message || e2));
+          }
+        });
+      }
+      /* Ручное движение любого слайдера = пресет «свой» */
+      for (var mi = 0; mi < MC_SLIDERS.length; mi++) {
+        var ms = document.getElementById(MC_SLIDERS[mi]);
+        if (!ms) continue;
+        ms.addEventListener('change', function () { sel.value = ''; });
+      }
+    })();
+
     /* jmp-breath: показываем миллисекунды для читаемости (0.05с → «50мс») */
     (function () {
       var s = document.getElementById('jmp-breath');
@@ -4757,6 +4989,15 @@ PanelBoot.run('ИИ: монтаж', function () {
       sum.className = 'proposal-summary';
       sum.textContent = proposal.summary || 'Готово.';
       area.appendChild(sum);
+      /* B1-7: pre-flight варнинги пайплайна (общий звук, дубль файла и т.п.) */
+      if (proposal.warnings && proposal.warnings.length) {
+        for (var wi = 0; wi < proposal.warnings.length; wi++) {
+          var wEl = document.createElement('div');
+          wEl.style.cssText = 'color:#f59e0b;font-size:11px;margin:4px 0;';
+          wEl.textContent = '⚠ ' + proposal.warnings[wi];
+          area.appendChild(wEl);
+        }
+      }
       var btns = document.createElement('div');
       btns.className = 'proposal-btns';
       var applyB = document.createElement('button');
@@ -4807,6 +5048,8 @@ PanelBoot.run('ИИ: монтаж', function () {
       if (prop.kind === 'transcript_cuts') {
         toolsStatusUi.show('Применяю монтаж…', true);
         toolsDisableRun(true);
+        /* B2-9: checkpoint перед ripple-удалениями */
+        _makeSequenceCheckpoint('монтаж (tools)', function () {
         PremiereBridge.applyTranscriptCuts(
           { removeIntervals: prop.removeIntervals, summary: prop.summary },
           function (err, dataTC) {
@@ -4833,6 +5076,7 @@ PanelBoot.run('ИИ: монтаж', function () {
             setTimeout(function () { toolsStatusUi.hide(); }, 2500);
           }
         );
+        }); /* конец _makeSequenceCheckpoint */
         return;
       }
 
@@ -4880,6 +5124,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         toolsDisableRun(true);
         _snapDirty = true;
         lastSnap = null;
+        /* B2-9: checkpoint — razor режет клипы даже в режиме disable */
+        _makeSequenceCheckpoint('MultiCam', function () {
         PremiereBridge.applyMulticamCuts(prop.plan, function (err, data) {
           toolsDisableRun(false);
           toolsStatusUi.hide();
@@ -4895,6 +5141,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           }
           setTimeout(function () { toolsStatusUi.hide(); }, 4000);
         });
+        }); /* конец _makeSequenceCheckpoint */
         return;
       }
 
@@ -4989,6 +5236,7 @@ PanelBoot.run('ИИ: монтаж', function () {
             var windowSec = typeof p.frameSec === 'number' ? p.frameSec : 0.05;
             var allClips = snap.clips || [];
             var timelines = [];
+            var mediaPaths = [];
             for (var si = 0; si < mapping.speakers.length; si++) {
               var aIdx = mapping.speakers[si].audioTrack;
               var clip = null;
@@ -5003,8 +5251,10 @@ PanelBoot.run('ИИ: монтаж', function () {
               }
               var tl = await AudioPreprocess.computeRmsTimeline(mediaPath, { windowSec: windowSec });
               timelines.push(tl);
+              mediaPaths.push(mediaPath);
             }
-            return { timelines: timelines };
+            /* B1-7: mediaPaths нужны пайплайну для pre-flight детекта общего файла */
+            return { timelines: timelines, mediaPaths: mediaPaths };
           }
         };
 

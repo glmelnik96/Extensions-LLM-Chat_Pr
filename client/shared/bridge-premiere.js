@@ -214,6 +214,22 @@
     getClipMediaPath: function (nodeId, cb) {
       var s = String(nodeId).replace(/"/g, '\\"');
       this.evalJson('$._EXT_PRM_.getClipMediaPath("' + s + '")', cb);
+    },
+
+    /** B1-1: переместить плейхед активной секвенции (клик по таймкоду в карточке). */
+    setPlayhead: function (timeSec, cb) {
+      this.evalJson('$._EXT_PRM_.setPlayheadSec(' + Number(timeSec) + ')', cb);
+    },
+
+    /** B2-9: checkpoint — клон активной секвенции перед разрушительным apply. */
+    backupActiveSequence: function (cb) {
+      this.evalJson('$._EXT_PRM_.backupActiveSequence()', cb);
+    },
+
+    /** B2-9: Revert — активировать бэкап-секвенцию по sequenceID. */
+    activateSequenceById: function (seqId, cb) {
+      var s = String(seqId).replace(/"/g, '\\"');
+      this.evalJson('$._EXT_PRM_.activateSequenceById("' + s + '")', cb);
     }
   };
 })(window);

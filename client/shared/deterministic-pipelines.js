@@ -935,7 +935,12 @@
       '/chapterize': chapterize,
       '/jump_cuts': jumpCuts,
       '/j_cuts': jCuts,
-      '/l_cuts': jCuts
+      '/l_cuts': jCuts,
+      /* B1-8 (заимствовано из CVP): русские алиасы — пользователь не обязан помнить англ. имена */
+      '/паразиты': cutFillers,
+      '/тишины': cutSilences,
+      '/главы': chapterize,
+      '/джампкаты': jumpCuts
     };
 
     if (cmd === '/l_cuts') {
@@ -1093,6 +1098,39 @@
   }
 
   /**
+   * B1-7 (10 июня 2026): pre-flight детект «общего звука».
+   * Главный публичный фейл AutoPod-класса инструментов: на всех дорожках один
+   * и тот же микс (общий рекордер/файл) → RMS-профили идентичны → свитчер
+   * не работает, пользователь винит плагин. Ловим ДО построения плана.
+   * timelines: [[{t, rms}], ...] — если у пары среднее |Δ| < thresholdDb,
+   * дорожки считаем дублями. Возвращает массив пар [i, j].
+   */
+  function _detectSharedAudio(timelines, thresholdDb) {
+    var thr = typeof thresholdDb === 'number' ? thresholdDb : 1.0;
+    var pairs = [];
+    if (!timelines || timelines.length < 2) return pairs;
+    for (var i = 0; i < timelines.length; i++) {
+      for (var j = i + 1; j < timelines.length; j++) {
+        var a = timelines[i] || [];
+        var b = timelines[j] || [];
+        var n = Math.min(a.length, b.length);
+        if (n < 20) continue; /* слишком мало данных для вывода */
+        var sum = 0;
+        var cnt = 0;
+        for (var k = 0; k < n; k++) {
+          var va = a[k] && a[k].rms;
+          var vb = b[k] && b[k].rms;
+          if (typeof va !== 'number' || typeof vb !== 'number') continue;
+          sum += Math.abs(va - vb);
+          cnt++;
+        }
+        if (cnt >= 20 && sum / cnt < thr) pairs.push([i, j]);
+      }
+    }
+    return pairs;
+  }
+
+  /**
    * MultiCam Phase 2A: реальный детект говорящего через per-track RMS.
    * ctx.rmsExtractor(ctx, mapping, params) → Promise<{timelines:[[{t,rms}],...]}>
    *   по одному [{t,rms}] на mic-дорожку спикера, в порядке mapping.speakers.
@@ -1135,6 +1173,23 @@
       return { ok: false, error: 'Не удалось извлечь аудио-RMS дорожек.' };
     }
 
+    /* B1-7: pre-flight варнинги — не блокируем, но честно предупреждаем */
+    var warnings = [];
+    var mediaPaths = extracted.mediaPaths || [];
+    for (var dpi = 0; dpi < mediaPaths.length; dpi++) {
+      for (var dpj = dpi + 1; dpj < mediaPaths.length; dpj++) {
+        if (mediaPaths[dpi] && mediaPaths[dpi] === mediaPaths[dpj]) {
+          warnings.push('Дорожки A' + (dpi + 1) + ' и A' + (dpj + 1) + ' указывают на ОДИН файл — переключение по голосу не сработает. Нужны раздельные микрофонные записи.');
+        }
+      }
+    }
+    if (!warnings.length) {
+      var sharedPairs = _detectSharedAudio(timelines, 1.0);
+      for (var shp = 0; shp < sharedPairs.length; shp++) {
+        warnings.push('Дорожки A' + (sharedPairs[shp][0] + 1) + ' и A' + (sharedPairs[shp][1] + 1) + ' звучат почти идентично (общий звук/микс?). Свитчер по голосу будет ненадёжен.');
+      }
+    }
+
     var frameSec = typeof params.frameSec === 'number' ? params.frameSec : 0.05;
     var frames = MulticamPlan.framesFromRmsTimelines(timelines, frameSec);
     if (!frames.length) {
@@ -1150,6 +1205,7 @@
     /* Phase 2B: опциональные параметры — отдаём только если заданы,
        иначе buildSwitchPlan возьмёт свои DEFAULTS */
     if (typeof params.maxHoldSec === 'number') planParams.maxHoldSec = params.maxHoldSec;
+    if (typeof params.overlapWideMinSec === 'number') planParams.overlapWideMinSec = params.overlapWideMinSec;
     if (typeof params.maxAllSpeakersSec === 'number') planParams.maxAllSpeakersSec = params.maxAllSpeakersSec;
     if (typeof params.variationsJitterSec === 'number') planParams.variationsJitterSec = params.variationsJitterSec;
     if (typeof params.variationsSeed === 'number') planParams.variationsSeed = params.variationsSeed;
@@ -1175,6 +1231,7 @@
         plan: plan,
         summary: 'Авто-MultiCam (по голосу): ' + built.segments.length + ' сегментов, ' +
           built.switchCount + ' переключений. Спикеров: ' + speakerCount + '.',
+        warnings: warnings,
         stats: { perTrackSeconds: perTrack, switchCount: built.switchCount }
       }
     };
@@ -1192,6 +1249,7 @@
     parsePipelineCommand: parsePipelineCommand,
     snapIntervalsToFrame: snapIntervalsToFrame,
     _mergeIntervals: _mergeIntervals,
+    _detectSharedAudio: _detectSharedAudio,
     _silencesFromSegmentGaps: _silencesFromSegmentGaps,
     _buildSimpleParagraphs: _buildSimpleParagraphs
   };

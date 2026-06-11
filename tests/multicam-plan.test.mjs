@@ -476,3 +476,57 @@ describe('MulticamPlan._snapToSpeechOnset', () => {
     assert.deepEqual(MP._snapToSpeechOnset(segs, [4.8], 0, 0), segs);
   });
 });
+
+describe('MulticamPlan._resolveShortOverlaps (B2-10: политика кросс-токов)', () => {
+  it('replaces a short overlap run with the previous speaker', () => {
+    // 5 кадров спикер 0, 3 кадра перебивка (-2), 5 кадров спикер 1
+    const labels = [0, 0, 0, 0, 0, -2, -2, -2, 1, 1, 1, 1, 1];
+    const out = MP._resolveShortOverlaps(labels, 5);
+    assert.deepEqual(out.slice(5, 8), [0, 0, 0], 'короткий кросс-ток держит предыдущего спикера');
+  });
+
+  it('keeps a long overlap run (>= minFrames) untouched', () => {
+    const labels = [0, 0, -2, -2, -2, -2, -2, 1, 1];
+    const out = MP._resolveShortOverlaps(labels, 5);
+    assert.deepEqual(out.slice(2, 7), [-2, -2, -2, -2, -2], 'долгая перебивка остаётся overlap → wide');
+  });
+
+  it('fills forward from the next speaker when run starts the timeline', () => {
+    const labels = [-2, -2, 1, 1, 1];
+    const out = MP._resolveShortOverlaps(labels, 5);
+    assert.deepEqual(out.slice(0, 2), [1, 1], 'нет предыдущего — берём следующего спикера');
+  });
+
+  it('skips backward over silence (-1) to find previous speaker', () => {
+    const labels = [0, 0, -1, -2, -2, 1, 1];
+    const out = MP._resolveShortOverlaps(labels, 5);
+    assert.deepEqual(out.slice(3, 5), [0, 0], 'тишина не прерывает поиск спикера назад');
+  });
+
+  it('is a no-op copy when minFrames <= 1', () => {
+    const labels = [0, -2, 1];
+    const out = MP._resolveShortOverlaps(labels, 1);
+    assert.deepEqual(out, labels);
+    assert.notEqual(out, labels, 'возвращает копию, не исходный массив');
+  });
+
+  it('handles empty input', () => {
+    assert.deepEqual(MP._resolveShortOverlaps([], 5), []);
+  });
+
+  it('buildSwitchPlan respects overlapWideMinSec=0 (политика выключена)', () => {
+    // Просто smoke: параметр прокидывается без падения
+    const frames = [];
+    let t = 0;
+    for (let i = 0; i < 100; i++) {
+      frames.push({ tStart: t, tEnd: t + FRAME_SEC, rmsByTrack: [-12, -50] });
+      t += FRAME_SEC;
+    }
+    const mapping = { wideVideoTrack: 1, speakers: [
+      { audioTrack: 1, videoTrack: 2, label: 'A' },
+      { audioTrack: 2, videoTrack: 3, label: 'B' }
+    ] };
+    const plan = MP.buildSwitchPlan(frames, mapping, { overlapWideMinSec: 0, frameSec: FRAME_SEC });
+    assert.ok(plan.segments.length >= 1);
+  });
+});

@@ -528,6 +528,9 @@
         };
         if (opts && opts.mode) payload.mode = opts.mode;
         if (opts && opts.markerSeconds && opts.markerSeconds.length) payload.markerSeconds = opts.markerSeconds;
+        /* B2-9: данные бэкап-секвенции для Revert */
+        if (opts && opts.backupId) payload.backupId = String(opts.backupId);
+        if (opts && opts.backupName) payload.backupName = String(opts.backupName);
         localStorage.setItem(this._undoKey(panelId), JSON.stringify(payload));
       } catch (e) {
         console.warn('[context-store] save undo state failed (LS quota?):', e && e.message);
