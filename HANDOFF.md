@@ -3,7 +3,7 @@
 > Это **первый файл, который должен прочитать любой агент** перед началом работы над проектом.
 > Цель — за 5 минут понять: что это, как устроено, где hot zones, как тестировать, чего НЕ трогать.
 
-**Последнее обновление:** 2026-06-04 · **Статус:** production-ready · **Тесты:** 330/330 unit + 23/23 LLM quality на 1ч подкасте
+**Последнее обновление:** 2026-06-12 · **Статус:** production-ready · **Тесты:** 438/438 unit + 23/23 LLM quality на 1ч подкасте
 
 ---
 
@@ -38,7 +38,9 @@
 | Cut fillers (Path A + Path B) | Tools → «Убрать паразиты» | ✅ gentle/normal/aggressive |
 | Jump cuts (ритм YouTube-стиль) | Tools → «Jump cuts» | ✅ Дыхание 0-200мс, min-сегмент |
 | Авто-главы (адаптивные по длине) | Tools → «Авто-главы» | ✅ 10/20/45с min-interval |
-| MultiCam план для подкастов | LLM tool `propose_multicam_plan` | ✅ Phase 1 MVP через clip.disabled |
+| MultiCam план для подкастов | Tools → «Авто-MultiCam» + LLM tool | ✅ Phase 2 audio-driven (RMS микрофонов), кастомный маппинг дорожек, пресеты; live-валидирован 2026-06-12 |
+| Чекпоинты / откат | Кнопка «⏪ Откатить» + бэкап-секвенция перед apply | ✅ live-валидирован |
+| Кликабельные таймкоды в чате | proposal-карты + свободный текст ответов | ✅ B1-1/B1-1b, клик → setPlayhead |
 | AI чат: монтаж по тексту | Chat view | ✅ propose/apply паттерн |
 | AI чат: маркеры (chapters/highlights) | Chat view | ✅ propose_markers |
 | Сборка по хронометражу («N секунд») | Story Cutter Timed starter | ✅ targetDurationSec validation, +20% cap |
@@ -74,7 +76,7 @@
 ```
 ┌─────────────────────────────────────────────────┐
 │  CEP Panel (Chromium + Node.js)                 │
-│  client/unified/index2.html + panel.js (4500 LoC)│
+│  client/unified/index2.html + panel.js (5500 LoC)│
 │                                                 │
 │  ┌──────────┐  ┌──────────────────────────────┐ │
 │  │ Вкладка  │  │ Вкладка «Инструменты»       │ │
@@ -123,12 +125,12 @@
 
 | Файл | LoC | Почему hot |
 |---|---|---|
-| `client/unified/panel.js` | ~4500 | UI + executors + agent loop. 76 функций, 64 async. Любое изменение рискует регрессией. |
+| `client/unified/panel.js` | ~5550 | UI + executors + agent loop. Любое изменение рискует регрессией. |
 | `client/shared/transcript-structure.js` | ~1055 | paragraphs/segments structure. `buildParagraphs`, `isParagraphsStale`, `analyzeForCutsWithLLM` — critical |
 | `client/shared/cloudru-client.js` | ~406 | HTTP client + retry + SSE streaming. **НЕТ unit-тестов** — backlog |
 | `client/shared/agent-loop.js` | ~14KB | Tool orchestration + cycle detection. **НЕТ unit-тестов** — backlog |
 | `client/shared/prompts.js` | ~30KB | Tiered prompts по intent. **НЕТ unit-тестов** — backlog. Любое изменение → re-validate 23/23 LLM checks |
-| `host/premiere.jsx` | ~700 | ExtendScript. Особенности: `_wrap()` декоратор для PP 2026, `safeSeconds()` null-guards, нет JSON.stringify pre-check (только try/catch) |
+| `host/premiere.jsx` | ~2760 | ExtendScript. Особенности: `_wrap()` декоратор для PP 2026, `safeSeconds()` null-guards, нет JSON.stringify pre-check (только try/catch) |
 
 **Правила hot zones:**
 - **Не делать pre-check** в ExtendScript (`typeof JSON === 'function'` etc.) — используй optimistic try/catch
@@ -140,8 +142,8 @@
 ## 6. Как тестировать
 
 ```bash
-# Unit тесты (быстрые, ~150мс)
-npm test                                              # 247/247 pass
+# Unit тесты (быстрые, ~1с) — именно npm test, не node --test tests/
+npm test                                              # 438/438 pass
 
 # Real LLM quality на реальном кэше через Cloud.ru API (~10 мин)
 node tests/integration/run-starters-quality.mjs       # 23/23 quality checks
@@ -153,6 +155,13 @@ node tests/integration/run-glm47-production.mjs
 
 # Ручной smoke (нельзя автоматизировать — это Premiere UI)
 # Чеклист: docs/MANUAL_TESTS.md
+
+# Live-прогон панели в живом Premiere через CDP (порт 8098 из .debug)
+node tools/cep-debug.mjs targets       # список CEP-панелей
+node tools/cep-debug.mjs reload        # перезагрузить панель
+node tools/cep-debug.mjs evalfile tools/_live_probe.js   # выполнить JS в панели
+# Кириллица/сложный JS — ТОЛЬКО через evalfile (shell ломает inline eval)
+# PremiereBridge.evalScript НЕ существует — сырой ExtendScript через new CSInterface().evalScript
 ```
 
 **Pattern для добавления unit-тестов:**
@@ -236,6 +245,9 @@ node tests/integration/run-glm47-production.mjs
   - Fix runtime: `MulticamPlan` экспорт напрямую в `window` (CEP `--enable-nodejs` ломал CommonJS-fallback)
   - **Status:** код в working state, тесты зелёные. Phase 2B manual test в Premiere — pending
 - **2026-06-04:** Phase 2 model migration — GLM-5.1 (агент/анализ/findMoments) + DeepSeek-V4-Pro (главы/код), `max_tokens` 8000→16000. См. [`.omc/research/2026-06-04-cloudru-new-models-evaluation.md`](.omc/research/2026-06-04-cloudru-new-models-evaluation.md)
+- **2026-06-10:** Quality/speed audit wave (честные host-ошибки, NTSC fps, streaming UI) + UI-2 (instant slider re-filter, background precompute) + Wave A (версионирование кэша анализа, audio-only тулзы, ETA моделей)
+- **2026-06-11:** Волна B заимствований у конкурентов — checkpoint/«⏪ Откатить», кликабельные таймкоды в proposal-картах, пресеты мультикама, кросс-токи; конкурентная разведка в docs
+- **2026-06-12:** MultiCam live-фиксы (BRAW-ошибка честно, media→sequence remap, варнинг плоского микрофона) + кастомный выбор дорожек по спикерам + `tools/cep-debug.mjs` (CDP live-прогоны) + кликабельные таймкоды в свободном тексте чата (B1-1b) + fix зацикливания find_moments (стем только с начала слова, multi-stem ranking). Всё live-валидировано в Premiere на реальных проектах (включая 53-мин подкаст, 768 сегментов)
 
 ---
 
@@ -253,8 +265,6 @@ node tests/integration/run-glm47-production.mjs
 - B-roll marker hints
 
 ### Tech debt (низкий приоритет)
-- 64 async-функции в panel.js без operation queue (race condition risk)
-- Hardcoded Windows ffmpeg paths
 - 7 модулей пишут в `global.X` без namespace guard
 - Migration CEP → UXP (ExtendScript EOL сентябрь 2026)
 
@@ -333,7 +343,7 @@ node tests/integration/run-glm47-production.mjs
 for f in client/unified/panel.js client/shared/*.js; do node --check "$f" || echo "FAIL: $f"; done
 
 # 2. Unit tests
-npm test                                              # должно быть 247/247
+npm test                                              # должно быть 438/438
 
 # 3. LLM quality (если менял prompts.js, conversation-starters.js, или агент-логику)
 node tests/integration/run-starters-quality.mjs       # 23/23

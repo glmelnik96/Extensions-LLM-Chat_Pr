@@ -507,6 +507,54 @@ label.row-check input {
   }
 }
 
+/* ── Welcome-карточка пустого чата (что умеет плагин, 12 июня 2026) ── */
+.welcome-card {
+  margin: 12px auto;
+  max-width: 520px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.welcome-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.welcome-list {
+  margin: 0 0 10px;
+  padding-left: 18px;
+  color: var(--muted);
+}
+.welcome-list li {
+  margin: 4px 0;
+  line-height: 1.45;
+}
+.welcome-examples-title {
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+.welcome-examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.welcome-example {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.welcome-example:hover {
+  background: #2a2a2a;
+  color: var(--text);
+  border-color: var(--accent);
+}
+
 /* ── Conversation Starters ────────────────────────────────────────── */
 /* UI compact v3 (7 мая 2026 evening): collapsible-карточки категорий.
    Свёрнутый вид: одна 28px-строка с 3 кнопками-категориями.

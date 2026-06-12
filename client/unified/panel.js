@@ -3641,6 +3641,9 @@ PanelBoot.run('ИИ: монтаж', function () {
       div.appendChild(body);
       el.chat.appendChild(div);
     });
+    /* Пустой чат → welcome-карточка «что умеет плагин» (12 июня 2026).
+       Исчезает с первым сообщением, возвращается после «Очистить чат». */
+    if (!el.chat.children.length && !_pendingProposal) renderWelcomeCard();
     if (_pendingProposal) renderPendingProposalCard();
     /* Скроллим вниз только если пользователь и так был внизу,
        либо последнее сообщение — его собственное (только что отправил). */
@@ -3648,6 +3651,64 @@ PanelBoot.run('ИИ: монтаж', function () {
     if (wasNearBottom || (lastMsg && lastMsg.role === 'user')) {
       el.chat.scrollTop = el.chat.scrollHeight;
     }
+  }
+
+  /* ── Welcome-карточка пустого чата: что умеет плагин (12 июня 2026) ──
+     Рендерится в #chat когда нет ни одного видимого сообщения и нет proposal.
+     Клик по примеру вставляет текст в input (паттерн стартеров). */
+  var WELCOME_ITEMS = [
+    '🎙 Транскрибация In–Out — кнопка сверху; после неё доступны команды по тексту',
+    '✂️ Монтаж по тексту: «убери паразитов», «уложи в 60 секунд», «вырежи вступление»',
+    '🏷️ Маркеры и главы: «поставь YouTube-главы», «отметь хайлайты»',
+    '🔍 Поиск моментов: «найди, где говорят про…» — таймкоды в ответах кликабельны, клик двигает плейхед',
+    '🛠 Тишины · Паразиты · Jump cuts · Авто-главы · Авто-MultiCam — вкладка «Инструменты»',
+    '⏪ Перед каждым применением создаётся чекпоинт-секвенция — можно откатить'
+  ];
+  var WELCOME_EXAMPLES = [
+    'Что на таймлайне?',
+    'Убери паразитов и тишины',
+    'Поставь маркеры на главы',
+    'Найди момент, где говорят про '
+  ];
+  function renderWelcomeCard() {
+    var card = document.createElement('div');
+    card.className = 'welcome-card';
+
+    var title = document.createElement('div');
+    title.className = 'welcome-title';
+    title.textContent = '👋 ИИ-ассистент монтажа — что умеет панель';
+    card.appendChild(title);
+
+    var ul = document.createElement('ul');
+    ul.className = 'welcome-list';
+    for (var i = 0; i < WELCOME_ITEMS.length; i++) {
+      var li = document.createElement('li');
+      li.textContent = WELCOME_ITEMS[i];
+      ul.appendChild(li);
+    }
+    card.appendChild(ul);
+
+    var exTitle = document.createElement('div');
+    exTitle.className = 'welcome-examples-title';
+    exTitle.textContent = 'Попробуй:';
+    card.appendChild(exTitle);
+
+    var row = document.createElement('div');
+    row.className = 'welcome-examples';
+    WELCOME_EXAMPLES.forEach(function (txt) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'welcome-example';
+      b.textContent = txt.replace(/\s+$/, '') + (/\s$/.test(txt) ? '…' : '');
+      b.onclick = function () {
+        el.input.value = txt;
+        el.input.focus();
+      };
+      row.appendChild(b);
+    });
+    card.appendChild(row);
+
+    el.chat.appendChild(card);
   }
 
   /* ─── Hint chips / starters / transcribe LED ─────────────────────── */

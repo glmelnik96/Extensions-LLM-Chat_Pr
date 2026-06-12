@@ -134,9 +134,10 @@ grep -n "apiKey" client/shared/fm-secrets.js
 ### Шаг 1 — Установить ffmpeg
 
 1. Скачать с https://ffmpeg.org/download.html (Windows builds → gyan.dev → release essentials)
-2. Распаковать в `C:\Program Files\ffmpeg`
-3. Добавить `C:\Program Files\ffmpeg\bin` в системный PATH:
+2. Распаковать в `C:\ffmpeg` **или** `C:\Program Files\ffmpeg` — плагин проверяет оба пути автоматически (`C:\ffmpeg\bin\ffmpeg.exe`, `C:\Program Files\ffmpeg\bin\ffmpeg.exe`), PATH в этом случае не обязателен
+3. Если распаковал в другое место — добавь его `bin` в системный PATH:
    - `Win+Pause` → Advanced system settings → Environment Variables → System variables → Path → Edit → New
+   - Плагин найдёт ffmpeg через `where ffmpeg`
 4. Открыть **новый** PowerShell (старый PATH не подхватит):
 
 ```powershell
@@ -190,9 +191,9 @@ notepad client\shared\fm-secrets.js
 # Вписать apiKey, сохранить
 ```
 
-### Шаги 5–7 — Открытие панели и smoke-тест
+### Шаги 5–6 — Открытие панели и smoke-тест
 
-Те же, что на macOS (см. шаги 6–7 выше). Только убедись, что Premiere — **полностью** новый процесс после смены `PlayerDebugMode`.
+Те же, что шаги 6–7 в разделе macOS выше. Только убедись, что Premiere — **полностью** новый процесс после смены `PlayerDebugMode`.
 
 ---
 
@@ -280,11 +281,13 @@ which ffmpeg
 **Фикс Windows:**
 ```powershell
 where ffmpeg
-# Если "Could not find files" — добавь bin-папку ffmpeg в PATH (см. Шаг 1 Windows)
+# Если "Could not find files" — либо положи ffmpeg в C:\ffmpeg\bin или
+# C:\Program Files\ffmpeg\bin (плагин проверяет оба сам), либо добавь свою
+# bin-папку в PATH (см. Шаг 1 Windows)
 # Перезапусти Premiere
 ```
 
-⚠️ CEP-Chromium на macOS наследует PATH из контекста, в котором запущен Premiere. Если ffmpeg в `/opt/homebrew/bin/` — мы ищем там по умолчанию (`audio-preprocess.js:26-51`). Если установил в произвольное место — добавь его в PATH **до** запуска Premiere.
+⚠️ Плагин ищет ffmpeg по фиксированным путям (`findFfmpegPath` в `audio-preprocess.js`): macOS — `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`; Windows — `C:\ffmpeg\bin`, `C:\Program Files\ffmpeg\bin`; затем fallback на `which`/`where` (PATH). CEP-Chromium наследует PATH из контекста, в котором запущен Premiere, поэтому если ffmpeg в произвольном месте — добавь его в PATH **до** запуска Premiere.
 
 ---
 

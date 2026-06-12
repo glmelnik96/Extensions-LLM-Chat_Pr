@@ -19,9 +19,21 @@
 | AI-чат (аудио ducking) | Реализовано, не тестировалось в продакшене |
 | J/L-cuts | Отключено — ExtendScript не поддерживает unlink() |
 | Скорость клипа | Не поддерживается — нет API в Premiere Pro 2025 |
-| Автотесты | 247/247 unit + 23/23 LLM quality checks на 1ч подкасте |
-| MultiCam-нарезка для подкастов | Phase 1 MVP — autopod-style, через QE DOM razor + clip.disabled |
+| Автотесты | 438/438 unit + 23/23 LLM quality checks на 1ч подкасте |
+| MultiCam-нарезка для подкастов | Phase 2 — audio-driven свитчер по RMS микрофонов, кастомный выбор дорожек по спикерам, пресеты Спокойный/Динамичный + свои |
+| Чекпоинты / Откат | Работает — бэкап-секвенция перед каждым apply, кнопка «⏪ Откатить» |
+| Кликабельные таймкоды | Работает — в proposal-картах и в свободном тексте чата («763–778 сек», «12:43») → клик двигает плейхед |
 | PP 2026 совместимость | Стабилизировано — `_wrap` decorator + cold-start retry |
+
+## Что нового (июнь 2026)
+
+- **Авто-MultiCam Phase 2**: свитчер камер по RMS-громкости микрофонов (AutoPod-паттерн). Режимы «Авто» (детект микрофонов) и «Вручную» — маппинг спикер→аудиодорожка→видеодорожка + общий план. Пресеты Спокойный/Динамичный + сохранение своих. Честные варнинги: «плоский» микрофон, BRAW без декодирования.
+- **Чекпоинты**: перед каждым apply создаётся бэкап-секвенция `[бэкап HH:MM:SS]`, откат одной кнопкой «⏪ Откатить».
+- **Кликабельные таймкоды** — и в proposal-картах, и в свободном тексте ответов чата: «763 – 778 сек», «12 мин 43 сек», «12:43», «1304с» → клик ставит плейхед.
+- **Точный find_moments**: стемминг по началу слова (запрос «рост» больше не матчит «просто»/«вопрос»), multi-stem ranking — сегменты со всеми словами запроса вытесняют частичные совпадения.
+- **⚡ Анализ аудио без транскрипции**: silences/jump cuts за ~30 сек через ffmpeg, не дожидаясь Whisper.
+- **Live-валидация на больших проектах**: чат проверен на 53-минутном подкасте (768 сегментов) — резюме, поиск моментов и дальние края транскрипта точны до секунд, без галлюцинаций.
+- **tools/cep-debug.mjs**: CDP-драйвер для live-прогонов панели (eval/evalfile/reload/screenshot через порт 8098).
 
 ## Новые проверки качества (май 2026)
 
@@ -184,7 +196,8 @@ cp client/shared/fm-secrets.example.js client/shared/fm-secrets.js
 
 ```
 1. Реестр: HKEY_CURRENT_USER\SOFTWARE\Adobe\CSXS.12 → PlayerDebugMode (DWORD) = 1
-2. Установить ffmpeg → распаковать в C:\Program Files\ffmpeg → добавить bin в PATH
+2. Установить ffmpeg → распаковать в C:\ffmpeg или C:\Program Files\ffmpeg → добавить bin в PATH
+   (плагин сам проверяет оба пути + `where ffmpeg`)
 3. Скопировать в: %AppData%\Adobe\CEP\extensions\Extensions-LLM-Chat_Pr
 4. Скопировать fm-secrets.example.js → fm-secrets.js, вписать apiKey
 5. Полный рестарт Premiere
@@ -266,7 +279,7 @@ var FM_SECRETS = { apiKey: 'ваш-ключ-cloud-ru' };
 ## Тесты
 
 ```bash
-npm test   # 247 тестов: валидаторы, pipelines, prompts, search, simulator, scenarios
+npm test   # 438 тестов: валидаторы, pipelines, prompts, search, simulator, multicam, scenarios
 ```
 
 Интеграция с Premiere — ручная проверка по чеклисту `docs/MANUAL_TESTS.md`.
@@ -289,15 +302,29 @@ npm test   # 247 тестов: валидаторы, pipelines, prompts, search,
 │       ├── audio-preprocess.js    — ffmpeg silencedetect + loudnorm
 │       ├── bridge-premiere.js     — CSInterface → ExtendScript мост
 │       ├── transcript-structure.js— paragraphs, topics, local detectors
-│       ├── find-moments.js        — semantic search (literal + TF-IDF)
+│       ├── find-moments.js        — semantic search (literal stems + TF-IDF)
+│       ├── multicam-plan.js       — план переключений камер по RMS микрофонов
 │       ├── tool-validators.js     — валидация планов перед apply
 │       ├── edit-plan-simulator.js — dry-run симуляция правок
+│       ├── operation-queue.js     — очередь длинных операций (transcribe/analyze)
+│       ├── analysis-routing.js    — выбор модели под задачу
+│       ├── audio-ducking.js       — план приглушения музыки под речь
+│       ├── audio-render.js        — экспорт аудио секвенции через .epr
+│       ├── whisper-cpp-client.js  — локальный whisper.cpp (fallback)
+│       ├── youtube-export.js      — главы → описание YouTube
+│       ├── markdown-lite.js       — безопасный рендер markdown в чате
+│       ├── conversation-starters.js / starters-ui.js — стартовые подсказки чата
+│       ├── ui-hints.js / ui-status.js — подсказки и статусная строка
+│       ├── panel-bootstrap.js     — загрузка модулей, cache-bust
+│       ├── abort-shim.js          — AbortController для старого CEF
 │       ├── fm-defaults.js         — конфигурация моделей
 │       └── fm-secrets.js          — API-ключ (gitignored)
 ├── host/
 │   ├── premiere.jsx               — ExtendScript: snapshot, razor, markers, export
 │   └── presets/                   — .epr пресет для аудио-экспорта
-├── tests/                         — 247 автотестов (node --test) + integration на Cloud.ru
+├── tools/
+│   └── cep-debug.mjs              — CDP-драйвер: eval/reload/screenshot панели (порт 8098)
+├── tests/                         — 438 автотестов (npm test) + integration на Cloud.ru
 └── docs/                          — документация
 ```
 
