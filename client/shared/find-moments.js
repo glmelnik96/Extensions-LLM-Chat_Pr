@@ -111,6 +111,51 @@
   }
 
   /**
+   * Live-находка 12 июня 2026: substring-матч стемм ловил середины слов —
+   * запрос «китай рост» → стем «рос» → совпадал с «п_рос_то»/«воп_рос», и
+   * find_moments возвращал первые 20 сегментов подряд (агент зацикливался).
+   * Стем должен совпадать только с НАЧАЛОМ слова (словоформы:
+   * стратег→стратегия/стратегии; кита→Китай/китайцы). \b с кириллицей в
+   * JS-regex не работает, поэтому токенизируем и сравниваем префиксы.
+   */
+  function stemMatchCount(text, stems) {
+    if (!stems.length) return 0;
+    var words = norm(text).split(/[^a-zа-я0-9]+/);
+    var hit = {};
+    var cnt = 0;
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      if (!w) continue;
+      for (var j = 0; j < stems.length; j++) {
+        if (!hit[j] && w.indexOf(stems[j]) === 0) {
+          hit[j] = 1;
+          cnt++;
+          if (cnt === stems.length) return cnt;
+        }
+      }
+    }
+    return cnt;
+  }
+
+  /**
+   * Оставить только хиты с максимальным числом совпавших стемов:
+   * «китай рост» — сегменты с обоими словами вытесняют сегменты, где только
+   * «Россия» зацепила стем «рос». Если максимум 1 — обычный OR (как раньше).
+   */
+  function keepBestStemHits(hits) {
+    var max = 0;
+    for (var i = 0; i < hits.length; i++) {
+      if (hits[i]._stemCnt > max) max = hits[i]._stemCnt;
+    }
+    if (max <= 1) return hits;
+    var out = [];
+    for (var j = 0; j < hits.length; j++) {
+      if (hits[j]._stemCnt === max) out.push(hits[j]);
+    }
+    return out;
+  }
+
+  /**
    * @param {object} entry  кэш транскрипта (см. transcript-structure.js)
    * @param {string} query
    * @param {object} opt    { k?:20, minScore?:0.0, scope?:'segments'|'paragraphs'|'auto', mergeGapSec?:1.5 }
@@ -139,47 +184,43 @@
     if (scope !== 'paragraphs' && segs.length) {
       for (var si = 0; si < segs.length; si++) {
         var s = segs[si];
-        var t = norm(s.text);
-        if (!t) continue;
-        var matched = false;
-        for (var qi = 0; qi < stems.length; qi++) {
-          if (t.indexOf(stems[qi]) >= 0) { matched = true; break; }
-        }
-        if (matched) {
+        if (!s.text) continue;
+        var cnt = stemMatchCount(s.text, stems);
+        if (cnt > 0) {
           hits.push({
             startSec: s.startSec,
             endSec: s.endSec,
-            score: 1,
+            score: cnt,
             text: s.text || '',
             source: 'segments',
             idx: si,
-            matchType: 'literal'
+            matchType: 'literal',
+            _stemCnt: cnt
           });
         }
       }
+      hits = keepBestStemHits(hits);
     }
 
     if (!hits.length && paras.length) {
       /* Fallback 1: literal по параграфам */
       for (var pi = 0; pi < paras.length; pi++) {
         var p = paras[pi];
-        var pt = norm(p.text);
-        var pmatched = false;
-        for (var pqi = 0; pqi < stems.length; pqi++) {
-          if (pt.indexOf(stems[pqi]) >= 0) { pmatched = true; break; }
-        }
-        if (pmatched) {
+        var pcnt = stemMatchCount(p.text, stems);
+        if (pcnt > 0) {
           hits.push({
             startSec: p.startSec,
             endSec: p.endSec,
-            score: 1,
+            score: pcnt,
             text: p.text || '',
             source: 'paragraphs',
             idx: pi,
-            matchType: 'literal'
+            matchType: 'literal',
+            _stemCnt: pcnt
           });
         }
       }
+      hits = keepBestStemHits(hits);
     }
 
     if (!hits.length) {

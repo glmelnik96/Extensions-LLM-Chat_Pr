@@ -3424,9 +3424,100 @@ PanelBoot.run('ИИ: монтаж', function () {
   function setBubbleBody(bodyEl, role, text) {
     if (role === 'assistant' && window.MarkdownLite && text) {
       bodyEl.innerHTML = MarkdownLite.render(text);
+      _linkifyTimecodes(bodyEl);
     } else {
       bodyEl.textContent = text || '';
     }
+  }
+
+  /* B1-1b (12 июня 2026): кликабельные таймкоды в свободном тексте ответов
+   * ассистента. LLM пишет «763 – 778 сек», «12 мин 43 сек», «21:54», «1304с» —
+   * превращаем в те же _tcJumpEl-спаны (прыжок плейхеда), что и в
+   * proposal-картах. Live-валидация 12 июня: ответы чата содержат точные
+   * таймкоды, но пользователю приходилось листать таймлайн вручную.
+   * ВАЖНО: \b в JS-regex не работает с кириллицей (с/сек — не \w),
+   * границы — через (?![а-яёa-z0-9]). */
+  var TC_TEXT_RE = new RegExp(
+    /* 1,2: диапазон «763 – 778 сек» (обе границы кликабельны) */
+    '(\\d+(?:[.,]\\d+)?)\\s*[\u2013\u2014-]\\s*(\\d+(?:[.,]\\d+)?)\\s*\u0441(?:\u0435\u043a)?(?![\u0430-\u044f\u0451a-z0-9])' +
+    /* 3,4: «12 мин 43 сек» */
+    '|(\\d+)\\s*\u043c\u0438\u043d(?:\u0443\u0442[\u0430-\u044f\u0451]*)?\\.?\\s*(\\d+)\\s*\u0441(?:\u0435\u043a)?(?![\u0430-\u044f\u0451a-z0-9])' +
+    /* 5,6,7: «1:02:33» */
+    '|(\\d{1,2}):(\\d{2}):(\\d{2})(?!\\d)' +
+    /* 8,9: «21:54» */
+    '|(\\d{1,3}):(\\d{2})(?![\\d:])' +
+    /* 10: «1304с» / «39.2 сек» */
+    '|(\\d+(?:[.,]\\d+)?)\\s*\u0441(?:\u0435\u043a)?(?![\u0430-\u044f\u0451a-z0-9])',
+    'gi'
+  );
+  function _tcNum(s) {
+    return parseFloat(String(s).replace(',', '.'));
+  }
+  function _tcSpan(sec, label) {
+    var sp = _tcJumpEl(sec, label);
+    sp.setAttribute('data-tc', '1');
+    return sp;
+  }
+  function _linkifyTextNode(node) {
+    var text = node.nodeValue;
+    TC_TEXT_RE.lastIndex = 0;
+    var m, last = 0, frag = null;
+    while ((m = TC_TEXT_RE.exec(text))) {
+      /* нет lookbehind в ES5: «2021:30» не должен дать «021:30» */
+      if (m.index > 0 && /[\d:.,]/.test(text.charAt(m.index - 1))) continue;
+      var parts;
+      if (m[1] !== undefined) {
+        var sepIdx = text.indexOf(m[2], m.index + m[1].length) - m.index;
+        parts = [
+          { sec: _tcNum(m[1]), label: m[0].slice(0, m[1].length) },
+          m[0].slice(m[1].length, sepIdx),
+          { sec: _tcNum(m[2]), label: m[0].slice(sepIdx) }
+        ];
+      } else if (m[3] !== undefined) {
+        parts = [{ sec: parseInt(m[3], 10) * 60 + parseInt(m[4], 10), label: m[0] }];
+      } else if (m[5] !== undefined) {
+        parts = [{ sec: (+m[5]) * 3600 + (+m[6]) * 60 + (+m[7]), label: m[0] }];
+      } else if (m[8] !== undefined) {
+        parts = [{ sec: (+m[8]) * 60 + (+m[9]), label: m[0] }];
+      } else {
+        parts = [{ sec: _tcNum(m[10]), label: m[0] }];
+      }
+      /* бессмыслица (NaN, >12 часов) — не кликаем */
+      var bad = false;
+      for (var pi = 0; pi < parts.length; pi++) {
+        var pp = parts[pi];
+        if (typeof pp === 'object' && (!isFinite(pp.sec) || pp.sec < 0 || pp.sec > 43200)) bad = true;
+      }
+      if (bad) continue;
+      if (!frag) frag = document.createDocumentFragment();
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      for (var pj = 0; pj < parts.length; pj++) {
+        var pt = parts[pj];
+        frag.appendChild(typeof pt === 'string' ? document.createTextNode(pt) : _tcSpan(pt.sec, pt.label));
+      }
+      last = m.index + m[0].length;
+    }
+    if (!frag) return;
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.parentNode.replaceChild(frag, node);
+  }
+  function _linkifyTimecodes(rootEl) {
+    if (!rootEl || !document.createTreeWalker) return;
+    var SKIP = { A: 1, CODE: 1, PRE: 1, BUTTON: 1, SELECT: 1, TEXTAREA: 1 };
+    var walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, null, false);
+    var nodes = [];
+    while (walker.nextNode()) {
+      var n = walker.currentNode;
+      var p = n.parentNode;
+      var skip = false;
+      while (p && p !== rootEl) {
+        if (SKIP[p.tagName] || (p.getAttribute && p.getAttribute('data-tc'))) { skip = true; break; }
+        p = p.parentNode;
+      }
+      if (!skip && /\d/.test(n.nodeValue)) nodes.push(n);
+    }
+    /* replaceChild ломает живой обход — собираем список заранее */
+    for (var i = 0; i < nodes.length; i++) _linkifyTextNode(nodes[i]);
   }
 
   /* Живой пузырь стриминга: создаётся на первом chunk'е, обновляется
