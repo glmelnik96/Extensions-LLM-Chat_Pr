@@ -273,7 +273,12 @@
      * thinking не нужен, замедляет и рискует null-content (как analyze, TEST D).
      *
      * chat — multi-step tool-calling (TEST C, 3.58s для GLM-5.1). Оставляем.
-     * report — long-form ризонинг по сессии. Оставляем true.
+     * report — Phase 3: false. _generateReport использует analysisModel(GLM-5.1)
+     *   + responseFormat json_object — ТА ЖЕ комбинация, что в analyze (TEST D:
+     *   GLM-5.1+thinking+json на большом input → content=null/зависание). На малой
+     *   сессии (1 чанк) работало с thinking, но длинная сессия (много чанков +
+     *   объединяющий вызов) гарантированно попадёт в баг. Отчёт — summarization,
+     *   thinking не нужен.
      *
      * Если поле undefined — fallback на enableThinking.
      */
@@ -281,7 +286,7 @@
       analyze: false,    /* GLM-5.1: иначе NoneType на больших input */
       chapter: false,    /* GLM-4.7: structured JSON, thinking не нужен и рискует null (Phase 3) */
       chat: true,        /* multi-step tool-calling — нужно */
-      report: true       /* AI-отчёт по сессии — нужно */
+      report: false      /* GLM-5.1 + json_object: как analyze, thinking ломает на больших сессиях (Phase 3) */
     },
 
     /**
