@@ -123,13 +123,15 @@
      * Модель для построения глав (buildTopicsWithLLM).
      * Получает весь транскрипт целиком (paragraphs) и определяет темы.
      *
-     * Phase 2: GLM-4.7 → DeepSeek-V4-Pro. TEST B показал DeepSeek 3.14s vs
-     * GLM-5.1 22.80s на той же задаче (≈7× быстрее), качество глав на русском
-     * сопоставимое, 0 EN-leak. 1M контекст позволяет обрабатывать целые
-     * 4-часовые подкасты без чанкования. Native thinking не требуется —
-     * DeepSeek и так держит long-context reasoning.
+     * Phase 3 (19.06.2026): DeepSeek-V4-Pro → GLM-4.7. Live-баг: инструмент
+     * «Главы» ЗАВИСАЛ на 180с+ — DeepSeek с thinking + json_object + max_tokens
+     * до 32K непрактично медленный в интерактиве (TEST B 3.14s не воспроизвёлся
+     * на реальном 10-мин транскрипте). GLM-4.7 — быстрый, FREE, качество глав на
+     * русском хорошее. thinkingPolicy.chapter=false (см. ниже) — для structured
+     * JSON thinking не нужен и рискует null-content (TEST D). ⚠ preview-модель:
+     * при 404 верни 'zai-org/GLM-5.1' (thinkingPolicy.chapter оставь false).
      */
-    chapterModel: 'deepseek-ai/DeepSeek-V4-Pro',
+    chapterModel: 'zai-org/GLM-4.7',
 
     /**
      * Модель для семантического поиска (find_moments через LLM, future use).
@@ -267,9 +269,8 @@
      * и возвращает content=null (SDK падает с NoneType). С thinking=false
      * та же задача — 0.67s на 10K input. См. TEST D.
      *
-     * chapter — теперь крутится на DeepSeek-V4-Pro, который thinking-флаг
-     * игнорирует. Оставляем true для совместимости, если chapterModel
-     * вручную переключат обратно на GLM.
+     * chapter — Phase 3: false. chapterModel=GLM-4.7, задача structured JSON;
+     * thinking не нужен, замедляет и рискует null-content (как analyze, TEST D).
      *
      * chat — multi-step tool-calling (TEST C, 3.58s для GLM-5.1). Оставляем.
      * report — long-form ризонинг по сессии. Оставляем true.
@@ -278,7 +279,7 @@
      */
     thinkingPolicy: {
       analyze: false,    /* GLM-5.1: иначе NoneType на больших input */
-      chapter: true,     /* DeepSeek-V4-Pro игнорирует флаг, безопасно */
+      chapter: false,    /* GLM-4.7: structured JSON, thinking не нужен и рискует null (Phase 3) */
       chat: true,        /* multi-step tool-calling — нужно */
       report: true       /* AI-отчёт по сессии — нужно */
     },
