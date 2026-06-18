@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.0';
+$._EXT_PRM_.version = '2.6.1';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -36,20 +36,112 @@ $._EXT_PRM_._resetOps = function () {
 };
 
 /**
- * Phase 1 (PP-26 stabilization, 2026-04-29; revised 3x 2026-04-30):
- * НЕТ pre-gate проверки JSON. Просто пытаемся, ловим — fallback на handcrafted JSON.
+ * JSON-полифилл для ExtendScript (2026-06-18).
  *
- * История попыток detect'а (все провалились в одну или другую сторону):
- *   v1: `typeof JSON.stringify === 'function'` — false-negative из-за
- *       ExtendScript COM-bridge возвращающего 'unknown' для native.
- *   v2: round-trip при load — JSON может инжектиться Adobe позже загрузки JSX.
- *   v3: lazy round-trip при первом вызове — всё равно false-negative по неясной
- *       причине (вероятно strict equality / `.a === 1` ведёт себя необычно
- *       в ExtendScript COM-context).
- *   v4 (тут): отказались от pre-check, делаем optimistic try/catch внутри _wrap.
+ * ПРОБЛЕМА: движок ExtendScript у части сборок Premiere НЕ имеет нативного
+ *   объекта JSON. На таких машинах любой из ~85 вызовов JSON.stringify/parse в
+ *   этом файле падал с `ReferenceError: JSON is undefined`, и плагин не работал
+ *   вовсе (подтверждено логом установки на стороннем устройстве). На других
+ *   сборках (напр. ExtendScript 4.5.6 в PP 26.2) JSON присутствует — поэтому
+ *   баг латентный и проявляется только при переносе на другую машину/ОС.
  *
- * Преимущество: не нужно гадать о ExtendScript-квирках. Если JSON работает —
- * сериализация просто пройдёт. Если нет — упадёт в catch и мы handcraft'нем JSON.
+ * РЕШЕНИЕ: защищённый гард `if (typeof JSON === 'undefined')` — полифилл
+ *   ставится ТОЛЬКО когда нативного JSON нет. Где JSON есть — блок пропускается,
+ *   используется родная (быстрая) реализация. Полностью безопасно для обеих сред.
+ *
+ * Почему не json2.js Крокфорда: оригинал содержит regex с Unicode-диапазонами,
+ *   на которых парсер ExtendScript падает с SyntaxError ещё до выполнения (файл
+ *   не загружается). Здесь stringify — посимвольный обход с escape-картой (без
+ *   regex), parse — eval с минимальной проверкой первого символа.
+ *
+ * БЕЗОПАСНОСТЬ parse: вход host-функций — это строго JSON, сериализованный нашим
+ *   же panel.js (V8). Это не сетевой/сторонний ввод, поэтому eval-парсинг
+ *   (стандартный для ExtendScript) приемлем. Не используйте этот JSON.parse для
+ *   недоверенных данных.
+ *
+ * _wrap (ниже) сохраняет optimistic try/catch как defense-in-depth: даже если
+ *   сериализация всё же упадёт, наружу уйдёт структурированная ошибка, а не
+ *   немой "EvalScript error.".
+ */
+if (typeof JSON === 'undefined') {
+  JSON = {};
+  (function () {
+    var esc = {};
+    esc['\b'] = '\\b';
+    esc['\t'] = '\\t';
+    esc['\n'] = '\\n';
+    esc['\f'] = '\\f';
+    esc['\r'] = '\\r';
+    esc['"'] = '\\"';
+    esc['\\'] = '\\\\';
+    function quote(s) {
+      var out = '',
+        i,
+        c,
+        e;
+      for (i = 0; i < s.length; i++) {
+        c = s.charAt(i);
+        e = esc[c];
+        if (e) {
+          out += e;
+        } else if (c.charCodeAt(0) < 32) {
+          out += '\\u' + ('0000' + c.charCodeAt(0).toString(16)).slice(-4);
+        } else {
+          out += c;
+        }
+      }
+      return '"' + out + '"';
+    }
+    function str(v) {
+      var i, k, part, parts;
+      if (v === null) return 'null';
+      switch (typeof v) {
+        case 'string':
+          return quote(v);
+        case 'number':
+          return isFinite(v) ? String(v) : 'null';
+        case 'boolean':
+          return String(v);
+        case 'object':
+          parts = [];
+          if (v instanceof Array) {
+            for (i = 0; i < v.length; i++) parts[i] = str(v[i]) || 'null';
+            return '[' + parts.join(',') + ']';
+          }
+          for (k in v) {
+            if (v.hasOwnProperty(k)) {
+              part = str(v[k]);
+              if (part !== undefined) parts.push(quote(k) + ':' + part);
+            }
+          }
+          return '{' + parts.join(',') + '}';
+        default:
+          return undefined; /* function / undefined — пропускаем */
+      }
+    }
+    JSON.stringify = function (v) {
+      return str(v);
+    };
+    JSON.parse = function (t) {
+      t = String(t);
+      var first = t.replace(/^\s+/, '').charAt(0);
+      if (first !== '{' && first !== '[' && first !== '"' &&
+          first !== '-' && (first < '0' || first > '9') &&
+          t.replace(/^\s+|\s+$/g, '') !== 'true' &&
+          t.replace(/^\s+|\s+$/g, '') !== 'false' &&
+          t.replace(/^\s+|\s+$/g, '') !== 'null') {
+        throw new SyntaxError('JSON.parse: неожиданный ввод');
+      }
+      return eval('(' + t + ')');
+    };
+  })();
+}
+
+/**
+ * Phase 1 (PP-26 stabilization, 2026-04-29; revised 2026-06-18):
+ * Полифилл выше гарантирует наличие JSON. _wrap дополнительно держит optimistic
+ * try/catch — если сериализация всё же упадёт, наружу уходит структурированная
+ * ошибка вместо немого "EvalScript error.".
  */
 
 /**
@@ -1206,7 +1298,8 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
 
       /* --- set_clips_enabled_by_name: все сегменты с данным именем клипа на секвенции --- */
       if (a === 'set_clips_enabled_by_name') {
-        var nm = String(op.clipName || op.name || '').trim();
+        /* ExtendScript (ES3) не имеет String.prototype.trim — используем regex. */
+        var nm = String(op.clipName || op.name || '').replace(/^\s+|\s+$/g, '');
         if (!nm) {
           results.push({ op: a, ok: false, error: 'Нужен clipName (имя клипа как в снимке)' });
           continue;

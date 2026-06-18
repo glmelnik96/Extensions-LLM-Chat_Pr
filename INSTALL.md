@@ -333,15 +333,18 @@ where ffmpeg
 
 ---
 
-### Проблема: «JSON polyfill missing in Premiere ExtendScript engine»
+### Проблема: «JSON is undefined» / любая операция падает с ReferenceError в ExtendScript
 
-**Причина:** Известный quirk ExtendScript на свежих PP-сборках — `typeof JSON.stringify` возвращает `'unknown'` вместо `'function'`. Это **уже исправлено** в host (Phase 1 wrap pattern, см. apr 2026).
+**Причина:** Часть сборок движка ExtendScript в Premiere **не имеют нативного объекта `JSON`**. Без него все ~85 вызовов `JSON.stringify/parse` в host падали, и плагин не работал вовсе. Баг проявляется только на определённых машинах/ОС (на других JSON присутствует), поэтому коварен при переносе.
 
-**Фикс:** Проверь, что у тебя **свежий** `host/premiere.jsx` — должен содержать строки:
+**Фикс:** В `host/premiere.jsx` встроен JSON-полифилл с защитным гардом (`if (typeof JSON === 'undefined')`) — ставится только там, где нативного JSON нет, и безопасен везде. Проверь, что версия host свежая:
 ```bash
-grep -n "Phase 1 (PP-26 stabilization" host/premiere.jsx
-# Если grep ничего не вернул — у тебя старая версия. Сделай git pull.
+grep -n "JSON-полифилл для ExtendScript" host/premiere.jsx   # должна найтись
+grep -n "_EXT_PRM_.version" host/premiere.jsx                # должно быть >= '2.6.1'
+# Если не нашлось — у тебя старая версия. Сделай git pull, полный рестарт Premiere.
 ```
+
+> Сопутствующее: ExtendScript — это ES3, в нём нет `String.trim`, `Array.forEach`, `Object.keys`. Если правишь host — не используй эти методы (host их обходит вручную).
 
 ---
 

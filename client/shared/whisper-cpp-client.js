@@ -44,13 +44,23 @@
     ensureNode();
     if (explicit && fs.existsSync(explicit)) return explicit;
     var home = os.homedir();
-    var candidates = [
+    var isWin = process.platform === 'win32';
+    /* path.join — кросс-ОС разделители (на Windows home = C:\Users\…). На Windows
+       бинарник имеет расширение .exe и ищется ещё в C:\whisper.cpp\. */
+    var candidates = isWin ? [
+      path.join(home, 'whisper.cpp', 'build', 'bin', 'whisper-cli.exe'),
+      path.join(home, 'whisper.cpp', 'build', 'bin', 'main.exe'),
+      path.join(home, 'whisper.cpp', 'main.exe'),
+      'C:\\whisper.cpp\\build\\bin\\whisper-cli.exe',
+      'C:\\whisper.cpp\\build\\bin\\main.exe',
+      'C:\\Program Files\\whisper.cpp\\build\\bin\\whisper-cli.exe'
+    ] : [
       /* Пользовательские сборки из исходников */
-      home + '/whisper.cpp/build/bin/whisper-cli',
-      home + '/whisper.cpp/build/bin/main',
-      home + '/whisper.cpp/main',
-      home + '/src/whisper.cpp/build/bin/whisper-cli',
-      home + '/projects/whisper.cpp/build/bin/whisper-cli',
+      path.join(home, 'whisper.cpp', 'build', 'bin', 'whisper-cli'),
+      path.join(home, 'whisper.cpp', 'build', 'bin', 'main'),
+      path.join(home, 'whisper.cpp', 'main'),
+      path.join(home, 'src', 'whisper.cpp', 'build', 'bin', 'whisper-cli'),
+      path.join(home, 'projects', 'whisper.cpp', 'build', 'bin', 'whisper-cli'),
       /* Brew */
       '/opt/homebrew/bin/whisper-cli',
       '/opt/homebrew/bin/whisper-cpp',
@@ -61,14 +71,21 @@
     for (var i = 0; i < candidates.length; i++) {
       try { if (fs.existsSync(candidates[i])) return candidates[i]; } catch (e) {}
     }
-    /* which с дополненным PATH */
+    /* Последняя попытка — through where (Windows) / which (Unix), как в findFfmpegPath. */
     try {
       var execSync = require('child_process').execSync;
-      var env = Object.assign({}, process.env, {
-        PATH: (process.env.PATH || '') + ':/opt/homebrew/bin:/usr/local/bin:' + home + '/whisper.cpp/build/bin'
-      });
-      var out = String(execSync('which whisper-cli || which whisper-cpp || true', { env: env, timeout: 5000 })).trim();
-      if (out && fs.existsSync(out)) return out;
+      if (isWin) {
+        var w = '';
+        try { w = String(execSync('where whisper-cli', { timeout: 5000 })).trim().split('\n')[0]; } catch (eW1) {}
+        if (!w) { try { w = String(execSync('where whisper-cpp', { timeout: 5000 })).trim().split('\n')[0]; } catch (eW2) {} }
+        if (w && fs.existsSync(w)) return w;
+      } else {
+        var env = Object.assign({}, process.env, {
+          PATH: (process.env.PATH || '') + ':/opt/homebrew/bin:/usr/local/bin:' + path.join(home, 'whisper.cpp', 'build', 'bin')
+        });
+        var out = String(execSync('which whisper-cli || which whisper-cpp || true', { env: env, timeout: 5000 })).trim();
+        if (out && fs.existsSync(out)) return out;
+      }
     } catch (e) {}
     return null;
   }
@@ -80,12 +97,13 @@
     ensureNode();
     if (explicit && fs.existsSync(explicit)) return explicit;
     var home = os.homedir();
+    /* path.join — кросс-ОС разделители (важно для Windows-домашней папки). */
     var candidates = [
-      home + '/whisper.cpp/models/ggml-medium.bin',
-      home + '/whisper.cpp/models/ggml-large-v3.bin',
-      home + '/whisper.cpp/models/ggml-large-v3-turbo.bin',
-      home + '/whisper.cpp/models/ggml-small.bin',
-      home + '/whisper.cpp/models/ggml-base.bin'
+      path.join(home, 'whisper.cpp', 'models', 'ggml-medium.bin'),
+      path.join(home, 'whisper.cpp', 'models', 'ggml-large-v3.bin'),
+      path.join(home, 'whisper.cpp', 'models', 'ggml-large-v3-turbo.bin'),
+      path.join(home, 'whisper.cpp', 'models', 'ggml-small.bin'),
+      path.join(home, 'whisper.cpp', 'models', 'ggml-base.bin')
     ];
     if (whisperBin) {
       /* <dir>/../models или <dir>/../../models */

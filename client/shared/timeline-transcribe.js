@@ -191,7 +191,8 @@
     var ffmpegBin = findFfmpegPath();
     if (!ffmpegBin) {
       return Promise.reject(new Error(
-        'ffmpeg не найден. Установите: brew install ffmpeg (macOS) или apt install ffmpeg (Linux). Путь проверен: /opt/homebrew/bin, /usr/local/bin, /usr/bin.'
+        'ffmpeg не найден. macOS: brew install ffmpeg. Windows: распакуйте в C:\\ffmpeg или C:\\Program Files\\ffmpeg (или добавьте в PATH). Linux: apt install ffmpeg. ' +
+        'Проверены: /opt/homebrew/bin, /usr/local/bin, /usr/bin, C:\\ffmpeg\\bin, C:\\Program Files\\ffmpeg\\bin, и where/which.'
       ));
     }
     var execFile = require('child_process').execFile;

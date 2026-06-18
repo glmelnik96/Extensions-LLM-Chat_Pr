@@ -163,6 +163,9 @@
         } catch (e3) {}
       }
     }
+    if (!ok && typeof console !== 'undefined' && console.warn) {
+      console.warn('[ContextStore] Не удалось записать кэш транскрипта ни в один путь:', paths.join(' | '));
+    }
     return ok;
   }
 

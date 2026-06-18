@@ -130,10 +130,11 @@
 | `client/shared/cloudru-client.js` | ~406 | HTTP client + retry + SSE streaming. **НЕТ unit-тестов** — backlog |
 | `client/shared/agent-loop.js` | ~14KB | Tool orchestration + cycle detection. **НЕТ unit-тестов** — backlog |
 | `client/shared/prompts.js` | ~30KB | Tiered prompts по intent. **НЕТ unit-тестов** — backlog. Любое изменение → re-validate 23/23 LLM checks |
-| `host/premiere.jsx` | ~2760 | ExtendScript. Особенности: `_wrap()` декоратор для PP 2026, `safeSeconds()` null-guards, нет JSON.stringify pre-check (только try/catch) |
+| `host/premiere.jsx` | ~2840 | ExtendScript (ES3!). Особенности: JSON-полифилл (гард по `typeof JSON`), `_wrap()` декоратор, `safeSeconds()` null-guards. НЕТ `.trim`/`.forEach`/`Object.keys` — см. ExtendScript quirks |
 
 **Правила hot zones:**
-- **Не делать pre-check** в ExtendScript (`typeof JSON === 'function'` etc.) — используй optimistic try/catch
+- **Не делать pre-check** в ExtendScript (`typeof JSON === 'function'` etc.) — используй optimistic try/catch; JSON гарантирован полифиллом вверху premiere.jsx
+- **ExtendScript = ES3**: нет `.trim`/`.forEach`/`Object.keys`/`.bind` — не добавляй их в host без CDP-пробы наличия
 - **panel.js не split'ить** без явной отмашки — это monster, но рабочий monster
 - **prompts.js не рефакторить** без re-validation через `tests/integration/run-starters-quality.mjs`
 
@@ -203,11 +204,14 @@ node tools/cep-debug.mjs evalfile tools/_live_probe.js   # выполнить JS
 - **Tool calling:** агент вызывает `propose_*` → плагин показывает карточку → user clicks Apply → `apply_*` исполняет. **Никогда не `apply_*` без `propose_*`**.
 - **Walking skeleton MVP:** end-to-end сначала, потом обогащение фаз. Не доводить одну фазу до идеала пока остальные не работают.
 
-### ExtendScript quirks (host/premiere.jsx)
-- **`_wrap()` декоратор** обертывает 10 exported functions для structured `{_hostError:true,...}` errors
+### ExtendScript quirks (host/premiere.jsx) — движок ES3, не ES5!
+- **`_wrap()` декоратор** обертывает exported functions для structured `{_hostError:true,...}` errors
 - **Cold-start retry** в `bridge-premiere.js` (300/900мс backoff) — для PP 25/26 race condition
 - **`safeSeconds()` null-guard** — `_clipTimes` может вернуть null на свежесмонтированной timeline
-- **Не делать `typeof JSON.stringify === 'function'`** — на PP 26 возвращает `'unknown'`, используй optimistic try/catch
+- **JSON-полифилл** (вверху файла, гард `if (typeof JSON === 'undefined')`): часть сборок ExtendScript НЕ имеют нативного JSON (подтверждено логом установки на стороннем устройстве) → все ~85 вызовов `JSON.*` падали с `ReferenceError`. Где JSON есть (напр. ES 4.5.6 в PP 26.2) — гард пропускает полифилл. **Не удалять.** `_wrap` сохраняет optimistic try/catch как defense-in-depth.
+- **Не делать `typeof JSON.stringify === 'function'`** — на PP 26 COM-bridge возвращает `'unknown'`, pre-check бессмысленен; полифилл + try/catch надёжнее.
+- **ES5-методы отсутствуют в ExtendScript** — проверено на живом PP 26.2 (ES 4.5.6): НЕТ `String.prototype.trim`, `Array.prototype.forEach`, `Object.keys` (но `Array.prototype.indexOf` ЕСТЬ). Вместо `.trim()` → `.replace(/^\s+|\s+$/g,'')`. Перед использованием любого ES5-метода в host — проверь его наличие пробой через CDP.
+- **Версия host** в `$._EXT_PRM_.version` — бампать при правках host (сейчас `2.6.1`).
 
 ### LLM patterns
 - **`targetDurationSec`** обязателен в `propose_transcript_cuts` для запросов «уложи в N сек»

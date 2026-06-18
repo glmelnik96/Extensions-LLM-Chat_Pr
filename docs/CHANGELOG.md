@@ -6,6 +6,17 @@
 
 ---
 
+## 2026-06-18 — Кросс-ОС/ExtendScript hardening (совместимость установки)
+
+Триггер: лог установки на стороннем устройстве показал падения в `host/premiere.jsx`. Аудит подтвердил латентные баги портируемости (на машине разработчика не проявлялись).
+
+- **JSON-полифилл в host** (`host/premiere.jsx`, гард `if (typeof JSON === 'undefined')`): часть сборок ExtendScript не имеют нативного JSON → все ~85 вызовов `JSON.*` падали с `ReferenceError`, плагин не работал. Полифилл без Unicode-regex (json2.js Крокфорда на нём падает), посимвольный stringify + eval-parse с проверкой первого символа. Где JSON есть (PP 26.2 / ES 4.5.6) — гард пропускает. Валидирован в реальном ES3-движке через CDP (round-trip кириллицы, отказ от bare-кода).
+- **`.trim()` → `.replace(/^\s+|\s+$/g,'')`** в host: `String.prototype.trim` отсутствует в ExtendScript (подтверждено на живом PP 26.2) — путь «удали клип [имя]» бросал TypeError.
+- **whisper.cpp кросс-ОС** (`whisper-cpp-client.js`): `path.join` вместо forward-slash конкатенации; Windows-кандидаты (`C:\whisper.cpp\…`, `.exe`); платформо-зависимый fallback `where`(Win)/`which`(Unix) вместо bash-only `which … || true`.
+- **Понятная ошибка ffmpeg** на Windows (`timeline-transcribe.js`): сообщение теперь упоминает `C:\ffmpeg` / `C:\Program Files\ffmpeg`, а не только Unix-пути.
+- **Диагностика кэша** (`context-store.js`): `console.warn`, когда запись кэша транскрипта не удалась ни в один путь.
+- Версия host: `2.6.0` → `2.6.1`. Три ffmpeg-файндера (audio-preprocess/timeline-transcribe/audio-render) проверены — уже платформо-корректны (`where`/`which` по `process.platform`), правок не требовали.
+
 ## 2026-06-12 — Кликабельные таймкоды в тексте чата + точный find_moments (c20bc90)
 
 - **B1-1b:** таймкоды в свободном тексте ответов агента кликабельны («763 – 778 сек», «12 мин 43 сек», «12:43», «1304с») → клик ставит плейхед. TreeWalker по текстовым нодам, skip A/CODE/PRE, без lookbehind (ES5).
