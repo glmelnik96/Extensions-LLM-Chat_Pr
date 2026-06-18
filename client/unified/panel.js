@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-18-guard-v3'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-txrestore-v5'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -62,6 +62,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   var _activeSystemAddon = null;
   var _pendingProposal = null;
   var _keepInvertWarning = null;
+  var _transcriptCheckpoints = {}; /* backupId → {key, entry} снимок транскрипта до apply (для отката) */
   /* Safety-guard (18.06.2026): прямой apply_* без карточки разрешён ТОЛЬКО если
      пользователь явно попросил. Иначе apply_* перенаправляется на propose_*.
      Причина: LLM стохастически нарушал «ВСЕГДА propose_*» и применял ripple-delete
@@ -2527,6 +2528,17 @@ PanelBoot.run('ИИ: монтаж', function () {
           backupId: data.backupId,
           backupName: data.backupName
         });
+        /* 19.06.2026: сохраняем КОПИЮ транскрипта до ripple-правок. apply_* сдвигает
+           кэш транскрипта (applyRippleDeletionsToTranscript), а откат восстанавливал
+           только секвенцию → транскрипт оставался rippled и не совпадал с восстановленным
+           таймлайном (live-баг: после отката чат «видел» 0-122с вместо 300-1500с). */
+        try {
+          var _ck = data.originalName || '';
+          if (_ck && ContextStore.getTranscriptEntry) {
+            var _ent = ContextStore.getTranscriptEntry(TRANSCRIPT_PID, _ck);
+            if (_ent) _transcriptCheckpoints[data.backupId] = { key: _ck, entry: JSON.parse(JSON.stringify(_ent)) };
+          }
+        } catch (eTc) {}
         refreshUndoButton();
       } catch (eSB) {}
       cb(data);
@@ -2605,6 +2617,26 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* Snap к границам сегментов для предотвращения обрезки слов + merge перекрытий */
     var snappedIntervals = mergeRemoveIntervals(snapIntervalsToSegmentBoundaries(paddedIntervals));
     var verification = computeVerification(snappedIntervals);
+
+    /* 19.06.2026: ре-валидация хронометража ПОСЛЕ снапа к границам абзацев.
+       validateKeepDuration проверяет сумму keep ДО снапа, но на длинных абзацах
+       снап раздувает результат (live-баг seq3: запрос 2 мин → итог 2:59 +50%, но
+       карточка показывалась с активным Apply). Если финал >target*1.20 — возвращаем
+       ошибку, чтобы LLM выбрал меньше/короче фрагментов. */
+    if (typeof args.targetDurationSec === 'number' && args.targetDurationSec > 0 &&
+        verification && typeof verification.totalKeepSec === 'number') {
+      var finalRatio = verification.totalKeepSec / args.targetDurationSec;
+      if (finalRatio > 1.20) {
+        return Promise.resolve({
+          validationError: 'После выравнивания по границам абзацев итог ' +
+            Math.round(verification.totalKeepSec) + 'с превышает цель ' + args.targetDurationSec +
+            'с на ' + Math.round((finalRatio - 1) * 100) + '% (>20%). ' +
+            'Выбери МЕНЬШЕ фрагментов или более короткие абзацы и пришли план заново. ' +
+            'Учитывай, что границы расширяются до краёв абзаца.'
+        });
+      }
+    }
+
     _pendingProposal = {
       kind: 'transcript_cuts',
       removeIntervals: snappedIntervals,
@@ -4007,6 +4039,18 @@ PanelBoot.run('ИИ: монтаж', function () {
           }
           _snapDirty = true;
           lastSnap = null;
+          /* 19.06.2026: восстанавливаем транскрипт-кэш до состояния перед apply,
+             иначе чат «видит» rippled-транскрипт, не совпадающий с восстановленным
+             таймлайном. Кладём и под ключ оригинала, и под имя бэкап-секвенции. */
+          try {
+            var _tc = _transcriptCheckpoints[u.backupId];
+            if (_tc && _tc.entry && ContextStore.setTranscriptEntry) {
+              ContextStore.setTranscriptEntry(TRANSCRIPT_PID, _tc.key, JSON.parse(JSON.stringify(_tc.entry)));
+              var _bn = dataB.name || u.backupName || '';
+              if (_bn && _bn !== _tc.key) ContextStore.setTranscriptEntry(TRANSCRIPT_PID, _bn, JSON.parse(JSON.stringify(_tc.entry)));
+              delete _transcriptCheckpoints[u.backupId];
+            }
+          } catch (eRt) {}
           showErr('Открыта бэкап-секвенция «' + (dataB.name || u.backupName || '') +
             '» — состояние до монтажа. Изменённая версия осталась в проекте.');
           ContextStore.clearLastUndoCount(active.panelId);
