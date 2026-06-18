@@ -59,6 +59,22 @@ function cdpEval(wsUrl, expression, { awaitPromise = true, timeoutMs = 30000 } =
   });
 }
 
+/* Отправить несколько CDP-команд подряд (без ожидания ответа по каждой) —
+   для Page.reload{ignoreCache}, Network.clearBrowserCache и т.п. */
+function cdpRaw(wsUrl, messages, { timeoutMs = 8000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    let done = 0;
+    const timer = setTimeout(() => { try { ws.close(); } catch {} resolve(); }, timeoutMs);
+    ws.onerror = (e) => { clearTimeout(timer); reject(new Error('WS error: ' + (e.message || e))); };
+    ws.onopen = () => messages.forEach((m) => ws.send(JSON.stringify(m)));
+    ws.onmessage = (msg) => {
+      let d; try { d = JSON.parse(msg.data); } catch { return; }
+      if (d.id) { done++; if (done >= messages.length) { clearTimeout(timer); setTimeout(() => { ws.close(); resolve(); }, 600); } }
+    };
+  });
+}
+
 /* ExtendScript через мост панели: __adobe_cep__.evalScript — callback API,
    оборачиваем в Promise на стороне панели. */
 function hostExpr(extendscript) {
@@ -70,8 +86,8 @@ function hostExpr(extendscript) {
 
 async function main() {
   let [cmd, arg] = process.argv.slice(2);
-  if (!cmd || !['targets', 'eval', 'evalfile', 'host', 'hostfile', 'reload'].includes(cmd)) {
-    console.error('Использование: cep-debug.mjs targets | eval "<js>" | evalfile <path> | host "<es>" | hostfile <path> | reload');
+  if (!cmd || !['targets', 'eval', 'evalfile', 'host', 'hostfile', 'reload', 'hardreload'].includes(cmd)) {
+    console.error('Использование: cep-debug.mjs targets | eval "<js>" | evalfile <path> | host "<es>" | hostfile <path> | reload | hardreload');
     process.exit(2);
   }
   if (cmd === 'evalfile' || cmd === 'hostfile') {
@@ -90,6 +106,20 @@ async function main() {
   if (cmd === 'reload') {
     await cdpEval(page.webSocketDebuggerUrl, 'location.reload(); "reloading"', { awaitPromise: false });
     console.log('reload отправлен:', page.title);
+    return;
+  }
+  if (cmd === 'hardreload') {
+    /* CEF кэширует panel.js/*.js — обычный location.reload() отдаёт старый код.
+       Сбрасываем кэш и перезагружаем с ignoreCache. ОБЯЗАТЕЛЬНО после правок
+       клиентского JS (panel.js/prompts.js/shared/*), иначе тестируешь старьё. */
+    await cdpRaw(page.webSocketDebuggerUrl, [
+      { id: 1, method: 'Network.enable' },
+      { id: 2, method: 'Network.setCacheDisabled', params: { cacheDisabled: true } },
+      { id: 3, method: 'Network.clearBrowserCache' },
+      { id: 4, method: 'Page.enable' },
+      { id: 5, method: 'Page.reload', params: { ignoreCache: true } }
+    ]);
+    console.log('hard-reload (cache cleared) отправлен:', page.title);
     return;
   }
   const expression = cmd === 'host' ? hostExpr(arg) : arg;

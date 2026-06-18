@@ -7,6 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
+try { window.__PANEL_BUILD__ = '2026-06-18-guard-v3'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -60,6 +61,15 @@ PanelBoot.run('ИИ: монтаж', function () {
   }
   var _activeSystemAddon = null;
   var _pendingProposal = null;
+  var _keepInvertWarning = null;
+  /* Safety-guard (18.06.2026): прямой apply_* без карточки разрешён ТОЛЬКО если
+     пользователь явно попросил. Иначе apply_* перенаправляется на propose_*.
+     Причина: LLM стохастически нарушал «ВСЕГДА propose_*» и применял ripple-delete
+     без подтверждения (live-баг на seq1: «вырежи с 10 по 20» → молча применил). */
+  var _directApplyAuthorized = false;
+  function _detectDirectApply(text) {
+    return /без\s+подтвержд|не\s+спрашив|не\s+подтвержд|сразу\s+примен|примен\w*\s+сразу|делай\s+сразу|без\s+предпросмотр|without\s+confirm/i.test(String(text || ''));
+  }
 
   /* Snapshot caching: слушаем событие изменения секвенции от Premiere.
      Если пользователь или внешний скрипт изменил таймлайн — помечаем snapshot dirty. */
@@ -1093,6 +1103,14 @@ PanelBoot.run('ИИ: монтаж', function () {
   }
 
   function execApplyTimecodeEdits(panelId, args) {
+    /* Safety-guard: без явного «без подтверждения» — показываем карточку. */
+    if (!_directApplyAuthorized) {
+      return Promise.resolve(execProposeTimecodeEdits(args)).then(function (r) {
+        return Object.assign({ _redirectedToPropose: true,
+          message: 'Прямое применение без подтверждения запрещено. Показал карточку propose_timecode_edits — пользователь нажмёт «Применить». Заверши ход.' },
+          (r && typeof r === 'object') ? r : {});
+      });
+    }
     /* Нормализуем: kind → action */
     if (args && Array.isArray(args.operations)) {
       args.operations = args.operations.map(function (op) {
@@ -1881,6 +1899,16 @@ PanelBoot.run('ИИ: монтаж', function () {
       'фрагментов keep: ' + (v.keepCount || 0) + ' · вырезов remove: ' + (v.removeCount || 0);
     card.appendChild(stats);
 
+    /* 18.06.2026: предупреждение о неполном покрытии транскрипта при сборке «на N мин». */
+    if (_pendingProposal.warnings && _pendingProposal.warnings.length) {
+      for (var pwi = 0; pwi < _pendingProposal.warnings.length; pwi++) {
+        var pwEl = document.createElement('div');
+        pwEl.style.cssText = 'color:#f59e0b;font-size:11px;margin:2px 0 8px;';
+        pwEl.textContent = '⚠ ' + _pendingProposal.warnings[pwi];
+        card.appendChild(pwEl);
+      }
+    }
+
     /* HIGH (6 мая 2026): Target vs Actual badge.
        Без этого «попросил 40 секунд, получил 70» неотличимо от обычного результата.
        Колор-код: ≤target*1.05 зелёный, ≤target*1.20 жёлтый, >target*1.20 красный. */
@@ -2552,10 +2580,14 @@ PanelBoot.run('ИИ: монтаж', function () {
           return Promise.resolve({ validationError: dRes.error });
         }
       }
-      var invRes = _invertKeepToRemove(args.keepIntervals, args.sequenceKey);
+      /* Сборка «на N минут» (targetDurationSec) → инвертируем в границах ВСЕЙ
+         секвенции, иначе нетранскрибированный хвост остаётся (live-баг: 3 мин → 47 мин). */
+      var assembleFull = typeof args.targetDurationSec === 'number' && args.targetDurationSec > 0;
+      var invRes = _invertKeepToRemove(args.keepIntervals, args.sequenceKey, assembleFull);
       if (invRes.error) {
         return Promise.resolve({ validationError: invRes.error });
       }
+      _keepInvertWarning = invRes.warning || null;
       workingArgs = Object.assign({}, args, { removeIntervals: invRes.removeIntervals });
     }
 
@@ -2585,7 +2617,8 @@ PanelBoot.run('ИИ: монтаж', function () {
       invertedFromKeep: hasKeep,
       /* HIGH (6 мая 2026): сохраняем target для UI-индикации в карточке.
          Без этого пользователь не видит «попросил 40, получил 70». */
-      targetDurationSec: typeof args.targetDurationSec === 'number' ? args.targetDurationSec : null
+      targetDurationSec: typeof args.targetDurationSec === 'number' ? args.targetDurationSec : null,
+      warnings: _keepInvertWarning ? [_keepInvertWarning] : null
     };
     renderPendingProposalCard();
     return Promise.resolve({
@@ -2602,11 +2635,17 @@ PanelBoot.run('ИИ: монтаж', function () {
   /**
    * US-004: инверсия keepIntervals → removeIntervals.
    * Определяет границы транскрипта, делегирует пуре-инверсию в AnalysisRouting.
+   *
+   * @param {boolean} fullSequence — если true, complement считается в границах
+   *   ВСЕЙ секвенции [0, sequenceEndSec], а не транскрипта. Нужно для сборки
+   *   «на N минут»: иначе нетранскрибированный хвост остаётся и финал ≫ target
+   *   (live-баг 18.06.2026: «нарезка 3 мин» → 47 мин из-за хвоста вне транскрипта).
    */
-  function _invertKeepToRemove(keepIntervals, sequenceKey) {
+  function _invertKeepToRemove(keepIntervals, sequenceKey, fullSequence) {
     /* Определяем [minSec, maxSec] — границы транскрипта. */
     var minSec = 0;
     var maxSec = 0;
+    var trMin = null, trMax = null;
     var segments = null;
     var seqKey = sequenceKey ? _cleanSeqKey(sequenceKey) : '';
     if (seqKey) {
@@ -2617,8 +2656,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         var last = segments[segments.length - 1];
         var fs = typeof first.startSec === 'number' ? first.startSec : first.start;
         var le = typeof last.endSec === 'number' ? last.endSec : last.end;
-        if (typeof fs === 'number') minSec = fs;
-        if (typeof le === 'number') maxSec = le;
+        if (typeof fs === 'number') { minSec = fs; trMin = fs; }
+        if (typeof le === 'number') { maxSec = le; trMax = le; }
       }
     }
     /* Fallback: по снапшоту */
@@ -2630,14 +2669,32 @@ PanelBoot.run('ИИ: монтаж', function () {
       return { error: 'Не удалось определить границы транскрипта. Передай sequenceKey или сначала транскрибируй In-Out.' };
     }
 
+    /* Сборка «на N минут»: финал должен быть ≈N, поэтому удаляем ВСЁ вне keep,
+       включая нетранскрибированные участки. Расширяем границы до всей секвенции. */
+    var warning = null;
+    if (fullSequence && lastSnap && lastSnap.ok) {
+      var seqEnd = typeof lastSnap.sequenceEndSec === 'number' && lastSnap.sequenceEndSec > 0
+        ? lastSnap.sequenceEndSec : maxSec;
+      var uncovered = (trMin !== null ? (trMin - 0) : 0) + (trMax !== null ? (seqEnd - trMax) : 0);
+      if (uncovered > 5) {
+        warning = 'Транскрипт покрывает не всю секвенцию (' +
+          fmtSec(trMin || 0) + '–' + fmtSec(trMax || maxSec) + ' из 0–' + fmtSec(seqEnd) +
+          '). Нетранскрибированные участки будут вырезаны как не вошедшие в нарезку.';
+      }
+      minSec = 0;
+      maxSec = seqEnd;
+    }
+
     if (typeof AnalysisRouting === 'undefined' || !AnalysisRouting.invertKeepToRemove) {
       return { error: 'AnalysisRouting.invertKeepToRemove не загружен (клиентский баг).' };
     }
-    return AnalysisRouting.invertKeepToRemove(keepIntervals, {
+    var res = AnalysisRouting.invertKeepToRemove(keepIntervals, {
       minSec: minSec,
       maxSec: maxSec,
       segments: segments
     });
+    if (res && !res.error && warning) res.warning = warning;
+    return res;
   }
 
   /* ─── Новые executors: propose_timecode_edits / propose_markers / find_moments / ducking / loudness ── */
@@ -2755,6 +2812,14 @@ PanelBoot.run('ИИ: монтаж', function () {
   /* §2.1: apply_edit_plan без подтверждения — нормализует ops и дёргает
      applyTimecodeEdits одним вызовом (один undo-group в Premiere). */
   function execApplyEditPlan(panelId, args) {
+    /* Safety-guard: без явного «без подтверждения» — показываем карточку. */
+    if (!_directApplyAuthorized) {
+      return Promise.resolve(execProposeEditPlan(args)).then(function (r) {
+        return Object.assign({ _redirectedToPropose: true,
+          message: 'Прямое применение без подтверждения запрещено. Показал карточку propose_edit_plan — пользователь нажмёт «Применить». Заверши ход.' },
+          (r && typeof r === 'object') ? r : {});
+      });
+    }
     return new Promise(function (resolve, reject) {
       var vErr = ToolValidators.validateEditPlan(lastSnap, args || {});
       if (vErr) {
@@ -3316,6 +3381,14 @@ PanelBoot.run('ИИ: монтаж', function () {
   }
 
   function execApplyTranscriptCuts(panelId, args) {
+    /* Safety-guard: без явного «без подтверждения» — показываем карточку. */
+    if (!_directApplyAuthorized) {
+      return Promise.resolve(execProposeTranscriptCuts(args)).then(function (r) {
+        return Object.assign({ _redirectedToPropose: true,
+          message: 'Прямое применение без подтверждения запрещено. Показал карточку propose_transcript_cuts — пользователь нажмёт «Применить». Заверши ход.' },
+          (r && typeof r === 'object') ? r : {});
+      });
+    }
     return new Promise(function (resolve, reject) {
       var vr = ToolValidators.validateTranscriptCuts(lastSnap, args);
       if (vr.error) {
@@ -4324,6 +4397,11 @@ PanelBoot.run('ИИ: монтаж', function () {
             operations: [{ action: delAction, startSec: direct.startSec, endSec: direct.endSec }],
             summary: 'Удалён участок ' + direct.startSec + '–' + direct.endSec + ' с (' + delAction + ')'
           };
+          /* Чекпоинт перед деструктивным fast-path — чтобы работала «⏪ Откатить»
+             (18.06.2026: раньше fast-path применял без бэкапа, откат только Ctrl+Z). */
+          await new Promise(function (resolve) {
+            _makeSequenceCheckpoint('вырезание интервала', function () { resolve(); });
+          });
           var fastRes = await new Promise(function (resolve, reject) {
             PremiereBridge.applyTimecodeEdits(plan, function (err, data) {
               if (err) reject(err);
@@ -4427,6 +4505,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         return;
       }
     }
+
+    /* Safety-guard: разрешаем прямой apply_* только при явной просьбе пользователя. */
+    _directApplyAuthorized = _detectDirectApply(text);
 
     /* P1-1: Tiered prompt — подключаем только релевантные секции */
     var sysContent = (typeof AgentPrompts !== 'undefined' && AgentPrompts.buildPrompt)

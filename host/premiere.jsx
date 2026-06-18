@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.1';
+$._EXT_PRM_.version = '2.6.2';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -996,6 +996,9 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
 
     /* --- Клипы --- */
     var clips = [];
+    /* seq.end.seconds на ряде сборок PP возвращает 0 (особенно на мультикам/
+       вложенных секвенциях) — считаем реальный конец как максимум по клипам. */
+    var maxClipEnd = 0;
     for (vi = 0; vi < seq.videoTracks.numTracks; vi++) {
       track = seq.videoTracks[vi];
       n = track.clips.numItems;
@@ -1017,6 +1020,7 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
             outPointSec: item.outPoint ? item.outPoint.seconds : null,
             disabled: vDisabled
           });
+          if (item.end.seconds > maxClipEnd) maxClipEnd = item.end.seconds;
         } catch (e5) {}
       }
     }
@@ -1050,6 +1054,7 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
             disabled: aDisabled,
             mediaPath: aMediaPath.replace(/\\/g, '/')
           });
+          if (item.end.seconds > maxClipEnd) maxClipEnd = item.end.seconds;
         } catch (e6) {}
       }
     }
@@ -1061,7 +1066,7 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
       frameSizeH: seq.frameSizeHorizontal || 0,
       frameSizeV: seq.frameSizeVertical || 0,
       playheadSec: playheadSec,
-      sequenceEndSec: seqEndSec,
+      sequenceEndSec: (seqEndSec > maxClipEnd ? seqEndSec : maxClipEnd),
       sequenceInSec: seqInSec,
       sequenceOutSec: seqOutSec,
       videoTrackCount: seq.videoTracks.numTracks,

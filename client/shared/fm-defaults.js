@@ -13,15 +13,15 @@
  * │ zai-org/GLM-5.1                  NEW    │  202K  │  198.86  │   829.60 │ ✓  │ ✓  │
  * │ moonshotai/Kimi-K2.6             NEW    │  262K  │  175.68  │   725.90 │ ✓  │ ✓  │
  * │ openai/gpt-oss-120b                     │  131K  │   15.86  │    61.00 │ ✓  │ ✓  │
- * │ Qwen/Qwen3-Coder-Next          Preview  │  262K  │  FREE    │   FREE   │ ✓  │ ✓  │
- * │ Qwen/Qwen3-Coder-480B-A35B-Instruct    │  262K  │   48.80  │    97.60 │ ✓  │ ✓  │
- * │ Qwen/Qwen3-235B-A22B-Instruct-2507     │  262K  │   20.74  │    61.00 │ ✓  │ ✓  │
- * │ Qwen/Qwen3-Next-80B-A3B-Instruct       │  262K  │   13.42  │   130.54 │ ✓  │ ✓  │
  * │ zai-org/GLM-4.7                 Preview  │  202K  │  FREE    │   FREE   │ ✓  │ ✓  │
- * │ zai-org/GLM-4.6                         │  202K  │   67.10  │   268.40 │ ✓  │ ✓  │
  * └─────────────────────────────────────────┴────────┴──────────┴──────────┴────┴────┘
  *
  * FC = Function Calling, SO = Structured Output
+ *
+ * ⚠ НЕДОСТУПНЫ на текущем аккаунте (HTTP 404 при вызове, проверено 18.06.2026):
+ *   zai-org/GLM-4.6, Qwen/Qwen3-235B-A22B-Instruct-2507, Qwen/Qwen3-Next-80B-A3B,
+ *   Qwen/Qwen3-Coder-Next, Qwen/Qwen3-Coder-480B-A35B. НЕ назначай их на роли —
+ *   404 ломает чат молча («Ответ не JSON» в клиенте).
  *
  * ═══════════════════════════════════════════════════════════════════════
  * РЕЗУЛЬТАТЫ ЖИВЫХ ТЕСТОВ (4 июня 2026, .omc/research/...):
@@ -62,7 +62,23 @@
  * chapterModel     → deepseek-ai/DeepSeek-V4-Pro (1M контекст, 7× быстрее, ru OK)
  * findMomentsModel → zai-org/GLM-5.1            (thinking=false)
  * codeModel        → deepseek-ai/DeepSeek-V4-Pro (1M контекст под кодовые ризонинги)
- * fastModel        → openai/gpt-oss-120b        (без изменений, дёшево/быстро)
+ * fastModel        → zai-org/GLM-4.7            (Phase 3: было gpt-oss-120b)
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * БЕНЧМАРК 18 июня 2026 (tests/integration/benchmark-models.mjs, 5 сценариев,
+ * реальные вызовы, кэш seq «2»):
+ *   • GLM-4.7   5/5  2.1s  13.5K ток — быстрейший, FREE, точен (включая длительность)
+ *   • GLM-5.1   5/5  5.2s  29.9K ток — надёжный multi-step, текущий chat/analysis
+ *   • gpt-oss   5/5  4.5s  24.8K ток — НО галлюцинировал длительность (363 вместо 484с!)
+ *   • Kimi-K2.6 5/5 16.0s  15.7K ток — сбалансирован, точный target
+ *   • DeepSeek  5/5 39.4s  29.9K ток — дотошнее всех (23 паразита vs 1), но медленный
+ *
+ * Phase 3 (18.06.2026): fastModel gpt-oss-120b → GLM-4.7. Причина — gpt-oss
+ * выдумывал длительность таймлайна в info-запросах (роль fast как раз отвечает
+ * на «что/сколько» — врать там нельзя). GLM-4.7: быстрее, точнее, FREE.
+ * ⚠ GLM-4.7 — preview-модель. Если её отзовут (404), верни fastModel обратно
+ *   на 'openai/gpt-oss-120b' (стабильна, но проверяй факты в info-ответах).
  * ═══════════════════════════════════════════════════════════════════════
  */
 (function (global) {
@@ -127,9 +143,12 @@
      * Двухмодельная стратегия: простые intent'ы → fastModel (дешевле, быстрее),
      * сложные → chatModel. Пустая строка '' — отключает routing, всегда chatModel.
      *
-     * openai/gpt-oss-120b: 131K, FC+SO, быстрый на Cloud.ru.
+     * Phase 3 (18.06.2026): gpt-oss-120b → GLM-4.7. Бенчмарк показал, что
+     * gpt-oss выдумывал длительность таймлайна в info-запросах (363 вместо 484с),
+     * а fast-роль как раз отвечает на «что/сколько на таймлайне». GLM-4.7 —
+     * FREE, 2.1s, точен. ⚠ preview: при 404 верни 'openai/gpt-oss-120b'.
      */
-    fastModel: 'openai/gpt-oss-120b',
+    fastModel: 'zai-org/GLM-4.7',
 
     /** Whisper для облачной транскрибации */
     whisperModel: 'openai/whisper-large-v3',
