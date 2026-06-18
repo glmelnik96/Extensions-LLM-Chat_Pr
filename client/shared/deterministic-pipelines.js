@@ -1272,10 +1272,37 @@
       if (!nm.ok) return { ok: false, error: nm.error };
       mapping = nm.mapping;
     } else {
-      var autoCount = Math.min(aTracks.length, vTracks.length - 1, MAX_SPEAKERS);
+      /* Авто-детект микрофонов (19.06.2026): раньше брали первые N аудиодорожек
+         (audioTrack 0,1,2…) вслепую. На реальном мультикаме первые дорожки —
+         камерное BRAW-аудио, которое ffmpeg НЕ декодирует → «0 кадров RMS», авто
+         падал. Теперь предпочитаем дорожки с декодируемым аудио: сначала чистые
+         микрофоны (WAV/MP3/FLAC), затем видео-с-аудио (MP4/MOV/MXF), BRAW/R3D
+         пропускаем. mediaPath берём из клипов снапшота (по первому клипу дорожки). */
+      var MIC_EXT = /\.(wav|mp3|m4a|aac|flac|ogg|opus)$/i;
+      var CAM_EXT = /\.(mp4|mov|mxf|avi|mkv|m4v)$/i;
+      var SKIP_EXT = /\.(braw|r3d|ari|arx)$/i;
+      var trackMedia = {};
+      (snap.clips || []).forEach(function (c) {
+        if (c.trackType === 'audio' && trackMedia[c.trackIndex] === undefined) {
+          trackMedia[c.trackIndex] = c.mediaPath || '';
+        }
+      });
+      var micTracks = [], camTracks = [], otherTracks = [];
+      for (var ati = 0; ati < aTracks.length; ati++) {
+        var idx = aTracks[ati].index;
+        var mp = trackMedia[idx] || '';
+        if (SKIP_EXT.test(mp)) continue;           /* BRAW/R3D — ffmpeg не извлечёт RMS */
+        if (MIC_EXT.test(mp)) micTracks.push(idx);
+        else if (CAM_EXT.test(mp)) camTracks.push(idx);
+        else otherTracks.push(idx);                /* неизвестный/пустой путь — как запасной */
+      }
+      var usable = micTracks.concat(camTracks).concat(otherTracks);
+      /* Fallback: если все отсеяли (нет mediaPath) — старое поведение. */
+      if (!usable.length) { for (var u = 0; u < aTracks.length; u++) usable.push(aTracks[u].index); }
+      var autoCount = Math.min(usable.length, vTracks.length - 1, MAX_SPEAKERS);
       var autoSpeakers = [];
       for (var spi = 0; spi < autoCount; spi++) {
-        autoSpeakers.push({ audioTrack: spi, videoTrack: spi + 1, label: 'Гость ' + (spi + 1) });
+        autoSpeakers.push({ audioTrack: usable[spi], videoTrack: spi + 1, label: 'Гость ' + (spi + 1) });
       }
       mapping = { wideVideoTrack: 0, speakers: autoSpeakers };
     }
