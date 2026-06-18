@@ -4418,6 +4418,14 @@ PanelBoot.run('ИИ: монтаж', function () {
     if (!beginOperation('send')) return;
     showErr('');
     el.input.value = '';
+    /* 19.06.2026: новый запрос замещает прежний НЕприменённый план — снимаем
+       зависшую proposal-карточку, чтобы пользователь случайно не применил
+       устаревший план после несвязанного сообщения (live-находка edge-теста). */
+    if (_pendingProposal) {
+      _pendingProposal = null;
+      var staleCard = document.getElementById('pending-proposal-card');
+      if (staleCard && staleCard.parentNode) staleCard.parentNode.removeChild(staleCard);
+    }
     var settings = ContextStore.getResolvedSettings();
     var panelId = active.panelId;
     var stored = ContextStore.getMessages(panelId);
