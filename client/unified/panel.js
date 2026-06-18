@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-txrestore-v5'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-audiosnap-v6'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -4576,15 +4576,32 @@ PanelBoot.run('ИИ: монтаж', function () {
       var autoSnap = await execGetSnapshot(true); /* ВСЕГДА свежий snap для каждого нового сообщения */
       if (autoSnap && autoSnap.ok) {
         var videoClips = (autoSnap.clips || []).filter(function (c) { return c.trackType === 'video'; });
-        var audioOnlyClips = (autoSnap.clips || []).filter(function (c) {
-          return c.trackType === 'audio' && !videoClips.some(function (v) { return v.name === c.name && Math.abs(v.startSec - c.startSec) < 0.1; });
+        var audioClipsAll = (autoSnap.clips || []).filter(function (c) { return c.trackType === 'audio'; });
+        /* 19.06.2026: линкованное аудио НЕ прячем полностью — иначе агент «не видит»
+           аудиоклип и не может выполнить loudness/ducking (live-баг: BRAW-аудио
+           линковано с видео → пропадало из снапшота → «нет аудиоклипа»). Вместо этого
+           привязываем audio nodeId к видео-строке маркером a=<nodeId>, а несвязанное
+           аудио показываем отдельной строкой. */
+        var linkedAudioBy = {};
+        var audioOnlyClips = [];
+        audioClipsAll.forEach(function (c) {
+          var v = null;
+          for (var vi3 = 0; vi3 < videoClips.length; vi3++) {
+            if (videoClips[vi3].name === c.name && Math.abs(videoClips[vi3].startSec - c.startSec) < 0.1) { v = videoClips[vi3]; break; }
+          }
+          if (v) { if (!linkedAudioBy[v.nodeId]) linkedAudioBy[v.nodeId] = c; }
+          else audioOnlyClips.push(c);
         });
         /* Вычисляем реальную длительность — sequenceEndSec бывает 0 */
         var effectiveEndSec = autoSnap.sequenceEndSec || 0;
         (autoSnap.clips || []).forEach(function (c) { if (c.endSec > effectiveEndSec) effectiveEndSec = c.endSec; });
-        var compactClips = videoClips.concat(audioOnlyClips).map(function (c) {
+        var compactClips = videoClips.map(function (c) {
+          var la = linkedAudioBy[c.nodeId];
+          return c.nodeId + '|' + c.name + '|' + c.trackType[0] + c.trackIndex + '|' + c.startSec + '-' + c.endSec +
+            (c.disabled ? '|off' : '') + (la ? '|a=' + la.nodeId + '@' + la.trackType[0] + la.trackIndex : '');
+        }).concat(audioOnlyClips.map(function (c) {
           return c.nodeId + '|' + c.name + '|' + c.trackType[0] + c.trackIndex + '|' + c.startSec + '-' + c.endSec + (c.disabled ? '|off' : '');
-        });
+        }));
         apiMessages.push({
           role: 'user',
           content: '[auto-snapshot] seq=' + autoSnap.sequenceName + ' dur=' + effectiveEndSec.toFixed(1) + 's fps=' + autoSnap.fps +
