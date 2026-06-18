@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.2';
+$._EXT_PRM_.version = '2.6.3';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -1437,25 +1437,28 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
             if (typeof app.enableQE === 'function') app.enableQE();
             var qeSeq = (typeof qe !== 'undefined' && qe.project) ? qe.project.getActiveSequence() : null;
             if (qeSeq) {
-              /* Сформировать timecode-строку дельты. */
               var fps = 30;
               try {
                 var fpsTime = seq.timebase ? Math.round(254016000000 / parseFloat(seq.timebase)) : 30;
                 if (fpsTime > 0 && fpsTime < 1000) fps = fpsTime;
               } catch (eF) {}
-              var sign = deltaSec < 0 ? '-' : '';
-              var ad = Math.abs(deltaSec);
-              var hh = Math.floor(ad / 3600);
-              var mm = Math.floor((ad - hh * 3600) / 60);
-              var ssF = ad - hh * 3600 - mm * 60;
-              var ss = Math.floor(ssF);
-              var ff = Math.round((ssF - ss) * fps);
-              if (ff >= fps) { ff = 0; ss++; }
               function pad(n) { return n < 10 ? '0' + n : '' + n; }
-              var tcStr = sign + pad(hh) + ';' + pad(mm) + ';' + pad(ss) + ';' + pad(ff);
-
-              /* Перебор: для каждого linked-клипа найти QE-аналог по (mediaType, start.secs ≈ oldStartSec) и вызвать .move(tcStr).
-                 Порядок R→L при перемещении вправо, L→R при перемещении влево, чтобы не наступать на собственные клипы. */
+              /* 19.06.2026: tcStr считаем ПО-КЛИПНО от ТЕКУЩЕЙ позиции до newStartSec.
+                 Раньше дельта была фиксированной (newStartSec-oldStartSec) и применялась
+                 ко ВСЕМ клипам, включая те, что уже сдвинула стратегия 1 (move(Time)) →
+                 двойной сдвиг видео и A/V-десинк (live-баг: target 48.24 → факт 53.25).
+                 Теперь каждый клип едет ровно на остаток до цели; уже на месте → пропуск. */
+              function _tcFromDelta(perDelta) {
+                var sgn = perDelta < 0 ? '-' : '';
+                var ad = Math.abs(perDelta);
+                var hh = Math.floor(ad / 3600);
+                var mm = Math.floor((ad - hh * 3600) / 60);
+                var ssF = ad - hh * 3600 - mm * 60;
+                var ss = Math.floor(ssF);
+                var ff = Math.round((ssF - ss) * fps);
+                if (ff >= fps) { ff = 0; ss++; }
+                return sgn + pad(hh) + ';' + pad(mm) + ';' + pad(ss) + ';' + pad(ff);
+              }
               var goingRightQ = op.newStartSec > oldStartSec;
               var qeMoveLog = [];
               var qeFails = 0;
@@ -1468,6 +1471,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
                 /* Иногда mediaType пуст — определяем по тому, на каком треке. */
 
                 var qeClip = null;
+                var qeClipStart = origStart;
                 try {
                   /* Сначала ищем в видео-треках, потом в аудио. */
                   var trackLists = [];
@@ -1488,24 +1492,30 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
                         var cs2 = parseFloat(cit2.start.secs || cit2.start.seconds || '0');
                         if (Math.abs(cs2 - origStart) < 0.06) {
                           /* Если это видео-клип linked2[lk], предпочесть совпадающий kind. */
-                          if (isVideo && trackLists[qtl].kind === 'video') { qeClip = cit2; break; }
-                          if (!isVideo && trackLists[qtl].kind === 'audio') { qeClip = cit2; break; }
+                          if (isVideo && trackLists[qtl].kind === 'video') { qeClip = cit2; qeClipStart = cs2; break; }
+                          if (!isVideo && trackLists[qtl].kind === 'audio') { qeClip = cit2; qeClipStart = cs2; break; }
                           /* Если mediaType неопределён — берём первый совпавший. */
-                          if (!qeClip) qeClip = cit2;
+                          if (!qeClip) { qeClip = cit2; qeClipStart = cs2; }
                         }
                       } catch (eCs2) {}
                     }
                   }
                 } catch (eFindL) {}
 
-                if (qeClip && typeof qeClip.move === 'function') {
+                /* По-клипная дельта: остаток от текущей позиции до целевого newStartSec.
+                   Если клип уже на месте (стратегия 1 его сдвинула) — не двигаем повторно. */
+                var perDeltaQ = op.newStartSec - qeClipStart;
+                if (qeClip && typeof qeClip.move === 'function' && Math.abs(perDeltaQ) > 0.02) {
                   try {
-                    qeClip.move(tcStr); $._EXT_PRM_._bump();
-                    qeMoveLog.push({ ok: true, kind: isVideo ? 'video' : 'audio', from: origStart });
+                    qeClip.move(_tcFromDelta(perDeltaQ)); $._EXT_PRM_._bump();
+                    qeMoveLog.push({ ok: true, kind: isVideo ? 'video' : 'audio', from: qeClipStart, perDelta: perDeltaQ });
                   } catch (eQEm) {
                     qeFails++;
-                    qeMoveLog.push({ ok: false, kind: isVideo ? 'video' : 'audio', from: origStart, error: String(eQEm.message || eQEm) });
+                    qeMoveLog.push({ ok: false, kind: isVideo ? 'video' : 'audio', from: qeClipStart, error: String(eQEm.message || eQEm) });
                   }
+                } else if (qeClip && Math.abs(perDeltaQ) <= 0.02) {
+                  /* Уже на целевой позиции — успех без движения. */
+                  qeMoveLog.push({ ok: true, kind: isVideo ? 'video' : 'audio', from: qeClipStart, perDelta: 0, skipped: true });
                 } else {
                   qeFails++;
                   qeMoveLog.push({ ok: false, kind: isVideo ? 'video' : 'audio', from: origStart, error: 'qe clip not found' });
