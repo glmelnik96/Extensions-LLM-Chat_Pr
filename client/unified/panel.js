@@ -5501,6 +5501,14 @@ PanelBoot.run('ИИ: монтаж', function () {
       var prop = _toolsProposal;
       var area = _toolsProposalArea;
 
+      /* 19.06.2026: деструктивный apply входит в общий operation-queue —
+         взаимоисключение с чатом (race на ripple/razor таймлайна). endOperation
+         вызывается в каждом host-колбэке после toolsDisableRun(false). */
+      if (!beginOperation('tools-apply:' + prop.kind)) {
+        toolsShowErr('Идёт обработка в чате — дождитесь завершения или нажмите «Стоп».');
+        return;
+      }
+
       if (prop.kind === 'transcript_cuts') {
         toolsStatusUi.show('Применяю монтаж…', true);
         toolsDisableRun(true);
@@ -5510,6 +5518,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           { removeIntervals: prop.removeIntervals, summary: prop.summary },
           function (err, dataTC) {
             toolsDisableRun(false);
+            endOperation();
             toolsStatusUi.hide();
             if (err) { toolsShowErr('Ошибка: ' + String(err.message || err)); return; }
             /* Host-контракт: ok:false (locked-дорожки и т.п.) приходит как data */
@@ -5541,6 +5550,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         toolsDisableRun(true);
         PremiereBridge.addSequenceMarkers(prop.markers || [], function (err, data) {
           toolsDisableRun(false);
+          endOperation();
           toolsStatusUi.hide();
           if (err) { toolsShowErr('Ошибка: ' + String(err.message || err)); return; }
           toolsHideProposal(area);
@@ -5561,6 +5571,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           { offsetFrames: prop.offsetFrames || 4, mode: prop.mode || 'j' },
           function (err, data) {
             toolsDisableRun(false);
+            endOperation();
             toolsStatusUi.hide();
             if (err) { toolsShowErr('Ошибка: ' + String(err.message || err)); return; }
             toolsHideProposal(area);
@@ -5584,6 +5595,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         _makeSequenceCheckpoint('MultiCam', function () {
         PremiereBridge.applyMulticamCuts(prop.plan, function (err, data) {
           toolsDisableRun(false);
+          endOperation();
           toolsStatusUi.hide();
           if (err) { toolsShowErr('Ошибка: ' + String(err.message || err)); return; }
           toolsHideProposal(area);
@@ -5601,6 +5613,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         return;
       }
 
+      endOperation();
       toolsShowErr('Неизвестный тип: ' + prop.kind);
     }
 
@@ -5672,6 +5685,16 @@ PanelBoot.run('ИИ: монтаж', function () {
           return;
       }
 
+      /* 19.06.2026: Tools-tab входит в ОБЩИЙ operation-queue. Раньше toolsRunTool
+         не вызывал beginOperation — только локальный toolsDisableRun. Это давало
+         re-entrancy: чат-операция и Tools-tab пайплайн могли бежать КОНКУРЕНТНО
+         (оба бьют в host/ffmpeg/снапшот, оба строят proposal → гонка на apply).
+         Подтверждено вживую: при активном чате кнопка silences не блокировалась
+         и стартовала параллельно. Теперь два пути взаимоисключающие. */
+      if (!beginOperation('tools:' + toolName)) {
+        toolsShowErr('Идёт обработка в чате — дождитесь завершения или нажмите «Стоп».');
+        return;
+      }
       toolsDisableRun(true);
       toolsStatusUi.show('Выполняю…', true);
 
@@ -5735,6 +5758,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       } catch (e) {
         toolsShowErr(String(e.message || e));
       } finally {
+        endOperation();
         toolsDisableRun(false);
         if (!_toolsProposal) toolsStatusUi.hide();
       }
