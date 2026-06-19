@@ -909,8 +909,16 @@
             fbResults.sort(function (a, b) { return a.index - b.index; });
             var fbSegs = [], fbText = '';
             for (var fbr = 0; fbr < fbResults.length; fbr++) {
+              /* 19.06.2026 BUGFIX: 3-й аргумент (clipInPointSec) был 0 → fallback-путь
+                 терял «− clipInPointSec» из формулы normalizeWhisperMediaFile
+                 (clipStart + (sourceTime − clipInPoint)). Этот путь и основной
+                 media_file путь (ниже) транскрибируют ОДИН И ТОТ ЖЕ ffmpegTmpM и
+                 обязаны давать одинаковые таймкоды; основной передаёт prep.clipInPointSec.
+                 При clipInPointSec>0 (клип подрезан в источнике) весь транскрипт
+                 fallback-режима съезжал на +clipInPointSec. offset (2-й арг) уже несёт
+                 clipStartSec+offsetInSpan, поэтому здесь — именно clipInPointSec. */
               var fbNorm = normalizeWhisperMediaFile(
-                fbResults[fbr].data, fbResults[fbr].offset, 0, prep.workInSec, prep.workOutSec
+                fbResults[fbr].data, fbResults[fbr].offset, (prep.clipInPointSec || 0), prep.workInSec, prep.workOutSec
               );
               fbSegs = fbSegs.concat(fbNorm.segments);
               fbText += (fbNorm.text || '') + ' ';

@@ -6,6 +6,11 @@
 
 ---
 
+## 2026-06-19 — Транскрибация: fallback-чанкинг медиафайла смещал таймкоды на clipInPointSec
+
+- **🔴 timeline-transcribe: auto-chunked fallback терял `− clipInPointSec`.** Аудит свежих модулей (4 субагента). Формула `normalizeWhisperMediaFile`: `таймкод = clipStart + (sourceTime − clipInPoint)`. Основной media_file путь передаёт `prep.clipInPointSec`, а fallback-путь (медиафайл всё ещё > лимита после извлечения → доп. нарезка) передавал `0` третьим аргументом. Оба транскрибируют ОДИН И ТОТ ЖЕ извлечённый ffmpegTmpM → обязаны совпадать, но при `clipInPointSec>0` (клип подрезан в источнике) весь транскрипт fallback-режима съезжал на +clipInPointSec. Фикс: 3-й аргумент `0`→`prep.clipInPointSec`. Алгебра: clipStart=100, clipInPoint=30, media-time=50 → main=120, старый fallback=150 (смещён +30), новый fallback=120 ✓. build→v12.
+- Дисциплинированная фильтрация (~85% лидов отсеяно): find-moments `Math.log(0)` — гуард `if(tf>0)`; edit-plan-simulator NaN/inverted — гейтится `validateTimecodePlan`/`validateEditPlan` ДО симуляции; edit-sim «right-part collision» — на деле смежные интервалы (корректный ripple); `extractRippleIntervals` без lift — by-design (lift не сдвигает); multicam `wideOnSilence/wideOnOverlap` — вестигиальные флаги (всегда true, нет UI). Отложено: simulator move_clip не сдвигает блокирующие клипы (preview-only, host применяет верно, move_clip редок).
+
 ## 2026-06-19 — Abort прерывает SSE-стриминг (раньше «Стоп» не останавливал чтение)
 
 - **🟠 UX (cloudru-client): «Стоп» во время SSE-стриминга не прерывал чтение до конца ответа модели.** `parseSSEStream` не принимал abortCheck → read-loop крутился до `done`, UI оставался «занят» секунды (актуально при `enableStreaming`, который off по умолчанию). Фикс: проброс abortCheck → проверка в начале каждой итерации → `reader.cancel()` (guarded) + throw AbortError; `releaseLock` в finally тоже guarded. +2 unit-теста (abort прерывает с AbortError; без abortCheck — обратная совместимость). build→v11. Тесты 440/440 (+2).
