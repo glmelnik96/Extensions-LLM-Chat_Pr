@@ -3,7 +3,7 @@
 > Это **первый файл, который должен прочитать любой агент** перед началом работы над проектом.
 > Цель — за 5 минут понять: что это, как устроено, где hot zones, как тестировать, чего НЕ трогать.
 
-**Последнее обновление:** 2026-06-19 · **Статус:** production-ready · **Тесты:** 438/438 unit + 23/23 LLM quality на 1ч подкасте
+**Последнее обновление:** 2026-06-19 · **Статус:** production-ready · **Тесты:** 440/440 unit + 23/23 LLM quality на 1ч подкасте
 
 ---
 
@@ -127,7 +127,7 @@
 |---|---|---|
 | `client/unified/panel.js` | ~5550 | UI + executors + agent loop. Любое изменение рискует регрессией. |
 | `client/shared/transcript-structure.js` | ~1055 | paragraphs/segments structure. `buildParagraphs`, `isParagraphsStale`, `analyzeForCutsWithLLM` — critical |
-| `client/shared/cloudru-client.js` | ~406 | HTTP client + retry + SSE streaming. **НЕТ unit-тестов** — backlog |
+| `client/shared/cloudru-client.js` | ~430 | HTTP client + retry + SSE streaming. Unit-тесты на internals (`_cloudRuInternals`): parseSSEStream (вкл. abort), isRetryable, parseJsonResponse, normalizeBase — `tests/cloudru-client.test.mjs` |
 | `client/shared/agent-loop.js` | ~14KB | Tool orchestration + cycle detection. **НЕТ unit-тестов** — backlog |
 | `client/shared/prompts.js` | ~30KB | Tiered prompts по intent. **НЕТ unit-тестов** — backlog. Любое изменение → re-validate 23/23 LLM checks |
 | `host/premiere.jsx` | ~2840 | ExtendScript (ES3!). Особенности: JSON-полифилл (гард по `typeof JSON`), `_wrap()` декоратор, `safeSeconds()` null-guards. НЕТ `.trim`/`.forEach`/`Object.keys` — см. ExtendScript quirks |
@@ -144,7 +144,7 @@
 
 ```bash
 # Unit тесты (быстрые, ~1с) — именно npm test, не node --test tests/
-npm test                                              # 438/438 pass
+npm test                                              # 440/440 pass
 
 # Real LLM quality на реальном кэше через Cloud.ru API (~10 мин)
 node tests/integration/run-starters-quality.mjs       # 23/23 quality checks
@@ -347,7 +347,7 @@ node tools/cep-debug.mjs evalfile tools/_live_probe.js   # выполнить JS
 for f in client/unified/panel.js client/shared/*.js; do node --check "$f" || echo "FAIL: $f"; done
 
 # 2. Unit tests
-npm test                                              # должно быть 438/438
+npm test                                              # должно быть 440/440
 
 # 3. LLM quality (если менял prompts.js, conversation-starters.js, или агент-логику)
 node tests/integration/run-starters-quality.mjs       # 23/23

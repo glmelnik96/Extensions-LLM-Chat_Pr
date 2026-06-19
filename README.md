@@ -19,7 +19,7 @@
 | AI-чат (аудио ducking) | Реализовано, не тестировалось в продакшене |
 | J/L-cuts | Отключено — ExtendScript не поддерживает unlink() |
 | Скорость клипа | Не поддерживается — нет API в Premiere Pro 2025 |
-| Автотесты | 438/438 unit + 23/23 LLM quality checks на 1ч подкасте |
+| Автотесты | 440/440 unit + 23/23 LLM quality checks на 1ч подкасте |
 | MultiCam-нарезка для подкастов | Phase 2 — audio-driven свитчер по RMS микрофонов, кастомный выбор дорожек по спикерам, пресеты Спокойный/Динамичный + свои |
 | Чекпоинты / Откат | Работает — бэкап-секвенция перед каждым apply, кнопка «⏪ Откатить» |
 | Кликабельные таймкоды | Работает — в proposal-картах и в свободном тексте чата («763–778 сек», «12:43») → клик двигает плейхед |
@@ -280,7 +280,7 @@ var FM_SECRETS = { apiKey: 'ваш-ключ-cloud-ru' };
 ## Тесты
 
 ```bash
-npm test   # 438 тестов: валидаторы, pipelines, prompts, search, simulator, multicam, scenarios
+npm test   # 440 тестов: валидаторы, pipelines, prompts, search, simulator, multicam, scenarios
 ```
 
 Интеграция с Premiere — ручная проверка по чеклисту `docs/MANUAL_TESTS.md`.
@@ -325,7 +325,7 @@ npm test   # 438 тестов: валидаторы, pipelines, prompts, search,
 │   └── presets/                   — .epr пресет для аудио-экспорта
 ├── tools/
 │   └── cep-debug.mjs              — CDP-драйвер: eval/reload/screenshot панели (порт 8098)
-├── tests/                         — 438 автотестов (npm test) + integration на Cloud.ru
+├── tests/                         — 440 автотестов (npm test) + integration на Cloud.ru
 └── docs/                          — документация
 ```
 
