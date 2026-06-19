@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.3';
+$._EXT_PRM_.version = '2.6.4';
 
 $._EXT_PRM_._EPS = 0.04;
 
