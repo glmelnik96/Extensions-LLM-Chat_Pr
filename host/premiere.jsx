@@ -1190,6 +1190,15 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           results.push({ op: a, ok: false, error: 'Нужны startSec и endSec' });
           continue;
         }
+        /* 19.06.2026: отклоняем negative startSec на границе host (last line of
+           defense). JS-слой ловит это для transcript_cuts (HIGH #6), но через
+           timecode_edits negative проходил и razor [neg,endSec] молча удалял
+           [0,endSec] реального контента. Отклоняем, а не клампим: negative =
+           баг вызывающей стороны, тихое удаление [0,endSec] хуже явной ошибки. */
+        if (op.startSec < 0) {
+          results.push({ op: a, ok: false, error: 'startSec не может быть отрицательным' });
+          continue;
+        }
         if (op.endSec <= op.startSec) {
           results.push({ op: a, ok: false, error: 'endSec должен быть > startSec' });
           continue;
@@ -1203,6 +1212,10 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
       if (a === 'lift_delete_range' || a === 'lift_delete_range_all_tracks') {
         if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number') {
           results.push({ op: a, ok: false, error: 'Нужны startSec и endSec' });
+          continue;
+        }
+        if (op.startSec < 0) {
+          results.push({ op: a, ok: false, error: 'startSec не может быть отрицательным' });
           continue;
         }
         if (op.endSec <= op.startSec) {
