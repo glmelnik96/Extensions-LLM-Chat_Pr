@@ -6,6 +6,10 @@
 
 ---
 
+## 2026-06-19 — Host-guard negative newStartSec в move_clip (defense-in-depth)
+
+- **🟠 Defense-in-depth (host): move_clip не валидировал negative newStartSec.** Симметрично negative-startSec guard для ripple/lift. JS-слой ловит это в обоих валидаторах (validateTimecodePlan:120 + validateEditPlan:248), но host обязан валидировать свои входы сам (last line of defense): при negative `_rippleShiftAllClipsFrom` сдвинул бы ВСЕ клипы от отрицательной отметки и поставил связку на negative-время → тихая порча всего таймлайна. host 2.6.5. Проверено синтетически: negative → отклонён, appliedCount 0, таймлайн не тронут.
+
 ## 2026-06-19 — Fast-path выреза не синхронизировал кэш транскрипта
 
 - **🔴 БАГ (transcript desync): fast-path «удали с X по Y сек» оставлял кэш транскрипта несдвинутым.** Канонический `apply_timecode_edits` (panel.js:1142-1168) после ripple-выреза делает `_snapDirty=true` + refresh snapshot + `applyRippleDeletionsToTranscript`. Fast-path (`onSend`, вырез без LLM) применял ту же host-операцию, но НЕ синхронил транскрипт → все сегменты после выреза съезжали на длину выреза, последующие чат-запросы видели неверные таймкоды. Снапшот тоже не инвалидировался (полагался на ненадёжное CEP-событие SequenceChanged). Live-доказательство: вырез 5-6с не сдвинул last-сегмент (1877.574 без изменений); после фикса вырез 7-8с сдвинул 1877.574→1876.574, first [0,8.02]→[0,7.02]. Фикс по каноническому паттерну: ripple синхронит, lift (оставляет дыру) — нет.

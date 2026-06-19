@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.4';
+$._EXT_PRM_.version = '2.6.5';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -1346,6 +1346,16 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         }
         if (typeof op.newStartSec !== 'number') {
           results.push({ op: a, ok: false, error: 'Нужен newStartSec (число)' });
+          continue;
+        }
+        /* 19.06.2026: negative newStartSec на границе host (last line of defense,
+           симметрично negative-startSec guard для ripple/lift_delete_range). JS-слой
+           ловит это в обоих валидаторах (validateTimecodePlan + validateEditPlan),
+           но host обязан валидировать свои входы сам: при negative
+           _rippleShiftAllClipsFrom сдвигает ВСЕ клипы от отрицательной отметки и
+           ставит связку на negative-время → тихая порча всего таймлайна. */
+        if (op.newStartSec < 0) {
+          results.push({ op: a, ok: false, error: 'newStartSec не может быть отрицательным' });
           continue;
         }
         var nodeRef = String(found.clip.nodeId);
