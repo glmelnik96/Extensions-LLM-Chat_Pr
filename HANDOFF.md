@@ -211,7 +211,7 @@ node tools/cep-debug.mjs evalfile tools/_live_probe.js   # выполнить JS
 - **JSON-полифилл** (вверху файла, гард `if (typeof JSON === 'undefined')`): часть сборок ExtendScript НЕ имеют нативного JSON (подтверждено логом установки на стороннем устройстве) → все ~85 вызовов `JSON.*` падали с `ReferenceError`. Где JSON есть (напр. ES 4.5.6 в PP 26.2) — гард пропускает полифилл. **Не удалять.** `_wrap` сохраняет optimistic try/catch как defense-in-depth.
 - **Не делать `typeof JSON.stringify === 'function'`** — на PP 26 COM-bridge возвращает `'unknown'`, pre-check бессмысленен; полифилл + try/catch надёжнее.
 - **ES5-методы отсутствуют в ExtendScript** — проверено на живом PP 26.2 (ES 4.5.6): НЕТ `String.prototype.trim`, `Array.prototype.forEach`, `Object.keys` (но `Array.prototype.indexOf` ЕСТЬ). Вместо `.trim()` → `.replace(/^\s+|\s+$/g,'')`. Перед использованием любого ES5-метода в host — проверь его наличие пробой через CDP.
-- **Версия host** в `$._EXT_PRM_.version` — бампать при правках host (сейчас `2.6.6`).
+- **Версия host** в `$._EXT_PRM_.version` — бампать при правках host (сейчас `2.6.7`).
 
 ### LLM patterns
 - **`targetDurationSec`** обязателен в `propose_transcript_cuts` для запросов «уложи в N сек»

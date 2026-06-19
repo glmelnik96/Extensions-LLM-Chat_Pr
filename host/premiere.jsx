@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.6';
+$._EXT_PRM_.version = '2.6.7';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -306,19 +306,33 @@ $._EXT_PRM_._removeClipAndLinked = function (seq, nodeId) {
   var toRemove = $._EXT_PRM_._findLinkedClips(seq, clip);
 
   var removed = [];
+  var failed = [];
   /* Удаляем в обратном порядке (по позиции), чтобы индексы не сбивались */
   toRemove.sort(function (a, b) {
     try { return b.start.seconds - a.start.seconds; } catch (eS) { return 0; }
   });
   for (var k = 0; k < toRemove.length; k++) {
+    var nid = '?';
+    try { nid = String(toRemove[k].nodeId); } catch (eN) {}
     try {
-      var nid = String(toRemove[k].nodeId);
       toRemove[k].remove(1, 1);
       $._EXT_PRM_._bump();
       removed.push(nid);
-    } catch (eR) {}
+    } catch (eR) { failed.push(nid); }
   }
-  return { ok: true, removed: removed, count: removed.length };
+  /* 19.06.2026: честный контракт (как applyTranscriptCuts «все провалились → ok:false»).
+     Раньше пустой catch глотал ошибку remove() (заблокированная дорожка и т.п.) и
+     функция ВСЕГДА возвращала ok:true — пользователь видел «удалено», хотя клип
+     остался. Теперь: ни один не удалён → ok:false; частичный провал → failedCount. */
+  if (removed.length === 0 && toRemove.length > 0) {
+    return {
+      ok: false,
+      error: 'не удалось удалить клип (возможно, заблокирована дорожка)',
+      removed: removed, count: 0,
+      failedCount: failed.length, failedNodeIds: failed
+    };
+  }
+  return { ok: true, removed: removed, count: removed.length, failedCount: failed.length, failedNodeIds: failed };
 };
 
 $._EXT_PRM_._collectIntersecting = function (seq, t0, t1) {
@@ -1325,10 +1339,19 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         }
         var enabled = op.enabled !== false;
         var linked = $._EXT_PRM_._findLinkedClips(seq, found.clip);
+        /* 19.06.2026: честный контракт. Раньше пустой catch глотал ошибку
+           (.disabled read-only на некоторых сборках PP) и ВСЕГДА возвращался
+           ok:true с affectedClips=linked.length, хотя ни один клип не переключился.
+           Теперь считаем фактически применённые; ни одного → ok:false. */
+        var enaOk = 0;
         for (var le = 0; le < linked.length; le++) {
-          try { linked[le].disabled = !enabled; $._EXT_PRM_._bump(); } catch (eEn) {}
+          try { linked[le].disabled = !enabled; $._EXT_PRM_._bump(); enaOk++; } catch (eEn) {}
         }
-        results.push({ op: a, ok: true, enabled: enabled, affectedClips: linked.length });
+        if (enaOk === 0 && linked.length > 0) {
+          results.push({ op: a, ok: false, error: 'не удалось переключить клип (.disabled недоступен в этой сборке PP)', enabled: enabled, affectedClips: 0 });
+          continue;
+        }
+        results.push({ op: a, ok: true, enabled: enabled, affectedClips: enaOk });
         continue;
       }
 

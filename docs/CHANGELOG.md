@@ -6,6 +6,10 @@
 
 ---
 
+## 2026-06-19 — Честный host-контракт для remove_clip / set_clip_enabled
+
+- **🟠 honest-error (host): remove_clip и set_clip_enabled рапортовали ok:true даже когда ничего не применилось.** Продолжение волны «честных host-ошибок» (f34ac75). `_removeClipAndLinked` глотал ошибку `remove()` (заблокированная дорожка) пустым catch и ВСЕГДА возвращал ok:true — пользователь видел «удалено», хотя клип остался. `set_clip_enabled` так же глотал ошибку `.disabled=` (read-only на части сборок PP) и возвращал ok:true с affectedClips=linked.length. Фикс: считаем фактически применённые операции; ни одной → ok:false + failedCount/failedNodeIds (remove) / error (enabled); частичный провал → failedCount. Контракт обратносовместим (caller читает .ok, пробрасывает detail). host 2.6.6→2.6.7. Live: валидный set_clip_enabled → ok:true, affectedClips=2 (фактически переключённые).
+
 ## 2026-06-19 — Abort-aware retry-backoff (Стоп неотзывчив до ~16с)
 
 - **🟠 UX (cloudru-client): «Стоп» во время retry-backoff не прерывал запрос до ~16с.** `await sleep(base+jitter)` был обычным setTimeout (1/2/4/8/16с); нажатие «Стоп» во время сна обрабатывалось только на след. итерации цикла (`throwIfAbortCheck`). Фикс: `abortableSleep(ms, abortCheck)` дробит сон на срезы ~150мс и просыпается рано при abort. Проверено автономно: abort на 200мс из 16-секундного сна → пробуждение на 309мс (не 16000); без abort — полная длительность; без abortCheck — fallback на plain sleep. build→v10.
