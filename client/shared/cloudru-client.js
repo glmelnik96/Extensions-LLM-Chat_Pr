@@ -186,7 +186,7 @@
    * onChunk(delta) — optional callback for progressive text display.
    * delta = { content?: string, tool_calls?: [...] }
    */
-  async function parseSSEStream(response, onChunk) {
+  async function parseSSEStream(response, onChunk, abortCheck) {
     var reader = response.body.getReader();
     var decoder = new TextDecoder();
     var buffer = '';
@@ -199,6 +199,16 @@
 
     try {
       while (true) {
+        /* 19.06.2026: abort прерывает read-loop стрима. Раньше parseSSEStream не
+           принимал abortCheck — нажатие «Стоп» во время стриминга не останавливало
+           чтение до конца ответа модели (UI «занят» секунды). Теперь проверяем в
+           начале каждой итерации: отменяем reader и бросаем AbortError. */
+        if (typeof abortCheck === 'function' && abortCheck()) {
+          try { if (reader.cancel) reader.cancel(); } catch (_c) {}
+          var abErr = new Error('Остановлено пользователем');
+          abErr.name = 'AbortError';
+          throw abErr;
+        }
         var readResult = await reader.read();
         if (readResult.done) break;
         buffer += decoder.decode(readResult.value, { stream: true });
@@ -261,7 +271,7 @@
         }
       }
     } finally {
-      reader.releaseLock();
+      try { reader.releaseLock(); } catch (_rl) {}
     }
 
     /* Build aggregated response */
@@ -363,7 +373,7 @@
 
       /* Streaming response */
       if (useStreaming && res.ok && res.body) {
-        return parseSSEStream(res, opts.onChunk);
+        return parseSSEStream(res, opts.onChunk, opts.abortCheck);
       }
 
       var text = await res.text();

@@ -6,6 +6,10 @@
 
 ---
 
+## 2026-06-19 — Abort прерывает SSE-стриминг (раньше «Стоп» не останавливал чтение)
+
+- **🟠 UX (cloudru-client): «Стоп» во время SSE-стриминга не прерывал чтение до конца ответа модели.** `parseSSEStream` не принимал abortCheck → read-loop крутился до `done`, UI оставался «занят» секунды (актуально при `enableStreaming`, который off по умолчанию). Фикс: проброс abortCheck → проверка в начале каждой итерации → `reader.cancel()` (guarded) + throw AbortError; `releaseLock` в finally тоже guarded. +2 unit-теста (abort прерывает с AbortError; без abortCheck — обратная совместимость). build→v11. Тесты 440/440 (+2).
+
 ## 2026-06-19 — Честный host-контракт для remove_clip / set_clip_enabled
 
 - **🟠 honest-error (host): remove_clip и set_clip_enabled рапортовали ok:true даже когда ничего не применилось.** Продолжение волны «честных host-ошибок» (f34ac75). `_removeClipAndLinked` глотал ошибку `remove()` (заблокированная дорожка) пустым catch и ВСЕГДА возвращал ok:true — пользователь видел «удалено», хотя клип остался. `set_clip_enabled` так же глотал ошибку `.disabled=` (read-only на части сборок PP) и возвращал ok:true с affectedClips=linked.length. Фикс: считаем фактически применённые операции; ни одной → ok:false + failedCount/failedNodeIds (remove) / error (enabled); частичный провал → failedCount. Контракт обратносовместим (caller читает .ok, пробрасывает detail). host 2.6.6→2.6.7. Live: валидный set_clip_enabled → ok:true, affectedClips=2 (фактически переключённые).

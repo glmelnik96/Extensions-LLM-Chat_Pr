@@ -162,4 +162,29 @@ describe('cloudru-client.parseSSEStream', () => {
     assert.equal(tc.length, 2);
     assert.deepEqual([tc[0].function.name, tc[1].function.name], ['f0', 'f1']);
   });
+
+  test('abortCheck прерывает стрим до завершения (AbortError)', async () => {
+    const text = sse([
+      { choices: [{ delta: { content: 'a' } }] },
+      { choices: [{ delta: { content: 'b' } }] },
+      { choices: [{ delta: { content: 'c' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] }
+    ]);
+    /* abortCheck зовётся в начале каждой итерации: 1-я — false (читаем), 2-я — true (abort) */
+    let calls = 0;
+    const abortCheck = () => (++calls > 1);
+    await assert.rejects(
+      () => CR.parseSSEStream(makeSSEResponse(text, 8), null, abortCheck),
+      (err) => err.name === 'AbortError'
+    );
+  });
+
+  test('без abortCheck стрим завершается нормально (обратная совместимость)', async () => {
+    const text = sse([
+      { choices: [{ delta: { content: 'ok' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] }
+    ]);
+    const res = await CR.parseSSEStream(makeSSEResponse(text), null);
+    assert.equal(res.choices[0].message.content, 'ok');
+  });
 });
