@@ -6,6 +6,12 @@
 
 ---
 
+## 2026-06-19 — Re-entrancy: Tools-tab бежал конкурентно с чатом + чистка проекта
+
+- **🔴 БАГ (concurrency): Tools-tab пайплайны бежали параллельно с чатом.** `toolsRunTool`/`toolsApply` не входили в общий operation-queue (только локальный `toolsDisableRun`, блокирующий лишь кнопки Tools-tab). Пользователь запускает чат-операцию → переключается на Tools-tab → жмёт пайплайн → оба бегут параллельно, бьют в host/ffmpeg/снапшот, могут дойти до apply → гонка на ripple/razor таймлайна. Подтверждено вживую («RAN(concurrent!)» при chatRunning:true). Фикс: оба пути входят в opQueue через beginOperation/endOperation (релиз во всех терминальных точках; `_makeSequenceCheckpoint` всегда вызывает cb → нет утечки лока). Взаимоисключение двунаправленное. Валидировано: Tools-tab при активном чате → «Идёт обработка в чате…», не запускается.
+- **Чистка проекта**: версии синхронизированы (host 2.6.3→2.6.4 за negative-startSec фикс, build-маркер audiosnap-v6→clampverif-stalecard-v7), HANDOFF актуализирован (host-версия 2.6.1→2.6.4, дата). Мусорные бэкап-секвенции консолидированы в `x_junk1-14` (удаляются одним фильтром в Project-панели; ExtendScript не умеет deleteSequence).
+- Наблюдение: undo-модель (переключение на бэкап-копию) оставляет KEEP-секвенции edit/raw/multicam в тест-модифицированном состоянии — источник медиа нетронут (операции неразрушающие), это тест-проект.
+
 ## 2026-06-19 — Цепочечный workflow + host-валидация edge-входов (баг negative startSec)
 
 - **🔴 БАГ (host): negative startSec молча удалял [0,endSec].** Детерминированный тест host-валидации: `ripple_delete_range`/`lift_delete_range` (+ `_all_tracks`) проверяли только `endSec>startSec`, не `startSec>=0`. Negative проходил в `_applyOneTimelineInterval` → razor [neg,endSec] удалял [0,endSec] реального контента (-50..10 → removed 2 клипа). JS-слой ловит это для transcript_cuts (HIGH #6), но через timecode_edits-путь negative доходил до host. Фикс: guard на границе host (отклоняем, не клампим). Валидировано: negative → ошибка, appliedCount 0.

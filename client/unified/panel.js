@@ -5505,7 +5505,7 @@ PanelBoot.run('ИИ: монтаж', function () {
          взаимоисключение с чатом (race на ripple/razor таймлайна). endOperation
          вызывается в каждом host-колбэке после toolsDisableRun(false). */
       if (!beginOperation('tools-apply:' + prop.kind)) {
-        toolsShowErr('Идёт обработка в чате — дождитесь завершения или нажмите «Стоп».');
+        toolsShowErr('Идёт обработка в чате — дождитесь завершения (кнопка «Стоп» на вкладке «Чат»).');
         return;
       }
 
@@ -5692,7 +5692,7 @@ PanelBoot.run('ИИ: монтаж', function () {
          Подтверждено вживую: при активном чате кнопка silences не блокировалась
          и стартовала параллельно. Теперь два пути взаимоисключающие. */
       if (!beginOperation('tools:' + toolName)) {
-        toolsShowErr('Идёт обработка в чате — дождитесь завершения или нажмите «Стоп».');
+        toolsShowErr('Идёт обработка в чате — дождитесь завершения (кнопка «Стоп» на вкладке «Чат»).');
         return;
       }
       toolsDisableRun(true);
