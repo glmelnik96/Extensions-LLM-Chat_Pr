@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-clampverif-stalecard-v7'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-fastpath-transcript-sync-v8'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -4473,6 +4473,28 @@ PanelBoot.run('ИИ: монтаж', function () {
           });
           /* Откат таймкодов средствами плагина не реализован — Cmd+Z в таймлайне Premiere вручную. */
           if (fastRes && !fastRes.ok) throw new Error(fastRes.error || 'Ошибка применения правки');
+          /* 19.06.2026: fast-path синхронизирует кэш транскрипта так же, как
+             канонический apply_timecode_edits (panel.js:1142-1168). Раньше fast-path
+             применял ripple к таймлайну, но НЕ сдвигал кэш транскрипта → после
+             «удали с 10 по 20 сек» все сегменты после выреза оставались съехавшими
+             на длину выреза, и последующие чат-запросы видели неверные таймкоды
+             (подтверждено live: вырез 5-6с не сдвинул last-сегмент 1877.574).
+             lift_delete оставляет дыру (контент не сдвигается) — канонический путь
+             его не синхронит, fast-path тоже только для ripple. */
+          _snapDirty = true;
+          try {
+            var fastSnap = await new Promise(function (resolve) {
+              PremiereBridge.getTimelineSnapshot(function (e2, d2) { resolve((!e2 && d2 && d2.ok) ? d2 : null); });
+            });
+            if (fastSnap) { lastSnap = fastSnap; _snapDirty = false; }
+            var fastSeqKey = (fastSnap && fastSnap.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
+            if (fastSeqKey && direct.ripple) {
+              ContextStore.applyRippleDeletionsToTranscript(
+                TRANSCRIPT_PID, fastSeqKey,
+                [{ startSec: direct.startSec, endSec: direct.endSec }]
+              );
+            }
+          } catch (eFastSync) { /* sync best-effort — таймлайн уже изменён */ }
           stored = ContextStore.getMessages(panelId);
           stored.push({
             role: 'assistant',
