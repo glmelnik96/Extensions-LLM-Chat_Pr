@@ -6,6 +6,13 @@
 
 ---
 
+## 2026-06-19 — Цепочечный workflow + host-валидация edge-входов (баг negative startSec)
+
+- **🔴 БАГ (host): negative startSec молча удалял [0,endSec].** Детерминированный тест host-валидации: `ripple_delete_range`/`lift_delete_range` (+ `_all_tracks`) проверяли только `endSec>startSec`, не `startSec>=0`. Negative проходил в `_applyOneTimelineInterval` → razor [neg,endSec] удалял [0,endSec] реального контента (-50..10 → removed 2 клипа). JS-слой ловит это для transcript_cuts (HIGH #6), но через timecode_edits-путь negative доходил до host. Фикс: guard на границе host (отклоняем, не клампим). Валидировано: negative → ошибка, appliedCount 0.
+- **Цепочечный монтаж без reload — корректен**: рез паразитов (111→121 клип, 1972→1886с) → без reload рез тишин (verification «28:01 из 31:26 = 89%», база = изменённый таймлайн, не оригинал) → apply (121→145, 1683с). Транскрипт автосинхронизируется после каждого ripple (409→400 сегм). Откат цепочки чистый.
+- **Host-валидация надёжна** (graceful на всех edge): inverted interval (end<start), NaN/null startSec, unknown action, empty operations, malformed JSON, nonexistent nodeId (move_clip/set_clip_enabled) — все возвращают понятную ошибку, appliedCount 0, таймлайн не тронут.
+- Наблюдение (архитектура, не баг): undo-кнопка одноуровневая, откат переключает активную на бэкап-копию, канонический «edit» остаётся в модифицированном состоянии. Следствие модели чекпоинтов (ExtendScript не умеет in-place undo ripple) — копит бэкап-секвенции.
+
 ## 2026-06-19 — Тест slash-команд и параметров инструментов: фикс verification >100%
 
 - **🟠 БАГ: verification показывал >100% остатка при рассинхроне транскрипт↔секвенция.** `/cut_silences` на секвенции короче своего транскрипта (транскрипт 65 мин, секвенция 55 мин после прежних резов) → «Останется: 60:04.3 из 55:02.3 (109%)» (остаётся больше оригинала). Причина: computeVerification не клампил keepIntervals (зазоры между removeIntervals) к концу секвенции. Фикс: клампим removeIntervals к [0, seqEnd] в начале. Валидировано: «109%» → «96%», keep 168→110.
