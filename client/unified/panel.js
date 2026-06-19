@@ -1406,9 +1406,20 @@ PanelBoot.run('ИИ: монтаж', function () {
     if (!seqEnd && lastSnap && lastSnap.clips) {
       lastSnap.clips.forEach(function (c) { if (c.endSec > seqEnd) seqEnd = c.endSec; });
     }
-    var removes = (removeList || []).slice().sort(function (a, b) {
-      return a.startSec - b.startSec;
-    });
+    /* 19.06.2026: клампим removeIntervals к [0, seqEnd]. Если транскрипт длиннее
+       секвенции (рассинхрон после правок/повторной транскрибации), интервалы за
+       концом секвенции раздували keep → «Останется 60:04 из 55:02 (109%)».
+       Зазоры за пределами секвенции — не реальный контент. */
+    var removes = (removeList || []).slice()
+      .map(function (iv) {
+        var s = Math.max(0, iv.startSec);
+        var e = seqEnd > 0 ? Math.min(iv.endSec, seqEnd) : iv.endSec;
+        return { startSec: s, endSec: e };
+      })
+      .filter(function (iv) { return iv.endSec > iv.startSec + 0.01; })
+      .sort(function (a, b) {
+        return a.startSec - b.startSec;
+      });
     var totalRemoveSec = 0;
     removes.forEach(function (iv) {
       totalRemoveSec += iv.endSec - iv.startSec;
