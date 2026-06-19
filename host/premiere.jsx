@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.5';
+$._EXT_PRM_.version = '2.6.6';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -1240,6 +1240,13 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           results.push({ op: a, ok: false, error: 'Нужны fromSec и deltaSec (числа)' });
           continue;
         }
+        /* 19.06.2026: negative fromSec на границе host (симметрично negative-guard
+           ripple/lift/move_clip). При negative _rippleShiftAllClipsFrom сдвинул бы
+           ВСЕ клипы от отрицательной отметки, включая [0..], → порча таймлайна. */
+        if (op.fromSec < 0) {
+          results.push({ op: a, ok: false, error: 'fromSec не может быть отрицательным' });
+          continue;
+        }
         if (op.deltaSec <= 0) {
           results.push({ op: a, ok: false, error: 'deltaSec должен быть > 0 (сдвиг вправо)' });
           continue;
@@ -1281,6 +1288,17 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         found = $._EXT_PRM_._findClipByNodeId(seq, op.nodeId);
         if (!found) {
           results.push({ op: a, ok: false, error: 'Клип не найден' });
+          continue;
+        }
+        /* 19.06.2026: отклоняем inverted bounds ДО модификации. Иначе _setTimelineIn
+           подрезал бы start (применился), затем _setTimelineOut с endSec<startSec
+           вернул бы ok:false — клип оставался в полу-подрезанном состоянии. */
+        if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number') {
+          results.push({ op: a, ok: false, error: 'Нужны startSec и endSec (числа)' });
+          continue;
+        }
+        if (op.endSec <= op.startSec) {
+          results.push({ op: a, ok: false, error: 'endSec должен быть > startSec' });
           continue;
         }
         r = $._EXT_PRM_._setTimelineIn(found, op.startSec);
@@ -1730,6 +1748,12 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
     for (k = 0; k < sorted.length; k++) {
       iv = sorted[k];
       if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') continue;
+      /* 19.06.2026: пропускаем negative startSec (симметрично negative-guard в
+         ripple/lift_delete_range и move_clip). _applyOneTimelineInterval через
+         _secToTimecode клампит negative→0 и razor молча удаляет [0,endSec]
+         реального контента. JS-слой (validateTranscriptCuts HIGH #6) это ловит,
+         но host обязан валидировать сам как last line of defense. */
+      if (iv.startSec < 0) continue;
       if (iv.endSec <= iv.startSec) continue;
       lg = [];
       $._EXT_PRM_._applyOneTimelineInterval(seq, iv.startSec, iv.endSec, lg, true, stats);

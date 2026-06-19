@@ -6,6 +6,16 @@
 
 ---
 
+## 2026-06-19 — Комплексный аудит: ещё 3 host-guard'а (applyTranscriptCuts/shift_ripple/bounds)
+
+Параллельный аудит 4 субагентами (deterministic-pipelines, host, agent-loop+cloudru, context-store+transcript+youtube). После строгой фильтрации (~80% лидов — ложные тревоги: set_timeline_in/out negative ловится range-check `s≥0`; synthesizeWords гуардит `filter(Boolean)`+`dur===0`; youtube «59:59» для <1ч корректен) подтверждены 3 host-бага того же класса negative/inverted:
+
+- **🔴 applyTranscriptCuts: negative startSec молча удалял [0,endSec].** Прямой аналог ripple-бага в отдельном пути. Проверял только `endSec<=startSec`, не `startSec<0` → `_applyOneTimelineInterval`→`_secToTimecode` клампит negative→0, razor режет [0,endSec]. Фикс: skip negative (как существующий skip endSec<=startSec). Live: negative → appliedCount 0, details:[], без удаления.
+- **🔴 shift_timeline_ripple: negative fromSec сдвигал весь таймлайн.** Валидировал `deltaSec>0`, не `fromSec>=0` → `_rippleShiftAllClipsFrom` от отрицательной отметки двигал ВСЕ клипы [0..]. Фикс: reject. Live: отклонён.
+- **🟠 set_timeline_bounds: inverted bounds оставлял клип полу-подрезанным.** `_setTimelineIn(startSec)` применялся, затем `_setTimelineOut(endSec<startSec)` → ok:false, но start уже подрезан. Фикс: reject `endSec<=startSec` + проверка типов ДО модификации. Live: отклонён.
+
+host 2.6.5→2.6.6, тесты 438/438. Отложено как low-value: negative timeSec в маркерах (недеструктивны + verification ловит drift), honest-error в _removeClipAndLinked/set_clip_enabled (пустые catch → ok:true), abort во время SSE-backoff/стриминга (UX-задержка ~2-3с, не порча данных).
+
 ## 2026-06-19 — Host-guard negative newStartSec в move_clip (defense-in-depth)
 
 - **🟠 Defense-in-depth (host): move_clip не валидировал negative newStartSec.** Симметрично negative-startSec guard для ripple/lift. JS-слой ловит это в обоих валидаторах (validateTimecodePlan:120 + validateEditPlan:248), но host обязан валидировать свои входы сам (last line of defense): при negative `_rippleShiftAllClipsFrom` сдвинул бы ВСЕ клипы от отрицательной отметки и поставил связку на negative-время → тихая порча всего таймлайна. host 2.6.5. Проверено синтетически: negative → отклонён, appliedCount 0, таймлайн не тронут.
