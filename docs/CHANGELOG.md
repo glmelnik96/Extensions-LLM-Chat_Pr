@@ -6,6 +6,10 @@
 
 ---
 
+## 2026-06-19 — Abort-aware retry-backoff (Стоп неотзывчив до ~16с)
+
+- **🟠 UX (cloudru-client): «Стоп» во время retry-backoff не прерывал запрос до ~16с.** `await sleep(base+jitter)` был обычным setTimeout (1/2/4/8/16с); нажатие «Стоп» во время сна обрабатывалось только на след. итерации цикла (`throwIfAbortCheck`). Фикс: `abortableSleep(ms, abortCheck)` дробит сон на срезы ~150мс и просыпается рано при abort. Проверено автономно: abort на 200мс из 16-секундного сна → пробуждение на 309мс (не 16000); без abort — полная длительность; без abortCheck — fallback на plain sleep. build→v10.
+
 ## 2026-06-19 — Комплексный аудит: ещё 3 host-guard'а (applyTranscriptCuts/shift_ripple/bounds)
 
 Параллельный аудит 4 субагентами (deterministic-pipelines, host, agent-loop+cloudru, context-store+transcript+youtube). После строгой фильтрации (~80% лидов — ложные тревоги: set_timeline_in/out negative ловится range-check `s≥0`; synthesizeWords гуардит `filter(Boolean)`+`dur===0`; youtube «59:59» для <1ч корректен) подтверждены 3 host-бага того же класса negative/inverted:

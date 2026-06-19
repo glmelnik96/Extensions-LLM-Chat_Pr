@@ -51,6 +51,26 @@
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
 
+  /* 19.06.2026: abort-aware sleep для retry-backoff. Раньше backoff был обычным
+     setTimeout (до ~16с), и нажатие «Стоп» во время сна не прерывало запрос до
+     следующей итерации цикла — UI оставался «занят» до конца backoff. Дробим сон
+     на срезы ~150мс и просыпаемся рано при abort; throwIfAbortCheck в начале
+     следующей итерации бросит AbortError. */
+  function abortableSleep(ms, abortCheck) {
+    if (typeof abortCheck !== 'function') return sleep(ms);
+    var SLICE = 150;
+    return new Promise(function (resolve) {
+      var elapsed = 0;
+      function tick() {
+        if (abortCheck() || elapsed >= ms) { resolve(); return; }
+        var step = Math.min(SLICE, ms - elapsed);
+        elapsed += step;
+        setTimeout(tick, step);
+      }
+      tick();
+    });
+  }
+
   /* ─── Retry wrapper ───────────────────────────────────────────────
    * Retry 2-3x for 5xx/429 errors with exponential backoff + jitter.
    * Don't retry 4xx (except 429) — those are client errors.
@@ -152,7 +172,7 @@
       if (/fetch failed|network|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(errMsg)) {
         extraDelay = NETWORK_TRANSIENT_DELAY_MS;
       }
-      await sleep(Math.round(base + jitter + extraDelay));
+      await abortableSleep(Math.round(base + jitter + extraDelay), abortCheck);
     }
     throw lastErr || new Error('Retry exhausted');
   }
