@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-tools-nochanges-status-v13'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-waveform-preview-v14'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5103,6 +5103,115 @@ PanelBoot.run('ИИ: монтаж', function () {
     var _toolsProposal = null;
     var _toolsProposalArea = null;
 
+    /* ── Waveform-превью (Phase 2) ─────────────────────────────
+       Рисует RMS-огибающую региона In–Out и поверх — красные зоны вырезания.
+       Зоны пересчитываются на лету при движении ползунков через ТОТ ЖЕ пайплайн
+       (cutSilences/jumpCuts), что и реальный вырез → preview==apply. Дорогой RMS
+       (ffmpeg) считается один раз в «Анализ аудио»; здесь — только перерисовка. */
+    var WaveformPreview = (function () {
+      var FLOOR_DB = -90, CEIL_DB = -6;
+      function dbToY(db, h) {
+        var v = (db - FLOOR_DB) / (CEIL_DB - FLOOR_DB);
+        if (v < 0) v = 0; else if (v > 1) v = 1;
+        return h - v * h;
+      }
+      function draw(canvas, rms, regions, opts) {
+        if (!canvas || !canvas.getContext) return;
+        opts = opts || {};
+        var ctx = canvas.getContext('2d');
+        var W = canvas.width, H = canvas.height;
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = '#141414'; ctx.fillRect(0, 0, W, H);
+        if (!rms || rms.length < 2 || W < 2) return;
+        var t0 = opts.tStart != null ? opts.tStart : rms[0].t;
+        var t1 = opts.tEnd != null ? opts.tEnd : rms[rms.length - 1].t;
+        var span = t1 - t0;
+        if (!(span > 0)) return;
+        function xOf(t) { return ((t - t0) / span) * W; }
+        /* Красные зоны — позади огибающей */
+        if (regions && regions.length) {
+          ctx.fillStyle = 'rgba(229,72,72,0.40)';
+          for (var i = 0; i < regions.length; i++) {
+            var rx1 = xOf(regions[i].startSec), rx2 = xOf(regions[i].endSec);
+            ctx.fillRect(rx1, 0, Math.max(1, rx2 - rx1), H);
+          }
+        }
+        /* Огибающая: max-dB по колонкам пикселей (даунсэмплинг к ширине canvas) */
+        var perCol = new Array(W);
+        for (var c = 0; c < W; c++) perCol[c] = -Infinity;
+        for (var k = 0; k < rms.length; k++) {
+          var x = Math.floor(xOf(rms[k].t));
+          if (x < 0 || x >= W) continue;
+          var db = (rms[k].rms == null || !isFinite(rms[k].rms)) ? FLOOR_DB : rms[k].rms;
+          if (db > perCol[x]) perCol[x] = db;
+        }
+        ctx.strokeStyle = '#4aa3ff';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        var last = FLOOR_DB;
+        for (var c2 = 0; c2 < W; c2++) {
+          var d = perCol[c2];
+          if (d === -Infinity) d = last; else last = d;
+          var y = dbToY(d, H);
+          ctx.moveTo(c2 + 0.5, H);
+          ctx.lineTo(c2 + 0.5, y);
+        }
+        ctx.stroke();
+      }
+      return { draw: draw };
+    })();
+    /* Состояние для live-перерисовки без host-вызова. */
+    var _waveState = null; /* { toolName, canvas, entry, rms, tStart, tEnd } */
+
+    /* Единый сбор параметров с ползунков — ОБЩИЙ для toolsRunTool (apply) и
+       waveform-превью, чтобы зоны на канве совпадали с реальным вырезом. */
+    function toolsCollectParams(toolName) {
+      var params = {};
+      function num(id, fn) { var el = document.getElementById(id); if (el) { var v = (fn || parseFloat)(el.value, 10); if (!isNaN(v)) return v; } return undefined; }
+      if (toolName === 'silences') {
+        var sMin = num('sil-min'); if (sMin !== undefined) params.minDuration = sMin;
+        var sPad = num('sil-pad'); if (sPad !== undefined) params.padding = sPad;
+        var sThr = num('sil-thresh', parseInt); if (sThr !== undefined) params.silenceThresholdDelta = sThr;
+      } else if (toolName === 'jumps') {
+        var jPause = num('jmp-pause'); if (jPause !== undefined) params.maxPause = jPause;
+        var jBreath = num('jmp-breath'); if (jBreath !== undefined) params.keepBreathing = jBreath;
+        var jMin = num('jmp-minseg'); if (jMin !== undefined) params.minSegmentDuration = jMin;
+      }
+      return params;
+    }
+
+    function toolsRenderWaveform() {
+      var st = _waveState;
+      if (!st || !st.canvas || !st.entry) return;
+      var params = toolsCollectParams(st.toolName);
+      var pipelineFn = st.toolName === 'jumps' ? DeterministicPipelines.jumpCuts : DeterministicPipelines.cutSilences;
+      var ctx = { transcriptEntry: st.entry, settings: {}, snapshot: null, onStatus: function () {}, abortCheck: function () { return false; } };
+      Promise.resolve(pipelineFn(ctx, params)).then(function (r) {
+        var regions = (r && r.proposal && r.proposal.removeIntervals) || [];
+        WaveformPreview.draw(st.canvas, st.rms, regions, { tStart: st.tStart, tEnd: st.tEnd });
+      }).catch(function () {
+        WaveformPreview.draw(st.canvas, st.rms, [], { tStart: st.tStart, tEnd: st.tEnd });
+      });
+    }
+
+    /* Показывает waveform для инструмента, если в entry есть rmsTimeline. */
+    function toolsShowWaveform(toolName, entry) {
+      var canvas = document.getElementById('wave-' + toolName);
+      if (!canvas) return;
+      var rms = entry && entry.audioAnalysis && entry.audioAnalysis.rmsTimeline;
+      if (!Array.isArray(rms) || rms.length < 2) { canvas.hidden = true; _waveState = null; return; }
+      /* Подгоняем пиксельную ширину canvas под фактическую (CSS width:100%). */
+      canvas.hidden = false;
+      var cssW = canvas.clientWidth || canvas.parentNode.clientWidth || 300;
+      canvas.width = Math.max(2, Math.floor(cssW));
+      if (!canvas.height) canvas.height = 64;
+      _waveState = {
+        toolName: toolName, canvas: canvas, entry: entry, rms: rms,
+        tStart: rms[0].t, tEnd: rms[rms.length - 1].t
+      };
+      toolsRenderWaveform();
+    }
+
     function toolsShowErr(t) {
       if (!toolsErr) return;
       toolsErr.textContent = t || '';
@@ -5184,6 +5293,24 @@ PanelBoot.run('ИИ: монтаж', function () {
       s.addEventListener('input', upd);
       upd();
     }
+    /* Live-перерисовка waveform-зон при движении ползунков инструмента. Через тот
+       же пайплайн (preview==apply), без host-вызова. rAF-троттлинг отрисовки. */
+    function bindWaveformRedraw(ids, toolName) {
+      var timer = null;
+      function onInput() {
+        if (!_waveState || _waveState.toolName !== toolName) return;
+        /* setTimeout-дебаунс (не requestAnimationFrame: rAF не вызывается, когда
+           панель в фоне/не перерисовывается, и live-обновление зависало). */
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(function () { timer = null; toolsRenderWaveform(); }, 40);
+      }
+      for (var i = 0; i < ids.length; i++) {
+        var el = document.getElementById(ids[i]);
+        if (el) el.addEventListener('input', onInput);
+      }
+    }
+    bindWaveformRedraw(['sil-min', 'sil-pad', 'sil-thresh'], 'silences');
+    bindWaveformRedraw(['jmp-pause', 'jmp-breath', 'jmp-minseg'], 'jumps');
     bindSlider('sil-min', 'sil-min-val', 'с');
     bindSlider('sil-pad', 'sil-pad-val', 'с');
     bindSlider('jmp-pause', 'jmp-pause-val', 'с');
@@ -5733,6 +5860,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         }
         var seqKey = snap.sequenceName || '';
         var entry = seqKey ? (ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqKey) || {}).entry : null;
+        /* Waveform-превью: если в entry есть RMS-таймлайн — показываем огибающую +
+           зоны. Дальше движение ползунков перерисовывает зоны без host-вызова. */
+        if (toolName === 'silences' || toolName === 'jumps') toolsShowWaveform(toolName, entry);
         var settings = ContextStore.getResolvedSettings();
 
         var ctx = {
