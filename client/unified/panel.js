@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-waveform-jumps-v15'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-waveform-symmetric-v16'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5109,34 +5109,32 @@ PanelBoot.run('ИИ: монтаж', function () {
        (cutSilences/jumpCuts), что и реальный вырез → preview==apply. Дорогой RMS
        (ffmpeg) считается один раз в «Анализ аудио»; здесь — только перерисовка. */
     var WaveformPreview = (function () {
-      var FLOOR_DB = -90, CEIL_DB = -6;
-      function dbToY(db, h) {
+      /* dB → амплитуда 0..1. Диапазон [-60,-12]: тишина → ноль у центра, речь →
+         к краям. Воспринимаемая громкость речи (RMS ~ -40..-15) ложится в видимый
+         размах. */
+      var FLOOR_DB = -60, CEIL_DB = -12;
+      function amp(db) {
         var v = (db - FLOOR_DB) / (CEIL_DB - FLOOR_DB);
         if (v < 0) v = 0; else if (v > 1) v = 1;
-        return h - v * h;
+        return v;
       }
       function draw(canvas, rms, regions, opts) {
         if (!canvas || !canvas.getContext) return;
         opts = opts || {};
         var ctx = canvas.getContext('2d');
         var W = canvas.width, H = canvas.height;
+        var mid = H / 2;
+        var maxHalf = mid - 2;
         ctx.clearRect(0, 0, W, H);
-        ctx.fillStyle = '#141414'; ctx.fillRect(0, 0, W, H);
-        if (!rms || rms.length < 2 || W < 2) return;
+        ctx.fillStyle = '#11151b'; ctx.fillRect(0, 0, W, H);
+        if (!rms || rms.length < 2 || W < 2) { return; }
         var t0 = opts.tStart != null ? opts.tStart : rms[0].t;
         var t1 = opts.tEnd != null ? opts.tEnd : rms[rms.length - 1].t;
         var span = t1 - t0;
         if (!(span > 0)) return;
         function xOf(t) { return ((t - t0) / span) * W; }
-        /* Красные зоны — позади огибающей */
-        if (regions && regions.length) {
-          ctx.fillStyle = 'rgba(229,72,72,0.40)';
-          for (var i = 0; i < regions.length; i++) {
-            var rx1 = xOf(regions[i].startSec), rx2 = xOf(regions[i].endSec);
-            ctx.fillRect(rx1, 0, Math.max(1, rx2 - rx1), H);
-          }
-        }
-        /* Огибающая: max-dB по колонкам пикселей (даунсэмплинг к ширине canvas) */
+
+        /* пиковый dB по колонке пикселей (даунсэмплинг к ширине canvas) */
         var perCol = new Array(W);
         for (var c = 0; c < W; c++) perCol[c] = -Infinity;
         for (var k = 0; k < rms.length; k++) {
@@ -5145,18 +5143,36 @@ PanelBoot.run('ИИ: монтаж', function () {
           var db = (rms[k].rms == null || !isFinite(rms[k].rms)) ? FLOOR_DB : rms[k].rms;
           if (db > perCol[x]) perCol[x] = db;
         }
-        ctx.strokeStyle = '#4aa3ff';
+        /* заполняем пустые колонки соседним значением (плавность) */
+        var lastV = FLOOR_DB;
+        for (var f = 0; f < W; f++) { if (perCol[f] === -Infinity) perCol[f] = lastV; else lastV = perCol[f]; }
+
+        /* центральная линия */
+        ctx.strokeStyle = 'rgba(255,255,255,0.10)';
         ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, mid + 0.5); ctx.lineTo(W, mid + 0.5); ctx.stroke();
+
+        /* симметричный waveform (зеркальный от центра) — заливка контура */
+        ctx.fillStyle = '#3d8bff';
         ctx.beginPath();
-        var last = FLOOR_DB;
-        for (var c2 = 0; c2 < W; c2++) {
-          var d = perCol[c2];
-          if (d === -Infinity) d = last; else last = d;
-          var y = dbToY(d, H);
-          ctx.moveTo(c2 + 0.5, H);
-          ctx.lineTo(c2 + 0.5, y);
+        ctx.moveTo(0, mid - Math.max(0.5, amp(perCol[0]) * maxHalf));
+        for (var c2 = 1; c2 < W; c2++) ctx.lineTo(c2, mid - Math.max(0.5, amp(perCol[c2]) * maxHalf));
+        for (var c3 = W - 1; c3 >= 0; c3--) ctx.lineTo(c3, mid + Math.max(0.5, amp(perCol[c3]) * maxHalf));
+        ctx.closePath();
+        ctx.fill();
+
+        /* зоны выреза ПОВЕРХ — полупрозрачная заливка + чёткие красные края */
+        if (regions && regions.length) {
+          for (var i = 0; i < regions.length; i++) {
+            var rx1 = xOf(regions[i].startSec), rx2 = xOf(regions[i].endSec);
+            var rw = Math.max(1, rx2 - rx1);
+            ctx.fillStyle = 'rgba(239,68,68,0.30)';
+            ctx.fillRect(rx1, 0, rw, H);
+            ctx.fillStyle = 'rgba(239,68,68,0.95)';
+            ctx.fillRect(rx1, 0, 1.5, H);            /* левая граница */
+            ctx.fillRect(rx2 - 1.5, 0, 1.5, H);      /* правая граница */
+          }
         }
-        ctx.stroke();
       }
       return { draw: draw };
     })();
@@ -5204,7 +5220,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       canvas.hidden = false;
       var cssW = canvas.clientWidth || canvas.parentNode.clientWidth || 300;
       canvas.width = Math.max(2, Math.floor(cssW));
-      if (!canvas.height) canvas.height = 64;
+      if (!canvas.height) canvas.height = 72;
       _waveState = {
         toolName: toolName, canvas: canvas, entry: entry, rms: rms,
         tStart: rms[0].t, tEnd: rms[rms.length - 1].t
