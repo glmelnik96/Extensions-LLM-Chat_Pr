@@ -313,6 +313,82 @@
   }
 
   /**
+   * silenceIntervalsFromRms — детекция тишин ИЗ RMS-таймлайна, полностью
+   * client-side (без ffmpeg). Включает порог как live-параметр: тишина = участки,
+   * где RMS < thresholdDb. Это enabler интерактивного waveform-превью: один проход
+   * ffmpeg (astats) даёт rmsTimeline, дальше любой порог/min/padding фильтруются
+   * мгновенно в браузере.
+   *
+   * @param {Array<{t:number, rms:number}>} rmsTimeline — sequence-time (offset уже применён)
+   * @param {object} opts
+   *   - thresholdDb (default -30): кадр тих, если rms < thresholdDb (или rms не конечен — digital silence)
+   *   - minDuration (default 1.0): минимальная длительность паузы (сек), считается ДО padding
+   *   - padding (default 0.15): отступ внутрь от краёв (сохраняет атаку/хвост речи)
+   * @returns {Array<{startSec, endSec, reason}>}
+   */
+  function silenceIntervalsFromRms(rmsTimeline, opts) {
+    opts = opts || {};
+    var thresholdDb = typeof opts.thresholdDb === 'number' ? opts.thresholdDb : -30;
+    var minDuration = typeof opts.minDuration === 'number' ? opts.minDuration : 1.0;
+    var padding = typeof opts.padding === 'number' ? opts.padding : 0.15;
+    var tl = Array.isArray(rmsTimeline) ? rmsTimeline : [];
+    if (tl.length < 2) return [];
+
+    /* Медианный шаг кадра — каждый «тихий» сэмпл покрывает [t, t+frameDur].
+       Медиана (а не среднее) устойчива к редким пропускам кадров (ffmpeg печатает
+       -inf для абсолютной тишины — такие строки regex не матчит, образуется gap). */
+    var dts = [];
+    for (var i = 1; i < tl.length; i++) {
+      var d = tl[i].t - tl[i - 1].t;
+      if (d > 0 && isFinite(d)) dts.push(d);
+    }
+    if (!dts.length) return [];
+    dts.sort(function (a, b) { return a - b; });
+    var frameDur = dts[Math.floor(dts.length / 2)] || 0.05;
+
+    function isSilent(p) {
+      var r = p && p.rms;
+      /* null/undefined/-Infinity/NaN = digital silence (ниже любого порога). */
+      return r == null || !isFinite(r) || r < thresholdDb;
+    }
+
+    /* Склеиваем соседние тихие сэмплы в runs. Допуск склейки frameDur*1.5
+       перекрывает пропущенные -inf кадры внутри паузы. */
+    var runs = [];
+    var cur = null;
+    for (var k = 0; k < tl.length; k++) {
+      var p = tl[k];
+      if (typeof p.t !== 'number' || !isFinite(p.t)) continue;
+      if (!isSilent(p)) continue;
+      var segStart = p.t;
+      var segEnd = p.t + frameDur;
+      if (cur && segStart - cur.e <= frameDur * 1.5) {
+        cur.e = Math.max(cur.e, segEnd);
+      } else {
+        if (cur) runs.push(cur);
+        cur = { s: segStart, e: segEnd };
+      }
+    }
+    if (cur) runs.push(cur);
+
+    /* minDuration-фильтр (по сырой длине run) + padding-сжатие. */
+    var out = [];
+    for (var j = 0; j < runs.length; j++) {
+      var dur = runs[j].e - runs[j].s;
+      if (dur < minDuration) continue;
+      var ss = runs[j].s + padding;
+      var se = runs[j].e - padding;
+      if (se - ss < 0.02) continue;
+      out.push({
+        startSec: Math.round(ss * 1000) / 1000,
+        endSec: Math.round(se * 1000) / 1000,
+        reason: 'тишина ' + dur.toFixed(2) + 'с (RMS < ' + thresholdDb + ' dB)'
+      });
+    }
+    return out;
+  }
+
+  /**
    * /cut_silences — гигиена: убрать явные длинные паузы (≥1с).
    * Параметры: minDuration (сек), padding (сек), silenceThresholdDelta (dB).
    *
@@ -1430,6 +1506,7 @@
     remapRmsToSequenceTime: remapRmsToSequenceTime,
     _normalizeMulticamMapping: _normalizeMulticamMapping,
     detectSilenceIntervals: detectSilenceIntervals,
+    silenceIntervalsFromRms: silenceIntervalsFromRms,
     parsePipelineCommand: parsePipelineCommand,
     snapIntervalsToFrame: snapIntervalsToFrame,
     _mergeIntervals: _mergeIntervals,

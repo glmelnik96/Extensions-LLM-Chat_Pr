@@ -525,6 +525,86 @@ describe('DeterministicPipelines.detectSilenceIntervals', () => {
 });
 
 /* ═══════════════════════════════════════════════════════════════
+ * silenceIntervalsFromRms — client-side детекция тишин для waveform-превью
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('DeterministicPipelines.silenceIntervalsFromRms', () => {
+  /* Хелпер: ровная сетка RMS-сэмплов c шагом dt; loud — уровень речи, quiet — тишины. */
+  function mkRms(spec, dt) {
+    dt = dt || 0.05;
+    const out = [];
+    let t = 0;
+    for (const seg of spec) {
+      const n = Math.round(seg.dur / dt);
+      for (let i = 0; i < n; i++) { out.push({ t: Math.round(t * 1000) / 1000, rms: seg.rms }); t += dt; }
+    }
+    return out;
+  }
+
+  it('пустой/короткий вход → []', () => {
+    /* .length вместо deepEqual: функция исполняется в vm-песочнице со своим
+       Array.prototype, deepStrictEqual падает на cross-realm проверке прототипа. */
+    assert.equal(DP.silenceIntervalsFromRms([], {}).length, 0);
+    assert.equal(DP.silenceIntervalsFromRms([{ t: 0, rms: -50 }], {}).length, 0);
+    assert.equal(DP.silenceIntervalsFromRms(null, {}).length, 0);
+  });
+
+  it('находит одну паузу между речью, применяет padding', () => {
+    // 2с речи (-12dB) → 2с тишины (-55dB) → 2с речи
+    const rms = mkRms([{ dur: 2, rms: -12 }, { dur: 2, rms: -55 }, { dur: 2, rms: -12 }]);
+    const out = DP.silenceIntervalsFromRms(rms, { thresholdDb: -30, minDuration: 1.0, padding: 0.15 });
+    assert.equal(out.length, 1);
+    // тишина ~[2.0, 4.0], padding 0.15 → [~2.15, ~3.85]
+    assert.ok(out[0].startSec >= 2.1 && out[0].startSec <= 2.25, 'start=' + out[0].startSec);
+    assert.ok(out[0].endSec >= 3.8 && out[0].endSec <= 3.95, 'end=' + out[0].endSec);
+  });
+
+  it('порог — live-параметр: ужесточение убирает «тихую речь»', () => {
+    // участок -28dB: тишина при пороге -25, НЕ тишина при пороге -35
+    const rms = mkRms([{ dur: 2, rms: -12 }, { dur: 2, rms: -28 }, { dur: 2, rms: -12 }]);
+    const loose = DP.silenceIntervalsFromRms(rms, { thresholdDb: -25, minDuration: 1.0, padding: 0.1 });
+    const strict = DP.silenceIntervalsFromRms(rms, { thresholdDb: -35, minDuration: 1.0, padding: 0.1 });
+    assert.equal(loose.length, 1, 'при -25 -28dB считается тишиной');
+    assert.equal(strict.length, 0, 'при -35 -28dB уже речь');
+  });
+
+  it('minDuration отсекает короткие паузы', () => {
+    // пауза 0.5с при minDuration 1.0 → отброшена
+    const rms = mkRms([{ dur: 2, rms: -12 }, { dur: 0.5, rms: -55 }, { dur: 2, rms: -12 }]);
+    assert.equal(DP.silenceIntervalsFromRms(rms, { minDuration: 1.0, padding: 0 }).length, 0);
+    assert.equal(DP.silenceIntervalsFromRms(rms, { minDuration: 0.3, padding: 0 }).length, 1);
+  });
+
+  it('digital silence (-Infinity/null/NaN) считается тишиной', () => {
+    const dt = 0.05;
+    const rms = [];
+    let t = 0;
+    for (let i = 0; i < 40; i++) { rms.push({ t: Math.round(t * 1000) / 1000, rms: -12 }); t += dt; }
+    for (let i = 0; i < 40; i++) { rms.push({ t: Math.round(t * 1000) / 1000, rms: -Infinity }); t += dt; }
+    for (let i = 0; i < 40; i++) { rms.push({ t: Math.round(t * 1000) / 1000, rms: -12 }); t += dt; }
+    const out = DP.silenceIntervalsFromRms(rms, { thresholdDb: -30, minDuration: 1.0, padding: 0.1 });
+    assert.equal(out.length, 1, 'участок -inf = тишина');
+  });
+
+  it('две раздельные паузы не сливаются', () => {
+    const rms = mkRms([
+      { dur: 1.5, rms: -12 }, { dur: 1.5, rms: -55 },
+      { dur: 1.5, rms: -12 }, { dur: 1.5, rms: -55 }, { dur: 1.5, rms: -12 }
+    ]);
+    const out = DP.silenceIntervalsFromRms(rms, { thresholdDb: -30, minDuration: 1.0, padding: 0.1 });
+    assert.equal(out.length, 2);
+    assert.ok(out[1].startSec > out[0].endSec, 'паузы упорядочены и раздельны');
+  });
+
+  it('padding больше половины паузы → интервал отброшен', () => {
+    const rms = mkRms([{ dur: 2, rms: -12 }, { dur: 1.1, rms: -55 }, { dur: 2, rms: -12 }]);
+    // пауза 1.1с, padding 0.6 с каждой стороны → 1.1-1.2 < 0 → отброшен
+    const out = DP.silenceIntervalsFromRms(rms, { thresholdDb: -30, minDuration: 1.0, padding: 0.6 });
+    assert.equal(out.length, 0);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
  * chapterize
  * ═══════════════════════════════════════════════════════════════ */
 
