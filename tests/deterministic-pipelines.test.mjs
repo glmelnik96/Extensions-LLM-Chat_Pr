@@ -641,6 +641,39 @@ describe('DeterministicPipelines.silenceIntervalsFromRms', () => {
     const out = DP.silenceIntervalsFromRms(rms, { thresholdDb: -30, minDuration: 1.0, padding: 0.6 });
     assert.equal(out.length, 0);
   });
+
+  /* РЕГРЕССИЯ (баг «удалил весь клип речи»): речь с микропаузами между словами
+     НЕ должна сливаться в одну «тишину на весь клип». */
+  it('речь с микропаузами (<minDuration) → НЕ режется (брайджинг не перепрыгивает речь)', () => {
+    // 12× [речь 0.3с -30, микропауза 0.2с -90] — непрерывная речь с зазорами по 0.2с
+    const spec = [];
+    for (let i = 0; i < 12; i++) { spec.push({ dur: 0.3, rms: -30 }); spec.push({ dur: 0.2, rms: -90 }); }
+    const rms = mkRms(spec);
+    const out = DP.silenceIntervalsFromRms(rms, { marginDb: 18, minDuration: 1.0, padding: 0.1 });
+    assert.equal(out.length, 0, 'микропаузы 0.2с < minDuration 1.0 → отсеяны, речь цела');
+  });
+
+  it('относительный порог: находит ТОЛЬКО настоящую паузу >minDuration среди речи', () => {
+    // речь, затем реальная пауза 2с, затем речь — с микропаузами вокруг
+    const spec = [
+      { dur: 0.3, rms: -28 }, { dur: 0.15, rms: -90 }, { dur: 0.3, rms: -30 }, { dur: 0.15, rms: -90 },
+      { dur: 2.0, rms: -90 },  // НАСТОЯЩАЯ пауза 2с
+      { dur: 0.3, rms: -29 }, { dur: 0.15, rms: -90 }, { dur: 0.3, rms: -31 }
+    ];
+    const rms = mkRms(spec);
+    const out = DP.silenceIntervalsFromRms(rms, { marginDb: 18, minDuration: 1.0, padding: 0.1 });
+    assert.equal(out.length, 1, 'только пауза 2с');
+    const dur = out[0].endSec - out[0].startSec;
+    assert.ok(dur > 1.5 && dur < 2.0, 'длительность ~2с минус padding, dur=' + dur);
+  });
+
+  it('относительный порог адаптируется к уровню записи (тихие камерные мики)', () => {
+    // та же структура, но ВСЁ на 30dB тише (речь -60, тишина -90) — абсолютный порог
+    // -30 счёл бы всё тишиной; относительный (от уровня речи -60) работает корректно
+    const rms = mkRms([{ dur: 1, rms: -60 }, { dur: 2, rms: -90 }, { dur: 1, rms: -60 }]);
+    const out = DP.silenceIntervalsFromRms(rms, { marginDb: 18, minDuration: 1.0, padding: 0.1 });
+    assert.equal(out.length, 1, 'тихая речь -60dB не принята за тишину');
+  });
 });
 
 /* ═══════════════════════════════════════════════════════════════

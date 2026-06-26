@@ -314,29 +314,31 @@
 
   /**
    * silenceIntervalsFromRms — детекция тишин ИЗ RMS-таймлайна, полностью
-   * client-side (без ffmpeg). Включает порог как live-параметр: тишина = участки,
-   * где RMS < thresholdDb. Это enabler интерактивного waveform-превью: один проход
-   * ffmpeg (astats) даёт rmsTimeline, дальше любой порог/min/padding фильтруются
-   * мгновенно в браузере.
+   * client-side (без ffmpeg). Enabler интерактивного waveform-превью: один проход
+   * ffmpeg (astats) даёт rmsTimeline, дальше всё фильтруется мгновенно в браузере.
    *
-   * @param {Array<{t:number, rms:number}>} rmsTimeline — sequence-time (offset уже применён)
+   * ПОРОГ — относительный (по умолчанию): «тишина» = на marginDb тише, чем громкий
+   * уровень речи в ЭТОМ регионе (P92 RMS). Абсолютные dB не работают: уровень записи
+   * варьируется (камерные мики -50dB vs студийные -20dB), а inputI (EBU R128 LUFS)
+   * не совпадает по шкале с astats RMS (dBFS) — отсюда баг «вырезал речь как тишину».
+   * Если передан thresholdDb — используется абсолютный порог (для явных вызовов/тестов).
+   *
+   * @param {Array<{t:number, rms:number}>} rmsTimeline — sequence-time
    * @param {object} opts
-   *   - thresholdDb (default -30): кадр тих, если rms < thresholdDb (или rms не конечен — digital silence)
-   *   - minDuration (default 1.0): минимальная длительность паузы (сек), считается ДО padding
-   *   - padding (default 0.15): отступ внутрь от краёв (сохраняет атаку/хвост речи)
+   *   - marginDb (default 22): насколько тише речи = тишина (относительный порог)
+   *   - thresholdDb: абсолютный порог dB (переопределяет marginDb)
+   *   - minDuration (default 1.0): мин. длительность паузы (сек) — микропаузы между
+   *     словами короче этого ОТСЕИВАЮТСЯ (защита речи)
+   *   - padding (default 0.15): отступ внутрь от краёв
    * @returns {Array<{startSec, endSec, reason}>}
    */
   function silenceIntervalsFromRms(rmsTimeline, opts) {
     opts = opts || {};
-    var thresholdDb = typeof opts.thresholdDb === 'number' ? opts.thresholdDb : -30;
     var minDuration = typeof opts.minDuration === 'number' ? opts.minDuration : 1.0;
     var padding = typeof opts.padding === 'number' ? opts.padding : 0.15;
     var tl = Array.isArray(rmsTimeline) ? rmsTimeline : [];
     if (tl.length < 2) return [];
 
-    /* Медианный шаг кадра — каждый «тихий» сэмпл покрывает [t, t+frameDur].
-       Медиана (а не среднее) устойчива к редким пропускам кадров (ffmpeg печатает
-       -inf для абсолютной тишины — такие строки regex не матчит, образуется gap). */
     var dts = [];
     for (var i = 1; i < tl.length; i++) {
       var d = tl[i].t - tl[i - 1].t;
@@ -346,14 +348,30 @@
     dts.sort(function (a, b) { return a - b; });
     var frameDur = dts[Math.floor(dts.length / 2)] || 0.05;
 
-    function isSilent(p) {
-      var r = p && p.rms;
-      /* null/undefined/-Infinity/NaN = digital silence (ниже любого порога). */
-      return r == null || !isFinite(r) || r < thresholdDb;
+    /* Порог: абсолютный (thresholdDb) ИЛИ относительный от уровня речи региона. */
+    var thr, relInfo = '';
+    if (typeof opts.thresholdDb === 'number') {
+      thr = opts.thresholdDb;
+    } else {
+      var margin = typeof opts.marginDb === 'number' ? opts.marginDb : 22;
+      var vals = [];
+      for (var v = 0; v < tl.length; v++) { var rr = tl[v].rms; if (typeof rr === 'number' && isFinite(rr)) vals.push(rr); }
+      if (!vals.length) return [];
+      vals.sort(function (a, b) { return a - b; });
+      var speechRef = vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.92))];
+      thr = speechRef - margin;
+      relInfo = ', речь≈' + Math.round(speechRef) + ' dB';
     }
 
-    /* Склеиваем соседние тихие сэмплы в runs. Допуск склейки frameDur*1.5
-       перекрывает пропущенные -inf кадры внутри паузы. */
+    function isSilent(p) {
+      var r = p && p.rms;
+      return r == null || !isFinite(r) || r < thr;
+    }
+
+    /* Склейка тихих сэмплов в runs. Допуск < frameDur — чтобы ОДИН речевой сэмпл
+       МЕЖДУ тишинами РАЗРЫВАЛ run (раньше frameDur*1.5 перепрыгивал речь и сливал
+       все микропаузы в одну «тишину на весь клип» — баг «удалил весь клип речи»). */
+    var BRIDGE = frameDur * 0.5;
     var runs = [];
     var cur = null;
     for (var k = 0; k < tl.length; k++) {
@@ -362,7 +380,7 @@
       if (!isSilent(p)) continue;
       var segStart = p.t;
       var segEnd = p.t + frameDur;
-      if (cur && segStart - cur.e <= frameDur * 1.5) {
+      if (cur && segStart - cur.e <= BRIDGE) {
         cur.e = Math.max(cur.e, segEnd);
       } else {
         if (cur) runs.push(cur);
@@ -371,7 +389,7 @@
     }
     if (cur) runs.push(cur);
 
-    /* minDuration-фильтр (по сырой длине run) + padding-сжатие. */
+    /* minDuration-фильтр (микропаузы между словами отсеиваются) + padding-сжатие. */
     var out = [];
     for (var j = 0; j < runs.length; j++) {
       var dur = runs[j].e - runs[j].s;
@@ -382,7 +400,7 @@
       out.push({
         startSec: Math.round(ss * 1000) / 1000,
         endSec: Math.round(se * 1000) / 1000,
-        reason: 'тишина ' + dur.toFixed(2) + 'с (RMS < ' + thresholdDb + ' dB)'
+        reason: 'тишина ' + dur.toFixed(2) + 'с (порог ' + Math.round(thr) + ' dB' + relInfo + ')'
       });
     }
     return out;
@@ -412,8 +430,11 @@
     var thresholdUsed = (entry.audioAnalysis && typeof entry.audioAnalysis.silenceThresholdUsed === 'number')
       ? entry.audioAnalysis.silenceThresholdUsed : -30;
 
-    /* silenceThresholdDelta: пользовательский порог (разница со средней громкостью).
-       Если задан — пересчитываем порог: inputI - delta. */
+    /* silenceThresholdDelta (ползунок «Тише речи на N dB») — ОТНОСИТЕЛЬНЫЙ запас:
+       тишина = на N dB тише уровня речи региона. Раньше считался как inputI - N
+       (абсолютный порог), но inputI (LUFS) ≠ astats RMS (dBFS) → порог попадал в
+       середину речи и резал её. Теперь N передаётся как marginDb в
+       silenceIntervalsFromRms, который сам берёт уровень речи из сигнала. */
     var userDelta = typeof params.silenceThresholdDelta === 'number' ? params.silenceThresholdDelta : 0;
     var inputI = (entry.audioAnalysis && typeof entry.audioAnalysis.inputI === 'number')
       ? entry.audioAnalysis.inputI : -24;
@@ -422,14 +443,13 @@
 
     /* preview==apply: если есть RMS-таймлайн (после «Анализ аудио»), детекция тишин
        идёт через silenceIntervalsFromRms — ТУ ЖЕ функцию, что waveform-превью
-       «Инструментов» фильтрует на лету при движении ползунков. Иначе превью и
-       реальный вырез могли бы разойтись. Fallback на detectSilenceIntervals
-       (gaps+ffmpeg) — когда RMS не считался (старый кэш / транскрипт из чата). */
+       «Инструментов» фильтрует на лету при движении ползунков. Fallback на
+       detectSilenceIntervals (gaps+ffmpeg) — когда RMS не считался. */
     var rmsTl = entry.audioAnalysis && entry.audioAnalysis.rmsTimeline;
     var removeIntervals;
     if (Array.isArray(rmsTl) && rmsTl.length > 1) {
       removeIntervals = silenceIntervalsFromRms(rmsTl, {
-        thresholdDb: effectiveThreshold,
+        marginDb: userDelta > 0 ? userDelta : 22,  /* относительный порог от уровня речи */
         minDuration: minDuration,
         padding: padding
       });
