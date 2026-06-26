@@ -217,6 +217,13 @@
         border: 1px solid #2a2a2a;
       }
       .tool-waveform[hidden] { display: none; }
+      .wave-legend {
+        font-size: 10px;
+        color: var(--muted);
+        margin-top: 3px;
+        text-align: right;
+      }
+      .wave-legend[hidden] { display: none; }
       .proposal-area {
         margin-top: 8px;
         padding: 8px;
@@ -341,7 +348,8 @@
               <span class="param-val" id="sil-pad-val">0.15с</span>
             </div>
             <canvas class="tool-waveform" id="wave-silences" height="72" hidden
-                    title="Waveform региона In–Out. Красным — что будет вырезано; двигайте ползунки — зоны обновляются вживую."></canvas>
+                    title="Waveform региона In–Out. Жёлтая линия — порог среза; красным — что будет вырезано; двигайте ползунки — обновляется вживую."></canvas>
+            <div class="wave-legend" id="wave-legend-silences" hidden></div>
             <button class="tool-run" data-tool="silences">Найти и вырезать</button>
             <div class="proposal-area" id="proposal-silences"></div>
           </div>

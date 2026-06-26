@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-tools-led-fresh-v22'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-waveform-threshold-line-v23'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5186,6 +5186,21 @@ PanelBoot.run('ИИ: монтаж', function () {
         }
         ctx.stroke();
 
+        /* ЛИНИЯ ПОРОГА: уровень громкости, ниже которого аудио = тишина (срез).
+           Симметрично от центра. Жёлтая пунктирная — двигается живьём за ползунком
+           «Тише речи на». Где RMS-ядро ныряет под линию = красная зона. */
+        if (typeof opts.thresholdDb === 'number' && isFinite(opts.thresholdDb)) {
+          var ty = amp(opts.thresholdDb) * maxHalf;
+          ctx.strokeStyle = 'rgba(245,200,60,0.85)';
+          ctx.lineWidth = 1;
+          if (ctx.setLineDash) ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          ctx.moveTo(0, mid - ty); ctx.lineTo(W, mid - ty);
+          ctx.moveTo(0, mid + ty); ctx.lineTo(W, mid + ty);
+          ctx.stroke();
+          if (ctx.setLineDash) ctx.setLineDash([]);
+        }
+
         /* зоны выреза ПОВЕРХ — полупрозрачная заливка + чёткие красные края */
         if (regions && regions.length) {
           for (var i = 0; i < regions.length; i++) {
@@ -5226,13 +5241,38 @@ PanelBoot.run('ИИ: монтаж', function () {
       if (!st || !st.canvas || !st.entry) return;
       var params = toolsCollectParams(st.toolName);
       var pipelineFn = st.toolName === 'jumps' ? DeterministicPipelines.jumpCuts : DeterministicPipelines.cutSilences;
+      /* Линия порога — только для «Тишины» (для Jump cuts «порог» = пауза во
+         времени, не уровень dB). Тот же marginDb, что детектор → линия = реальный
+         срез. */
+      var drawOpts = { tStart: st.tStart, tEnd: st.tEnd };
+      if (st.toolName === 'silences' && DeterministicPipelines.rmsThresholdInfo) {
+        var ud = params.silenceThresholdDelta;
+        var info = DeterministicPipelines.rmsThresholdInfo(st.rms, { marginDb: (typeof ud === 'number' && ud > 0) ? ud : 22 });
+        if (info) { drawOpts.thresholdDb = info.thresholdDb; toolsUpdateWaveLegend(info, st.toolName); }
+      } else {
+        toolsUpdateWaveLegend(null, st.toolName);
+      }
       var ctx = { transcriptEntry: st.entry, settings: {}, snapshot: null, onStatus: function () {}, abortCheck: function () { return false; } };
       Promise.resolve(pipelineFn(ctx, params)).then(function (r) {
         var regions = (r && r.proposal && r.proposal.removeIntervals) || [];
-        WaveformPreview.draw(st.canvas, st.rms, regions, { tStart: st.tStart, tEnd: st.tEnd });
+        WaveformPreview.draw(st.canvas, st.rms, regions, drawOpts);
       }).catch(function () {
-        WaveformPreview.draw(st.canvas, st.rms, [], { tStart: st.tStart, tEnd: st.tEnd });
+        WaveformPreview.draw(st.canvas, st.rms, [], drawOpts);
       });
+    }
+
+    /* Числовой ридаут под waveform: уровень речи и порог среза (чтобы пользователь
+       видел КОНКРЕТНЫЕ dB, а не только линию). */
+    function toolsUpdateWaveLegend(info, toolName) {
+      var el = document.getElementById('wave-legend-' + toolName);
+      if (!el) return;
+      if (info && typeof info.thresholdDb === 'number') {
+        var ref = info.speechRefDb != null ? ('речь ≈ ' + Math.round(info.speechRefDb) + ' dB · ') : '';
+        el.textContent = ref + 'порог среза ' + Math.round(info.thresholdDb) + ' dB';
+        el.hidden = false;
+      } else {
+        el.hidden = true;
+      }
     }
 
     /* Показывает waveform для инструмента, если в entry есть rmsTimeline. */

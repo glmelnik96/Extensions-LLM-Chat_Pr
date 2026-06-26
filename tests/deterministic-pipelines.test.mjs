@@ -676,6 +676,33 @@ describe('DeterministicPipelines.silenceIntervalsFromRms', () => {
   });
 });
 
+describe('DeterministicPipelines.rmsThresholdInfo (линия порога на waveform)', () => {
+  function mkRms(spec, dt) {
+    dt = dt || 0.05; const out = []; let t = 0;
+    for (const seg of spec) { const n = Math.round(seg.dur / dt); for (let i = 0; i < n; i++) { out.push({ t: Math.round(t * 1000) / 1000, rms: seg.rms }); t += dt; } }
+    return out;
+  }
+  it('абсолютный thresholdDb возвращается как есть, speechRef=null', () => {
+    const info = DP.rmsThresholdInfo([{ t: 0, rms: -30 }], { thresholdDb: -42 });
+    assert.equal(info.thresholdDb, -42);
+    assert.equal(info.speechRefDb, null);
+  });
+  it('относительный: порог = P92(rms) - margin (тот же, что у детектора)', () => {
+    // 90% речи -25, 10% тишины -90 → P92 ≈ -25
+    const rms = mkRms([{ dur: 9, rms: -25 }, { dur: 1, rms: -90 }]);
+    const info = DP.rmsThresholdInfo(rms, { marginDb: 18 });
+    assert.equal(Math.round(info.speechRefDb), -25, 'уровень речи ≈ -25');
+    assert.equal(Math.round(info.thresholdDb), -43, 'порог = -25 - 18');
+    /* Совпадение с детектором: при пороге -43 тишина -90 < -43 → режется. */
+    const cuts = DP.silenceIntervalsFromRms(mkRms([{ dur: 3, rms: -25 }, { dur: 2, rms: -90 }, { dur: 3, rms: -25 }]), { marginDb: 18, minDuration: 1, padding: 0.1 });
+    assert.equal(cuts.length, 1);
+  });
+  it('пустой/без конечных rms → null', () => {
+    assert.equal(DP.rmsThresholdInfo([], { marginDb: 18 }), null);
+    assert.equal(DP.rmsThresholdInfo([{ t: 0, rms: -Infinity }], { marginDb: 18 }), null);
+  });
+});
+
 /* ═══════════════════════════════════════════════════════════════
  * chapterize
  * ═══════════════════════════════════════════════════════════════ */

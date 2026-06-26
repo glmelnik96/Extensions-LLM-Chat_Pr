@@ -332,6 +332,27 @@
    *   - padding (default 0.15): отступ внутрь от краёв
    * @returns {Array<{startSec, endSec, reason}>}
    */
+  /**
+   * rmsThresholdInfo — вычисляет порог тишины (dB) для RMS-таймлайна. ОБЩИЙ
+   * источник истины для детекции (silenceIntervalsFromRms) и для линии порога на
+   * waveform-превью — чтобы линия совпадала с реальным срезом.
+   * @returns {{thresholdDb:number, speechRefDb:number|null}|null}
+   */
+  function rmsThresholdInfo(rmsTimeline, opts) {
+    opts = opts || {};
+    var tl = Array.isArray(rmsTimeline) ? rmsTimeline : [];
+    if (typeof opts.thresholdDb === 'number') {
+      return { thresholdDb: opts.thresholdDb, speechRefDb: null };
+    }
+    var margin = typeof opts.marginDb === 'number' ? opts.marginDb : 22;
+    var vals = [];
+    for (var v = 0; v < tl.length; v++) { var rr = tl[v].rms; if (typeof rr === 'number' && isFinite(rr)) vals.push(rr); }
+    if (!vals.length) return null;
+    vals.sort(function (a, b) { return a - b; });
+    var speechRef = vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.92))];
+    return { thresholdDb: speechRef - margin, speechRefDb: speechRef };
+  }
+
   function silenceIntervalsFromRms(rmsTimeline, opts) {
     opts = opts || {};
     var minDuration = typeof opts.minDuration === 'number' ? opts.minDuration : 1.0;
@@ -349,19 +370,10 @@
     var frameDur = dts[Math.floor(dts.length / 2)] || 0.05;
 
     /* Порог: абсолютный (thresholdDb) ИЛИ относительный от уровня речи региона. */
-    var thr, relInfo = '';
-    if (typeof opts.thresholdDb === 'number') {
-      thr = opts.thresholdDb;
-    } else {
-      var margin = typeof opts.marginDb === 'number' ? opts.marginDb : 22;
-      var vals = [];
-      for (var v = 0; v < tl.length; v++) { var rr = tl[v].rms; if (typeof rr === 'number' && isFinite(rr)) vals.push(rr); }
-      if (!vals.length) return [];
-      vals.sort(function (a, b) { return a - b; });
-      var speechRef = vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.92))];
-      thr = speechRef - margin;
-      relInfo = ', речь≈' + Math.round(speechRef) + ' dB';
-    }
+    var thInfo = rmsThresholdInfo(tl, opts);
+    if (thInfo == null) return [];
+    var thr = thInfo.thresholdDb;
+    var relInfo = thInfo.speechRefDb != null ? (', речь≈' + Math.round(thInfo.speechRefDb) + ' dB') : '';
 
     function isSilent(p) {
       var r = p && p.rms;
@@ -1542,6 +1554,7 @@
     _normalizeMulticamMapping: _normalizeMulticamMapping,
     detectSilenceIntervals: detectSilenceIntervals,
     silenceIntervalsFromRms: silenceIntervalsFromRms,
+    rmsThresholdInfo: rmsThresholdInfo,
     parsePipelineCommand: parsePipelineCommand,
     snapIntervalsToFrame: snapIntervalsToFrame,
     _mergeIntervals: _mergeIntervals,
