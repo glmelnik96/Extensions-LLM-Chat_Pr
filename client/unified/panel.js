@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-silence-relative-thr-v20'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-tools-seqguard-v21'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5941,6 +5941,12 @@ PanelBoot.run('ИИ: монтаж', function () {
           keepStatus = true;
           setTimeout(function () { toolsStatusUi.hide(); }, 4000);
         } else if (result.proposal) {
+          /* 19.06.2026 БЕЗОПАСНОСТЬ: привязываем proposal к секвенции, на которой
+             он построен. Без snapshot assertSequenceMatch (на Apply) пропускал
+             guard → правки могли уйти в ДРУГУЮ секвенцию, если пользователь
+             переключился между proposal и Apply. Теперь Apply сверит имя. */
+          result.proposal.snapshot = snap;
+          result.proposal.seqKey = seqKey;
           toolsShowProposal(proposalId, result.proposal);
           toolsStatusUi.hide();
         }
