@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-waveform-linear-amp-v24'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-waveform-filled-v25'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5169,22 +5169,21 @@ PanelBoot.run('ИИ: монтаж', function () {
         ctx.lineWidth = 1;
         ctx.beginPath(); ctx.moveTo(0, mid + 0.5); ctx.lineTo(W, mid + 0.5); ctx.stroke();
 
-        /* Двухтоновый waveform: внешний контур по PEAK (светлый «гало») + плотное
-           ядро по RMS (ярче) — как в Premiere/Audition. Симметрично от центра. */
-        ctx.strokeStyle = 'rgba(120,170,255,0.55)';
-        ctx.beginPath();
-        for (var c2 = 0; c2 < W; c2++) {
-          var hp = Math.max(0.5, amp(colPeak[c2]) * maxHalf);
-          ctx.moveTo(c2 + 0.5, mid - hp); ctx.lineTo(c2 + 0.5, mid + hp);
+        /* ЗАЛИВНОЙ двухтоновый waveform (как на таймлайне Premiere): peak-огибающая
+           заполняется сплошным контуром (светлее) + ядро по RMS (ярче) поверх.
+           Заливка убирает «расчёску» из дискретных полосок — форма читается цельно. */
+        function fillEnvelope(col, color, minPx) {
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.moveTo(0, mid - Math.max(minPx, amp(col[0]) * maxHalf));
+          var ci;
+          for (ci = 1; ci < W; ci++) ctx.lineTo(ci, mid - Math.max(minPx, amp(col[ci]) * maxHalf));
+          for (ci = W - 1; ci >= 0; ci--) ctx.lineTo(ci, mid + Math.max(minPx, amp(col[ci]) * maxHalf));
+          ctx.closePath();
+          ctx.fill();
         }
-        ctx.stroke();
-        ctx.strokeStyle = '#3d8bff';
-        ctx.beginPath();
-        for (var c4 = 0; c4 < W; c4++) {
-          var hr = Math.max(0.4, amp(colRms[c4]) * maxHalf);
-          ctx.moveTo(c4 + 0.5, mid - hr); ctx.lineTo(c4 + 0.5, mid + hr);
-        }
-        ctx.stroke();
+        fillEnvelope(colPeak, 'rgba(120,170,255,0.50)', 0.5); /* гало по пику */
+        fillEnvelope(colRms, '#3d8bff', 0.4);                /* ядро по RMS */
 
         /* ЛИНИЯ ПОРОГА: уровень громкости, ниже которого аудио = тишина (срез).
            Симметрично от центра. Жёлтая пунктирная — двигается живьём за ползунком
