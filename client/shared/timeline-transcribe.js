@@ -346,17 +346,22 @@
    * pathForAnalysis — один реальный WAV-файл, который уже есть на диске (prep.path или первый чанк).
    * timelineOffsetSec — смещение, чтобы перевести "секунды файла" в "секунды таймлайна".
    */
-  async function computeAudioPreprocess(pathForAnalysis, timelineOffsetSec, progress) {
+  async function computeAudioPreprocess(pathForAnalysis, timelineOffsetSec, progress, opts) {
     if (!pathForAnalysis || typeof global.AudioPreprocess === 'undefined') {
       return null;
     }
+    opts = opts || {};
     var off = typeof timelineOffsetSec === 'number' && !isNaN(timelineOffsetSec) ? timelineOffsetSec : 0;
     try {
       if (progress) progress('Анализ аудио (silencedetect + loudnorm)…');
-      var res = await global.AudioPreprocess.analyzeAll(pathForAnalysis, {
-        silence: { thresholdDb: -30, minDurationSec: 0.5 }
-        /* rms опущен — дорого на длинных файлах; подключим по прямому запросу пользователя */
-      });
+      var analyzeOpts = { silence: { thresholdDb: -30, minDurationSec: 0.5 } };
+      /* wantRms — RMS-таймлайн для waveform-превью «Инструментов». Opt-in: дорого
+         на длинных файлах (лишний astats-проход), поэтому запрашивается только из
+         «⚡ Анализ аудио» (подготовка к инструментам), не из транскрибации. */
+      if (opts.wantRms) {
+        analyzeOpts.rms = { windowSec: typeof opts.rmsWindowSec === 'number' ? opts.rmsWindowSec : 0.05 };
+      }
+      var res = await global.AudioPreprocess.analyzeAll(pathForAnalysis, analyzeOpts);
       /* Сдвигаем тишины в таймлайн-координаты */
       var silences = [];
       if (Array.isArray(res.silences)) {
@@ -368,13 +373,23 @@
           };
         });
       }
-      return {
+      var out = {
         silences: silences,
         loudness: res.loudness && !res.loudness.error ? res.loudness : null,
         silencesError: Array.isArray(res.silences) ? null : (res.silences && res.silences.error) || null,
         loudnessError: res.loudness && res.loudness.error ? res.loudness.error : null,
         silenceThresholdUsed: typeof res.silenceThresholdUsed === 'number' ? res.silenceThresholdUsed : null
       };
+      /* RMS-таймлайн → sequence-time (как silences). Только при wantRms и успехе. */
+      if (opts.wantRms && Array.isArray(res.rms)) {
+        out.rmsTimeline = res.rms.map(function (p) {
+          return { t: Math.round((p.t + off) * 1000) / 1000, rms: p.rms };
+        });
+        if (typeof res.loudness === 'object' && res.loudness && typeof res.loudness.inputI === 'number') {
+          out.inputI = res.loudness.inputI;
+        }
+      }
+      return out;
     } catch (eP) {
       return { error: String(eP && eP.message || eP) };
     }
@@ -992,7 +1007,11 @@
     var offsetSec = typeof prep.timelineOffsetSec === 'number' ? prep.timelineOffsetSec : 0;
 
     progress('Анализ аудио без транскрибации…');
-    var aa = await computeAudioPreprocess(pathForAnalysis, offsetSec, progress);
+    /* wantRms: RMS-таймлайн для интерактивного waveform-превью «Инструментов».
+       Считается здесь один раз (на уже-экспортированном файле), кэшируется в
+       entry.audioAnalysis.rmsTimeline — дальше порог/min/padding фильтруются
+       client-side через silenceIntervalsFromRms без перезапуска ffmpeg. */
+    var aa = await computeAudioPreprocess(pathForAnalysis, offsetSec, progress, { wantRms: true, rmsWindowSec: 0.05 });
     if (!aa) throw new Error('AudioPreprocess недоступен (ffmpeg?)');
     if (aa.error) throw new Error('Ошибка анализа: ' + aa.error);
 
