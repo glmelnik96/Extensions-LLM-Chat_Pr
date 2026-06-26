@@ -176,6 +176,45 @@ describe('DeterministicPipelines.cutSilences', () => {
     assert.ok(r.proposal.removeIntervals.length >= 1);
   });
 
+  test('preview==apply: с rmsTimeline детекция идёт через RMS (не ffmpeg-silences)', async () => {
+    /* rmsTimeline: речь 0-2с (-12), тишина 2-4с (-55), речь 4-6с (-12). ffmpeg
+       silences ПУСТЫ и сегментов-gap НЕТ — значит найденная тишина может прийти
+       ТОЛЬКО из RMS-источника (доказывает контракт preview==apply). */
+    const rms = [];
+    let t = 0;
+    const push = (dur, val) => { for (let i = 0; i < Math.round(dur / 0.05); i++) { rms.push({ t: Math.round(t * 1000) / 1000, rms: val }); t += 0.05; } };
+    push(2, -12); push(2, -55); push(2, -12);
+    const entry = makeEntry(
+      [{ startSec: 0, endSec: 6, text: 'непрерывная речь без зазоров' }],
+      { audioAnalysis: { rmsTimeline: rms, silences: [], inputI: -20, silenceThresholdUsed: -30 } }
+    );
+    const r = await DP.cutSilences(makeCtx({ transcriptEntry: entry }), { minDuration: 1.0, padding: 0.15 });
+    assert.equal(r.ok, true);
+    assert.ok(r.proposal, 'нашёл тишину из RMS');
+    assert.equal(r.proposal.removeIntervals.length, 1);
+    // тишина ~[2,4], padding 0.15 → [~2.15, ~3.85]
+    assert.ok(r.proposal.removeIntervals[0].startSec >= 2.1 && r.proposal.removeIntervals[0].startSec <= 2.3);
+    assert.ok(r.proposal.removeIntervals[0].endSec >= 3.7 && r.proposal.removeIntervals[0].endSec <= 3.9);
+  });
+
+  test('rmsTimeline + порог-дельта: ужесточение убирает «тихую речь» (live-порог)', async () => {
+    const rms = [];
+    let t = 0;
+    const push = (dur, val) => { for (let i = 0; i < Math.round(dur / 0.05); i++) { rms.push({ t: Math.round(t * 1000) / 1000, rms: val }); t += 0.05; } };
+    push(2, -12); push(2, -28); push(2, -12); /* средний участок -28dB */
+    const entry = makeEntry(
+      [{ startSec: 0, endSec: 6, text: 'речь' }],
+      { audioAnalysis: { rmsTimeline: rms, silences: [], inputI: -10 } }
+    );
+    /* delta=15 → порог inputI-15 = -25 → -28 считается тишиной */
+    const loose = await DP.cutSilences(makeCtx({ transcriptEntry: entry }), { minDuration: 1.0, padding: 0.1, silenceThresholdDelta: 15 });
+    /* delta=5 → порог -15 → -28 НЕ тишина (громче порога? нет: -28 < -15 → тишина).
+       Возьмём delta=25 → порог -35 → -28 уже речь (-28 > -35). */
+    const strict = await DP.cutSilences(makeCtx({ transcriptEntry: entry }), { minDuration: 1.0, padding: 0.1, silenceThresholdDelta: 25 });
+    assert.ok(loose.proposal && loose.proposal.removeIntervals.length === 1, 'порог -25: -28dB = тишина');
+    assert.ok(strict.noChanges || (strict.proposal && strict.proposal.removeIntervals.length === 0), 'порог -35: -28dB = речь');
+  });
+
   test('тишины длиннее minDuration → proposal с вырезкой', async () => {
     const entry = makeEntry(
       [{ startSec: 0, endSec: 30, text: 'тест' }],

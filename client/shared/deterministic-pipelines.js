@@ -420,12 +420,27 @@
     var effectiveThreshold = userDelta > 0 ? Math.floor(inputI - userDelta) : thresholdUsed;
     var threshLabel = effectiveThreshold + ' dB';
 
-    var removeIntervals = detectSilenceIntervals(entry, {
-      minDuration: minDuration,
-      padding: padding,
-      thresholdDb: effectiveThreshold,
-      source: 'gaps+ffmpeg'
-    });
+    /* preview==apply: если есть RMS-таймлайн (после «Анализ аудио»), детекция тишин
+       идёт через silenceIntervalsFromRms — ТУ ЖЕ функцию, что waveform-превью
+       «Инструментов» фильтрует на лету при движении ползунков. Иначе превью и
+       реальный вырез могли бы разойтись. Fallback на detectSilenceIntervals
+       (gaps+ffmpeg) — когда RMS не считался (старый кэш / транскрипт из чата). */
+    var rmsTl = entry.audioAnalysis && entry.audioAnalysis.rmsTimeline;
+    var removeIntervals;
+    if (Array.isArray(rmsTl) && rmsTl.length > 1) {
+      removeIntervals = silenceIntervalsFromRms(rmsTl, {
+        thresholdDb: effectiveThreshold,
+        minDuration: minDuration,
+        padding: padding
+      });
+    } else {
+      removeIntervals = detectSilenceIntervals(entry, {
+        minDuration: minDuration,
+        padding: padding,
+        thresholdDb: effectiveThreshold,
+        source: 'gaps+ffmpeg'
+      });
+    }
 
     var silences = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
     var segs = entry.segments || [];
