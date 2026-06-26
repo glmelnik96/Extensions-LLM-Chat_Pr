@@ -395,6 +395,53 @@
     }
   }
 
+  /* SILENCE_FLOOR_DB — значение для «тихого» бакета при слиянии RMS-серий.
+     Ниже любого реального порога слайдера (3..30 dB ниже речи ≈ -27..-54). */
+  var SILENCE_FLOOR_DB = -90;
+
+  /**
+   * mergeRmsTimelines — сливает несколько RMS-серий (перекрывающиеся мик-дорожки
+   * подкаста) в одну плотную по сетке windowSec. В каждом бакете берём MAX rms =
+   * «громчайший микрофон» ≈ программное аудио. Бакеты без сэмплов (все микрофоны
+   * молчат / -inf, которые computeAudioPreprocess пропускает) заполняются
+   * SILENCE_FLOOR_DB → silenceIntervalsFromRms видит их как тишину. Для одной
+   * непересекающейся серии вырождается в плотную версию её самой.
+   *
+   * @param {Array<Array<{t,rms}>>} seriesList
+   * @param {number} windowSec
+   * @returns {Array<{t,rms}>}
+   */
+  function mergeRmsTimelines(seriesList, windowSec) {
+    var win = typeof windowSec === 'number' && windowSec > 0 ? windowSec : 0.05;
+    var buckets = {};
+    var s, i;
+    for (s = 0; s < (seriesList || []).length; s++) {
+      var ser = seriesList[s];
+      if (!Array.isArray(ser)) continue;
+      for (i = 0; i < ser.length; i++) {
+        var p = ser[i];
+        if (!p || typeof p.t !== 'number' || !isFinite(p.t)) continue;
+        var r = p.rms;
+        if (r == null || !isFinite(r)) continue; /* -inf-сэмпл = тишина, учтётся как пробел */
+        var key = Math.round(p.t / win);
+        if (!(key in buckets) || r > buckets[key]) buckets[key] = r;
+      }
+    }
+    var keys = Object.keys(buckets);
+    if (!keys.length) return [];
+    var nums = keys.map(Number).sort(function (a, b) { return a - b; });
+    var minK = nums[0];
+    var maxK = nums[nums.length - 1];
+    var out = [];
+    /* Защита от патологически больших диапазонов (битый t) — кап на ~2млн бакетов. */
+    if (maxK - minK > 2000000) maxK = minK + 2000000;
+    for (var key2 = minK; key2 <= maxK; key2++) {
+      var rms = (key2 in buckets) ? buckets[key2] : SILENCE_FLOOR_DB; /* пробел = все молчат */
+      out.push({ t: Math.round(key2 * win * 1000) / 1000, rms: rms });
+    }
+    return out;
+  }
+
   /**
    * Аудиоанализ (silencedetect + loudnorm) списка чанков ПАРАЛЛЕЛЬНО
    * (FFMPEG_CONCURRENCY процессов). Аудит 2026-06-09: раньше чанки
@@ -403,35 +450,49 @@
    * items: [{path, timelineOffsetSec}]. Ошибки отдельных чанков глотаются
    * (как и раньше) — silences просто не добавляются.
    * loudness/threshold берутся из первого (по порядку) успешного чанка.
+   *
+   * opts.wantRms — также собрать и слить RMS-таймлайны всех чанков (для waveform).
    */
-  async function analyzeChunksInParallel(items, progress) {
+  async function analyzeChunksInParallel(items, progress, opts) {
+    opts = opts || {};
     var list = (items || []).filter(function (c) { return c && c.path; });
+    var ppOpts = opts.wantRms ? { wantRms: true, rmsWindowSec: opts.rmsWindowSec } : undefined;
     var tasks = list.map(function (c) {
       return function () {
-        return computeAudioPreprocess(c.path, c.timelineOffsetSec, null)
+        return computeAudioPreprocess(c.path, c.timelineOffsetSec, null, ppOpts)
           .catch(function () { return null; });
       };
     });
     var results = await promisePool(tasks, FFMPEG_CONCURRENCY);
     var allSil = [];
+    var rmsSeries = [];
     var firstLoud = null;
     var firstThresh = null;
+    var firstInputI = null;
     for (var i = 0; i < results.length; i++) {
       var aa = results[i];
       if (!aa || aa.error) continue;
       if (Array.isArray(aa.silences)) allSil = allSil.concat(aa.silences);
+      if (opts.wantRms && Array.isArray(aa.rmsTimeline)) rmsSeries.push(aa.rmsTimeline);
       if (!firstLoud && aa.loudness) firstLoud = aa.loudness;
       if (firstThresh == null && aa.silenceThresholdUsed != null) firstThresh = aa.silenceThresholdUsed;
+      if (firstInputI == null && typeof aa.inputI === 'number') firstInputI = aa.inputI;
     }
     allSil.sort(function (a, b) { return a.startSec - b.startSec; });
     if (progress) progress('Анализ аудио: ' + results.length + ' чанков готово');
-    return {
+    var out = {
       silences: allSil,
       loudness: firstLoud,
       silencesError: null,
       loudnessError: null,
       silenceThresholdUsed: firstThresh
     };
+    if (opts.wantRms) {
+      /* MAX-по-бакету: перекрывающиеся мик-дорожки → «громчайший микрофон». */
+      out.rmsTimeline = mergeRmsTimelines(rmsSeries, opts.rmsWindowSec || 0.05);
+      if (firstInputI != null) out.inputI = firstInputI;
+    }
+    return out;
   }
 
   /**
@@ -1001,6 +1062,49 @@
   async function runAudioOnlyAnalysis(prep, onProgress) {
     if (!prep) throw new Error('prep required');
     var progress = typeof onProgress === 'function' ? onProgress : function () {};
+
+    /* clip_queue (несколько аудиоклипов в In–Out, напр. мультимик-подкаст).
+       19.06.2026 BUGFIX: раньше audio-only путь читал только prep.path/chunks[0]
+       и падал на clip_queue («prep.path обязателен»), хотя транскрибация его умеет.
+       Извлекаем регион [srcStart, span] каждого клипа через ffmpeg → анализируем
+       параллельно → сливаем silences + RMS (MAX по перекрытым микрофонам). */
+    if (prep.mode === 'clip_queue' && prep.items && prep.items.length) {
+      var chunkList = [];
+      var tempChunks = [];
+      try {
+        for (var qi = 0; qi < prep.items.length; qi++) {
+          var it = prep.items[qi];
+          if (!it || !it.path) continue;
+          var span = it.workOutSec - it.workInSec;
+          if (!(span > 0.05)) continue;
+          /* source-time старта региона: clipInPoint + (workIn - clipStart) — как в транскрибации */
+          var srcStart = (it.clipInPointSec || 0) + (it.workInSec - (it.clipStartSec || 0));
+          progress('Анализ аудио: клип ' + (qi + 1) + '/' + prep.items.length + '…');
+          var chunks = await extractAudioChunksWithFfmpeg(it.path, srcStart, span, 90, progress, 'wav');
+          for (var ci = 0; ci < chunks.length; ci++) {
+            chunkList.push({ path: chunks[ci].path, timelineOffsetSec: it.workInSec + chunks[ci].offsetInSpanSec });
+            tempChunks.push(chunks[ci]);
+          }
+        }
+        if (!chunkList.length) throw new Error('Не удалось извлечь аудио из клипов In–Out');
+        var aaq = await analyzeChunksInParallel(chunkList, progress, { wantRms: true, rmsWindowSec: 0.05 });
+        return {
+          segments: [],
+          paragraphs: [],
+          text: '',
+          audioAnalysis: aaq,
+          timelineOffsetSec: typeof prep.workInSec === 'number' ? prep.workInSec : 0,
+          durationSec: (typeof prep.workOutSec === 'number' && typeof prep.workInSec === 'number')
+            ? (prep.workOutSec - prep.workInSec) : null,
+          mode: 'audio-only',
+          analysisOnly: true,
+          builtAt: Date.now()
+        };
+      } finally {
+        unlinkChunkList(tempChunks);
+      }
+    }
+
     /* Берём путь к аудио для анализа: либо prep.path (один файл), либо первый chunk. */
     var pathForAnalysis = prep.path || (prep.chunks && prep.chunks[0] && prep.chunks[0].path);
     if (!pathForAnalysis) throw new Error('prep.path или prep.chunks[0].path обязателен');
@@ -1037,6 +1141,7 @@
     runFromPrep: runFromPrep,
     runAudioOnlyAnalysis: runAudioOnlyAnalysis,
     computeAudioPreprocess: computeAudioPreprocess,
+    mergeRmsTimelines: mergeRmsTimelines,
     unlinkWorkFiles: function (prep) {
       if (typeof require === 'undefined') return;
       var fs = require('fs');

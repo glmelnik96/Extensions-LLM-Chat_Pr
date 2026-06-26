@@ -80,3 +80,55 @@ describe('TimelineTranscribe.computeAudioPreprocess — wantRms', () => {
     assert.equal(aa.rmsTimeline, undefined, 'нет res.rms → нет rmsTimeline');
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * mergeRmsTimelines — слияние перекрытых мик-дорожек (MAX по бакету)
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('TimelineTranscribe.mergeRmsTimelines', () => {
+  const TT = loadTimelineTranscribe({});
+
+  it('пустой/невалидный вход → []', () => {
+    assert.equal(TT.mergeRmsTimelines([], 0.05).length, 0);
+    assert.equal(TT.mergeRmsTimelines(null, 0.05).length, 0);
+    assert.equal(TT.mergeRmsTimelines([null, []], 0.05).length, 0);
+  });
+
+  it('одна серия → плотная версия (бакеты по сетке)', () => {
+    const s = [{ t: 0.0, rms: -12 }, { t: 0.05, rms: -14 }, { t: 0.1, rms: -13 }];
+    const out = TT.mergeRmsTimelines([s], 0.05);
+    assert.equal(out.length, 3);
+    assert.equal(out[0].rms, -12);
+    assert.equal(out[2].rms, -13);
+  });
+
+  it('перекрытые микрофоны → MAX (громчайший) в каждом бакете', () => {
+    // mic A громкий в начале, mic B громкий в конце; один и тот же диапазон t
+    const micA = [{ t: 0.0, rms: -10 }, { t: 0.05, rms: -12 }, { t: 0.1, rms: -50 }];
+    const micB = [{ t: 0.0, rms: -55 }, { t: 0.05, rms: -52 }, { t: 0.1, rms: -11 }];
+    const out = TT.mergeRmsTimelines([micA, micB], 0.05);
+    assert.equal(out.length, 3);
+    assert.equal(out[0].rms, -10, 'бакет0: max(-10,-55)');
+    assert.equal(out[1].rms, -12, 'бакет1: max(-12,-52)');
+    assert.equal(out[2].rms, -11, 'бакет2: max(-50,-11)');
+  });
+
+  it('пробел между сэмплами (все молчат) → заполнен SILENCE_FLOOR (-90)', () => {
+    // сэмплы на 0.0 и 0.3 (между ними дыра — все микрофоны молчали/-inf)
+    const s = [{ t: 0.0, rms: -12 }, { t: 0.3, rms: -12 }];
+    const out = TT.mergeRmsTimelines([s], 0.05);
+    // бакеты 0..6, заполнены: края -12, середина -90
+    assert.ok(out.length >= 6, 'плотная сетка между 0 и 0.3');
+    const mid = out.find((p) => p.t > 0.1 && p.t < 0.25);
+    assert.ok(mid && mid.rms === -90, 'дыра = тишина -90');
+    assert.equal(out[0].rms, -12);
+    assert.equal(out[out.length - 1].rms, -12);
+  });
+
+  it('-Infinity-сэмплы пропускаются (как тишина-пробел)', () => {
+    const s = [{ t: 0.0, rms: -12 }, { t: 0.05, rms: -Infinity }, { t: 0.1, rms: -12 }];
+    const out = TT.mergeRmsTimelines([s], 0.05);
+    assert.equal(out.length, 3);
+    assert.equal(out[1].rms, -90, 'бакет с -inf → floor -90');
+  });
+});
