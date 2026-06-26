@@ -187,30 +187,35 @@
   function computeRmsTimeline(inputPath, opt) {
     opt = opt || {};
     var win = typeof opt.windowSec === 'number' ? opt.windowSec : 0.5;
+    /* Печатаем ВСЕ Overall-метрики окна (без key-фильтра) — нужны и RMS_level
+       (для детекции тишин), и Peak_level (для waveform-визуала: пики показывают
+       структуру слов/пауз, как на таймлайне; RMS слишком сглажен). */
     var args = [
       '-hide_banner', '-nostats', '-i', inputPath,
-      '-af', 'astats=metadata=1:reset=' + win + ',ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-',
+      '-af', 'astats=metadata=1:reset=' + win + ',ametadata=print:file=-',
       '-f', 'null', '-'
     ];
     return runFfmpeg(args, 300000).then(function (res) {
       var out = [];
-      /* Строки вида:
-         frame:###   pts:###   pts_time:12.345000
-         lavfi.astats.Overall.RMS_level=-23.456000
-         Стандартный вывод printMetadata идёт в stdout потому что file=- */
       var combined = (res.stdout || '') + '\n' + (res.stderr || '');
       var lines = combined.split('\n');
-      var curT = null;
+      var curT = null, curRms = null, curPeak = null;
+      function flush() {
+        if (curT !== null && curRms !== null) {
+          out.push({ t: Math.round(curT * 1000) / 1000, rms: curRms, peak: curPeak });
+        }
+        curRms = null; curPeak = null;
+      }
       for (var i = 0; i < lines.length; i++) {
         var line = lines[i];
         var mt = line.match(/pts_time:\s*([\d.]+)/);
-        if (mt) { curT = parseFloat(mt[1]); continue; }
-        var mr = line.match(/Overall\.RMS_level\s*=\s*(-?[\d.]+)/);
-        if (mr && curT !== null) {
-          out.push({ t: Math.round(curT * 1000) / 1000, rms: parseFloat(mr[1]) });
-          curT = null;
-        }
+        if (mt) { flush(); curT = parseFloat(mt[1]); continue; }
+        var mr = line.match(/Overall\.RMS_level\s*=\s*(-?[\d.]+|-?inf)/);
+        if (mr) { curRms = (mr[1].indexOf('inf') >= 0) ? -Infinity : parseFloat(mr[1]); continue; }
+        var mp = line.match(/Overall\.Peak_level\s*=\s*(-?[\d.]+|-?inf)/);
+        if (mp) { curPeak = (mp[1].indexOf('inf') >= 0) ? -Infinity : parseFloat(mp[1]); continue; }
       }
+      flush();
       return out;
     });
   }

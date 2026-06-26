@@ -383,7 +383,7 @@
       /* RMS-таймлайн → sequence-time (как silences). Только при wantRms и успехе. */
       if (opts.wantRms && Array.isArray(res.rms)) {
         out.rmsTimeline = res.rms.map(function (p) {
-          return { t: Math.round((p.t + off) * 1000) / 1000, rms: p.rms };
+          return { t: Math.round((p.t + off) * 1000) / 1000, rms: p.rms, peak: p.peak };
         });
         if (typeof res.loudness === 'object' && res.loudness && typeof res.loudness.inputI === 'number') {
           out.inputI = res.loudness.inputI;
@@ -413,7 +413,7 @@
    */
   function mergeRmsTimelines(seriesList, windowSec) {
     var win = typeof windowSec === 'number' && windowSec > 0 ? windowSec : 0.05;
-    var buckets = {};
+    var bRms = {}, bPeak = {};
     var s, i;
     for (s = 0; s < (seriesList || []).length; s++) {
       var ser = seriesList[s];
@@ -424,10 +424,12 @@
         var r = p.rms;
         if (r == null || !isFinite(r)) continue; /* -inf-сэмпл = тишина, учтётся как пробел */
         var key = Math.round(p.t / win);
-        if (!(key in buckets) || r > buckets[key]) buckets[key] = r;
+        if (!(key in bRms) || r > bRms[key]) bRms[key] = r;
+        var pk = p.peak;
+        if (typeof pk === 'number' && isFinite(pk) && (!(key in bPeak) || pk > bPeak[key])) bPeak[key] = pk;
       }
     }
-    var keys = Object.keys(buckets);
+    var keys = Object.keys(bRms);
     if (!keys.length) return [];
     var nums = keys.map(Number).sort(function (a, b) { return a - b; });
     var minK = nums[0];
@@ -436,8 +438,9 @@
     /* Защита от патологически больших диапазонов (битый t) — кап на ~2млн бакетов. */
     if (maxK - minK > 2000000) maxK = minK + 2000000;
     for (var key2 = minK; key2 <= maxK; key2++) {
-      var rms = (key2 in buckets) ? buckets[key2] : SILENCE_FLOOR_DB; /* пробел = все молчат */
-      out.push({ t: Math.round(key2 * win * 1000) / 1000, rms: rms });
+      var rms = (key2 in bRms) ? bRms[key2] : SILENCE_FLOOR_DB; /* пробел = все молчат */
+      var peak = (key2 in bPeak) ? bPeak[key2] : SILENCE_FLOOR_DB;
+      out.push({ t: Math.round(key2 * win * 1000) / 1000, rms: rms, peak: peak });
     }
     return out;
   }
@@ -1087,7 +1090,7 @@
           }
         }
         if (!chunkList.length) throw new Error('Не удалось извлечь аудио из клипов In–Out');
-        var aaq = await analyzeChunksInParallel(chunkList, progress, { wantRms: true, rmsWindowSec: 0.05 });
+        var aaq = await analyzeChunksInParallel(chunkList, progress, { wantRms: true, rmsWindowSec: 0.025 });
         return {
           segments: [],
           paragraphs: [],
@@ -1115,7 +1118,7 @@
        Считается здесь один раз (на уже-экспортированном файле), кэшируется в
        entry.audioAnalysis.rmsTimeline — дальше порог/min/padding фильтруются
        client-side через silenceIntervalsFromRms без перезапуска ffmpeg. */
-    var aa = await computeAudioPreprocess(pathForAnalysis, offsetSec, progress, { wantRms: true, rmsWindowSec: 0.05 });
+    var aa = await computeAudioPreprocess(pathForAnalysis, offsetSec, progress, { wantRms: true, rmsWindowSec: 0.025 });
     if (!aa) throw new Error('AudioPreprocess недоступен (ffmpeg?)');
     if (aa.error) throw new Error('Ошибка анализа: ' + aa.error);
 

@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-waveform-symmetric-v16'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-waveform-twotone-v19'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5109,15 +5109,7 @@ PanelBoot.run('ИИ: монтаж', function () {
        (cutSilences/jumpCuts), что и реальный вырез → preview==apply. Дорогой RMS
        (ffmpeg) считается один раз в «Анализ аудио»; здесь — только перерисовка. */
     var WaveformPreview = (function () {
-      /* dB → амплитуда 0..1. Диапазон [-60,-12]: тишина → ноль у центра, речь →
-         к краям. Воспринимаемая громкость речи (RMS ~ -40..-15) ложится в видимый
-         размах. */
-      var FLOOR_DB = -60, CEIL_DB = -12;
-      function amp(db) {
-        var v = (db - FLOOR_DB) / (CEIL_DB - FLOOR_DB);
-        if (v < 0) v = 0; else if (v > 1) v = 1;
-        return v;
-      }
+      var ABS_FLOOR = -90; /* dB для пропусков/-inf (digital silence) */
       function draw(canvas, rms, regions, opts) {
         if (!canvas || !canvas.getContext) return;
         opts = opts || {};
@@ -5134,43 +5126,66 @@ PanelBoot.run('ИИ: монтаж', function () {
         if (!(span > 0)) return;
         function xOf(t) { return ((t - t0) / span) * W; }
 
-        /* пиковый dB по колонке пикселей (даунсэмплинг к ширине canvas) */
-        var perCol = new Array(W);
-        for (var c = 0; c < W; c++) perCol[c] = -Infinity;
+        /* max peak и max rms по колонке пикселей (даунсэмплинг к ширине canvas) */
+        var colPeak = new Array(W), colRms = new Array(W);
+        for (var c = 0; c < W; c++) { colPeak[c] = -Infinity; colRms[c] = -Infinity; }
         for (var k = 0; k < rms.length; k++) {
           var x = Math.floor(xOf(rms[k].t));
           if (x < 0 || x >= W) continue;
-          var db = (rms[k].rms == null || !isFinite(rms[k].rms)) ? FLOOR_DB : rms[k].rms;
-          if (db > perCol[x]) perCol[x] = db;
+          var pk = (typeof rms[k].peak === 'number' && isFinite(rms[k].peak)) ? rms[k].peak : ABS_FLOOR;
+          var rm = (typeof rms[k].rms === 'number' && isFinite(rms[k].rms)) ? rms[k].rms : ABS_FLOOR;
+          if (pk > colPeak[x]) colPeak[x] = pk;
+          if (rm > colRms[x]) colRms[x] = rm;
         }
-        /* заполняем пустые колонки соседним значением (плавность) */
-        var lastV = FLOOR_DB;
-        for (var f = 0; f < W; f++) { if (perCol[f] === -Infinity) perCol[f] = lastV; else lastV = perCol[f]; }
+        var lp = ABS_FLOOR, lr = ABS_FLOOR;
+        for (var f = 0; f < W; f++) {
+          if (colPeak[f] === -Infinity) colPeak[f] = lp; else lp = colPeak[f];
+          if (colRms[f] === -Infinity) colRms[f] = lr; else lr = colRms[f];
+        }
+
+        /* АДАПТИВНАЯ нормализация (авто-масштаб как у waveform на таймлайне Premiere):
+           маппим фактический диапазон [dMin, dMax] пиков региона → [0,1]. Без этого
+           тихое аудио (камерные мики -60..-90 dB) рисовалось плоской линией.
+           Гард на минимальный размах 6 dB, чтобы не раздувать шум в «полный» сигнал. */
+        var dMin = Infinity, dMax = -Infinity;
+        for (var mm = 0; mm < W; mm++) { var d0 = colPeak[mm]; if (d0 < dMin) dMin = d0; if (d0 > dMax) dMax = d0; }
+        if (!(dMax > -Infinity)) return;
+        var range = dMax - dMin;
+        if (range < 6) { dMin = dMax - 6; range = 6; }
+        function amp(db) { var v = (db - dMin) / range; if (v < 0) v = 0; else if (v > 1) v = 1; return v; }
 
         /* центральная линия */
-        ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
         ctx.lineWidth = 1;
         ctx.beginPath(); ctx.moveTo(0, mid + 0.5); ctx.lineTo(W, mid + 0.5); ctx.stroke();
 
-        /* симметричный waveform (зеркальный от центра) — заливка контура */
-        ctx.fillStyle = '#3d8bff';
+        /* Двухтоновый waveform: внешний контур по PEAK (светлый «гало») + плотное
+           ядро по RMS (ярче) — как в Premiere/Audition. Симметрично от центра. */
+        ctx.strokeStyle = 'rgba(120,170,255,0.55)';
         ctx.beginPath();
-        ctx.moveTo(0, mid - Math.max(0.5, amp(perCol[0]) * maxHalf));
-        for (var c2 = 1; c2 < W; c2++) ctx.lineTo(c2, mid - Math.max(0.5, amp(perCol[c2]) * maxHalf));
-        for (var c3 = W - 1; c3 >= 0; c3--) ctx.lineTo(c3, mid + Math.max(0.5, amp(perCol[c3]) * maxHalf));
-        ctx.closePath();
-        ctx.fill();
+        for (var c2 = 0; c2 < W; c2++) {
+          var hp = Math.max(0.5, amp(colPeak[c2]) * maxHalf);
+          ctx.moveTo(c2 + 0.5, mid - hp); ctx.lineTo(c2 + 0.5, mid + hp);
+        }
+        ctx.stroke();
+        ctx.strokeStyle = '#3d8bff';
+        ctx.beginPath();
+        for (var c4 = 0; c4 < W; c4++) {
+          var hr = Math.max(0.4, amp(colRms[c4]) * maxHalf);
+          ctx.moveTo(c4 + 0.5, mid - hr); ctx.lineTo(c4 + 0.5, mid + hr);
+        }
+        ctx.stroke();
 
         /* зоны выреза ПОВЕРХ — полупрозрачная заливка + чёткие красные края */
         if (regions && regions.length) {
           for (var i = 0; i < regions.length; i++) {
             var rx1 = xOf(regions[i].startSec), rx2 = xOf(regions[i].endSec);
             var rw = Math.max(1, rx2 - rx1);
-            ctx.fillStyle = 'rgba(239,68,68,0.30)';
+            ctx.fillStyle = 'rgba(239,68,68,0.28)';
             ctx.fillRect(rx1, 0, rw, H);
             ctx.fillStyle = 'rgba(239,68,68,0.95)';
-            ctx.fillRect(rx1, 0, 1.5, H);            /* левая граница */
-            ctx.fillRect(rx2 - 1.5, 0, 1.5, H);      /* правая граница */
+            ctx.fillRect(rx1, 0, 1.5, H);
+            ctx.fillRect(rx2 - 1.5, 0, 1.5, H);
           }
         }
       }
