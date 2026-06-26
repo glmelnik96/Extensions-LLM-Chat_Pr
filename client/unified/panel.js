@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-waveform-threshold-line-v23'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-waveform-linear-amp-v24'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5153,16 +5153,16 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (colRms[f] === -Infinity) colRms[f] = lr; else lr = colRms[f];
         }
 
-        /* АДАПТИВНАЯ нормализация (авто-масштаб как у waveform на таймлайне Premiere):
-           маппим фактический диапазон [dMin, dMax] пиков региона → [0,1]. Без этого
-           тихое аудио (камерные мики -60..-90 dB) рисовалось плоской линией.
-           Гард на минимальный размах 6 dB, чтобы не раздувать шум в «полный» сигнал. */
-        var dMin = Infinity, dMax = -Infinity;
-        for (var mm = 0; mm < W; mm++) { var d0 = colPeak[mm]; if (d0 < dMin) dMin = d0; if (d0 > dMax) dMax = d0; }
-        if (!(dMax > -Infinity)) return;
-        var range = dMax - dMin;
-        if (range < 6) { dMin = dMax - 6; range = 6; }
-        function amp(db) { var v = (db - dMin) / range; if (v < 0) v = 0; else if (v > 1) v = 1; return v; }
+        /* ЛИНЕЙНАЯ амплитуда (как waveform в Premiere/Audition), НЕ dB. В dB-шкале
+           -14 и -40 оба «высокие» (логарифм сжимает) → непрерывная речь сливается
+           в монолит («3 острова»). В линейной амплитуде тишина (-80dB → lin≈0.0001)
+           реально плоская, а речь даёт пики — чёткая структура как на таймлайне.
+           Нормируем на макс. линейную амплитуду пика региона (адаптив под уровень). */
+        function dbToLin(db) { return (!isFinite(db) || db <= ABS_FLOOR) ? 0 : Math.pow(10, db / 20); }
+        var maxLin = 0;
+        for (var mm = 0; mm < W; mm++) { var lpk = dbToLin(colPeak[mm]); if (lpk > maxLin) maxLin = lpk; }
+        if (!(maxLin > 0)) return;
+        function amp(db) { var v = dbToLin(db) / maxLin; if (v < 0) v = 0; else if (v > 1) v = 1; return v; }
 
         /* центральная линия */
         ctx.strokeStyle = 'rgba(255,255,255,0.08)';
