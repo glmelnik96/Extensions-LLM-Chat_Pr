@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-transcribe-fallback-offset-v12'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-tools-nochanges-status-v13'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5719,6 +5719,11 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
       toolsDisableRun(true);
       toolsStatusUi.show('Выполняю…', true);
+      /* keepStatus: noChanges-сообщение должно ОСТАТЬСЯ видимым. Иначе finally
+         ниже (toolsStatusUi.hide при отсутствии proposal) скрывал его синхронно
+         сразу после show → инструмент без находок выглядел как «кнопка не работает»
+         (юзер не видел «Длинных пауз не обнаружено»). */
+      var keepStatus = false;
 
       try {
         var snap = await execGetSnapshot(true);
@@ -5772,7 +5777,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           toolsShowErr(result.error || 'Ошибка.');
         } else if (result.noChanges) {
           toolsStatusUi.show(result.summary || 'Изменений нет.', false);
-          setTimeout(function () { toolsStatusUi.hide(); }, 2500);
+          keepStatus = true;
+          setTimeout(function () { toolsStatusUi.hide(); }, 4000);
         } else if (result.proposal) {
           toolsShowProposal(proposalId, result.proposal);
           toolsStatusUi.hide();
@@ -5782,7 +5788,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       } finally {
         endOperation();
         toolsDisableRun(false);
-        if (!_toolsProposal) toolsStatusUi.hide();
+        if (!_toolsProposal && !keepStatus) toolsStatusUi.hide();
       }
     }
 
