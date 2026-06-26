@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-perclip-led-v28'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-state-badge-v29'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5359,15 +5359,21 @@ PanelBoot.run('ИИ: монтаж', function () {
       toolsErr.style.display = t ? 'block' : 'none';
     }
 
+    var toolsLedWrap = document.getElementById('tools-led-wrap');
+    /* 3 ПОНЯТНЫХ СОСТОЯНИЯ аудио-анализа (цветовая плашка):
+         красная  «нужен анализ»  — анализа нет (или устарел под текущий In/Out);
+         жёлтая   «анализ идёт…»  — идёт «Анализ аудио»;
+         зелёная  «анализ готов»  — есть audioAnalysis (или транскрипт).
+       'audio' и 'ok' оба → зелёная (для инструментов важно одно: анализ есть).
+       Разделение audio/транскрипт ушло на уровень карточек (гейт needs-transcript). */
     function toolsSetLed(state, text) {
-      if (!toolsLed) return;
-      /* P0-2 (10 июня 2026): третье состояние 'audio' (синий) — есть аудиоанализ
-         без транскрипта: «Тишина» и «MultiCam» уже доступны. */
-      toolsLed.className = 'transcript-led transcript-led--' +
-        (state === 'ok' ? 'green' : state === 'busy' ? 'yellow' : state === 'audio' ? 'blue' : 'red');
+      var color = (state === 'ok' || state === 'audio') ? 'green'
+                : (state === 'busy') ? 'yellow' : 'red';
+      if (toolsLed) toolsLed.className = 'transcript-led transcript-led--' + color;
+      if (toolsLedWrap) toolsLedWrap.className = 'led-wrap tools-state tools-state--' + color;
       if (toolsLedText) {
         toolsLedText.textContent = text != null ? text :
-          (state === 'ok' ? 'готов' : state === 'busy' ? 'идёт…' : state === 'audio' ? 'только аудио' : 'нет');
+          (color === 'green' ? 'анализ готов' : color === 'yellow' ? 'анализ идёт…' : 'нужен анализ');
       }
     }
 
@@ -5416,10 +5422,14 @@ PanelBoot.run('ИИ: монтаж', function () {
         }
       } catch (e) { /* findTranscriptEntry не должен падать */ }
       var seqLabel = seqName ? ' · «' + seqName + '»' : '';
-      var staleSuffix = stale ? ' ⚠ обновите (In/Out)' : '';
-      if (hasTranscript) toolsSetLed('ok', 'готов' + seqLabel + staleSuffix);
-      else if (hasAudio) toolsSetLed('audio', 'аудио' + seqLabel + staleSuffix);
-      else toolsSetLed('red', 'нет анализа' + seqLabel);
+      if (!hasAudio && !hasTranscript) {
+        toolsSetLed('red', 'нужен анализ' + seqLabel);
+      } else if (stale) {
+        /* анализ есть, но для ДРУГОГО In/Out — для текущей области нужен заново */
+        toolsSetLed('red', 'нужен анализ' + seqLabel + ' (область сменилась)');
+      } else {
+        toolsSetLed(hasTranscript ? 'ok' : 'audio', 'анализ готов' + seqLabel);
+      }
       toolsUpdateCards(hasTranscript, hasAudio);
     }
     var _ledRefreshInFlight = false;

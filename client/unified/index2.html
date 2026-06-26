@@ -169,6 +169,24 @@
       }
       .tool-gate-btn:hover { background: #ffd75a; }
       .tool-run:disabled { opacity: 0.4; cursor: not-allowed; }
+
+      /* Плашка состояния аудио-анализа: 3 понятных состояния с цветом —
+         красная «нужен анализ», жёлтая «анализ идёт», зелёная «анализ готов». */
+      .tools-state {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        border: 1px solid transparent;
+        white-space: nowrap;
+      }
+      .tools-state .transcript-led { width: 8px; height: 8px; box-shadow: none; border: none; }
+      .tools-state--red { background: rgba(192, 57, 43, 0.14); border-color: rgba(192, 57, 43, 0.55); color: #e8897e; }
+      .tools-state--yellow { background: rgba(243, 156, 18, 0.15); border-color: rgba(243, 156, 18, 0.6); color: #f0b65a; }
+      .tools-state--green { background: rgba(34, 153, 84, 0.16); border-color: rgba(34, 153, 84, 0.62); color: #6ed79b; }
       .tool-card-title {
         font-size: 13px;
         font-weight: 600;
@@ -346,9 +364,9 @@
       <div class="view-panel" id="view-tools">
         <div class="tools-transcript-bar">
           <button type="button" data-action="audio-only-analyze" class="secondary" style="font-size:11px;padding:4px 8px;" title="Быстрый аудио-анализ без Whisper (~30 сек). Достаточно для «Убрать тишины» и «Jump cuts». Транскрипция (для семантического монтажа) — на вкладке «Чат».">⚡ Анализ аудио</button>
-          <span class="led-wrap">
+          <span class="led-wrap tools-state tools-state--red" id="tools-led-wrap" title="Состояние аудио-анализа активной секвенции">
             <span id="tools-led" class="transcript-led transcript-led--red"></span>
-            <span id="tools-led-text" style="font-size:10px;color:var(--muted);">нет</span>
+            <span id="tools-led-text">нужен анализ</span>
           </span>
           <span class="grow"></span>
         </div>
