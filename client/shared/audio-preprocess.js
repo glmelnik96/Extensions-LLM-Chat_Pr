@@ -186,13 +186,24 @@
    */
   function computeRmsTimeline(inputPath, opt) {
     opt = opt || {};
-    var win = typeof opt.windowSec === 'number' ? opt.windowSec : 0.5;
-    /* Печатаем ВСЕ Overall-метрики окна (без key-фильтра) — нужны и RMS_level
-       (для детекции тишин), и Peak_level (для waveform-визуала: пики показывают
-       структуру слов/пауз, как на таймлайне; RMS слишком сглажен). */
+    var win = typeof opt.windowSec === 'number' && opt.windowSec > 0 ? opt.windowSec : 0.5;
+    /* ОКНО задаём ЧЕРЕЗ asetnsamples, а НЕ через astats reset.
+       БАГ (до 26.06.2026): фильтр был `astats=...:reset=` + win, т.е. reset=0.025.
+       Параметр astats `reset` — это ЦЕЛОЕ ЧИСЛО КАДРОВ, а не секунды; ffmpeg
+       округляет 0.025 → 0 = reset ОТКЛЮЧЁН. Тогда Overall.RMS_level — это
+       КУМУЛЯТИВНОЕ среднее с начала файла (сходится к общему RMS и «застывает»),
+       а Overall.Peak_level — кумулятивный максимум (лестница вверх, потом полка).
+       Результат: waveform = почти плоская линия (интеграл сигнала, НЕ сам сигнал),
+       детекция тишин лупит по сошедшейся константе → «находит тишины не там» и
+       ползунки «ничего не меняют». ПРОВЕРЕНО ffmpeg'ом на реальном клипе.
+       ФИКС: aresample к фикс-частоте → asetnsamples=N (N = win*rate сэмплов на
+       окно) → astats reset=1 (сброс на КАЖДОМ окне) → Overall.* = метрики ИМЕННО
+       этого окна. Печатаем RMS_level (детекция) и Peak_level (waveform-структура). */
+    var RMS_RATE = 48000;
+    var nsamp = Math.max(1, Math.round(win * RMS_RATE));
     var args = [
       '-hide_banner', '-nostats', '-i', inputPath,
-      '-af', 'astats=metadata=1:reset=' + win + ',ametadata=print:file=-',
+      '-af', 'aresample=' + RMS_RATE + ',asetnsamples=' + nsamp + ':p=0,astats=metadata=1:reset=1,ametadata=print:file=-',
       '-f', 'null', '-'
     ];
     return runFfmpeg(args, 300000).then(function (res) {
