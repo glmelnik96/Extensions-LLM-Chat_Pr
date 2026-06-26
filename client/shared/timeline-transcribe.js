@@ -1074,12 +1074,14 @@
     if (prep.mode === 'clip_queue' && prep.items && prep.items.length) {
       var chunkList = [];
       var tempChunks = [];
+      var clipRangesQ = []; /* sequence-time границы каждого клипа → порог тишины по клипу */
       try {
         for (var qi = 0; qi < prep.items.length; qi++) {
           var it = prep.items[qi];
           if (!it || !it.path) continue;
           var span = it.workOutSec - it.workInSec;
           if (!(span > 0.05)) continue;
+          clipRangesQ.push({ startSec: it.workInSec, endSec: it.workOutSec });
           /* source-time старта региона: clipInPoint + (workIn - clipStart) — как в транскрибации */
           var srcStart = (it.clipInPointSec || 0) + (it.workInSec - (it.clipStartSec || 0));
           progress('Анализ аудио: клип ' + (qi + 1) + '/' + prep.items.length + '…');
@@ -1091,6 +1093,7 @@
         }
         if (!chunkList.length) throw new Error('Не удалось извлечь аудио из клипов In–Out');
         var aaq = await analyzeChunksInParallel(chunkList, progress, { wantRms: true, rmsWindowSec: 0.025 });
+        if (aaq && clipRangesQ.length > 1) aaq.clipRanges = clipRangesQ; /* >1 клип → пер-клиповый порог */
         return {
           segments: [],
           paragraphs: [],

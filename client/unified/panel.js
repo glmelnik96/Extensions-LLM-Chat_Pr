@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-tools-audit-v27'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-perclip-led-v28'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -4999,7 +4999,17 @@ PanelBoot.run('ИИ: монтаж', function () {
 
       var entry = await TimelineTranscribe.runAudioOnlyAnalysis(prep, function (msg) {
         statusUi.show(msg, true);
+        try { if (window.__toolsSetProgress) window.__toolsSetProgress(msg); } catch (eP) {}
       });
+
+      /* Запоминаем In/Out, для которого считали — чтобы Tools-LED показал «устарел»,
+         если монтажёр сдвинул область и анализ больше не соответствует. */
+      if (entry && entry.audioAnalysis) {
+        entry.audioAnalysis.analyzedRegion = {
+          inSec: (typeof snap.sequenceInSec === 'number') ? snap.sequenceInSec : null,
+          outSec: (typeof snap.sequenceOutSec === 'number') ? snap.sequenceOutSec : null
+        };
+      }
 
       /* Phase 1.6 (6 мая 2026, P0 #2): MERGE not REPLACE.
          Если уже есть полный транскрипт в кеше — НЕ затираем segments/paragraphs/text.
@@ -5188,16 +5198,39 @@ PanelBoot.run('ИИ: монтаж', function () {
         /* ЛИНИЯ ПОРОГА: уровень громкости, ниже которого аудио = тишина (срез).
            Симметрично от центра. Жёлтая пунктирная — двигается живьём за ползунком
            «Тише речи на». Где RMS-ядро ныряет под линию = красная зона. */
-        if (typeof opts.thresholdDb === 'number' && isFinite(opts.thresholdDb)) {
-          var ty = amp(opts.thresholdDb) * maxHalf;
+        var thrSegs = (opts.thresholdSegments && opts.thresholdSegments.length)
+          ? opts.thresholdSegments
+          : (typeof opts.thresholdDb === 'number' && isFinite(opts.thresholdDb)
+              ? [{ startSec: t0, endSec: t1, thresholdDb: opts.thresholdDb }] : null);
+        if (thrSegs) {
           ctx.strokeStyle = 'rgba(245,200,60,0.85)';
           ctx.lineWidth = 1;
           if (ctx.setLineDash) ctx.setLineDash([4, 3]);
           ctx.beginPath();
-          ctx.moveTo(0, mid - ty); ctx.lineTo(W, mid - ty);
-          ctx.moveTo(0, mid + ty); ctx.lineTo(W, mid + ty);
+          /* СТУПЕНЧАТАЯ линия порога: у каждого клипа свой уровень (пер-клиповый
+             порог при нескольких клипах разной громкости). Один сегмент =
+             прежняя сплошная горизонтальная линия. */
+          for (var ti = 0; ti < thrSegs.length; ti++) {
+            var sg = thrSegs[ti];
+            if (typeof sg.thresholdDb !== 'number' || !isFinite(sg.thresholdDb)) continue;
+            var x1 = Math.max(0, xOf(sg.startSec)), x2 = Math.min(W, xOf(sg.endSec));
+            if (!(x2 > x1)) continue;
+            var sty = amp(sg.thresholdDb) * maxHalf;
+            ctx.moveTo(x1, mid - sty); ctx.lineTo(x2, mid - sty);
+            ctx.moveTo(x1, mid + sty); ctx.lineTo(x2, mid + sty);
+          }
           ctx.stroke();
           if (ctx.setLineDash) ctx.setLineDash([]);
+          /* тонкие вертикальные границы между клипами */
+          if (thrSegs.length > 1) {
+            ctx.strokeStyle = 'rgba(245,200,60,0.22)';
+            ctx.beginPath();
+            for (var tv = 1; tv < thrSegs.length; tv++) {
+              var bx = xOf(thrSegs[tv].startSec);
+              if (bx > 0 && bx < W) { ctx.moveTo(bx, 0); ctx.lineTo(bx, H); }
+            }
+            ctx.stroke();
+          }
         }
 
         /* зоны выреза ПОВЕРХ — полупрозрачная заливка + чёткие красные края */
@@ -5252,9 +5285,20 @@ PanelBoot.run('ИИ: монтаж', function () {
         var marginDb = st.toolName === 'silences'
           ? ((typeof ud === 'number' && ud > 0) ? ud : 22)
           : 22;
-        var info = DeterministicPipelines.rmsThresholdInfo(st.rms, { marginDb: marginDb });
-        if (info) { drawOpts.thresholdDb = info.thresholdDb; toolsUpdateWaveLegend(info, st.toolName); }
-        else toolsUpdateWaveLegend(null, st.toolName);
+        /* Пер-клиповый порог: ступенчатая линия + ридаут по клипам. clipRanges
+           берутся из audioAnalysis (заполняются при «Анализ аудио» для >1 клипа). */
+        var clipRanges = st.entry.audioAnalysis && st.entry.audioAnalysis.clipRanges;
+        var segs = DeterministicPipelines.rmsThresholdSegments
+          ? DeterministicPipelines.rmsThresholdSegments(st.rms, clipRanges, { marginDb: marginDb })
+          : null;
+        if (segs && segs.length) {
+          drawOpts.thresholdSegments = segs;
+          toolsUpdateWaveLegend(segs, st.toolName);
+        } else {
+          var info = DeterministicPipelines.rmsThresholdInfo(st.rms, { marginDb: marginDb });
+          if (info) { drawOpts.thresholdDb = info.thresholdDb; toolsUpdateWaveLegend([info], st.toolName); }
+          else toolsUpdateWaveLegend(null, st.toolName);
+        }
       } else {
         toolsUpdateWaveLegend(null, st.toolName);
       }
@@ -5269,15 +5313,25 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     /* Числовой ридаут под waveform: уровень речи и порог среза (чтобы пользователь
        видел КОНКРЕТНЫЕ dB, а не только линию). */
-    function toolsUpdateWaveLegend(info, toolName) {
+    function toolsUpdateWaveLegend(segs, toolName) {
       var el = document.getElementById('wave-legend-' + toolName);
       if (!el) return;
-      if (info && typeof info.thresholdDb === 'number') {
+      if (!segs || !segs.length) { el.hidden = true; return; }
+      if (segs.length === 1) {
+        var info = segs[0];
+        if (typeof info.thresholdDb !== 'number') { el.hidden = true; return; }
         var ref = info.speechRefDb != null ? ('речь ≈ ' + Math.round(info.speechRefDb) + ' dB · ') : '';
         el.textContent = ref + 'порог среза ' + Math.round(info.thresholdDb) + ' dB';
         el.hidden = false;
       } else {
-        el.hidden = true;
+        /* несколько клипов — показываем диапазон порогов + что он пер-клиповый */
+        var lo = Infinity, hi = -Infinity;
+        for (var i = 0; i < segs.length; i++) {
+          var t = segs[i].thresholdDb;
+          if (typeof t === 'number' && isFinite(t)) { if (t < lo) lo = t; if (t > hi) hi = t; }
+        }
+        el.textContent = segs.length + ' клипа: порог по каждому ' + Math.round(lo) + '…' + Math.round(hi) + ' dB';
+        el.hidden = false;
       }
     }
 
@@ -5305,15 +5359,15 @@ PanelBoot.run('ИИ: монтаж', function () {
       toolsErr.style.display = t ? 'block' : 'none';
     }
 
-    function toolsSetLed(state) {
+    function toolsSetLed(state, text) {
       if (!toolsLed) return;
       /* P0-2 (10 июня 2026): третье состояние 'audio' (синий) — есть аудиоанализ
          без транскрипта: «Тишина» и «MultiCam» уже доступны. */
       toolsLed.className = 'transcript-led transcript-led--' +
         (state === 'ok' ? 'green' : state === 'busy' ? 'yellow' : state === 'audio' ? 'blue' : 'red');
       if (toolsLedText) {
-        toolsLedText.textContent =
-          state === 'ok' ? 'готов' : state === 'busy' ? 'идёт…' : state === 'audio' ? 'только аудио' : 'нет';
+        toolsLedText.textContent = text != null ? text :
+          (state === 'ok' ? 'готов' : state === 'busy' ? 'идёт…' : state === 'audio' ? 'только аудио' : 'нет');
       }
     }
 
@@ -5336,9 +5390,20 @@ PanelBoot.run('ИИ: монтаж', function () {
         window.toolsRefreshLed();
       } catch (e) {}
     });
-    /* Вычислить и показать LED/карточки для КОНКРЕТНОЙ секвенции. */
-    function _applyToolsLedForSeq(seqName) {
-      var hasTranscript = false, hasAudio = false;
+    /* Анализ устарел? — сравниваем In/Out, для которого считали анализ, с текущим
+       In/Out секвенции. Если монтажёр сдвинул область — анализ нужно обновить. */
+    function _regionStale(entry, snap) {
+      var ar = entry && entry.audioAnalysis && entry.audioAnalysis.analyzedRegion;
+      if (!ar || !snap || typeof snap !== 'object') return false;
+      function norm(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+      function near(a, b) { if (a === null && b === null) return true; if (a === null || b === null) return false; return Math.abs(a - b) <= 0.5; }
+      return !(near(norm(snap.sequenceInSec), norm(ar.inSec)) && near(norm(snap.sequenceOutSec), norm(ar.outSec)));
+    }
+    /* Вычислить и показать LED/карточки. Принимает СНИМОК (объект) — чтобы показать
+       имя секвенции и определить устаревание по In/Out. Строка = только имя (fallback). */
+    function _applyToolsLedForSeq(snap) {
+      var seqName = (snap && typeof snap === 'object') ? (snap.sequenceName || '') : (typeof snap === 'string' ? snap : '');
+      var hasTranscript = false, hasAudio = false, stale = false;
       try {
         if (seqName) {
           var f = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName);
@@ -5346,10 +5411,15 @@ PanelBoot.run('ИИ: монтаж', function () {
             hasTranscript = !!(f.entry.segments && f.entry.segments.length);
             /* P0-2: аудиоанализ (ffmpeg) без Whisper достаточен для «Тишины» */
             hasAudio = hasTranscript || !!f.entry.audioAnalysis;
+            if (hasAudio) stale = _regionStale(f.entry, snap);
           }
         }
       } catch (e) { /* findTranscriptEntry не должен падать */ }
-      toolsSetLed(hasTranscript ? 'ok' : hasAudio ? 'audio' : 'red');
+      var seqLabel = seqName ? ' · «' + seqName + '»' : '';
+      var staleSuffix = stale ? ' ⚠ обновите (In/Out)' : '';
+      if (hasTranscript) toolsSetLed('ok', 'готов' + seqLabel + staleSuffix);
+      else if (hasAudio) toolsSetLed('audio', 'аудио' + seqLabel + staleSuffix);
+      else toolsSetLed('red', 'нет анализа' + seqLabel);
       toolsUpdateCards(hasTranscript, hasAudio);
     }
     var _ledRefreshInFlight = false;
@@ -5366,10 +5436,17 @@ PanelBoot.run('ИИ: монтаж', function () {
       try {
         PremiereBridge.getTimelineSnapshot(function (err, snap) {
           _ledRefreshInFlight = false;
-          if (!err && snap && snap.ok) { lastSnap = snap; _snapDirty = false; _applyToolsLedForSeq(snap.sequenceName || ''); }
-          else _applyToolsLedForSeq((lastSnap && lastSnap.sequenceName) || '');
+          if (!err && snap && snap.ok) { lastSnap = snap; _snapDirty = false; _applyToolsLedForSeq(snap); }
+          else _applyToolsLedForSeq(lastSnap || '');
         });
-      } catch (e) { _ledRefreshInFlight = false; _applyToolsLedForSeq((lastSnap && lastSnap.sequenceName) || ''); }
+      } catch (e) { _ledRefreshInFlight = false; _applyToolsLedForSeq(lastSnap || ''); }
+    };
+    /* Прогресс «Анализ аудио» прямо в LED-тексте Tools-вкладки: счётчик клипов =
+       честный индикатор (клип 2/3), иначе «идёт…». Зовётся из onAudioOnlyAnalyze. */
+    window.__toolsSetProgress = function (msg) {
+      if (!_toolsBusy || !toolsLedText) return;
+      var m = String(msg || '').match(/клип\s+(\d+\/\d+)/);
+      toolsLedText.textContent = m ? ('идёт… клип ' + m[1]) : 'идёт…';
     };
     /* Busy-индикатор «Анализ аудио» именно на вкладке Инструменты (кнопка тут же).
        Раньше busy шёл только на Chat-LED — на Tools-вкладке было непонятно, идёт

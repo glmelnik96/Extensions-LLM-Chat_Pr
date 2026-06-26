@@ -353,6 +353,68 @@
     return { thresholdDb: speechRef - margin, speechRefDb: speechRef };
   }
 
+  /**
+   * rmsThresholdSegments — порог тишины ПО КАЖДОМУ КЛИПУ отдельно.
+   *
+   * Зачем: при нескольких клипах разной громкости в одном In–Out единый
+   * глобальный порог (P92 по всему региону) ломается — уровень речи тянет
+   * ГРОМКИЙ клип, и речь ТИХОГО клипа целиком уходит под порог = вырезается.
+   * Монтажёрский e2e-баг (найден 26.06.2026). Решение: для каждого клипа считаем
+   * свой P92 в его временных границах → свой порог. Линия порога на waveform
+   * становится ступенчатой (честно отражает разный уровень по клипам).
+   *
+   * clipRanges — массив {startSec, endSec} в sequence-time (из audioAnalysis.
+   * clipRanges, заполняется при «Анализ аудио»). Пустой/нет → один сегмент на
+   * весь регион (вырождается в прежнее глобальное поведение).
+   *
+   * @returns {Array<{startSec, endSec, thresholdDb, speechRefDb}>}
+   */
+  function rmsThresholdSegments(rmsTimeline, clipRanges, opts) {
+    opts = opts || {};
+    var margin = typeof opts.marginDb === 'number' ? opts.marginDb : 22;
+    var tl = Array.isArray(rmsTimeline) ? rmsTimeline : [];
+    if (!tl.length) return [];
+    var ranges = null;
+    if (Array.isArray(clipRanges) && clipRanges.length) {
+      ranges = [];
+      for (var c = 0; c < clipRanges.length; c++) {
+        var r = clipRanges[c];
+        if (r && typeof r.startSec === 'number' && typeof r.endSec === 'number' && r.endSec > r.startSec) {
+          ranges.push({ startSec: r.startSec, endSec: r.endSec });
+        }
+      }
+      ranges.sort(function (a, b) { return a.startSec - b.startSec; });
+    }
+    if (!ranges || !ranges.length) {
+      /* один сегмент на весь регион (+ε чтобы захватить последнее окно) */
+      ranges = [{ startSec: tl[0].t, endSec: tl[tl.length - 1].t + 0.001 }];
+    }
+    var out = [];
+    for (var i = 0; i < ranges.length; i++) {
+      var vals = [];
+      for (var k = 0; k < tl.length; k++) {
+        var p = tl[k];
+        if (p.t >= ranges[i].startSec && p.t < ranges[i].endSec) {
+          var rr = p.rms;
+          if (typeof rr === 'number' && isFinite(rr)) vals.push(rr);
+        }
+      }
+      if (typeof opts.thresholdDb === 'number') {
+        out.push({ startSec: ranges[i].startSec, endSec: ranges[i].endSec, thresholdDb: opts.thresholdDb, speechRefDb: null });
+        continue;
+      }
+      if (!vals.length) {
+        /* клип без сэмплов (тишина/-inf) — оставляем низкий порог, ничего не режем агрессивно */
+        out.push({ startSec: ranges[i].startSec, endSec: ranges[i].endSec, thresholdDb: -80, speechRefDb: null });
+        continue;
+      }
+      vals.sort(function (a, b) { return a - b; });
+      var speechRef = vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.92))];
+      out.push({ startSec: ranges[i].startSec, endSec: ranges[i].endSec, thresholdDb: speechRef - margin, speechRefDb: speechRef });
+    }
+    return out;
+  }
+
   function silenceIntervalsFromRms(rmsTimeline, opts) {
     opts = opts || {};
     var minDuration = typeof opts.minDuration === 'number' ? opts.minDuration : 1.0;
@@ -369,15 +431,20 @@
     dts.sort(function (a, b) { return a - b; });
     var frameDur = dts[Math.floor(dts.length / 2)] || 0.05;
 
-    /* Порог: абсолютный (thresholdDb) ИЛИ относительный от уровня речи региона. */
-    var thInfo = rmsThresholdInfo(tl, opts);
-    if (thInfo == null) return [];
-    var thr = thInfo.thresholdDb;
-    var relInfo = thInfo.speechRefDb != null ? (', речь≈' + Math.round(thInfo.speechRefDb) + ' dB') : '';
+    /* Порог ПО КАЖДОМУ КЛИПУ (или один сегмент на весь регион, если clipRanges нет).
+       Окно сравнивается с порогом ИМЕННО своего клипа — тихий клип не уходит под
+       порог громкого. */
+    var segs = rmsThresholdSegments(tl, opts.clipRanges, opts);
+    if (!segs.length) return [];
+    function segAt(t) {
+      for (var s = 0; s < segs.length; s++) { if (t >= segs[s].startSec && t < segs[s].endSec) return segs[s]; }
+      return segs[t < segs[0].startSec ? 0 : segs.length - 1];
+    }
 
     function isSilent(p) {
       var r = p && p.rms;
-      return r == null || !isFinite(r) || r < thr;
+      if (r == null || !isFinite(r)) return true;
+      return r < segAt(p.t).thresholdDb;
     }
 
     /* Склейка тихих сэмплов в runs. Допуск < frameDur — чтобы ОДИН речевой сэмпл
@@ -409,10 +476,12 @@
       var ss = runs[j].s + padding;
       var se = runs[j].e - padding;
       if (se - ss < 0.02) continue;
+      var rsg = segAt(runs[j].s);
+      var relInfo = rsg.speechRefDb != null ? (', речь≈' + Math.round(rsg.speechRefDb) + ' dB') : '';
       out.push({
         startSec: Math.round(ss * 1000) / 1000,
         endSec: Math.round(se * 1000) / 1000,
-        reason: 'тишина ' + dur.toFixed(2) + 'с (порог ' + Math.round(thr) + ' dB' + relInfo + ')'
+        reason: 'тишина ' + dur.toFixed(2) + 'с (порог ' + Math.round(rsg.thresholdDb) + ' dB' + relInfo + ')'
       });
     }
     return out;
@@ -463,7 +532,8 @@
       removeIntervals = silenceIntervalsFromRms(rmsTl, {
         marginDb: userDelta > 0 ? userDelta : 22,  /* относительный порог от уровня речи */
         minDuration: minDuration,
-        padding: padding
+        padding: padding,
+        clipRanges: entry.audioAnalysis && entry.audioAnalysis.clipRanges  /* порог по каждому клипу */
       });
     } else {
       removeIntervals = detectSilenceIntervals(entry, {
@@ -702,7 +772,8 @@
       removeIntervals = silenceIntervalsFromRms(rmsTl, {
         marginDb: 22,
         minDuration: maxPause,
-        padding: keepBreathing
+        padding: keepBreathing,
+        clipRanges: entry.audioAnalysis && entry.audioAnalysis.clipRanges  /* порог по каждому клипу */
       });
     } else {
       removeIntervals = detectSilenceIntervals(entry, {
@@ -1575,6 +1646,7 @@
     detectSilenceIntervals: detectSilenceIntervals,
     silenceIntervalsFromRms: silenceIntervalsFromRms,
     rmsThresholdInfo: rmsThresholdInfo,
+    rmsThresholdSegments: rmsThresholdSegments,
     parsePipelineCommand: parsePipelineCommand,
     snapIntervalsToFrame: snapIntervalsToFrame,
     _mergeIntervals: _mergeIntervals,

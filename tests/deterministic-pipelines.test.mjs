@@ -703,6 +703,53 @@ describe('DeterministicPipelines.rmsThresholdInfo (линия порога на 
   });
 });
 
+describe('DeterministicPipelines пер-клиповый порог (несколько клипов разной громкости)', () => {
+  /* e2e-баг монтажёра (26.06.2026): при нескольких клипах разной громкости в одном
+     In–Out единый глобальный порог тянул ГРОМКИЙ клип, и речь ТИХОГО клипа целиком
+     уходила под порог = вырезалась. Фикс: порог по каждому клипу (clipRanges). */
+  function mk2clip() {
+    // Клип A 0..10с: речь -20, пауза 4..6с=-55. Клип B 10..20с: речь -45, пауза 14..16с=-70.
+    const tl = [];
+    for (let t = 0; t < 20; t += 0.025) {
+      let rms;
+      if (t < 10) rms = (t >= 4 && t < 6) ? -55 : -20;
+      else rms = (t >= 14 && t < 16) ? -70 : -45;
+      tl.push({ t: Math.round(t * 1000) / 1000, rms });
+    }
+    return tl;
+  }
+  const clipRanges = [{ startSec: 0, endSec: 10 }, { startSec: 10, endSec: 20 }];
+
+  it('БЕЗ clipRanges (глобальный порог) — тихий клип B вырезается целиком (воспроизводит баг)', () => {
+    const out = DP.silenceIntervalsFromRms(mk2clip(), { marginDb: 22, minDuration: 1.0, padding: 0.15 });
+    const hasWholeClipCut = out.some((iv) => (iv.endSec - iv.startSec) > 7);
+    assert.equal(hasWholeClipCut, true, 'глобальный порог режет тихий клип целиком');
+  });
+
+  it('С clipRanges — режутся только реальные паузы каждого клипа', () => {
+    const out = DP.silenceIntervalsFromRms(mk2clip(), { marginDb: 22, minDuration: 1.0, padding: 0.15, clipRanges });
+    assert.equal(out.length, 2, 'две паузы (по одной на клип), не вырезанный клип');
+    // пауза клипа A ~4..6, клипа B ~14..16
+    assert.ok(out[0].startSec >= 3.9 && out[0].endSec <= 6.1, 'пауза A 4..6с');
+    assert.ok(out[1].startSec >= 13.9 && out[1].endSec <= 16.1, 'пауза B 14..16с');
+    out.forEach((iv) => assert.ok((iv.endSec - iv.startSec) < 3, 'ни один рез не покрывает целый клип'));
+  });
+
+  it('rmsThresholdSegments даёт свой порог на клип (громкий ≈-42, тихий ≈-67)', () => {
+    const segs = DP.rmsThresholdSegments(mk2clip(), clipRanges, { marginDb: 22 });
+    assert.equal(segs.length, 2);
+    assert.equal(Math.round(segs[0].speechRefDb), -20, 'клип A речь -20');
+    assert.equal(Math.round(segs[0].thresholdDb), -42, 'клип A порог -42');
+    assert.equal(Math.round(segs[1].speechRefDb), -45, 'клип B речь -45');
+    assert.equal(Math.round(segs[1].thresholdDb), -67, 'клип B порог -67');
+  });
+
+  it('без clipRanges rmsThresholdSegments вырождается в один глобальный сегмент', () => {
+    const segs = DP.rmsThresholdSegments(mk2clip(), null, { marginDb: 22 });
+    assert.equal(segs.length, 1, 'один сегмент на весь регион');
+  });
+});
+
 /* ═══════════════════════════════════════════════════════════════
  * chapterize
  * ═══════════════════════════════════════════════════════════════ */
