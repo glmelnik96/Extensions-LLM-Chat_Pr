@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-tools-seqguard-v21'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-tools-led-fresh-v22'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -76,7 +76,12 @@ PanelBoot.run('ИИ: монтаж', function () {
      Если пользователь или внешний скрипт изменил таймлайн — помечаем snapshot dirty. */
   try {
     cs.addEventListener('com.adobe.csxs.events.SequenceChanged', function () { _snapDirty = true; });
-    cs.addEventListener('com.adobe.csxs.events.ActiveSequenceChanged', function () { _snapDirty = true; });
+    cs.addEventListener('com.adobe.csxs.events.ActiveSequenceChanged', function () {
+      _snapDirty = true;
+      /* Смена активной секвенции: уведомляем вкладку Инструментов сбросить stale
+         waveform/proposal и пересчитать LED под новую секвенцию. */
+      try { document.dispatchEvent(new CustomEvent('omc:active-sequence-changed')); } catch (eAS) {}
+    });
   } catch (eEvt) { /* CEP events могут не работать в некоторых версиях — fallback: всегда dirty */ }
   /* { kind: 'transcript_cuts'|'timecode_edits'|'markers'|'audio_ducking'|'loudness',
        payload: ..., summary, createdAt, simulation? (для timecode), verification? (для transcript_cuts) } */
@@ -4968,6 +4973,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     var prep = null;
     statusUi.show('Подготовка аудио (быстрый режим)…', true);
     setTranscriptLed('busy');
+    try { if (window.__toolsSetBusy) window.__toolsSetBusy(true); } catch (eTB) {}
     try {
       prep = await new Promise(function (resolve, reject) {
         PremiereBridge.prepareTranscribeFromTimeline(
@@ -5044,6 +5050,9 @@ PanelBoot.run('ИИ: монтаж', function () {
       endOperation();
       setTranscribeButtonsDisabled(false);
       el.stop.disabled = true;
+      /* Снимаем busy: __toolsSetBusy(false) пересчитает Tools-LED под фактическое
+         состояние (ok/audio/red) свежей секвенции. */
+      try { if (window.__toolsSetBusy) window.__toolsSetBusy(false); } catch (eTB2) {}
     }
   }
   /* Кнопка подключается через querySelector — может быть в нескольких местах. */
@@ -5102,6 +5111,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     var toolsTranscribe = document.getElementById('tools-btn-transcribe');
     var _toolsProposal = null;
     var _toolsProposalArea = null;
+    var _toolsBusy = false; /* идёт «Анализ аудио» — держим LED busy, не перетираем */
 
     /* ── Waveform-превью (Phase 2) ─────────────────────────────
        Рисует RMS-огибающую региона In–Out и поверх — красные зоны вырезания.
@@ -5266,17 +5276,24 @@ PanelBoot.run('ИИ: монтаж', function () {
     document.addEventListener('omc:transcript-led-changed', function () {
       try { window.toolsRefreshLed(); } catch (e) {}
     });
-    window.toolsRefreshLed = function () {
-      var hasTranscript = false;
-      var hasAudio = false;
+    /* 19.06.2026: активная секвенция сменилась — состояние инструментов (waveform-
+       превью, proposal) относится к ПРЕЖНЕЙ секвенции. Сбрасываем, чтобы ползунки
+       не рисовали чужой waveform, а зависшая карточка не применилась к новой
+       секвенции. LED пересчитываем под новую активную. Диспатчится из внешнего
+       обработчика ActiveSequenceChanged. */
+    document.addEventListener('omc:active-sequence-changed', function () {
       try {
-        /* Try lastSnap first, then fall back to any cached transcript */
-        var seqName = (lastSnap && lastSnap.sequenceName) || '';
-        if (!seqName) {
-          /* No snapshot cached — check if there's any transcript at all */
-          var keys = ContextStore.listTranscriptCacheKeys(TRANSCRIPT_PID);
-          if (keys && keys.length) seqName = keys[0];
-        }
+        _waveState = null;
+        var ws = document.getElementById('wave-silences'); if (ws) ws.hidden = true;
+        var wj = document.getElementById('wave-jumps'); if (wj) wj.hidden = true;
+        toolsHideAllProposals();
+        window.toolsRefreshLed();
+      } catch (e) {}
+    });
+    /* Вычислить и показать LED/карточки для КОНКРЕТНОЙ секвенции. */
+    function _applyToolsLedForSeq(seqName) {
+      var hasTranscript = false, hasAudio = false;
+      try {
         if (seqName) {
           var f = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName);
           if (f && f.entry) {
@@ -5285,11 +5302,36 @@ PanelBoot.run('ИИ: монтаж', function () {
             hasAudio = hasTranscript || !!f.entry.audioAnalysis;
           }
         }
-      } catch (e) {
-        console.warn('[tools] LED refresh failed:', e && e.message);
-      }
+      } catch (e) { /* findTranscriptEntry не должен падать */ }
       toolsSetLed(hasTranscript ? 'ok' : hasAudio ? 'audio' : 'red');
       toolsUpdateCards(hasTranscript, hasAudio);
+    }
+    var _ledRefreshInFlight = false;
+    window.toolsRefreshLed = function () {
+      /* Во время «Анализ аудио» держим busy — не перетираем индикатор прогресса. */
+      if (_toolsBusy) { toolsSetLed('busy'); return; }
+      /* 19.06.2026 FIX: LED отражает АКТИВНУЮ секвенцию. ВСЕГДА запрашиваем свежий
+         снапшот — НЕ полагаемся на _snapDirty/lastSnap: CEP-событие
+         ActiveSequenceChanged ненадёжно («могут не работать»), при его пропуске LED
+         показывал состояние СТАРОЙ секвенции (или произвольной keys[0]). in-flight
+         guard защищает от наложения частых вызовов (tab-switch/события). */
+      if (_ledRefreshInFlight) return;
+      _ledRefreshInFlight = true;
+      try {
+        PremiereBridge.getTimelineSnapshot(function (err, snap) {
+          _ledRefreshInFlight = false;
+          if (!err && snap && snap.ok) { lastSnap = snap; _snapDirty = false; _applyToolsLedForSeq(snap.sequenceName || ''); }
+          else _applyToolsLedForSeq((lastSnap && lastSnap.sequenceName) || '');
+        });
+      } catch (e) { _ledRefreshInFlight = false; _applyToolsLedForSeq((lastSnap && lastSnap.sequenceName) || ''); }
+    };
+    /* Busy-индикатор «Анализ аудио» именно на вкладке Инструменты (кнопка тут же).
+       Раньше busy шёл только на Chat-LED — на Tools-вкладке было непонятно, идёт
+       анализ или нет. Вызывается из onAudioOnlyAnalyze (start/finally). */
+    window.__toolsSetBusy = function (on) {
+      _toolsBusy = !!on;
+      if (on) toolsSetLed('busy');
+      else window.toolsRefreshLed();
     };
 
     /* P0-2 (10 июня 2026): карточки по реальным требованиям пайплайнов.
