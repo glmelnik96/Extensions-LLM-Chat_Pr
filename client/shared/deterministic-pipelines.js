@@ -685,13 +685,33 @@
     var segs = entry.segments || [];
     var silences = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
 
-    /* R13: применяем тот же gating по threshold, что и cutSilences. */
-    var removeIntervals = detectSilenceIntervals(entry, {
-      minDuration: maxPause,
-      padding: keepBreathing,
-      source: 'gaps+ffmpeg'
-      /* thresholdDb опущен → detectSilenceIntervals использует silenceThresholdUsed из entry */
-    });
+    /* 26.06.2026: ЕДИНЫЙ детектор с «Убрать тишины» — silenceIntervalsFromRms по
+       RMS-таймлайну. Раньше jumpCuts шёл через detectSilenceIntervals (ffmpeg
+       silencedetect at silenceThresholdUsed≈-30) — ДРУГОЙ движок, чем «Тишины» и
+       чем сама waveform-волна на карточке. Последствия: (1) на тихих записях
+       порог -30 ловил >40% хронометража как «паузу» (over-aggressive — резал
+       речь); (2) красные зоны не совпадали с RMS-волной превью (тот же класс
+       «не там», что и в «Тишинах»). Теперь оба инструмента используют один
+       относительный порог (на marginDb тише уровня речи региона) → WYSIWYG и
+       консистентность. jumpCuts = «агрессивнее» за счёт меньших maxPause/дыхания,
+       НЕ за счёт более громкого порога. Fallback на detectSilenceIntervals, когда
+       RMS-таймлайна нет (старые кэши / транскрипт без аудио-анализа). */
+    var rmsTl = entry.audioAnalysis && entry.audioAnalysis.rmsTimeline;
+    var removeIntervals;
+    if (Array.isArray(rmsTl) && rmsTl.length > 1) {
+      removeIntervals = silenceIntervalsFromRms(rmsTl, {
+        marginDb: 22,
+        minDuration: maxPause,
+        padding: keepBreathing
+      });
+    } else {
+      removeIntervals = detectSilenceIntervals(entry, {
+        minDuration: maxPause,
+        padding: keepBreathing,
+        source: 'gaps+ffmpeg'
+        /* thresholdDb опущен → detectSilenceIntervals использует silenceThresholdUsed из entry */
+      });
+    }
 
     if (removeIntervals.length === 0) {
       return {

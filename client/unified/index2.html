@@ -136,8 +136,39 @@
         margin-bottom: 8px;
       }
       .tool-card.disabled {
-        opacity: 0.45;
+        opacity: 0.55;
       }
+      /* Гейт-подсказка: что нужно сделать, чтобы инструмент заработал, + действие.
+         Раньше gated-карточка только тускнела (opacity), а кнопка «Найти и
+         вырезать» оставалась кликабельной и выдавала сырую ошибку — отсюда
+         ощущение «кнопки бесполезны». Теперь карточка честно объясняет гейт. */
+      .tool-gate {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 6px 0 2px;
+        padding: 7px 9px;
+        font-size: 11px;
+        color: var(--muted);
+        background: rgba(245, 200, 60, 0.07);
+        border: 1px solid rgba(245, 200, 60, 0.30);
+        border-radius: 6px;
+      }
+      .tool-gate-msg { flex: 1; min-width: 0; }
+      .tool-gate-btn {
+        flex: none;
+        padding: 4px 10px;
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+        color: #11151b;
+        background: #f5c83c;
+        border: none;
+        border-radius: 5px;
+      }
+      .tool-gate-btn:hover { background: #ffd75a; }
+      .tool-run:disabled { opacity: 0.4; cursor: not-allowed; }
       .tool-card-title {
         font-size: 13px;
         font-weight: 600;
@@ -370,7 +401,9 @@
           </div>
 
           <!-- 3. Jump Cuts -->
-          <div class="tool-card needs-transcript" id="card-jumps">
+          <!-- 26.06.2026: needs-audio (НЕ needs-transcript) — jumpCuts работает по
+               RMS-таймлайну/silencedetect без Whisper, как «Тишины». -->
+          <div class="tool-card needs-audio" id="card-jumps">
             <div class="tool-card-title">⚡ Jump cuts</div>
             <div class="tool-card-desc">Ритм: агрессивно сжимает паузы, YouTube-стиль. Оставляет «дыхание» чтобы не звучало клиппированно.</div>
             <div class="param-row">
@@ -389,7 +422,8 @@
               <span class="param-val" id="jmp-minseg-val">0.3с</span>
             </div>
             <canvas class="tool-waveform" id="wave-jumps" height="72" hidden
-                    title="Waveform региона In–Out. Красным — что будет вырезано; двигайте ползунки — зоны обновляются вживую."></canvas>
+                    title="Waveform региона In–Out. Жёлтая линия — порог среза; красным — что будет вырезано; двигайте ползунки — зоны обновляются вживую."></canvas>
+            <div class="wave-legend" id="wave-legend-jumps" hidden></div>
             <button class="tool-run" data-tool="jumps">Найти и вырезать</button>
             <div class="proposal-area" id="proposal-jumps"></div>
           </div>

@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-waveform-realRMS-v26'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-06-19-tools-audit-v27'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -5244,10 +5244,17 @@ PanelBoot.run('ИИ: монтаж', function () {
          времени, не уровень dB). Тот же marginDb, что детектор → линия = реальный
          срез. */
       var drawOpts = { tStart: st.tStart, tEnd: st.tEnd };
-      if (st.toolName === 'silences' && DeterministicPipelines.rmsThresholdInfo) {
+      /* Линия порога — для «Тишины» И «Jump cuts»: оба теперь детектят по RMS с
+         относительным порогом (на marginDb тише уровня речи), значит линия = реальный
+         срез у обоих. «Тишины» дают margin ползунком, jumps — фикс. 22 dB. */
+      if (DeterministicPipelines.rmsThresholdInfo && (st.toolName === 'silences' || st.toolName === 'jumps')) {
         var ud = params.silenceThresholdDelta;
-        var info = DeterministicPipelines.rmsThresholdInfo(st.rms, { marginDb: (typeof ud === 'number' && ud > 0) ? ud : 22 });
+        var marginDb = st.toolName === 'silences'
+          ? ((typeof ud === 'number' && ud > 0) ? ud : 22)
+          : 22;
+        var info = DeterministicPipelines.rmsThresholdInfo(st.rms, { marginDb: marginDb });
         if (info) { drawOpts.thresholdDb = info.thresholdDb; toolsUpdateWaveLegend(info, st.toolName); }
+        else toolsUpdateWaveLegend(null, st.toolName);
       } else {
         toolsUpdateWaveLegend(null, st.toolName);
       }
@@ -5383,11 +5390,43 @@ PanelBoot.run('ИИ: монтаж', function () {
       for (i = 0; i < cards.length; i++) {
         if (hasTranscript) cards[i].classList.remove('disabled');
         else cards[i].classList.add('disabled');
+        _setCardGate(cards[i], !hasTranscript, 'transcript');
       }
       var audioCards = document.querySelectorAll('.tool-card.needs-audio');
       for (i = 0; i < audioCards.length; i++) {
         if (hasAudio) audioCards[i].classList.remove('disabled');
         else audioCards[i].classList.add('disabled');
+        _setCardGate(audioCards[i], !hasAudio, 'audio');
+      }
+    }
+
+    /* Гейт-подсказка на карточке: вместо немой 45%-прозрачности — явное «что
+       нужно» + кнопка действия. Блокируем «Найти и вырезать», пока гейт активен
+       (раньше кнопка кликалась и выдавала сырую ошибку → «кнопки бесполезны»). */
+    function _setCardGate(card, gated, kind) {
+      var runBtn = card.querySelector('.tool-run');
+      if (runBtn) runBtn.disabled = gated;
+      var gate = card.querySelector('.tool-gate');
+      if (!gated) { if (gate) gate.hidden = true; return; }
+      if (!gate) {
+        gate = document.createElement('div');
+        gate.className = 'tool-gate';
+        var msg = document.createElement('span'); msg.className = 'tool-gate-msg';
+        var btn = document.createElement('button'); btn.type = 'button'; btn.className = 'tool-gate-btn';
+        gate.appendChild(msg); gate.appendChild(btn);
+        card.insertBefore(gate, runBtn || null);
+      }
+      gate.hidden = false;
+      var msgEl = gate.querySelector('.tool-gate-msg');
+      var btnEl = gate.querySelector('.tool-gate-btn');
+      if (kind === 'audio') {
+        msgEl.textContent = 'Нужен аудио-анализ региона In–Out.';
+        btnEl.textContent = '⚡ Анализировать';
+        btnEl.onclick = function () { onAudioOnlyAnalyze(); };
+      } else {
+        msgEl.textContent = 'Нужна транскрипция (текстовый инструмент).';
+        btnEl.textContent = 'Перейти в Чат';
+        btnEl.onclick = function () { var t = document.querySelector('.view-tab[data-view="chat"]'); if (t) t.click(); };
       }
     }
 
