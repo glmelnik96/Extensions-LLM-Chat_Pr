@@ -4673,6 +4673,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         messages: apiMessages,
         tools: active.tools,
         toolExecutors: buildExecutorsForPreset(active),
+        /* M5: эти инструменты меняют таймлайн — agent-loop выполняет пачку
+           tool_calls с любым из них строго последовательно (не Promise.all). */
+        mutatingTools: ['apply_timecode_edits', 'apply_edit_plan', 'apply_transcript_cuts', 'add_markers'],
         maxSteps: settings.maxAgentSteps || 24,
         abortSignal: ac.signal,
         abortCheck: function () {

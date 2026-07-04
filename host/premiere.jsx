@@ -2067,6 +2067,12 @@ $._EXT_PRM_._exportInOutAsChunks = function (seq, preset, root, chunkSec, chunkE
   var savedOut = parseFloat(seq.getOutPoint());
   if (isNaN(savedIn)) savedIn = 0;
   if (isNaN(savedOut)) savedOut = 0;
+  /* M6 (аудит 04.07.2026): на некоторых сборках PP getInPoint()/getOutPoint()
+     возвращают мусорные гигантские значения (см. клампы в
+     prepareTranscribeFromTimeline). Без клампа savedOut=1e9 давал 500 чанков
+     «пустого» экспорта. Тот же порог 360000с (100ч). */
+  if (savedIn < 0 || savedIn > 360000) savedIn = 0;
+  if (savedOut < 0 || savedOut > 360000) savedOut = 0;
   if (savedOut <= savedIn + eps) {
     return { ok: false, error: 'NO_IN_OUT', code: 'NO_IN_OUT' };
   }

@@ -218,6 +218,17 @@
     var messages = opts.messages.slice();
     var tools = opts.tools;
     var toolExecutors = opts.toolExecutors;
+    /* M5 (аудит 04.07.2026): имена инструментов, меняющих таймлайн. Если модель
+       вернула несколько tool_calls и среди них есть мутирующий — выполняем ВСЕ
+       последовательно: ExtendScript однопоточный, а ripple-правки сдвигают
+       координаты, поэтому параллельный запуск двух apply_* даёт резы по уже
+       устаревшим таймкодам. Список передаёт панель; по умолчанию пусто. */
+    var mutatingTools = {};
+    if (opts.mutatingTools && opts.mutatingTools.length) {
+      for (var mti = 0; mti < opts.mutatingTools.length; mti++) {
+        mutatingTools[opts.mutatingTools[mti]] = true;
+      }
+    }
     var maxSteps =
       opts.maxSteps ||
       (settings && typeof settings.maxAgentSteps === 'number' ? settings.maxAgentSteps : 24);
@@ -346,42 +357,62 @@
         tool_calls: toolCalls
       });
 
-      /* ── Execute tool_calls (parallel if independent) ──────── */
-      var toolPromises = [];
+      /* ── Execute tool_calls ─────────────────────────────────── */
+      /* Собираем задачи-фабрики (не запускаем сразу): режим исполнения
+         зависит от наличия мутирующих инструментов в этой пачке. */
+      var toolTasks = [];
+      var hasMutating = false;
       for (var i = 0; i < toolCalls.length; i++) {
         throwIfAborted(signal, abortCheck);
         var tc = toolCalls[i];
         var fn = tc.function;
         var name = fn.name;
         var args = safeParseArgs(fn.arguments);
+        if (mutatingTools[name]) hasMutating = true;
 
         /* If JSON repair injected _parseError, report it as tool result */
         if (args._parseError) {
-          toolPromises.push(
-            _makeToolResult(tc.id, JSON.stringify({ error: args._parseError }))
-          );
+          toolTasks.push((function (tcId, perr) {
+            return function () { return _makeToolResult(tcId, JSON.stringify({ error: perr })); };
+          })(tc.id, args._parseError));
           continue;
         }
 
-        onStatus({
-          phase: 'tool',
-          name: name,
-          step: step,
-          maxSteps: maxSteps,
-          message: 'Шаг ' + step + '/' + maxSteps + ' · инструмент: ' + name
-        });
         var exec = toolExecutors[name];
         if (!exec) {
-          toolPromises.push(
-            _makeToolResult(tc.id, JSON.stringify({ error: 'Неизвестный инструмент: ' + name }))
-          );
+          toolTasks.push((function (tcId, n) {
+            return function () { return _makeToolResult(tcId, JSON.stringify({ error: 'Неизвестный инструмент: ' + n })); };
+          })(tc.id, name));
         } else {
-          toolPromises.push(_execTool(exec, args, tc.id));
+          toolTasks.push((function (ex, ar, tcId, n) {
+            return function () {
+              onStatus({
+                phase: 'tool',
+                name: n,
+                step: step,
+                maxSteps: maxSteps,
+                message: 'Шаг ' + step + '/' + maxSteps + ' · инструмент: ' + n
+              });
+              return _execTool(ex, ar, tcId);
+            };
+          })(exec, args, tc.id, name));
         }
       }
 
-      /* Parallel execution: all tool calls run concurrently */
-      var toolResults = await Promise.all(toolPromises);
+      var toolResults;
+      if (hasMutating && toolTasks.length > 1) {
+        /* M5: мутирующая операция в пачке → строго последовательно, в порядке
+           tool_calls. Промежуточные throwIfAborted: «Стоп» между операциями
+           не даёт запустить следующую правку таймлайна. */
+        toolResults = [];
+        for (var si = 0; si < toolTasks.length; si++) {
+          throwIfAborted(signal, abortCheck);
+          toolResults.push(await toolTasks[si]());
+        }
+      } else {
+        /* Только чтение/propose — параллельно, как раньше. */
+        toolResults = await Promise.all(toolTasks.map(function (t) { return t(); }));
+      }
       for (var ri = 0; ri < toolResults.length; ri++) {
         messages.push(toolResults[ri]);
       }

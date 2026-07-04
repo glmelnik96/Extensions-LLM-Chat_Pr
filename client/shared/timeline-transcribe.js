@@ -648,16 +648,17 @@
         progress('Файл ' + Math.round(szW / 1024 / 1024) + ' МБ > лимита — нарезаю через ffmpeg…');
         var chunkSecW = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
           ? settings.transcribeExportChunkSec : 90;
-        /* Определяем длительность файла. timelineOffsetSec = In, workOutSec может быть в prep */
-        var spanSecW = 0;
-        try {
-          var probeRes = await AudioPreprocess.analyzeLoudness(prep.path);
-          /* Длительность = из stderr Duration, но loudness не даёт напрямую.
-             Рассчитаем из размера файла (PCM 16kHz mono = 32000 bytes/sec). */
-        } catch (eP) {}
-        /* Надёжный расчёт: для PCM 16kHz mono WAV ~32000 B/s; для MP3 ~16000 B/s */
-        var estBytesPerSec = String(prep.path || '').match(/\.wav$/i) ? 32000 : 16000;
-        spanSecW = Math.max(30, Math.ceil(szW / estBytesPerSec));
+        /* M2 (аудит 04.07.2026): реальная длительность через ffmpeg Duration.
+           Старая байт-эвристика (WAV=32000 B/s) была верна только для
+           16kHz mono PCM, а WAV из Premiere-пресета — 48kHz stereo
+           (~192000 B/s) → длительность завышалась в 6 раз, чанки уходили
+           за EOF. Эвристика остаётся только как fallback при null. */
+        var spanSecW = (typeof global.AudioPreprocess !== 'undefined' && global.AudioPreprocess.probeDurationSec)
+          ? await global.AudioPreprocess.probeDurationSec(prep.path) : null;
+        if (!spanSecW) {
+          var estBytesPerSec = String(prep.path || '').match(/\.wav$/i) ? 32000 : 16000;
+          spanSecW = Math.max(30, Math.ceil(szW / estBytesPerSec));
+        }
         var ewChunks = await extractAudioChunksWithFfmpeg(prep.path, 0, spanSecW, chunkSecW, progress, chunkFmt);
         var combinedW = [];
         var textAccW = '';
@@ -804,9 +805,14 @@
         try {
           var directChunkPath = tempAudioPath(pathQ);
           await extractAudioWithFfmpeg(pathQ, directChunkPath);
+          /* M1 (аудит 04.07.2026): extractAudioWithFfmpeg извлекает ВЕСЬ исходник,
+             т.е. t=0 в чанке — это НАЧАЛО медиафайла, а не начало клипа.
+             Источник t → таймлайн: clipStartSec + (t − clipInPointSec).
+             Старый offset clipStartSec для подрезанного клипа (inPoint>0)
+             сдвигал все тишины на +clipInPointSec. */
           allChunksForAnalysis.push({
             path: directChunkPath,
-            timelineOffsetSec: it.clipStartSec || 0
+            timelineOffsetSec: (it.clipStartSec || 0) - (it.clipInPointSec || 0)
           });
         } catch (eDirectExtract) {}
       }
@@ -934,7 +940,11 @@
           progress('Аудио ' + Math.round(szM / 1024 / 1024) + ' МБ > лимита — дополнительная нарезка…');
           var chunkSecFB = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
             ? settings.transcribeExportChunkSec : 90;
-          var spanFB = Math.max(30, Math.ceil(szM / 32000));
+          /* M2 (аудит 04.07.2026): реальная длительность через ffmpeg Duration,
+             байт-эвристика 32000 B/s — только fallback (верна лишь для 16kHz mono PCM). */
+          var spanFB = (typeof global.AudioPreprocess !== 'undefined' && global.AudioPreprocess.probeDurationSec)
+            ? await global.AudioPreprocess.probeDurationSec(ffmpegTmpM) : null;
+          if (!spanFB) spanFB = Math.max(30, Math.ceil(szM / 32000));
           var fbChunks = await extractAudioChunksWithFfmpeg(ffmpegTmpM, 0, spanFB, chunkSecFB, progress, chunkFmt);
           try {
             var fbDone = 0;
@@ -974,7 +984,11 @@
               fbText += (fbNorm.text || '') + ' ';
             }
             var fbAA = null;
-            try { fbAA = await computeAudioPreprocess(ffmpegTmpM, prep.clipStartSec || 0, progress); } catch (eAFB) {}
+            /* M1 (аудит 04.07.2026): ffmpegTmpM — аудио ВСЕГО исходника (t=0 = начало
+               медиафайла). Источник t → таймлайн: clipStartSec + (t − clipInPointSec) —
+               та же формула, что в normalizeWhisperMediaFile. Старый offset clipStartSec
+               при подрезанном клипе сдвигал тишины на +clipInPointSec. */
+            try { fbAA = await computeAudioPreprocess(ffmpegTmpM, (prep.clipStartSec || 0) - (prep.clipInPointSec || 0), progress); } catch (eAFB) {}
             return {
               raw: { ffmpegChunks: fbChunks.length },
               segments: mergeSegmentLists([fbSegs]),
@@ -1006,9 +1020,11 @@
         prep.workOutSec
       );
       try {
-        /* Для media_file используем путь к исходнику (или tmp если был извлечён).
-           Смещение — clipStartSec, чтобы тишины были в координатах таймлайна. */
-        normM.audioAnalysis = await computeAudioPreprocess(actualPathM, prep.clipStartSec || 0, progress);
+        /* Для media_file используем путь к исходнику (или tmp если был извлечён) —
+           в обоих случаях t=0 = начало МЕДИАФАЙЛА, не клипа. M1 (аудит 04.07.2026):
+           источник t → таймлайн: clipStartSec + (t − clipInPointSec), поэтому offset
+           = clipStartSec − clipInPointSec (раньше clipInPointSec терялся). */
+        normM.audioAnalysis = await computeAudioPreprocess(actualPathM, (prep.clipStartSec || 0) - (prep.clipInPointSec || 0), progress);
       } catch (eAM) {}
       if (ffmpegTmpM) {
         try { if (typeof require !== 'undefined') require('fs').unlinkSync(ffmpegTmpM); } catch (eU2) {}

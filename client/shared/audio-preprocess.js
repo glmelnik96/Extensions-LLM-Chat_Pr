@@ -59,6 +59,14 @@
       var execFile = require('child_process').execFile;
       execFile(bin, args, { timeout: timeoutMs || 180000, maxBuffer: 32 * 1024 * 1024 },
         function (err, stdout, stderr) {
+          /* M3 (аудит 04.07.2026): kill по таймауту давал err.code === null и
+             непустой stderr → старое условие resolve'ило ЧАСТИЧНЫЙ результат как
+             успех (анализ «успешен», но найдена только часть тишин). Таймаут —
+             всегда ошибка. */
+          if (err && (err.killed || err.signal)) {
+            return reject(new Error('ffmpeg прерван по таймауту (' + (err.signal || 'kill') + ', лимит ' +
+              Math.round((timeoutMs || 180000) / 1000) + 'с) — результат неполный. Файл слишком длинный или диск занят.'));
+          }
           /* ffmpeg даже при "успехе" пишет метрики в stderr и иногда выходит с кодом 0.
              Также для -f null детектор выходит с кодом 0 и всей информацией в stderr. */
           var exitCode = (err && (err.code != null)) ? err.code : 0;
@@ -68,6 +76,24 @@
           resolve({ stdout: String(stdout || ''), stderr: String(stderr || ''), exitCode: exitCode });
         });
     });
+  }
+
+  /**
+   * Реальная длительность медиафайла в секундах (парс «Duration: HH:MM:SS.xx»
+   * из stderr ffmpeg). Замена байт-эвристикам вида size/32000: у WAV из
+   * Premiere-пресета (48kHz stereo) реальный битрейт ~192000 B/s — эвристика
+   * завышала длительность в 6 раз, чанки уходили за EOF (M2, аудит 04.07.2026).
+   * Возвращает Promise<number|null> — null, если ffmpeg не сообщил Duration.
+   */
+  function probeDurationSec(inputPath) {
+    /* Без выходного файла ffmpeg завершается с ошибкой, но Duration уже в stderr —
+       runFfmpeg резолвит, т.к. stderr непустой. */
+    return runFfmpeg(['-hide_banner', '-i', inputPath], 30000).then(function (res) {
+      var m = String(res.stderr || '').match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
+      if (!m) return null;
+      var sec = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+      return isFinite(sec) && sec > 0 ? Math.round(sec * 1000) / 1000 : null;
+    }).catch(function () { return null; });
   }
 
   /**
@@ -312,6 +338,7 @@
   global.AudioPreprocess = {
     hasNode: hasNode,
     findFfmpegPath: findFfmpegPath,
+    probeDurationSec: probeDurationSec,
     detectSilences: detectSilences,
     analyzeLoudness: analyzeLoudness,
     computeRmsTimeline: computeRmsTimeline,
