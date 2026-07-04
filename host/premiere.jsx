@@ -526,6 +526,10 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple, stat
   var qeAvailable = false;
   var qeSeq = null;
   try {
+    /* QE DOM появляется только после app.enableQE(). Без этого в свежей сессии
+       Premiere первый же вызов уходил в trim-fallback (Case 4 теряет правую
+       часть клипа при интервале в середине). См. аудит 04.07.2026, C1. */
+    if (typeof app.enableQE === 'function') app.enableQE();
     if (typeof qe !== 'undefined' && qe.project && typeof qe.project.getActiveSequence === 'function') {
       qeSeq = qe.project.getActiveSequence();
       if (qeSeq) qeAvailable = true;

@@ -85,8 +85,22 @@
       setTimeout(tryLoad, DELAYS[attempt]);
     },
 
-    evalJson: function (extendScriptExpr, callback) {
-      var TIMEOUT_MS = 30000; /* 30 секунд — защита от зависания ExtendScript */
+    /**
+     * opts (необязателен):
+     *   mutating:  true для операций, меняющих таймлайн. ExtendScript однопоточный
+     *              и отменить запущенную операцию нельзя — при таймауте она,
+     *              скорее всего, ещё выполняется. Поэтому: длинный таймаут по
+     *              умолчанию (120с) и сообщение «НЕ запускайте повторно» вместо
+     *              «попробуйте снова» (повтор = двойное применение резов по уже
+     *              сдвинутым координатам). См. аудит 04.07.2026, M4.
+     *   timeoutMs: явный таймаут в мс.
+     */
+    evalJson: function (extendScriptExpr, callback, opts) {
+      opts = opts || {};
+      var mutating = opts.mutating === true;
+      var TIMEOUT_MS = typeof opts.timeoutMs === 'number'
+        ? opts.timeoutMs
+        : (mutating ? 120000 : 30000);
       this.ensureHost(function (err) {
         if (err) {
           callback(err, null);
@@ -100,7 +114,9 @@
           try { callback(errArg, dataArg); } catch (cbErr) { /* callback сам отвечает за обработку */ }
         };
         var timer = setTimeout(function () {
-          finish(new Error('ExtendScript не ответил за ' + (TIMEOUT_MS / 1000) + 'с. Premiere может быть занят — попробуйте снова.'), null);
+          finish(new Error(mutating
+            ? 'ExtendScript не ответил за ' + (TIMEOUT_MS / 1000) + 'с, но операция могла продолжить выполняться в Premiere. НЕ запускайте её повторно: сначала проверьте таймлайн и при необходимости откатите через Edit → Undo.'
+            : 'ExtendScript не ответил за ' + (TIMEOUT_MS / 1000) + 'с. Premiere может быть занят — попробуйте снова.'), null);
         }, TIMEOUT_MS);
 
         /* Cold-start retry для evalJson: первая операция после загрузки JSX
@@ -111,7 +127,15 @@
         var DELAYS = [0, 250, 750];
         function tryEval() {
           cs.evalScript(extendScriptExpr, function (raw) {
-            if (state !== 'pending') return;
+            if (state !== 'pending') {
+              /* Поздний ответ после таймаута: операция в host всё же завершилась.
+                 Для мутирующих операций фиксируем это в консоли — важная улика,
+                 если пользователь сообщит о «двойных резах». */
+              if (state === 'timed_out') {
+                try { console.warn('[PremiereBridge] Host ответил ПОСЛЕ таймаута' + (mutating ? ' (мутирующая операция — таймлайн изменён!)' : '') + ': ' + String(raw).slice(0, 200)); } catch (eW) {}
+              }
+              return;
+            }
             var s = typeof raw === 'string' ? raw : String(raw);
             if (isColdStartGlitch(s)) {
               attempt++;
@@ -162,22 +186,22 @@
 
     applyTimecodeEdits: function (planObj, cb) {
       var json = escapeDoubleQuoted(JSON.stringify(planObj));
-      this.evalJson('$._EXT_PRM_.applyTimecodeEdits("' + json + '")', cb);
+      this.evalJson('$._EXT_PRM_.applyTimecodeEdits("' + json + '")', cb, { mutating: true });
     },
 
     applyMulticamCuts: function (planObj, cb) {
       var json = escapeDoubleQuoted(JSON.stringify(planObj));
-      this.evalJson('$._EXT_PRM_.applyMulticamCuts("' + json + '")', cb);
+      this.evalJson('$._EXT_PRM_.applyMulticamCuts("' + json + '")', cb, { mutating: true });
     },
 
     applyTranscriptCuts: function (cutsObj, cb) {
       var json = escapeDoubleQuoted(JSON.stringify(cutsObj));
-      this.evalJson('$._EXT_PRM_.applyTranscriptCuts("' + json + '")', cb);
+      this.evalJson('$._EXT_PRM_.applyTranscriptCuts("' + json + '")', cb, { mutating: true });
     },
 
     addSequenceMarkers: function (markersArr, cb) {
       var json = escapeDoubleQuoted(JSON.stringify(markersArr));
-      this.evalJson('$._EXT_PRM_.addSequenceMarkers("' + json + '")', cb);
+      this.evalJson('$._EXT_PRM_.addSequenceMarkers("' + json + '")', cb, { mutating: true });
     },
 
     /** extensionRoot, exportPresetPath, maxDirectTranscribeMediaSec */
@@ -195,7 +219,7 @@
     /** Удалить маркеры по списку секунд (откат для add_markers — Edit→Undo не работает по маркерам в PP 2025). */
     removeMarkersBySeconds: function (secondsArr, cb) {
       var json = escapeDoubleQuoted(JSON.stringify({ seconds: secondsArr || [] }));
-      this.evalJson('$._EXT_PRM_.removeMarkersBySeconds("' + json + '")', cb);
+      this.evalJson('$._EXT_PRM_.removeMarkersBySeconds("' + json + '")', cb, { mutating: true });
     },
 
     /** Импорт файла в проект (в bin "AI Renders" по умолчанию). */
@@ -207,7 +231,7 @@
     /** J-cut / L-cut automation. params: {offsetFrames, mode} */
     applyJCuts: function (params, cb) {
       var json = escapeDoubleQuoted(JSON.stringify(params || {}));
-      this.evalJson('$._EXT_PRM_.applyJCuts("' + json + '")', cb);
+      this.evalJson('$._EXT_PRM_.applyJCuts("' + json + '")', cb, { mutating: true });
     },
 
     /** B1-1: переместить плейхед активной секвенции (клик по таймкоду в карточке). */
