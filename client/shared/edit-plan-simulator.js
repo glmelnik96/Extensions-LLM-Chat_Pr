@@ -367,11 +367,7 @@
   global.EditPlanSimulator = {
     simulate: simulate,
     simulateUnified: simulateUnified,
-    normalizeUnifiedOp: normalizeUnifiedOp,
     normalizeUnifiedPlan: normalizeUnifiedPlan,
-    extractRippleIntervals: extractRippleIntervals,
-    _rippleDeleteRange: rippleDeleteRange,
-    _liftDeleteRange: liftDeleteRange,
-    _shiftRipple: shiftRipple
+    extractRippleIntervals: extractRippleIntervals
   };
 })(typeof window !== 'undefined' ? window : this);

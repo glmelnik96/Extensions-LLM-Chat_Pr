@@ -210,12 +210,6 @@
       this.evalJson('$._EXT_PRM_.applyJCuts("' + json + '")', cb);
     },
 
-    /** Получить mediaPath клипа на таймлайне по nodeId. */
-    getClipMediaPath: function (nodeId, cb) {
-      var s = String(nodeId).replace(/"/g, '\\"');
-      this.evalJson('$._EXT_PRM_.getClipMediaPath("' + s + '")', cb);
-    },
-
     /** B1-1: переместить плейхед активной секвенции (клик по таймкоду в карточке). */
     setPlayhead: function (timeSec, cb) {
       this.evalJson('$._EXT_PRM_.setPlayheadSec(' + Number(timeSec) + ')', cb);

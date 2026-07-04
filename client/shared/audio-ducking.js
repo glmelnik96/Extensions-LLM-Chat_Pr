@@ -119,32 +119,8 @@
     return Math.round(n * 1000) / 1000;
   }
 
-  /**
-   * Преобразует ducking-keyframes в список маркеров-подсказок (для пресета markers).
-   */
-  function keyframesAsMarkers(keyframes, opt) {
-    opt = opt || {};
-    var duckDb = opt.duckDb || -12;
-    var out = [];
-    for (var i = 0; i < keyframes.length; i++) {
-      var k = keyframes[i];
-      var isDuck = Math.abs(k.gainDb - duckDb) < 0.01;
-      if (k.gainDb === 0 && i > 0 && Math.abs(keyframes[i - 1].gainDb - duckDb) < 0.01) {
-        out.push({ timeSec: k.timeSec, name: '⬆ restore 0 dB', comment: 'audio ducking restore' });
-      } else if (isDuck && (i === 0 || Math.abs(keyframes[i - 1].gainDb) < 0.01)) {
-        out.push({
-          timeSec: k.timeSec,
-          name: '⬇ duck ' + duckDb + ' dB',
-          comment: 'audio ducking start'
-        });
-      }
-    }
-    return out;
-  }
-
   global.AudioDucking = {
     computeDucking: computeDucking,
-    computeLoudnessGain: computeLoudnessGain,
-    keyframesAsMarkers: keyframesAsMarkers
+    computeLoudnessGain: computeLoudnessGain
   };
 })(typeof window !== 'undefined' ? window : this);

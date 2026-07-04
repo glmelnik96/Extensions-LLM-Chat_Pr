@@ -215,8 +215,6 @@
 
   global.AudioRender = {
     renderDucking: renderDucking,
-    renderLoudnorm: renderLoudnorm,
-    _findFfmpeg: findFfmpeg,
-    _rendersDir: rendersDir
+    renderLoudnorm: renderLoudnorm
   };
 })(typeof window !== 'undefined' ? window : this);

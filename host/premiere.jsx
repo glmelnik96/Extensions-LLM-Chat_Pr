@@ -771,76 +771,6 @@ $._EXT_PRM_._findClipsByDisplayName = function (seq, clipName) {
 };
 
 /**
- * Сдвинуть вправо на deltaSec все клипы, пересекающие [rangeStart, rangeEnd),
- * кроме исключённых по nodeId (связка переносимого клипа). Сортировка справа налево.
- */
-$._EXT_PRM_._shiftClipsOverlappingRangeRight = function (seq, rangeStart, rangeEnd, deltaSec, excludeNodeIdSet) {
-  var eps = $._EXT_PRM_._EPS;
-  var items = [];
-  var vi,
-    ai,
-    j,
-    tr,
-    it,
-    n,
-    s,
-    e;
-  function pushClip(clip) {
-    var id = String(clip.nodeId);
-    if (excludeNodeIdSet[id]) return;
-    try {
-      s = clip.start.seconds;
-      e = clip.end.seconds;
-    } catch (e0) {
-      return;
-    }
-    if (e <= rangeStart + eps || s >= rangeEnd - eps) return;
-    if (s < rangeEnd - eps && e > rangeStart + eps) items.push(clip);
-  }
-  for (vi = 0; vi < seq.videoTracks.numTracks; vi++) {
-    tr = seq.videoTracks[vi];
-    n = tr.clips.numItems;
-    for (j = 0; j < n; j++) {
-      try {
-        it = tr.clips[j];
-        if (it) pushClip(it);
-      } catch (e1) {}
-    }
-  }
-  for (ai = 0; ai < seq.audioTracks.numTracks; ai++) {
-    tr = seq.audioTracks[ai];
-    n = tr.clips.numItems;
-    for (j = 0; j < n; j++) {
-      try {
-        it = tr.clips[j];
-        if (it) pushClip(it);
-      } catch (e2) {}
-    }
-  }
-  var scored = [];
-  for (var k = 0; k < items.length; k++) {
-    try {
-      scored.push({ clip: items[k], s: items[k].start.seconds });
-    } catch (e3) {}
-  }
-  scored.sort(function (a, b) {
-    return b.s - a.s;
-  });
-  var log = [];
-  for (var m = 0; m < scored.length; m++) {
-    var c = scored[m].clip;
-    try {
-      var ns = c.start.seconds + deltaSec;
-      var ne = c.end.seconds + deltaSec;
-      c.start.seconds = ns; $._EXT_PRM_._bump();
-      c.end.seconds = ne; $._EXT_PRM_._bump();
-      log.push({ nodeId: String(c.nodeId), newStartSec: ns, newEndSec: ne });
-    } catch (eMv) {}
-  }
-  return log;
-};
-
-/**
  * Ripple: сдвинуть вправо на deltaSec все клипы с start >= fromSec (кроме exclude по nodeId).
  * Порядок справа налево. Нужен для move_clip: иначе сдвиг только пересекающих [0,L] заводит длинный клип на соседний.
  * @returns {Array} лог { nodeId, newStartSec, newEndSec }
@@ -2550,39 +2480,6 @@ $._EXT_PRM_.importMediaFile = function (jsonArg) {
 };
 
 /**
- * Получить mediaPath клипа по nodeId (быстрый lookup без полного снимка).
- */
-$._EXT_PRM_.getClipMediaPath = function (nodeId) {
-  try {
-    if (!app.project || !app.project.activeSequence) {
-      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
-    }
-    var seq = app.project.activeSequence;
-    var found = $._EXT_PRM_._findClipByNodeId(seq, nodeId);
-    if (!found) return JSON.stringify({ ok: false, error: 'Клип не найден: ' + nodeId });
-    var clip = found.clip;
-    var pi = clip.projectItem;
-    var mp = '';
-    try {
-      if (pi && typeof pi.getMediaPath === 'function') mp = String(pi.getMediaPath() || '');
-      else if (pi && pi.mediaPath) mp = String(pi.mediaPath);
-    } catch (eGP) {}
-    if (!mp) return JSON.stringify({ ok: false, error: 'У клипа нет mediaPath (вложенная секвенция/генератор)' });
-    return JSON.stringify({
-      ok: true,
-      mediaPath: mp.replace(/\\/g, '/'),
-      name: clip.name || '',
-      startSec: clip.start.seconds,
-      endSec: clip.end.seconds,
-      inPointSec: clip.inPoint ? clip.inPoint.seconds : 0,
-      outPointSec: clip.outPoint ? clip.outPoint.seconds : null
-    });
-  } catch (e) {
-    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
-  }
-};
-
-/**
  * B1-1 (2026-06-11): переместить плейхед активной секвенции на заданную секунду.
  * Используется кликабельными таймкодами в карточках предложений панели.
  */
@@ -2917,7 +2814,6 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     'prepareTranscribeFromTimeline',
     'removeMarkersBySeconds',
     'importMediaFile',
-    'getClipMediaPath',
     'applyMulticamCuts',
     'setPlayheadSec',
     'backupActiveSequence',

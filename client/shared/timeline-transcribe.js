@@ -499,33 +499,11 @@
   }
 
   /**
-   * Универсальный вызов одного аудио-файла через выбранный бэкенд.
+   * Вызов облачного Whisper (Cloud.ru) для одного аудио-файла.
    * Возвращает объект в формате Whisper verbose_json: { segments:[{start,end,text}], text }.
-   *
-   * settings.transcribeBackend:
-   *   'whisper.cpp' — локальный whisper.cpp (WhisperCppClient). Не имеет лимита
-   *                   на размер; для .mov/.mp4 всё равно нужен промежуточный WAV
-   *                   (вызывающий код делает это через ffmpeg).
-   *   'cloud'       — облачный CloudRuClient.transcribeAudio. Лимит ~20 МБ.
+   * Лимит upload ~20 МБ; длинные диапазоны режутся на чанки вызывающим кодом.
    */
   async function backendTranscribe(settings, opts) {
-    var backend = (settings && settings.transcribeBackend) || 'cloud';
-    var onProgress = opts && opts.onProgress;
-    if (backend === 'whisper.cpp') {
-      if (typeof global.WhisperCppClient === 'undefined') {
-        throw new Error('WhisperCppClient не загружен (проверь script в index.html).');
-      }
-      return global.WhisperCppClient.transcribeFile({
-        filePath: opts.path,
-        binPath: settings.whisperCppBin || '',
-        modelPath: settings.whisperCppModel || '',
-        language: settings.whisperCppLanguage || 'ru',
-        threads: settings.whisperCppThreads || 0,
-        extraArgs: Array.isArray(settings.whisperCppExtraArgs) ? settings.whisperCppExtraArgs : [],
-        signal: opts.signal,
-        onProgress: onProgress
-      });
-    }
     /* Облачный путь — multipart через CloudRuClient */
     var CC = opts.CloudRuClient;
     if (!CC) throw new Error('CloudRuClient не передан в backendTranscribe');
@@ -578,19 +556,14 @@
     var abortCheck = opt.abortCheck;
     var progress = typeof opt.onProgress === 'function' ? opt.onProgress : function () {};
     var CC = opt.CloudRuClient || global.CloudRuClient;
-    var backend = settings.transcribeBackend || 'cloud';
-    var isLocal = backend === 'whisper.cpp';
-    /* Для локального бэкенда размер файла не ограничен — ставим заведомо большой лимит. */
-    var maxBytes = isLocal
-      ? Number.POSITIVE_INFINITY
-      : (typeof settings.maxTranscribeUploadBytes === 'number' && !isNaN(settings.maxTranscribeUploadBytes)
-          ? settings.maxTranscribeUploadBytes
-          : 24 * 1024 * 1024);
-    if (progress) progress('Бэкенд транскрибации: ' + backend + (isLocal ? ' (локально, оффлайн)' : ' (Cloud.ru)'));
+    var maxBytes = typeof settings.maxTranscribeUploadBytes === 'number' && !isNaN(settings.maxTranscribeUploadBytes)
+      ? settings.maxTranscribeUploadBytes
+      : 24 * 1024 * 1024;
+    if (progress) progress('Бэкенд транскрибации: Cloud.ru');
 
-    /* Формат ffmpeg-чанков: cloud → mp3 (меньше upload, см. fm-defaults
-       transcribeChunkFormat), whisper.cpp → всегда wav (whisper-cli ждёт PCM). */
-    var chunkFmt = isLocal ? 'wav' : (settings.transcribeChunkFormat === 'wav' ? 'wav' : 'mp3');
+    /* Формат ffmpeg-чанков: mp3 по умолчанию (меньше upload, см. fm-defaults
+       transcribeChunkFormat). */
+    var chunkFmt = settings.transcribeChunkFormat === 'wav' ? 'wav' : 'mp3';
 
     function beforeAwait() {
       throwIfAborted(signal, abortCheck);
@@ -949,9 +922,7 @@
       var szM = szPre;
       var actualPathM = prep.path;
       var ffmpegTmpM = null;
-      /* Для whisper.cpp видео-контейнеры (.mov/.mp4) не принимаются — всегда извлекаем. */
-      var needExtractForLocal = isLocal && !isAudioExt(prep.path);
-      if (szM > maxBytes || needExtractForLocal) {
+      if (szM > maxBytes) {
         progress('Извлечение аудио через ffmpeg…');
         ffmpegTmpM = tempAudioPath(prep.path);
         beforeAwait();

@@ -152,42 +152,11 @@
      */
     fastModel: 'zai-org/GLM-4.7',
 
-    /** Whisper для облачной транскрибации */
+    /**
+     * Whisper для облачной транскрибации (Cloud.ru Foundation Models).
+     * Лимит ~20 МБ на файл; длинные диапазоны автоматически режутся через ffmpeg.
+     */
     whisperModel: 'openai/whisper-large-v3',
-
-    /**
-     * Бэкенд транскрибации:
-     *   'whisper.cpp' — локальный whisper.cpp (бесплатно, без 413, оффлайн).
-     *                   Требует установленный бинарник whisper-cli и модель ggml-*.bin.
-     *   'cloud'       — облачный Whisper через cloud.ru Foundation Models.
-     *                   Лимит ~20 МБ на файл; длинные диапазоны автоматически
-     *                   режутся через ffmpeg.
-     * По умолчанию используем локальный бэкенд.
-     */
-    transcribeBackend: 'cloud',
-
-    /**
-     * Абсолютный путь к whisper-cli. Пусто — автопоиск:
-     *   ~/whisper.cpp/build/bin/whisper-cli, /opt/homebrew/bin/whisper-cli, ...
-     * Явно прописать стоит, если бинарник лежит в нестандартной директории.
-     */
-    whisperCppBin: '',
-
-    /**
-     * Абсолютный путь к модели ggml-*.bin. Пусто — автопоиск:
-     *   ~/whisper.cpp/models/ggml-medium.bin (приоритет), затем large-v3, small, base.
-     * Рекомендуем medium для русского (1.5 GB, хороший компромисс качества/скорости).
-     */
-    whisperCppModel: '',
-
-    /** Язык распознавания для whisper.cpp. 'auto' — автоопределение. */
-    whisperCppLanguage: 'ru',
-
-    /** Число потоков whisper-cli (0 — default самого whisper.cpp). */
-    whisperCppThreads: 0,
-
-    /** Дополнительные флаги whisper-cli (array строк). Например ['-bs','5','-bo','5']. */
-    whisperCppExtraArgs: [],
 
     /**
      * Сдвиг таймкодов (сек) — для старых сценариев; при транскрибации In–Out смещение берётся из секвенции.

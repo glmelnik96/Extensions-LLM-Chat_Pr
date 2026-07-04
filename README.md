@@ -312,7 +312,6 @@ npm test   # 463 тестов: валидаторы, pipelines, prompts, search,
 │       ├── analysis-routing.js    — выбор модели под задачу
 │       ├── audio-ducking.js       — план приглушения музыки под речь
 │       ├── audio-render.js        — экспорт аудио секвенции через .epr
-│       ├── whisper-cpp-client.js  — локальный whisper.cpp (fallback)
 │       ├── youtube-export.js      — главы → описание YouTube
 │       ├── markdown-lite.js       — безопасный рендер markdown в чате
 │       ├── conversation-starters.js / starters-ui.js — стартовые подсказки чата

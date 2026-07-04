@@ -100,7 +100,7 @@
 │  │ • context-store.js    — кэш транскриптов  │ │
 │  │ • conversation-starters.js — 6 стартеров   │ │
 │  │ • youtube-export.js   — chapters formatter │ │
-│  │ • timeline-transcribe.js, whisper-cpp-client│ │
+│  │ • timeline-transcribe.js — Whisper Cloud.ru│ │
 │  │ • audio-preprocess.js, audio-render.js     │ │
 │  │ • multicam-plan.js, ui-status.js, ui-hints.js│
 │  └────────────────────┬───────────────────────┘ │

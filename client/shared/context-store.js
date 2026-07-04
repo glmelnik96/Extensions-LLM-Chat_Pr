@@ -276,18 +276,6 @@
         maxTranscribeUploadBytes:
           typeof maxUp === 'number' && !isNaN(maxUp) ? maxUp : 20971520,
         exportChunkExtension: chunkExt,
-        /* Локальный бэкенд транскрибации (whisper.cpp). */
-        transcribeBackend: String(d.transcribeBackend || 'cloud'),
-        whisperCppBin: String(d.whisperCppBin || '').trim(),
-        whisperCppModel: String(d.whisperCppModel || '').trim(),
-        whisperCppLanguage: String(d.whisperCppLanguage || 'ru').trim(),
-        whisperCppThreads:
-          typeof d.whisperCppThreads === 'number' && d.whisperCppThreads >= 0
-            ? d.whisperCppThreads
-            : 0,
-        whisperCppExtraArgs: Array.isArray(d.whisperCppExtraArgs)
-          ? d.whisperCppExtraArgs.slice()
-          : [],
         maxChatHistoryMessages:
           typeof d.maxChatHistoryMessages === 'number' && d.maxChatHistoryMessages > 0
             ? d.maxChatHistoryMessages
