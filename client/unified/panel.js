@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-07-04-gate-v31'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-07-04-ripple-v33'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -4070,6 +4070,10 @@ PanelBoot.run('ИИ: монтаж', function () {
           showErr('Открыта бэкап-секвенция «' + (dataB.name || u.backupName || '') +
             '» — состояние до монтажа. Изменённая версия осталась в проекте.');
           ContextStore.clearLastUndoCount(active.panelId);
+          /* Аудит 04.07.2026: CEP-событие ActiveSequenceChanged ненадёжно —
+             после отката вручную сбрасываем tools-состояние (waveform/proposal
+             от ПРЕЖНЕЙ секвенции) тем же слушателем. */
+          try { document.dispatchEvent(new CustomEvent('omc:active-sequence-changed')); } catch (eEvU) {}
           refreshUndoButton();
           setTimeout(function () { showErr(''); }, 5000);
         });
@@ -5200,7 +5204,13 @@ PanelBoot.run('ИИ: монтаж', function () {
         var maxLin = 0;
         for (var mm = 0; mm < W; mm++) { var lpk = dbToLin(colPeak[mm]); if (lpk > maxLin) maxLin = lpk; }
         if (!(maxLin > 0)) return;
-        function amp(db) { var v = dbToLin(db) / maxLin; if (v < 0) v = 0; else if (v > 1) v = 1; return v; }
+        /* Аудит 04.07.2026: перцептивная шкала (γ=0.4) вместо чисто линейной.
+           В линейной порог −40…−63 dB = 0.1–0.7% высоты → жёлтая линия прилипала
+           к центру и НЕ двигалась за ползунком (визуально «не работает»).
+           Степень 0.4 растягивает низ (порог на 4–14px от центра, ход ползунка
+           виден), но структура сохраняется: тишина ~2px, дыхание ~7px,
+           речь 20–36px — «монолит» чистой dB-шкалы не возвращается. */
+        function amp(db) { var v = dbToLin(db) / maxLin; if (v < 0) v = 0; else if (v > 1) v = 1; return Math.pow(v, 0.4); }
 
         /* центральная линия */
         ctx.strokeStyle = 'rgba(255,255,255,0.08)';
@@ -5442,6 +5452,21 @@ PanelBoot.run('ИИ: монтаж', function () {
         _waveState = null;
         var ws = document.getElementById('wave-silences'); if (ws) ws.hidden = true;
         var wj = document.getElementById('wave-jumps'); if (wj) wj.hidden = true;
+        toolsHideAllProposals();
+        window.toolsRefreshLed();
+      } catch (e) {}
+    });
+    /* Аудит 04.07.2026: координаты транскрипта/анализа рипплнулись (apply тишин/
+       филлеров/jump cuts из ЛЮБОЙ вкладки — ContextStore диспатчит). Waveform и
+       proposal построены в СТАРЫХ координатах — прячем; LED пересчитает гейты
+       (audioAnalysis при ripple сбрасывается — нужен новый «Анализ аудио»). */
+    document.addEventListener('omc:transcript-rippled', function () {
+      try {
+        _waveState = null;
+        var ws2 = document.getElementById('wave-silences'); if (ws2) ws2.hidden = true;
+        var wj2 = document.getElementById('wave-jumps'); if (wj2) wj2.hidden = true;
+        var ls2 = document.getElementById('wave-legend-silences'); if (ls2) ls2.hidden = true;
+        var lj2 = document.getElementById('wave-legend-jumps'); if (lj2) lj2.hidden = true;
         toolsHideAllProposals();
         window.toolsRefreshLed();
       } catch (e) {}

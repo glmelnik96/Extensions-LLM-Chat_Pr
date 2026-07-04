@@ -180,6 +180,17 @@
     }
   }
 
+  /* Аудит 04.07.2026: единая точка «координаты транскрипта сдвинулись» (ripple/
+     unknown shift) — UI (waveform-превью, proposal-карточки, LED) подписывается
+     и сбрасывает своё состояние. Guard: в node-тестах document нет. */
+  function notifyTranscriptShifted() {
+    try {
+      if (typeof document !== 'undefined' && typeof CustomEvent === 'function') {
+        document.dispatchEvent(new CustomEvent('omc:transcript-rippled'));
+      }
+    } catch (e) {}
+  }
+
   function normSeqKey(s) {
     return String(s || '')
       .trim()
@@ -414,6 +425,20 @@
       }
       var entry = shallowCopy(found.entry);
       entry.segments = newSegs;
+      /* Аудит 04.07.2026: audioAnalysis (rmsTimeline/silences) НЕ ремапится —
+         после ripple его координаты смещены, а карточки «Тишина»/«Jump cuts»
+         оставались активными и следующий прогон резал бы по СТАРЫМ таймкодам.
+         Честно инвалидируем: гейт попросит новый «Анализ аудио» (30 сек). */
+      delete entry.audioAnalysis;
+      /* analyzedRegion транскрипта сдвигаем той же математикой, что сегменты:
+         In/Out в Premiere ripple тоже смещает, транскрипт остаётся валидным. */
+      if (entry.analyzedRegion) {
+        var arIn = entry.analyzedRegion.inSec, arOut = entry.analyzedRegion.outSec;
+        entry.analyzedRegion = {
+          inSec: (typeof arIn === 'number' && isFinite(arIn)) ? Math.round((arIn - shiftBefore(arIn)) * 1000) / 1000 : null,
+          outSec: (typeof arOut === 'number' && isFinite(arOut)) ? Math.round((arOut - shiftBefore(arOut)) * 1000) / 1000 : null
+        };
+      }
       entry.editHistory = Array.isArray(found.entry.editHistory) ? found.entry.editHistory.slice() : [];
       entry.editHistory.push({
         at: Date.now(),
@@ -424,6 +449,7 @@
       var map = this.getTranscriptCache(panelId);
       map[found.matchedKey] = entry;
       this.setTranscriptCache(panelId, map);
+      notifyTranscriptShifted();
       return true;
     },
 
@@ -435,6 +461,9 @@
       var found = this.findTranscriptEntry(panelId, sequenceKey);
       if (!found || !found.entry) return false;
       var entry = shallowCopy(found.entry);
+      /* Аудит 04.07.2026: сдвиг неизвестен → координаты rmsTimeline/silences
+         невалидны, честно требуем новый «Анализ аудио». */
+      delete entry.audioAnalysis;
       entry.editHistory = Array.isArray(found.entry.editHistory) ? found.entry.editHistory.slice() : [];
       entry.editHistory.push({ at: Date.now(), kind: 'unknown_shift', reason: String(reason || '') });
       entry.editedAfterTranscribe = true;
@@ -442,6 +471,7 @@
       var map = this.getTranscriptCache(panelId);
       map[found.matchedKey] = entry;
       this.setTranscriptCache(panelId, map);
+      notifyTranscriptShifted();
       return true;
     },
 
