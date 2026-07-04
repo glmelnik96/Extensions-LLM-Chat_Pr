@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-07-04-ui-wave-v30'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-07-04-gate-v31'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -4796,6 +4796,14 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
   }
 
+  /* In/Out из снапшота: Premiere возвращает -400000 как сентинел «точка не
+     задана» (getInPoint/getOutPoint), parseFloat его пропускает. Нормализуем
+     в null, чтобы analyzedRegion и сравнение «область сменилась» не путали
+     сентинел с реальным таймкодом. */
+  function normInOutSec(v) {
+    return (typeof v === 'number' && isFinite(v) && v >= 0) ? v : null;
+  }
+
   async function onTranscribeTimeline() {
     if (!beginOperation('transcribe')) return;
     showErr('');
@@ -4860,6 +4868,18 @@ PanelBoot.run('ИИ: монтаж', function () {
           TranscriptStructure.buildStructure(norm, { pauseThresholdSec: 0.9, maxParagraphSec: 60 });
         }
       } catch (eStr) {}
+      /* Аудит 04.07.2026: полная транскрибация тоже запоминает In/Out, для
+         которого считалась — иначе детект «область сменилась» работал только
+         после быстрого «⚡ Анализа аудио», а после полной транскрибации LED
+         вечно показывал «анализ готов» для любой области. */
+      try {
+        var regionT = {
+          inSec: normInOutSec(snap.sequenceInSec),
+          outSec: normInOutSec(snap.sequenceOutSec)
+        };
+        if (norm.audioAnalysis) norm.audioAnalysis.analyzedRegion = regionT;
+        norm.analyzedRegion = regionT;
+      } catch (eAR) {}
       ContextStore.setTranscriptEntry(TRANSCRIPT_PID, key, norm);
 
       try {
@@ -5014,8 +5034,8 @@ PanelBoot.run('ИИ: монтаж', function () {
          если монтажёр сдвинул область и анализ больше не соответствует. */
       if (entry && entry.audioAnalysis) {
         entry.audioAnalysis.analyzedRegion = {
-          inSec: (typeof snap.sequenceInSec === 'number') ? snap.sequenceInSec : null,
-          outSec: (typeof snap.sequenceOutSec === 'number') ? snap.sequenceOutSec : null
+          inSec: normInOutSec(snap.sequenceInSec),
+          outSec: normInOutSec(snap.sequenceOutSec)
         };
       }
 
@@ -5402,6 +5422,16 @@ PanelBoot.run('ИИ: монтаж', function () {
     document.addEventListener('omc:transcript-led-changed', function () {
       try { window.toolsRefreshLed(); } catch (e) {}
     });
+    /* Аудит 04.07.2026: смена In/Out в таймлайне НЕ шлёт CEP-событий — пока
+       вкладка «Инструменты» открыта, LED/гейты не пересчитывались вовсе
+       (только tab-switch). Триггер «монтажёр вернулся в панель» = focus окна:
+       подвинул In/Out → кликнул в панель → состояние честно пересчиталось. */
+    window.addEventListener('focus', function () {
+      try {
+        var vt = document.getElementById('view-tools');
+        if (vt && vt.classList.contains('active')) window.toolsRefreshLed();
+      } catch (e) {}
+    });
     /* 19.06.2026: активная секвенция сменилась — состояние инструментов (waveform-
        превью, proposal) относится к ПРЕЖНЕЙ секвенции. Сбрасываем, чтобы ползунки
        не рисовали чужой waveform, а зависшая карточка не применилась к новой
@@ -5419,11 +5449,11 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* Анализ устарел? — сравниваем In/Out, для которого считали анализ, с текущим
        In/Out секвенции. Если монтажёр сдвинул область — анализ нужно обновить. */
     function _regionStale(entry, snap) {
-      var ar = entry && entry.audioAnalysis && entry.audioAnalysis.analyzedRegion;
+      var ar = entry && ((entry.audioAnalysis && entry.audioAnalysis.analyzedRegion) || entry.analyzedRegion);
       if (!ar || !snap || typeof snap !== 'object') return false;
-      function norm(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+      /* normInOutSec: -400000-сентинел «In/Out не задан» → null с обеих сторон */
       function near(a, b) { if (a === null && b === null) return true; if (a === null || b === null) return false; return Math.abs(a - b) <= 0.5; }
-      return !(near(norm(snap.sequenceInSec), norm(ar.inSec)) && near(norm(snap.sequenceOutSec), norm(ar.outSec)));
+      return !(near(normInOutSec(snap.sequenceInSec), normInOutSec(ar.inSec)) && near(normInOutSec(snap.sequenceOutSec), normInOutSec(ar.outSec)));
     }
     /* Вычислить и показать LED/карточки. Принимает СНИМОК (объект) — чтобы показать
        имя секвенции и определить устаревание по In/Out. Строка = только имя (fallback). */
@@ -5450,7 +5480,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       } else {
         toolsSetLed(hasTranscript ? 'ok' : 'audio', 'анализ готов' + seqLabel);
       }
-      toolsUpdateCards(hasTranscript, hasAudio);
+      toolsUpdateCards(hasTranscript, hasAudio, stale);
     }
     var _ledRefreshInFlight = false;
     window.toolsRefreshLed = function () {
@@ -5491,26 +5521,31 @@ PanelBoot.run('ИИ: монтаж', function () {
        .needs-transcript — нужны Whisper-сегменты (паразиты, jump cuts, главы);
        .needs-audio — достаточно audioAnalysis ИЛИ транскрипта («Тишина»);
        MultiCam без класса — ему нужен только снимок таймлайна + ffmpeg. */
-    function toolsUpdateCards(hasTranscript, hasAudio) {
-      var i;
+    function toolsUpdateCards(hasTranscript, hasAudio, stale) {
+      /* Аудит 04.07.2026: stale («область In–Out сменилась») теперь БЛОКИРУЕТ
+         карточки, а не только красит LED — раньше LED говорил «нужен анализ»,
+         но кнопки оставались живыми и резали по СТАРОЙ области. */
+      var i, gated;
       var cards = document.querySelectorAll('.tool-card.needs-transcript');
       for (i = 0; i < cards.length; i++) {
-        if (hasTranscript) cards[i].classList.remove('disabled');
-        else cards[i].classList.add('disabled');
-        _setCardGate(cards[i], !hasTranscript, 'transcript');
+        gated = !hasTranscript || stale;
+        if (gated) cards[i].classList.add('disabled');
+        else cards[i].classList.remove('disabled');
+        _setCardGate(cards[i], gated, 'transcript', hasTranscript && stale);
       }
       var audioCards = document.querySelectorAll('.tool-card.needs-audio');
       for (i = 0; i < audioCards.length; i++) {
-        if (hasAudio) audioCards[i].classList.remove('disabled');
-        else audioCards[i].classList.add('disabled');
-        _setCardGate(audioCards[i], !hasAudio, 'audio');
+        gated = !hasAudio || stale;
+        if (gated) audioCards[i].classList.add('disabled');
+        else audioCards[i].classList.remove('disabled');
+        _setCardGate(audioCards[i], gated, 'audio', hasAudio && stale);
       }
     }
 
     /* Гейт-подсказка на карточке: вместо немой 45%-прозрачности — явное «что
        нужно» + кнопка действия. Блокируем «Найти и вырезать», пока гейт активен
        (раньше кнопка кликалась и выдавала сырую ошибку → «кнопки бесполезны»). */
-    function _setCardGate(card, gated, kind) {
+    function _setCardGate(card, gated, kind, stale) {
       var runBtn = card.querySelector('.tool-run');
       if (runBtn) runBtn.disabled = gated;
       var gate = card.querySelector('.tool-gate');
@@ -5527,11 +5562,16 @@ PanelBoot.run('ИИ: монтаж', function () {
       var msgEl = gate.querySelector('.tool-gate-msg');
       var btnEl = gate.querySelector('.tool-gate-btn');
       if (kind === 'audio') {
-        msgEl.textContent = 'Нужен аудио-анализ региона In–Out.';
-        btnEl.textContent = '⚡ Анализировать';
+        /* stale: анализ есть, но для другого In/Out — просим обновить, не «нужен» */
+        msgEl.textContent = stale
+          ? 'Область In–Out изменилась — анализ был для другой области.'
+          : 'Нужен аудио-анализ региона In–Out.';
+        btnEl.textContent = stale ? '⚡ Обновить анализ' : '⚡ Анализировать';
         btnEl.onclick = function () { onAudioOnlyAnalyze(); };
       } else {
-        msgEl.textContent = 'Нужна транскрипция (текстовый инструмент).';
+        msgEl.textContent = stale
+          ? 'Область In–Out изменилась — транскрипт был для другой области.'
+          : 'Нужна транскрипция (текстовый инструмент).';
         btnEl.textContent = 'Перейти в Чат';
         btnEl.onclick = function () { var t = document.querySelector('.view-tab[data-view="chat"]'); if (t) t.click(); };
       }
