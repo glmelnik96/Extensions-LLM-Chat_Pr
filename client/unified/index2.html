@@ -25,7 +25,7 @@
         text-align: center;
       }
       .view-tab:hover { color: var(--text); background: rgba(255,255,255,0.03); }
-      .view-tab.active { color: #6cb6ff; border-bottom-color: #6cb6ff; }
+      .view-tab.active { color: var(--accent-text); border-bottom-color: var(--accent-text); }
 
       .view-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
       .view-panel.active { display: flex; }
@@ -102,7 +102,7 @@
         white-space: nowrap;
       }
       .starters-cat-btn:hover { background: rgba(255,255,255,0.04); color: var(--text); }
-      .starters-cat-btn.active { color: #6cb6ff; border-bottom-color: #6cb6ff; }
+      .starters-cat-btn.active { color: var(--accent-text); border-bottom-color: var(--accent-text); }
 
       /* ── Tools panel styles ─────────────────────────────────────── */
       .tools-transcript-bar {
@@ -183,7 +183,9 @@
         border: 1px solid transparent;
         white-space: nowrap;
       }
-      .tools-state .transcript-led { width: 8px; height: 8px; box-shadow: none; border: none; }
+      /* UI-аудит 04.07.2026: LED единого размера (11px из styles.css) во всех
+         местах — раньше в плашке был 8px, выглядело как два разных индикатора. */
+      .tools-state .transcript-led { box-shadow: none; border: none; }
       .tools-state--red { background: rgba(192, 57, 43, 0.14); border-color: rgba(192, 57, 43, 0.55); color: #e8897e; }
       .tools-state--yellow { background: rgba(243, 156, 18, 0.15); border-color: rgba(243, 156, 18, 0.6); color: #f0b65a; }
       .tools-state--green { background: rgba(34, 153, 84, 0.16); border-color: rgba(34, 153, 84, 0.62); color: #6ed79b; }
@@ -276,8 +278,8 @@
       .proposal-area {
         margin-top: 8px;
         padding: 8px;
-        background: #1a2a1a;
-        border: 1px solid #3fb950;
+        background: var(--success-bg);
+        border: 1px solid var(--success-border);
         border-radius: 6px;
         font-size: 11px;
         display: none;
@@ -299,7 +301,7 @@
         border: none;
         cursor: pointer;
       }
-      .btn-apply { background: #3fb950; color: #000; }
+      .btn-apply { background: var(--success-text); color: #000; }
       .btn-cancel { background: #555; color: #fff; }
     </style>
   </head>
@@ -379,19 +381,19 @@
           <div class="tool-card needs-audio" id="card-silences">
             <div class="tool-card-title">🔇 Убрать тишины</div>
             <div class="tool-card-desc">Гигиена звука: убирает явные паузы ≥1с, сохраняет естественный ритм речи.</div>
-            <div class="param-row">
+            <div class="param-row" title="Паузы короче этого значения не трогаем. Меньше = агрессивнее (вырезаются и короткие паузы)">
               <span class="param-label">Мин. длительность</span>
               <input type="range" id="sil-min" min="0.3" max="3.0" step="0.1" value="1.0" />
               <span class="param-val" id="sil-min-val">1.0с</span>
             </div>
             <!-- P1-1: честная подпись — значение НЕ абсолютный dBFS-порог,
                  а дельта от измеренной громкости речи (порог = inputI − N dB) -->
-            <div class="param-row" title="Тишина = всё, что на N dB тише средней громкости речи (порог адаптируется к записи автоматически)">
+            <div class="param-row" title="Тишина = всё, что на N dB тише средней громкости речи (порог адаптируется к записи автоматически). Больше = осторожнее (тишиной считается только совсем тихое)">
               <span class="param-label">Тише речи на</span>
               <input type="range" id="sil-thresh" min="3" max="30" step="1" value="18" />
               <span class="param-val" id="sil-thresh-val">18 dB</span>
             </div>
-            <div class="param-row">
+            <div class="param-row" title="Отступ от границ тишины: сколько оставить до/после реза, чтобы не обрезать начало или хвост слова">
               <span class="param-label">Padding</span>
               <input type="range" id="sil-pad" min="0" max="0.5" step="0.05" value="0.15" />
               <span class="param-val" id="sil-pad-val">0.15с</span>
@@ -424,17 +426,17 @@
           <div class="tool-card needs-audio" id="card-jumps">
             <div class="tool-card-title">⚡ Jump cuts</div>
             <div class="tool-card-desc">Ритм: агрессивно сжимает паузы, YouTube-стиль. Оставляет «дыхание» чтобы не звучало клиппированно.</div>
-            <div class="param-row">
+            <div class="param-row" title="Паузы длиннее этого сжимаются. Меньше = агрессивнее (плотнее ритм)">
               <span class="param-label">Макс. пауза</span>
               <input type="range" id="jmp-pause" min="0.1" max="2.0" step="0.05" value="0.5" />
               <span class="param-val" id="jmp-pause-val">0.5с</span>
             </div>
-            <div class="param-row">
+            <div class="param-row" title="Сколько паузы оставить после сжатия — чтобы монтаж не звучал клиппированно. 0 = встык">
               <span class="param-label">Дыхание</span>
               <input type="range" id="jmp-breath" min="0" max="0.2" step="0.01" value="0.05" />
               <span class="param-val" id="jmp-breath-val">50мс</span>
             </div>
-            <div class="param-row">
+            <div class="param-row" title="Речевые кусочки короче этого не оставляем отдельными «огрызками» — рез пропускается">
               <span class="param-label">Мин. сегмент</span>
               <input type="range" id="jmp-minseg" min="0" max="1.0" step="0.05" value="0.3" />
               <span class="param-val" id="jmp-minseg-val">0.3с</span>
@@ -450,7 +452,7 @@
           <div class="tool-card needs-transcript" id="card-chapters">
             <div class="tool-card-title">📑 Авто-главы</div>
             <div class="tool-card-desc">Маркеры-главы по темам. 1 вызов LLM если темы не в кэше.</div>
-            <div class="param-row">
+            <div class="param-row" title="0 = авто: модель сама решает, сколько тем в материале">
               <span class="param-label">Кол-во глав</span>
               <input type="range" id="ch-count" min="0" max="20" step="1" value="0" />
               <span class="param-val" id="ch-count-val">авто</span>
@@ -490,27 +492,27 @@
               </select>
               <button type="button" id="mc-preset-save" class="secondary" style="padding:2px 8px;" title="Сохранить текущие слайдеры как «Мой пресет»">💾</button>
             </div>
-            <div class="param-row">
+            <div class="param-row" title="Минимальная длительность одного плана. Меньше = чаще переключения камер">
               <span class="param-label">Мин. план</span>
               <input type="range" id="mc-minhold" min="0.5" max="4" step="0.1" value="1.5" />
               <span class="param-val" id="mc-minhold-val">1.5с</span>
             </div>
-            <div class="param-row">
+            <div class="param-row" title="Если один спикер говорит дольше — принудительно перебиваем общим планом, чтобы картинка не застывала">
               <span class="param-label">Макс. план</span>
               <input type="range" id="mc-maxhold" min="3" max="15" step="0.5" value="8" />
               <span class="param-val" id="mc-maxhold-val">8с</span>
             </div>
-            <div class="param-row">
+            <div class="param-row" title="Насколько микрофон должен быть громче остальных, чтобы «взять» план. Больше = реже переключения, устойчивее к перебиваниям">
               <span class="param-label">Порог лидера</span>
               <input type="range" id="mc-margin" min="3" max="12" step="1" value="6" />
               <span class="param-val" id="mc-margin-val">6 dB</span>
             </div>
-            <div class="param-row">
+            <div class="param-row" title="Тише этого уровня микрофон считается молчащим (никто не говорит → общий план). Ползунок вправо = порог ниже (строже)">
               <span class="param-label">Порог тишины</span>
               <input type="range" id="mc-silence" min="20" max="50" step="1" value="35" />
               <span class="param-val" id="mc-silence-val">-35 dB</span>
             </div>
-            <div class="param-row">
+            <div class="param-row" title="Случайный разброс длительности планов, чтобы нарезка не выглядела механически ровной. 0 = выкл">
               <span class="param-label">Вариативность</span>
               <input type="range" id="mc-jitter" min="0" max="0.5" step="0.05" value="0" />
               <span class="param-val" id="mc-jitter-val">выкл</span>

@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-06-19-state-badge-v29'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-07-04-ui-wave-v30'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -4706,9 +4706,14 @@ PanelBoot.run('ИИ: монтаж', function () {
       renderMessages(ContextStore.getMessages(panelId));
     } catch (e) {
       statusUi.hide();
-      if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1))
+      if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1)) {
         showErr('Остановлено (запрос к API FM прерван).');
-      else showErr(String(e.message || e));
+      } else {
+        /* UI-аудит 04.07.2026: сырой «401 Unauthorized» без подсказки —
+           поток поддержки. _classifyError даёт actionable-hint (ключ/сеть/лимиты). */
+        var clsChat = _classifyError(e);
+        showErr(String(e.message || e), clsChat.hint ? { hint: clsChat.hint } : undefined);
+      }
     } finally {
       removeStreamBubble(); /* успех → renderMessages уже всё показал; ошибка → не оставляем «печатает…» */
       if (runAbort === ac) runAbort = null;
@@ -5320,11 +5325,14 @@ PanelBoot.run('ИИ: монтаж', function () {
       var el = document.getElementById('wave-legend-' + toolName);
       if (!el) return;
       if (!segs || !segs.length) { el.hidden = true; return; }
+      /* UI-аудит 04.07.2026: цветовой ключ — без него жёлтая линия и красные
+         зоны на canvas оставались загадкой (title видно только по hover). */
+      var COLOR_KEY = ' · ─ жёлтая: порог · ▮ красное: вырезается';
       if (segs.length === 1) {
         var info = segs[0];
         if (typeof info.thresholdDb !== 'number') { el.hidden = true; return; }
         var ref = info.speechRefDb != null ? ('речь ≈ ' + Math.round(info.speechRefDb) + ' dB · ') : '';
-        el.textContent = ref + 'порог среза ' + Math.round(info.thresholdDb) + ' dB';
+        el.textContent = ref + 'порог среза ' + Math.round(info.thresholdDb) + ' dB' + COLOR_KEY;
         el.hidden = false;
       } else {
         /* несколько клипов — показываем диапазон порогов + что он пер-клиповый */
@@ -5333,7 +5341,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           var t = segs[i].thresholdDb;
           if (typeof t === 'number' && isFinite(t)) { if (t < lo) lo = t; if (t > hi) hi = t; }
         }
-        el.textContent = segs.length + ' клипа: порог по каждому ' + Math.round(lo) + '…' + Math.round(hi) + ' dB';
+        el.textContent = segs.length + ' клипа: порог по каждому ' + Math.round(lo) + '…' + Math.round(hi) + ' dB' + COLOR_KEY;
         el.hidden = false;
       }
     }
@@ -5358,8 +5366,17 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     function toolsShowErr(t) {
       if (!toolsErr) return;
-      toolsErr.textContent = t || '';
-      toolsErr.style.display = t ? 'block' : 'none';
+      var msg = t || '';
+      /* UI-аудит 04.07.2026: actionable-подсказка вместо сырого текста ошибки
+         (тот же классификатор, что в чате: ключ / сеть / лимиты API). */
+      if (msg) {
+        try {
+          var clsT = _classifyError(msg);
+          if (clsT.hint && msg.indexOf(clsT.hint) === -1) msg += ' — ' + clsT.hint;
+        } catch (eC) {}
+      }
+      toolsErr.textContent = msg;
+      toolsErr.style.display = msg ? 'block' : 'none';
     }
 
     var toolsLedWrap = document.getElementById('tools-led-wrap');
