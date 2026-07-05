@@ -5,7 +5,7 @@
  * Соответствие API (см. официальный Scripting Guide):
  * - getTimelineSnapshot: Sequence.videoTracks/audioTracks → TrackItem.start/end/inPoint/outPoint, nodeId
  * - applyTimecodeEdits: TrackItem.remove(ripple, align) — ripple-delete; in/out через присвоение .seconds
- * - ripple_delete_range: split средней части клипа через Track.insertClip(projectItem, time, …) + подгонка in/out
+ * - ripple_delete_range: QE razor на границах + remove(ripple,1) средних фрагментов; insertClip НЕ используется (создавал дубликаты)
  * - applyTranscriptCuts: тот же механизм вырезания интервалов
  * - addSequenceMarkers: createMarker(String(Math.round(sec * timebase))); lift/ripple через remove(0|1,1)
  * - move_clip: по умолчанию ripple-insert (все start >= newStartSec += dur), затем установка клипа; shift_timeline_ripple

@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-07-05-selfcorr-v36'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-07-05-montage-plan-v37'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -61,6 +61,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   }
   var _activeSystemAddon = null;
   var _pendingProposal = null;
+  var _pendingPlanContext = null;
   var _keepInvertWarning = null;
   var _transcriptCheckpoints = {}; /* backupId → {key, entry} снимок транскрипта до apply (для отката) */
   /* Safety-guard (18.06.2026): прямой apply_* без карточки разрешён ТОЛЬКО если
@@ -671,6 +672,49 @@ PanelBoot.run('ИИ: монтаж', function () {
             summary: { type: 'string' }
           },
           required: ['summary']
+        }
+      }
+    },
+    {
+      type: 'function',
+      'function': {
+        name: 'propose_montage_plan',
+        description:
+          'План монтажа по смыслам: сократить материал до целевого хронометража. ' +
+          'Блоки keep/cut покрывают ВСЕ абзацы транскрипта ровно по одному разу. ' +
+          'Плагин сам считает длительности по абзацам (не считай секунды вручную), ' +
+          'валидирует попадание в цель ±10% и показывает пользователю карточку плана на подтверждение. ' +
+          'Используй для запросов «сожми до N минут», «сократи сохранив суть», «собери по смыслу». ' +
+          'Требуется транскрипт (get_transcript_structure).',
+        parameters: {
+          type: 'object',
+          properties: {
+            sequenceKey: { type: 'string', description: 'Имя секвенции (sequenceName из снимка)' },
+            targetDurationSec: { type: 'number', description: 'Целевой хронометраж в секундах, > 0' },
+            blocks: {
+              type: 'array',
+              description: 'Блоки плана в хронологическом порядке. Каждый абзац транскрипта — ровно в одном блоке.',
+              items: {
+                type: 'object',
+                properties: {
+                  action: { type: 'string', enum: ['keep', 'cut'] },
+                  paragraphs: {
+                    type: 'object',
+                    properties: {
+                      from: { type: 'integer', description: 'Первый абзац блока (индекс i)' },
+                      to: { type: 'integer', description: 'Последний абзац блока включительно' }
+                    },
+                    required: ['from', 'to']
+                  },
+                  theme: { type: 'string', description: 'Для keep: тема/роль блока в драматургии (3-6 слов)' },
+                  reason: { type: 'string', description: 'Для cut: почему вырезаем (повтор / вода / слабый кусок / офтоп + уточнение)' }
+                },
+                required: ['action', 'paragraphs']
+              }
+            },
+            summary: { type: 'string', description: '1-2 предложения: что получится' }
+          },
+          required: ['sequenceKey', 'targetDurationSec', 'blocks', 'summary']
         }
       }
     },
@@ -2023,11 +2067,151 @@ PanelBoot.run('ИИ: монтаж', function () {
       return null;
     }
 
+    /* ── Task 4 (5 июля 2026): секция плана монтажа ──────────────── */
+    var _hasPlan = Array.isArray(_pendingProposal.planBlocks) && _pendingProposal.planBlocks.length > 0;
+    if (_hasPlan) {
+      var pb = _pendingProposal.planBlocks;
+      var ps = _pendingProposal.planStats || {};
+      var ks = _pendingProposal.keepSummary || [];
+      var rs = _pendingProposal.removeSummary || [];
+
+      /* Заголовок */
+      var planHdr = document.createElement('div');
+      planHdr.style.cssText = 'font-size:12px;font-weight:600;margin-bottom:6px;';
+      planHdr.textContent = '\uD83D\uDCCB План монтажа (' + pb.length + ' блоков)';
+      card.appendChild(planHdr);
+
+      /* Строка итога с target-badge логикой */
+      var planTotalSec = (ps.keepSec || 0) + (ps.cutSec || 0);
+      var planKeepSec = ps.keepSec || 0;
+      var planTargetSec = ps.targetSec || 0;
+      var planSummaryEl = document.createElement('div');
+      planSummaryEl.style.cssText = 'font-size:12px;margin-bottom:8px;';
+      /* Пороги плана: ±10% ok / ±20% warn — совпадают с допуском валидатора
+         MontagePlan (TOLERANCE=0.10), осознанно отличаются от верхнего
+         target-badge (тот односторонний: ≤+5% ok / ≤+20% warn). Валидный
+         план всегда в пределах ±10%, так что здесь почти всегда ok. */
+      var planVariant = '';
+      if (planTargetSec > 0 && planKeepSec > 0) {
+        var planRatio = planKeepSec / planTargetSec;
+        if (planRatio <= 1.10 && planRatio >= 0.90) {
+          planVariant = 'ok';
+        } else if (planRatio <= 1.20 && planRatio >= 0.80) {
+          planVariant = 'warn';
+        } else {
+          planVariant = 'bad';
+        }
+        planSummaryEl.className = 'proposal-target-badge proposal-target-badge--' + planVariant;
+      }
+      var planStatusSym = planVariant === 'ok' ? ' \u2713' : ' \u2717';
+      var planKeepLabel = document.createTextNode(
+        'Хронометраж: ' + fmtSec(planTotalSec) + ' \u2192 ' + fmtSec(planKeepSec) +
+        ' (цель ' + fmtSec(planTargetSec) + (planVariant ? planStatusSym : '') + ')'
+      );
+      planSummaryEl.appendChild(planKeepLabel);
+      card.appendChild(planSummaryEl);
+
+      /* Подготовка сопоставления planBlocks → keepSummary/removeSummary.
+         buildSummaries сортирует каждый массив по startSec. Чтобы надёжно
+         сопоставить, извлекаем keep/cut блоки, сортируем по paragraphs.from
+         (= порядок startSec), и берём из ks/rs по порядку. */
+      var keepBlocks = [];
+      var cutBlocks = [];
+      for (var pbi = 0; pbi < pb.length; pbi++) {
+        var entry = { idx: pbi, block: pb[pbi] };
+        if (pb[pbi].action === 'keep') {
+          keepBlocks.push(entry);
+        } else {
+          cutBlocks.push(entry);
+        }
+      }
+      keepBlocks.sort(function (a, b) { return a.block.paragraphs.from - b.block.paragraphs.from; });
+      cutBlocks.sort(function (a, b) { return a.block.paragraphs.from - b.block.paragraphs.from; });
+
+      /* Записать summaryRef в каждый entry */
+      for (var ki2 = 0; ki2 < keepBlocks.length; ki2++) {
+        keepBlocks[ki2].sum = ks[ki2] || null;
+      }
+      for (var ci2 = 0; ci2 < cutBlocks.length; ci2++) {
+        cutBlocks[ci2].sum = rs[ci2] || null;
+      }
+
+      /* Собрать обратно в порядке planBlocks */
+      var blockMap = {};
+      for (var km = 0; km < keepBlocks.length; km++) {
+        blockMap[keepBlocks[km].idx] = keepBlocks[km];
+      }
+      for (var cm = 0; cm < cutBlocks.length; cm++) {
+        blockMap[cutBlocks[cm].idx] = cutBlocks[cm];
+      }
+
+      /* Список блоков */
+      var planList = document.createElement('div');
+      planList.className = 'plan-blocks-list';
+      for (var bli = 0; bli < pb.length; bli++) {
+        var blk = pb[bli];
+        var mapped = blockMap[bli];
+        var sum = mapped ? mapped.sum : null;
+        var blRow = document.createElement('div');
+        blRow.className = 'plan-block-row plan-block-row--' + blk.action;
+        var blHead = document.createElement('span');
+
+        if (blk.action === 'keep') {
+          blHead.appendChild(document.createTextNode('\u2713 ['));
+          if (sum) {
+            blHead.appendChild(_tcJumpEl(sum.startSec));
+            blHead.appendChild(document.createTextNode(' \u2013 '));
+            blHead.appendChild(_tcJumpEl(sum.endSec));
+            blHead.appendChild(document.createTextNode('] '));
+            var durSec = sum.endSec - sum.startSec;
+            var themeStr = blk.theme ? String(blk.theme).slice(0, 120) : '';
+            var durStr = ' \u00B7 ' + fmtSec(durSec);
+            var themeSp = document.createElement('span');
+            themeSp.textContent = themeStr + durStr;
+            blHead.appendChild(themeSp);
+          } else {
+            blHead.appendChild(document.createTextNode('] ' + (blk.theme || '')));
+          }
+        } else {
+          blHead.appendChild(document.createTextNode('\u2717 ['));
+          if (sum) {
+            blHead.appendChild(_tcJumpEl(sum.startSec));
+            blHead.appendChild(document.createTextNode(' \u2013 '));
+            blHead.appendChild(_tcJumpEl(sum.endSec));
+            blHead.appendChild(document.createTextNode('] '));
+            var cutDur = sum.endSec - sum.startSec;
+            var reasonStr = blk.reason ? String(blk.reason).slice(0, 120) : '';
+            var cutInfo = '\u00B7 ' + fmtSec(cutDur);
+            if (reasonStr) cutInfo += ' \u00B7 ' + reasonStr;
+            var cutSp = document.createElement('span');
+            cutSp.textContent = cutInfo;
+            blHead.appendChild(cutSp);
+          } else {
+            blHead.appendChild(document.createTextNode('] ' + (blk.reason || '')));
+          }
+        }
+
+        blRow.appendChild(blHead);
+        planList.appendChild(blRow);
+      }
+      card.appendChild(planList);
+    }
+
+    /* Контейнер для keep/remove списков: при наличии плана — свёрнут в <details> */
+    var ivContainer = _hasPlan ? document.createElement('details') : null;
+    if (ivContainer) {
+      ivContainer.className = 'proposal-details';
+      var ivSummary = document.createElement('summary');
+      ivSummary.textContent = 'Детализация интервалов';
+      ivContainer.appendChild(ivSummary);
+    }
+    var ivTarget = ivContainer || card;
+
     if (Array.isArray(v.keepIntervals) && v.keepIntervals.length) {
       var keepHdr = document.createElement('div');
       keepHdr.textContent = '✓ Остаётся в ролике (' + v.keepIntervals.length + ')';
       keepHdr.style.cssText = 'font-size:11px;font-weight:600;color:#10b981;margin-bottom:4px;';
-      card.appendChild(keepHdr);
+      ivTarget.appendChild(keepHdr);
       var keepList = document.createElement('div');
       keepList.style.cssText =
         'max-height:160px;overflow-y:auto;font-size:11px;background:rgba(16,185,129,0.08);padding:6px 8px;border-radius:4px;margin-bottom:8px;';
@@ -2054,7 +2238,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         }
         keepList.appendChild(row);
       });
-      card.appendChild(keepList);
+      ivTarget.appendChild(keepList);
     }
 
     var removeList = _pendingProposal.removeIntervals || [];
@@ -2062,7 +2246,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       var rmHdr = document.createElement('div');
       rmHdr.textContent = '✗ Убирается (' + removeList.length + ')';
       rmHdr.style.cssText = 'font-size:11px;font-weight:600;color:#f43f5e;margin-bottom:4px;';
-      card.appendChild(rmHdr);
+      ivTarget.appendChild(rmHdr);
       var rmBox = document.createElement('div');
       rmBox.style.cssText =
         'max-height:160px;overflow-y:auto;font-size:11px;background:rgba(244,63,94,0.08);padding:6px 8px;border-radius:4px;margin-bottom:8px;';
@@ -2097,7 +2281,11 @@ PanelBoot.run('ИИ: монтаж', function () {
         }
         rmBox.appendChild(row);
       });
-      card.appendChild(rmBox);
+      ivTarget.appendChild(rmBox);
+    }
+
+    if (ivContainer) {
+      card.appendChild(ivContainer);
     }
 
     card.appendChild(_buildButtons('✓ Применить монтаж'));
@@ -2823,6 +3011,17 @@ PanelBoot.run('ИИ: монтаж', function () {
       targetDurationSec: typeof args.targetDurationSec === 'number' ? args.targetDurationSec : null,
       warnings: _keepInvertWarning ? [_keepInvertWarning] : null
     };
+    /* Проброс контекста плана монтажа (propose_montage_plan → карточка) */
+    if (_pendingPlanContext) {
+      _pendingProposal.planBlocks = _pendingPlanContext.blocks;
+      _pendingProposal.planStats = _pendingPlanContext.stats;
+      _pendingProposal.planWarnings = _pendingPlanContext.warnings;
+      /* Конкатенация planWarnings в общий warnings для рендера карточки */
+      if (_pendingPlanContext.warnings && _pendingPlanContext.warnings.length) {
+        var existing = _pendingProposal.warnings || [];
+        _pendingProposal.warnings = existing.concat(_pendingPlanContext.warnings);
+      }
+    }
     renderPendingProposalCard();
     var result = {
       ok: true,
@@ -2839,6 +3038,85 @@ PanelBoot.run('ИИ: монтаж', function () {
       result._refErrors = refResult.refErrors;
     }
     return Promise.resolve(result);
+  }
+
+  /**
+   * План монтажа по смыслам (спека 2026-07-05): валидация детерминированным
+   * MontagePlan.validatePlan → removeRefs → делегирование в execProposeTranscriptCuts
+   * (padding/snap/merge/карточка/apply переиспользуются целиком).
+   */
+  function execProposeMontagePlan(args) {
+    args = args || {};
+    var sequenceKey = String(args.sequenceKey || '').trim();
+    if (!sequenceKey) return Promise.resolve({ error: 'propose_montage_plan: нужен sequenceKey (sequenceName из снимка)' });
+
+    /* Поиск entry в кэше транскрипта — паттерн из _resolveRemoveRefs */
+    var key = _cleanSeqKey(sequenceKey);
+    var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+    if (!found || !found.entry) {
+      return Promise.resolve({ error: 'Транскрипт для «' + key + '» не найден. Вызови get_transcript_structure.' });
+    }
+    var entry = found.entry;
+
+    /* Staleness-гейт как в _resolveRemoveRefs */
+    if (entry.possiblyStale) {
+      return Promise.resolve({
+        error: 'Транскрипт устарел (таймлайн менялся). Перестрой транскрипт (get_transcript_structure) перед планированием.'
+      });
+    }
+
+    /* Пересборка paragraphs если нужно (паттерн из _resolveRemoveRefs) */
+    if (typeof TranscriptStructure !== 'undefined') {
+      var needsRebuild = !entry.paragraphs || !entry.paragraphs.length ||
+        (TranscriptStructure.isParagraphsStale && TranscriptStructure.isParagraphsStale(entry));
+      if (needsRebuild) {
+        try {
+          TranscriptStructure.buildStructure(entry);
+          ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, entry);
+        } catch (eRB) {
+          return Promise.resolve({
+            error: 'Не удалось пересобрать структуру: ' +
+              (eRB && eRB.message ? eRB.message : String(eRB)) +
+              ' — вызови get_transcript_structure'
+          });
+        }
+      }
+    }
+
+    /* Детерминированная валидация плана */
+    var v = MontagePlan.validatePlan(args, entry);
+    if (!v.ok) {
+      return Promise.resolve({ error: 'План не прошёл проверку: ' + v.errors.join('; '), _planStats: v.stats });
+    }
+
+    /* Развернуть cut-блоки в removeRefs + собрать summaries */
+    var refs = MontagePlan.buildRemoveRefs(args.blocks);
+    var summaries = MontagePlan.buildSummaries(args.blocks, entry);
+
+    /* Проброс контекста плана в _pendingProposal через _pendingPlanContext */
+    _pendingPlanContext = { blocks: args.blocks, stats: v.stats, warnings: v.warnings };
+    var res;
+    try {
+      res = execProposeTranscriptCuts({
+        sequenceKey: sequenceKey,
+        removeRefs: refs,
+        targetDurationSec: args.targetDurationSec,
+        keepSummary: summaries.keepSummary,
+        removeSummary: summaries.removeSummary,
+        summary: args.summary
+      });
+    } finally {
+      _pendingPlanContext = null;
+    }
+    /* execProposeTranscriptCuts — sync (возвращает Promise.resolve),
+       но обрабатываем единообразно через Promise для будущей совместимости. */
+    return Promise.resolve(res).then(function (r) {
+      if (r && r.ok) {
+        r._planStats = v.stats;
+        if (v.warnings.length) r._planWarnings = v.warnings;
+      }
+      return r;
+    });
   }
 
   /**
@@ -3724,6 +4002,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       apply_edit_plan: function (args) { return execApplyEditPlan(pid, args); },
       /* текст */
       propose_transcript_cuts: execProposeTranscriptCuts,
+      propose_montage_plan: execProposeMontagePlan,
       apply_transcript_cuts: function (args) { return execApplyTranscriptCuts(pid, args); },
       /* маркеры */
       add_markers: function (args) { return execAddMarkers(pid, args); },
@@ -4008,6 +4287,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   var WELCOME_ITEMS = [
     '🎙 Транскрибация In–Out — кнопка сверху; после неё доступны команды по тексту',
     '✂️ Монтаж по тексту: «убери паразитов», «уложи в 60 секунд», «вырежи вступление»',
+    '📐 Сжать ролик до нужной длины с сохранением сути — агент покажет план (что остаётся и почему режем) до применения. Пример: «сожми до 15 минут»',
     '🏷️ Маркеры и главы: «поставь YouTube-главы», «отметь хайлайты»',
     '🔍 Поиск моментов: «найди, где говорят про…» — таймкоды в ответах кликабельны, клик двигает плейхед',
     '🛠 Тишины · Паразиты · Jump cuts · Авто-главы · Авто-MultiCam — вкладка «Инструменты»',

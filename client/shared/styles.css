@@ -137,6 +137,34 @@ button:hover {
   background: var(--danger-bg-strong);
   border-left-color: var(--danger-border);
 }
+/* Task 4 (5 июля 2026): секция плана монтажа в карточке proposal */
+.plan-blocks-list {
+  font-size: 11px;
+  max-height: 200px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+}
+.plan-block-row {
+  margin-bottom: 4px;
+  padding: 2px 0;
+}
+.plan-block-row--keep { color: var(--success-text); }
+.plan-block-row--cut  { color: var(--danger-text); }
+/* <details> для свёртки keep/remove при наличии плана */
+.proposal-details {
+  margin-bottom: 8px;
+}
+.proposal-details > summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 4px 0;
+  user-select: none;
+}
+.proposal-details > summary:hover {
+  color: var(--text);
+}
 /* MEDIUM #11 (6 мая 2026): opsList — убрали opacity, увеличили max-height */
 .proposal-ops-list {
   font-size: 11px;
