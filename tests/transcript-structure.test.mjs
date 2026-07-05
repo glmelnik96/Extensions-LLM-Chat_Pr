@@ -563,4 +563,62 @@ describe('TranscriptStructure.resolveRefsToIntervals', () => {
     assert.strictEqual(result.intervals.length, 0);
     assert.strictEqual(result.errors.length, 3);
   });
+
+  /* ─── merge/sort: регресс на live-баг мультиспикера (1_SYNCED) ───
+     На синхронизированной мультиспикерной секвенции соседние абзацы
+     перекрываются во времени (спикер A 0–59.5, спикер B 57.27–110.47).
+     resolveRefsToIntervals обязан слить перекрывающиеся интервалы, иначе
+     validateTranscriptCuts отклоняет их как «Перекрытие» ещё до merge-шага. */
+  test('перекрывающиеся во времени абзацы → интервалы сливаются в один', () => {
+    const overlapping = [
+      { startSec: 0.0, endSec: 59.5, text: 'Спикер A' },
+      { startSec: 57.27, endSec: 110.47, text: 'Спикер B' },
+      { startSec: 108.0, endSec: 150.0, text: 'Спикер A снова' },
+    ];
+    const result = TS.resolveRefsToIntervals(overlapping, [
+      { paragraph: 0 }, { paragraph: 1 }, { paragraph: 2 }
+    ]);
+    assert.strictEqual(result.intervals.length, 1);
+    assert.strictEqual(result.intervals[0].startSec, 0.0);
+    assert.strictEqual(result.intervals[0].endSec, 150.0);
+  });
+
+  test('после merge интервалы отсортированы и не перекрываются (> EPS)', () => {
+    const overlapping = [
+      { startSec: 0.0, endSec: 59.5, text: 'A' },
+      { startSec: 57.27, endSec: 110.47, text: 'B' },
+      { startSec: 200.0, endSec: 250.0, text: 'C' },
+    ];
+    const { intervals } = TS.resolveRefsToIntervals(overlapping, [
+      { paragraph: 0 }, { paragraph: 1 }, { paragraph: 2 }
+    ]);
+    for (let i = 1; i < intervals.length; i++) {
+      assert.ok(
+        intervals[i].startSec >= intervals[i - 1].endSec - 0.01,
+        'интервалы не должны перекрываться после merge'
+      );
+    }
+  });
+
+  test('refs в обратном порядке → интервалы отсортированы по возрастанию', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [
+      { paragraph: 2 }, { paragraph: 0 }
+    ]);
+    assert.strictEqual(result.intervals.length, 2);
+    assert.strictEqual(result.intervals[0].startSec, 0.0);
+    assert.strictEqual(result.intervals[1].startSec, 13.0);
+  });
+
+  test('merge сохраняет первый заданный reason', () => {
+    const overlapping = [
+      { startSec: 0.0, endSec: 10.0, text: 'A' },
+      { startSec: 8.0, endSec: 20.0, text: 'B' },
+    ];
+    const result = TS.resolveRefsToIntervals(overlapping, [
+      { paragraph: 0, reason: 'первый' },
+      { paragraph: 1, reason: 'второй' }
+    ]);
+    assert.strictEqual(result.intervals.length, 1);
+    assert.strictEqual(result.intervals[0].reason, 'первый');
+  });
 });

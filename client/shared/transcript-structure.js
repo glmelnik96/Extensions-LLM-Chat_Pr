@@ -1094,6 +1094,28 @@
         reason: typeof ref.reason === 'string' ? ref.reason : undefined
       });
     }
+    /* Сортировка + merge перекрывающихся/смежных интервалов.
+       На мультиспикерных (синхронизированных) секвенциях соседние абзацы
+       перекрываются во времени, поэтому refs в исходном порядке дают
+       перекрывающиеся интервалы. validateTranscriptCuts отклоняет такие
+       ещё ДО padding/merge-шага, и монтаж не может выдать карточку.
+       Сливаем в источнике: удаляемый регион = объединение абзацев. */
+    if (intervals.length > 1) {
+      var MERGE_EPS = 0.05; /* > EPS валидатора (0.01), чтобы гарантированно снять перекрытие */
+      intervals.sort(function (a, b) { return a.startSec - b.startSec; });
+      var mergedIntervals = [intervals[0]];
+      for (var m = 1; m < intervals.length; m++) {
+        var cur = intervals[m];
+        var last = mergedIntervals[mergedIntervals.length - 1];
+        if (cur.startSec <= last.endSec + MERGE_EPS) {
+          if (cur.endSec > last.endSec) last.endSec = cur.endSec;
+          if (last.reason === undefined && cur.reason !== undefined) last.reason = cur.reason;
+        } else {
+          mergedIntervals.push(cur);
+        }
+      }
+      intervals = mergedIntervals;
+    }
     return { intervals: intervals, errors: errors };
   }
 
