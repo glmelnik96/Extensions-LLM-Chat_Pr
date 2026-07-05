@@ -1039,6 +1039,64 @@
     });
   }
 
+  /* ═══════════════════════════════════════════════════════════════════════
+   * resolveRefsToIntervals — P0-C: резолвер ссылок на абзацы/сегменты
+   * в готовые {startSec, endSec} интервалы.
+   *
+   * refs: массив ссылок вида {paragraph: N} или
+   *       {paragraph: N, sentenceFrom: a, sentenceTo: b} (зарезервировано).
+   * paragraphs: массив абзацев из entry.paragraphs (каждый имеет startSec, endSec).
+   *
+   * Возвращает { intervals: [{startSec, endSec}], errors: [строки] }.
+   * Невалидные ссылки (индекс вне диапазона, не число) попадают в errors,
+   * валидные разворачиваются. Пустой refs → пустой intervals + без ошибок.
+   *
+   * Уровень предложений (sentenceFrom/sentenceTo) НЕ поддержан: абзацы не
+   * разбиваются на предложения с собственными таймингами. Если передать
+   * sentenceFrom/sentenceTo — вернётся весь абзац целиком + warning в errors.
+   * ═══════════════════════════════════════════════════════════════════════ */
+  function resolveRefsToIntervals(paragraphs, refs) {
+    var intervals = [];
+    var errors = [];
+    if (!Array.isArray(refs) || !refs.length) return { intervals: intervals, errors: errors };
+    if (!Array.isArray(paragraphs) || !paragraphs.length) {
+      errors.push('paragraphs пуст — невозможно развернуть ссылки');
+      return { intervals: intervals, errors: errors };
+    }
+    var pLen = paragraphs.length;
+    for (var i = 0; i < refs.length; i++) {
+      var ref = refs[i];
+      if (!ref || typeof ref !== 'object') {
+        errors.push('refs[' + i + ']: не объект');
+        continue;
+      }
+      var pIdx = ref.paragraph;
+      if (typeof pIdx !== 'number' || isNaN(pIdx) || pIdx !== Math.floor(pIdx)) {
+        errors.push('refs[' + i + ']: paragraph должен быть целым числом, получено ' + String(pIdx));
+        continue;
+      }
+      if (pIdx < 0 || pIdx >= pLen) {
+        errors.push('refs[' + i + ']: paragraph=' + pIdx + ' вне диапазона 0–' + (pLen - 1));
+        continue;
+      }
+      var p = paragraphs[pIdx];
+      if (!p || typeof p.startSec !== 'number' || typeof p.endSec !== 'number') {
+        errors.push('refs[' + i + ']: абзац ' + pIdx + ' не имеет startSec/endSec');
+        continue;
+      }
+      /* Уровень предложений: зарезервирован, не поддержан (абзацы не имеют sub-timing) */
+      if (typeof ref.sentenceFrom === 'number' || typeof ref.sentenceTo === 'number') {
+        errors.push('refs[' + i + ']: sentenceFrom/sentenceTo не поддержан — используется весь абзац ' + pIdx);
+      }
+      intervals.push({
+        startSec: p.startSec,
+        endSec: p.endSec,
+        reason: typeof ref.reason === 'string' ? ref.reason : undefined
+      });
+    }
+    return { intervals: intervals, errors: errors };
+  }
+
   global.TranscriptStructure = {
     buildParagraphs: buildParagraphs,
     buildSpeakers: buildSpeakers,
@@ -1046,6 +1104,7 @@
     analyzeForCutsWithLLM: analyzeForCutsWithLLM,
     buildStructure: buildStructure,
     isParagraphsStale: isParagraphsStale,
+    resolveRefsToIntervals: resolveRefsToIntervals,
     /* P0-2: локальные детекторы */
     detectFillers: detectFillers,
     detectIntroOutro: detectIntroOutro,

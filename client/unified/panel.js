@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-07-05-gates-v34'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-07-05-selfcorr-v35'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -594,13 +594,25 @@ PanelBoot.run('ИИ: монтаж', function () {
       'function': {
         name: 'propose_transcript_cuts',
         description:
-          'Предложить план вырезания интервалов пользователю на подтверждение (НЕ выполняет правку). Покажет карточку «Применить / Отмена». Передавай keepSummary и removeSummary с цитатами. ДЛЯ СБОРОЧНОГО МОНТАЖА («собери ролик про X», «сделай выжимку»): используй keepIntervals — список того, что ОСТАВИТЬ. Плагин сам вычислит removeIntervals как дополнение. keepIntervals и removeIntervals взаимоисключают друг друга.',
+          'Предложить план вырезания интервалов пользователю на подтверждение (НЕ выполняет правку). Покажет карточку «Применить / Отмена». Обязателен хотя бы один из removeRefs / removeIntervals / keepIntervals. Передавай keepSummary и removeSummary с цитатами. ПРЕДПОЧИТАЙ removeRefs после get_transcript_structure — индексы абзацев надёжнее ручного копирования секунд. removeIntervals с ручными секундами — только когда режешь НЕ по границам структуры. ДЛЯ СБОРОЧНОГО МОНТАЖА («собери ролик про X», «сделай выжимку»): используй keepIntervals — список того, что ОСТАВИТЬ. Плагин сам вычислит removeIntervals как дополнение. keepIntervals и removeIntervals/removeRefs взаимоисключают друг друга.',
         parameters: {
           type: 'object',
           properties: {
+            removeRefs: {
+              type: 'array',
+              description: 'ПРЕДПОЧТИТЕЛЬНЫЙ способ: ссылки на абзацы из get_transcript_structure. Плагин сам развернёт индексы в точные секунды из кэша. Надёжнее ручного копирования секунд. Можно комбинировать с removeIntervals (результаты сольются). Нельзя с keepIntervals.',
+              items: {
+                type: 'object',
+                properties: {
+                  paragraph: { type: 'integer', description: 'Индекс абзаца (поле i из get_transcript_structure).' },
+                  reason: { type: 'string' }
+                },
+                required: ['paragraph']
+              }
+            },
             removeIntervals: {
               type: 'array',
-              description: 'Интервалы для удаления. Используй для обычной чистки («убери паузы»).',
+              description: 'Интервалы для удаления (ручные секунды). Используй когда режешь НЕ по границам абзацев, или для результатов analyze_transcript_for_cuts.',
               items: {
                 type: 'object',
                 properties: {
@@ -613,7 +625,7 @@ PanelBoot.run('ИИ: монтаж', function () {
             },
             keepIntervals: {
               type: 'array',
-              description: 'Интервалы, которые ОСТАВИТЬ (сборочный монтаж). Плагин вычислит removeIntervals автоматически как дополнение к этим интервалам. Границы выровняются по сегментам транскрипта. Не передавай вместе с removeIntervals.',
+              description: 'Интервалы, которые ОСТАВИТЬ (сборочный монтаж). Плагин вычислит removeIntervals автоматически как дополнение к этим интервалам. Границы выровняются по сегментам транскрипта. Не передавай вместе с removeIntervals/removeRefs.',
               items: {
                 type: 'object',
                 properties: {
@@ -667,10 +679,22 @@ PanelBoot.run('ИИ: монтаж', function () {
       'function': {
         name: 'apply_transcript_cuts',
         description:
-          'Вырезать интервалы времени на таймлайне. Все дорожки. ВНИМАНИЕ: используй только если пользователь явно попросил «без подтверждения», иначе используй propose_transcript_cuts.',
+          'Вырезать интервалы времени на таймлайне. Все дорожки. ВНИМАНИЕ: используй только если пользователь явно попросил «без подтверждения», иначе используй propose_transcript_cuts. ПРЕДПОЧИТАЙ removeRefs (индексы абзацев) — надёжнее ручного копирования секунд. Хотя бы один из removeRefs/removeIntervals обязателен.',
         parameters: {
           type: 'object',
           properties: {
+            removeRefs: {
+              type: 'array',
+              description: 'ПРЕДПОЧТИТЕЛЬНЫЙ способ: ссылки на абзацы из get_transcript_structure. Можно комбинировать с removeIntervals.',
+              items: {
+                type: 'object',
+                properties: {
+                  paragraph: { type: 'integer', description: 'Индекс абзаца (поле i из get_transcript_structure).' },
+                  reason: { type: 'string' }
+                },
+                required: ['paragraph']
+              }
+            },
             removeIntervals: {
               type: 'array',
               items: {
@@ -684,8 +708,7 @@ PanelBoot.run('ИИ: монтаж', function () {
               }
             },
             summary: { type: 'string' }
-          },
-          required: ['removeIntervals']
+          }
         }
       }
     },
@@ -1107,10 +1130,17 @@ PanelBoot.run('ИИ: монтаж', function () {
         'Для следующей страницы: get_transcript_structure(sequenceKey, fromParagraph=' + to + '). ' +
         'Для полного анализа длинного транскрипта используй analyze_transcript_for_cuts.';
     }
+    out2._hint = 'Для вырезки используй removeRefs:[{paragraph: i}] в propose_transcript_cuts — ' +
+      'плагин сам развернёт индексы в секунды. Надёжнее ручного копирования таймкодов.';
     if (out2.editedAfterTranscribe) {
       out2._notice = 'Структура пересчитана под текущее состояние таймлайна.';
     }
     return Promise.resolve(out2);
+  }
+
+  /* ─── Хелпер: ожидаемая дельта длительности — делегирует в EditPlanSimulator ── */
+  function _calcExpectedDelta(operations) {
+    return EditPlanSimulator.calcExpectedDeltaSec(operations);
   }
 
   function execApplyTimecodeEdits(panelId, args) {
@@ -1141,6 +1171,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         });
         return;
       }
+      /* Фиксируем состояние ДО мутации для дифф-отчёта */
+      var beforeSnap = (lastSnap && lastSnap.ok) ? lastSnap : null;
+      var expectedDeltaSec = _calcExpectedDelta(args.operations);
       _snapDirty = true; /* Мутирующая операция — сбрасываем кэш snapshot */
       PremiereBridge.applyTimecodeEdits(args, function (err, data) {
         if (err) {
@@ -1151,7 +1184,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         _snapDirty = true;
         PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
           if (!snapErr && snapData && snapData.ok) { lastSnap = snapData; _snapDirty = false; }
-          data._autoSnapshot = snapData || null;
+          /* Компактный дифф вместо тяжёлого полного снимка */
+          data._timelineDiff = EditPlanSimulator.buildTimelineDiff(beforeSnap, snapData, expectedDeltaSec);
+          data._autoSnapshot = EditPlanSimulator.compactSnapshotForLlm(snapData);
           try {
             var seqKey = (snapData && snapData.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
             if (seqKey && Array.isArray(args.operations)) {
@@ -1193,6 +1228,12 @@ PanelBoot.run('ИИ: монтаж', function () {
               }
             }
           } catch (eSh3) {}
+          /* P1-E: подсказка при частичном провале операций */
+          if (data && typeof data.opsFailed === 'number' && data.opsFailed > 0) {
+            data._partialFailureHint = 'Часть операций не применилась — см. results[]. ' +
+              'Пересылай ТОЛЬКО упавшие (исправив причину), НЕ повторяй весь план: ' +
+              'успешные уже применены, координаты сдвинулись → вызови get_timeline_snapshot и пересчитай.';
+          }
           resolve(data);
         });
       });
@@ -2580,22 +2621,115 @@ PanelBoot.run('ИИ: монтаж', function () {
     renderMessages(msgs);
   }
 
+  /* ─── P0-C: резолвер removeRefs → removeIntervals через кэш структуры ─── */
+
+  /**
+   * Разворачивает removeRefs (ссылки на абзацы) в removeIntervals и сливает
+   * с уже переданными removeIntervals. Возвращает:
+   *   { removeIntervals: [...], refErrors: [...], staleness: null|string }
+   * Если refErrors непуст, но есть валидные интервалы — интервалы возвращаются,
+   * а refErrors передаются в результат инструмента (_refErrors).
+   */
+  function _resolveRemoveRefs(args, sequenceKey) {
+    var hasRefs = Array.isArray(args.removeRefs) && args.removeRefs.length > 0;
+    var hasManual = Array.isArray(args.removeIntervals) && args.removeIntervals.length > 0;
+    if (!hasRefs) return { removeIntervals: args.removeIntervals || [], refErrors: [], staleness: null };
+
+    /* Ищем entry в кэше */
+    var key = _cleanSeqKey(sequenceKey || args.sequenceKey || '');
+    var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+    if (!found || !found.entry) {
+      return {
+        removeIntervals: hasManual ? args.removeIntervals : [],
+        refErrors: ['Нет кэша транскрипта для «' + key + '» — removeRefs невозможно развернуть.'],
+        staleness: null
+      };
+    }
+    var entry = found.entry;
+
+    /* P0-C stale-гейт: если entry.possiblyStale — координаты сегментов
+       могут не соответствовать тому, что видела модель. Это жёсткий блок,
+       потому что структура пересчитывается в get_transcript_structure,
+       а possiblyStale снимается только при пересборке. Если possiblyStale
+       стоит — значит модель не вызвала get_transcript_structure после правки.
+       Ранний return: НЕ мутируем стор и НЕ резолвим refs при stale. */
+    if (entry.possiblyStale) {
+      return {
+        removeIntervals: hasManual ? args.removeIntervals : [],
+        refErrors: [],
+        staleness: 'Структура транскрипта устарела (таймлайн менялся после последнего get_transcript_structure). ' +
+          'Вызови get_transcript_structure заново и пересоставь removeRefs по свежим индексам.'
+      };
+    }
+
+    /* Пересборка paragraphs если stale (аналогично execGetTranscriptStructure) */
+    if (typeof TranscriptStructure !== 'undefined') {
+      var needsRebuild = !entry.paragraphs || !entry.paragraphs.length ||
+        (TranscriptStructure.isParagraphsStale && TranscriptStructure.isParagraphsStale(entry));
+      if (needsRebuild) {
+        try {
+          TranscriptStructure.buildStructure(entry);
+          ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, entry);
+        } catch (eRB) {
+          var rebuildMsg = 'не удалось пересобрать структуру: ' +
+            (eRB && eRB.message ? eRB.message : String(eRB)) +
+            ' — вызови get_transcript_structure';
+          return {
+            removeIntervals: hasManual ? args.removeIntervals : [],
+            refErrors: [rebuildMsg],
+            staleness: null
+          };
+        }
+      }
+    }
+
+    var resolved = TranscriptStructure.resolveRefsToIntervals(entry.paragraphs || [], args.removeRefs);
+
+    /* Сливаем с ручными removeIntervals */
+    var merged = (hasManual ? args.removeIntervals : []).concat(resolved.intervals);
+    return {
+      removeIntervals: merged,
+      refErrors: resolved.errors,
+      staleness: null
+    };
+  }
+
   function execProposeTranscriptCuts(args) {
     args = args || {};
+    var hasRefs = Array.isArray(args.removeRefs) && args.removeRefs.length > 0;
     var hasRemove = Array.isArray(args.removeIntervals) && args.removeIntervals.length > 0;
     var hasKeep = Array.isArray(args.keepIntervals) && args.keepIntervals.length > 0;
 
-    /* US-004: mutual exclusion */
-    if (hasRemove && hasKeep) {
+    /* US-004: mutual exclusion — keepIntervals несовместимы с removeRefs/removeIntervals */
+    if ((hasRemove || hasRefs) && hasKeep) {
       return Promise.resolve({
-        validationError: 'Передавай ЛИБО removeIntervals (для «убери X»), ЛИБО keepIntervals ' +
+        validationError: 'Передавай ЛИБО removeIntervals/removeRefs (для «убери X»), ЛИБО keepIntervals ' +
           '(для «собери ролик про X»). Одновременно нельзя — это неоднозначно.'
       });
     }
-    if (!hasRemove && !hasKeep) {
+    if (!hasRemove && !hasKeep && !hasRefs) {
       return Promise.resolve({
-        validationError: 'Нужен хотя бы один из: removeIntervals или keepIntervals.'
+        validationError: 'Нужен хотя бы один из: removeRefs, removeIntervals или keepIntervals.'
       });
+    }
+
+    /* P0-C: разворачиваем removeRefs в интервалы ДО всей остальной логики */
+    var refResult = null;
+    if (hasRefs) {
+      refResult = _resolveRemoveRefs(args, args.sequenceKey);
+      /* Жёсткий блок при устаревшей структуре */
+      if (refResult.staleness) {
+        return Promise.resolve({ validationError: refResult.staleness });
+      }
+      /* Если все ссылки невалидны и ручных интервалов нет — ошибка */
+      if (!refResult.removeIntervals.length && refResult.refErrors.length) {
+        return Promise.resolve({
+          validationError: 'Все removeRefs невалидны: ' + refResult.refErrors.join('; ')
+        });
+      }
+      /* Подменяем removeIntervals на развёрнутые */
+      args = Object.assign({}, args, { removeIntervals: refResult.removeIntervals });
+      hasRemove = refResult.removeIntervals.length > 0;
     }
 
     /* US-004: если keepIntervals — инвертируем в removeIntervals. */
@@ -2622,6 +2756,22 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
       _keepInvertWarning = invRes.warning || null;
       workingArgs = Object.assign({}, args, { removeIntervals: invRes.removeIntervals });
+    }
+
+    /* P1-F: прокидываем analyzedRegion из кэша транскрипта для warn «интервал
+       вне проанализированной области». Entry.analyzedRegion = {inSec, outSec}
+       (In/Out секвенции на момент транскрибации). */
+    var _arSeqKey = _cleanSeqKey(workingArgs.sequenceKey || args.sequenceKey || '');
+    if (_arSeqKey && !workingArgs._analyzedRegion) {
+      var _arFound = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, _arSeqKey);
+      if (_arFound && _arFound.entry && _arFound.entry.analyzedRegion) {
+        var _arR = _arFound.entry.analyzedRegion;
+        if (typeof _arR.inSec === 'number' && typeof _arR.outSec === 'number') {
+          workingArgs = Object.assign({}, workingArgs, {
+            _analyzedRegion: { fromSec: _arR.inSec, toSec: _arR.outSec }
+          });
+        }
+      }
     }
 
     var vr = ToolValidators.validateTranscriptCuts(lastSnap, workingArgs);
@@ -2674,15 +2824,21 @@ PanelBoot.run('ИИ: монтаж', function () {
       warnings: _keepInvertWarning ? [_keepInvertWarning] : null
     };
     renderPendingProposalCard();
-    return Promise.resolve({
+    var result = {
       ok: true,
       status: 'waiting_user_confirmation',
       message:
         (hasKeep ? 'keepIntervals инвертированы в ' + snappedIntervals.length + ' removeIntervals. ' : '') +
+        (hasRefs ? 'removeRefs развёрнуты в ' + (refResult ? refResult.removeIntervals.length : 0) + ' интервалов. ' : '') +
         'План предложен пользователю. Жди, пока он нажмёт «Применить» или «Отмена». ' +
         'НЕ вызывай apply_transcript_cuts сам — это сделает UI по кнопке.',
       _verification: verification
-    });
+    };
+    /* P0-C: если часть removeRefs невалидна — сообщаем модели */
+    if (refResult && refResult.refErrors && refResult.refErrors.length) {
+      result._refErrors = refResult.refErrors;
+    }
+    return Promise.resolve(result);
   }
 
   /**
@@ -2884,6 +3040,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         resolve({ error: 'После нормализации не осталось валидных ops.' });
         return;
       }
+      /* Фиксируем состояние ДО мутации для дифф-отчёта */
+      var beforeSnap = (lastSnap && lastSnap.ok) ? lastSnap : null;
+      var expectedDeltaSec = _calcExpectedDelta(norm.operations);
       PremiereBridge.applyTimecodeEdits(
         { operations: norm.operations, summary: args.summary || '' },
         function (err, data) {
@@ -2893,7 +3052,9 @@ PanelBoot.run('ИИ: монтаж', function () {
           }
           PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
             if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
-            data._autoSnapshot = snapData || null;
+            /* Компактный дифф вместо тяжёлого полного снимка */
+            data._timelineDiff = EditPlanSimulator.buildTimelineDiff(beforeSnap, snapData, expectedDeltaSec);
+            data._autoSnapshot = EditPlanSimulator.compactSnapshotForLlm(snapData);
             /* Пересчёт кэша транскрипта — как в execApplyTimecodeEdits */
             try {
               var seqKey = (snapData && snapData.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
@@ -3434,6 +3595,32 @@ PanelBoot.run('ИИ: монтаж', function () {
   }
 
   function execApplyTranscriptCuts(panelId, args) {
+    args = args || {};
+    /* P0-C: разворачиваем removeRefs ДО любой другой логики */
+    var hasRefsApply = Array.isArray(args.removeRefs) && args.removeRefs.length > 0;
+    var applyRefResult = null;
+    if (hasRefsApply) {
+      applyRefResult = _resolveRemoveRefs(args, args.sequenceKey);
+      if (applyRefResult.staleness) {
+        return Promise.resolve({ validationError: applyRefResult.staleness });
+      }
+      if (!applyRefResult.removeIntervals.length && applyRefResult.refErrors.length) {
+        return Promise.resolve({
+          validationError: 'Все removeRefs невалидны: ' + applyRefResult.refErrors.join('; ')
+        });
+      }
+      args = Object.assign({}, args, { removeIntervals: applyRefResult.removeIntervals });
+      /* Убираем removeRefs из копии: execProposeTranscriptCuts иначе
+         резолвит их повторно и удвоит интервалы (redirect-путь). */
+      delete args.removeRefs;
+    }
+    /* Проверяем, что после резолва есть хотя бы один интервал */
+    var hasRemoveApply = Array.isArray(args.removeIntervals) && args.removeIntervals.length > 0;
+    if (!hasRemoveApply) {
+      return Promise.resolve({
+        validationError: 'Нужен хотя бы один из: removeRefs или removeIntervals.'
+      });
+    }
     /* Safety-guard: без явного «без подтверждения» — показываем карточку. */
     if (!_directApplyAuthorized) {
       return Promise.resolve(execProposeTranscriptCuts(args)).then(function (r) {
@@ -3443,6 +3630,20 @@ PanelBoot.run('ИИ: монтаж', function () {
       });
     }
     return new Promise(function (resolve, reject) {
+      /* P1-F: прокидываем analyzedRegion (аналогично propose-пути) */
+      var _arKey2 = _cleanSeqKey(args.sequenceKey || '');
+      if (_arKey2 && !args._analyzedRegion) {
+        var _arF2 = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, _arKey2);
+        if (_arF2 && _arF2.entry && _arF2.entry.analyzedRegion) {
+          var _arR2 = _arF2.entry.analyzedRegion;
+          if (typeof _arR2.inSec === 'number' && typeof _arR2.outSec === 'number') {
+            args = Object.assign({}, args, {
+              _analyzedRegion: { fromSec: _arR2.inSec, toSec: _arR2.outSec }
+            });
+          }
+        }
+      }
+
       var vr = ToolValidators.validateTranscriptCuts(lastSnap, args);
       if (vr.error) {
         resolve({ validationError: vr.error });
@@ -3453,6 +3654,16 @@ PanelBoot.run('ИИ: монтаж', function () {
         removeIntervals: mergeRemoveIntervals(snapIntervalsToSegmentBoundaries(args.removeIntervals || []))
       });
       var verification = computeVerification(args.removeIntervals);
+      /* Фиксируем состояние ДО мутации для дифф-отчёта */
+      var beforeSnap = (lastSnap && lastSnap.ok) ? lastSnap : null;
+      /* expectedDelta = −сумма длительностей merged removeIntervals */
+      var expectedDeltaSec = 0;
+      (args.removeIntervals || []).forEach(function (iv) {
+        if (typeof iv.startSec === 'number' && typeof iv.endSec === 'number') {
+          expectedDeltaSec -= (iv.endSec - iv.startSec);
+        }
+      });
+      expectedDeltaSec = Math.round(expectedDeltaSec * 100) / 100;
       /* B2-9: checkpoint и на агентском пути apply */
       _makeSequenceCheckpoint('монтаж по тексту (агент)', function () {
       PremiereBridge.applyTranscriptCuts(args, function (err, data) {
@@ -3468,7 +3679,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         if (data && typeof data === 'object') data._verification = verification;
         PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
           if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
-          data._autoSnapshot = snapData || null;
+          /* Компактный дифф вместо тяжёлого полного снимка */
+          data._timelineDiff = EditPlanSimulator.buildTimelineDiff(beforeSnap, snapData, expectedDeltaSec);
+          data._autoSnapshot = EditPlanSimulator.compactSnapshotForLlm(snapData);
           try {
             var seqKey = (snapData && snapData.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
             if (seqKey) {
@@ -3476,6 +3689,16 @@ PanelBoot.run('ИИ: монтаж', function () {
               data._transcriptShifted = true;
             }
           } catch (eSh2) {}
+          /* P0-C: если часть removeRefs невалидна — сообщаем модели */
+          if (applyRefResult && applyRefResult.refErrors && applyRefResult.refErrors.length) {
+            data._refErrors = applyRefResult.refErrors;
+          }
+          /* P1-E: подсказка при частичном провале интервалов */
+          if (data && typeof data.ivFailed === 'number' && data.ivFailed > 0) {
+            data._partialFailureHint = 'Часть интервалов не применилась — см. results[]. ' +
+              'Пересылай ТОЛЬКО упавшие (исправив причину), НЕ повторяй весь план: ' +
+              'успешные уже вырезаны, координаты сдвинулись → вызови get_timeline_snapshot и пересчитай.';
+          }
           resolve(data);
         });
       });

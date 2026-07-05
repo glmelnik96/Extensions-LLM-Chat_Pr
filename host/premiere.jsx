@@ -1658,24 +1658,25 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
 
       results.push({ op: a || '?', ok: false, error: 'Неизвестное действие' });
     }
+    /* P1-E: штампуем оригинальный индекс входной операции на каждый результат.
+       Все ветки внутри цикла делают ровно один results.push() на итерацию,
+       поэтому results[j] ↔ ops[j] (порядок 1:1, без сортировки). */
+    var opsOk = 0, opsFail = 0;
+    for (var ri = 0; ri < results.length; ri++) {
+      results[ri].i = ri;
+      if (results[ri].ok === false) opsFail++;
+      else opsOk++;
+    }
 
     /* Если БЫЛИ интервальные операции и НИ ОДИН razor/remove не прошёл —
        таймлайн фактически не изменился, честно отвечаем ok:false. */
-    if (hasRangeOps && rangeStats.failed > 0 && rangeStats.applied === 0) {
-      return JSON.stringify({
-        ok: false,
-        error: 'ни одна операция не применилась — проверьте, не заблокированы ли дорожки',
-        results: results,
-        appliedCount: 0,
-        failedCount: rangeStats.failed,
-        failedReasons: rangeStats.reasons,
-        undoSteps: $._EXT_PRM_._opCounter,
-        hostVersion: $._EXT_PRM_.version
-      });
-    }
+    var tcGlobalOk = !(hasRangeOps && rangeStats.failed > 0 && rangeStats.applied === 0) && !(opsFail > 0 && opsOk === 0);
     return JSON.stringify({
-      ok: true,
+      ok: tcGlobalOk,
+      error: tcGlobalOk ? undefined : 'ни одна операция не применилась — проверьте, не заблокированы ли дорожки',
       results: results,
+      opsOk: opsOk,
+      opsFailed: opsFail,
       appliedCount: rangeStats.applied,
       failedCount: rangeStats.failed,
       failedReasons: rangeStats.reasons,
@@ -1719,50 +1720,74 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
     }
     $._EXT_PRM_._resetOps();
     var intervals = cuts.removeIntervals || [];
-    var sorted = intervals.slice().sort(function (x, y) {
-      return y.startSec - x.startSec;
-    });
+    /* Запоминаем оригинальный индекс ВХОДНОГО массива (модель ссылается
+       на свои интервалы по порядку; внутренняя сортировка его не ломает). */
+    var tagged = [];
+    var ti;
+    for (ti = 0; ti < intervals.length; ti++) {
+      tagged.push({ _origIdx: ti, startSec: intervals[ti].startSec, endSec: intervals[ti].endSec });
+    }
+    /* Сортируем по убыванию startSec (справа налево) — ripple-удаление
+       более позднего интервала НЕ сдвигает координаты более ранних,
+       поэтому интервалы независимы → fail-soft безопасен. */
+    tagged.sort(function (x, y) { return y.startSec - x.startSec; });
     var allLog = [];
     /* Сводный счётчик razor/remove/trim по всем интервалам (см. _statFail). */
     var stats = { applied: 0, failed: 0, reasons: [] };
+    /* P1-E: пер-интервальные результаты (индекс = оригинальный входной). */
+    var perResults = [];
+    var ivOk = 0, ivFail = 0;
     var k,
       iv,
       lg;
-    for (k = 0; k < sorted.length; k++) {
-      iv = sorted[k];
-      if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') continue;
+    for (k = 0; k < tagged.length; k++) {
+      iv = tagged[k];
+      if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') {
+        perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: false, error: 'startSec/endSec не числа' });
+        ivFail++;
+        continue;
+      }
       /* 19.06.2026: пропускаем negative startSec (симметрично negative-guard в
          ripple/lift_delete_range и move_clip). _applyOneTimelineInterval через
          _secToTimecode клампит negative→0 и razor молча удаляет [0,endSec]
          реального контента. JS-слой (validateTranscriptCuts HIGH #6) это ловит,
          но host обязан валидировать сам как last line of defense. */
-      if (iv.startSec < 0) continue;
-      if (iv.endSec <= iv.startSec) continue;
+      if (iv.startSec < 0) {
+        perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: false, error: 'startSec отрицательный' });
+        ivFail++;
+        continue;
+      }
+      if (iv.endSec <= iv.startSec) {
+        perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: false, error: 'endSec <= startSec' });
+        ivFail++;
+        continue;
+      }
       lg = [];
-      $._EXT_PRM_._applyOneTimelineInterval(seq, iv.startSec, iv.endSec, lg, true, stats);
+      /* fail-soft: ошибка одного интервала не останавливает остальные
+         (порядок справа-налево → интервалы независимы). */
+      try {
+        $._EXT_PRM_._applyOneTimelineInterval(seq, iv.startSec, iv.endSec, lg, true, stats);
+        perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: true });
+        ivOk++;
+      } catch (eIv) {
+        perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: false, error: String(eIv && eIv.message ? eIv.message : eIv) });
+        ivFail++;
+      }
       allLog.push({ interval: iv, log: lg });
     }
     /* Все операции провалились (например, дорожки заблокировали после preflight,
        или QE отказал) — честный ok:false вместо тихого «успеха». */
-    if (stats.failed > 0 && stats.applied === 0) {
-      return JSON.stringify({
-        ok: false,
-        error: 'ни одна операция не применилась — проверьте, не заблокированы ли дорожки',
-        appliedIntervals: sorted.length,
-        appliedCount: 0,
-        failedCount: stats.failed,
-        failedReasons: stats.reasons,
-        details: allLog,
-        undoSteps: $._EXT_PRM_._opCounter,
-        hostVersion: $._EXT_PRM_.version
-      });
-    }
+    var globalOk = ivOk > 0 || ivFail === 0;
     return JSON.stringify({
-      ok: true,
-      appliedIntervals: sorted.length,
+      ok: globalOk,
+      error: globalOk ? undefined : 'ни одна операция не применилась — проверьте, не заблокированы ли дорожки',
+      appliedIntervals: tagged.length,
       appliedCount: stats.applied,
       failedCount: stats.failed,
       failedReasons: stats.reasons,
+      results: perResults,
+      ivOk: ivOk,
+      ivFailed: ivFail,
       details: allLog,
       undoSteps: $._EXT_PRM_._opCounter,
       hostVersion: $._EXT_PRM_.version

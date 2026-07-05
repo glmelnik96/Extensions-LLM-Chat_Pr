@@ -151,6 +151,9 @@ describe('agent-loop.compressToolHistory', () => {
   function bigTool(id) {
     return { role: 'tool', tool_call_id: id, content: 'x'.repeat(700) };
   }
+  function assistantWithCalls(calls) {
+    return { role: 'assistant', content: null, tool_calls: calls.map(([id, name]) => ({ id, function: { name, arguments: '{}' } })) };
+  }
 
   test('последние 4 tool-результата — полные, более старые усечены до 600 байт', () => {
     const msgs = [bigTool('t0'), bigTool('t1'), bigTool('t2'), bigTool('t3'), bigTool('t4'), bigTool('t5')];
@@ -158,10 +161,11 @@ describe('agent-loop.compressToolHistory', () => {
     /* свежие 4 (t2..t5) — полные */
     assert.equal(out[5].content.length, 700);
     assert.equal(out[2].content.length, 700);
-    /* старые 2 (t0,t1) — усечены */
-    assert.ok(out[0].content.length < 700);
-    assert.ok(/\[truncated 100 bytes/.test(out[0].content));
-    assert.ok(/\[truncated 100 bytes/.test(out[1].content));
+    /* старые 2 (t0,t1) — усечены: первые 600 символов + маркер */
+    assert.ok(out[0].content.startsWith('x'.repeat(600)), 'тело усечено до 600 символов');
+    assert.ok(!out[0].content.includes('x'.repeat(601)), 'оригинал не сохранён целиком');
+    assert.ok(/обрезано 100 байт/.test(out[0].content));
+    assert.ok(/обрезано 100 байт/.test(out[1].content));
   });
 
   test('порядок сообщений и tool_call_id сохраняются', () => {
@@ -174,6 +178,38 @@ describe('agent-loop.compressToolHistory', () => {
     const msgs = [{ role: 'user', content: 'u' }, bigTool('t0')];
     const out = AL.compressToolHistory(msgs);
     assert.equal(out[0].content, 'u');
+  });
+
+  test('усечённый маркер содержит имя инструмента из assistant.tool_calls', () => {
+    const msgs = [
+      assistantWithCalls([['c1', 'get_sequence_markers']]),
+      bigTool('c1'),
+      bigTool('c2'), bigTool('c3'), bigTool('c4'), bigTool('c5')
+    ];
+    const out = AL.compressToolHistory(msgs);
+    /* c1 — старый (5-й tool, за пределами KEEP_FULL=4), должен быть усечён */
+    assert.ok(/обрезано/.test(out[1].content), 'маркер должен содержать «обрезано»');
+    assert.ok(/get_sequence_markers/.test(out[1].content), 'маркер должен содержать имя инструмента');
+    assert.ok(!/данные есть выше/.test(out[1].content), 'старый врущий маркер не должен присутствовать');
+  });
+
+  test('tool без соответствующего assistant → generic-маркер', () => {
+    const msgs = [
+      bigTool('orphan_id'),
+      bigTool('c2'), bigTool('c3'), bigTool('c4'), bigTool('c5')
+    ];
+    const out = AL.compressToolHistory(msgs);
+    assert.ok(/обрезано/.test(out[0].content), 'generic-маркер должен содержать «обрезано»');
+    assert.ok(/get_\*-инструмент/.test(out[0].content), 'generic-маркер должен подсказать get_*');
+    assert.ok(!/данные есть выше/.test(out[0].content), 'старый врущий маркер не должен присутствовать');
+  });
+
+  test('короткие (<600 байт) старые tool-результаты не получают маркер', () => {
+    const shortTool = { role: 'tool', tool_call_id: 'short', content: 'small data' };
+    const msgs = [shortTool, bigTool('c2'), bigTool('c3'), bigTool('c4'), bigTool('c5')];
+    const out = AL.compressToolHistory(msgs);
+    assert.equal(out[0].content, 'small data', 'короткий результат не должен быть изменён');
+    assert.ok(!/обрезано/.test(out[0].content));
   });
 });
 
@@ -363,5 +399,190 @@ describe('agent-loop.AgentLoopStats (ETA)', () => {
     const second = llmEvents[llmEvents.length - 1];
     assert.ok(typeof second.etaMs === 'number' && second.etaMs >= 0);
     assert.ok(/Запрос к FM: m2/.test(second.message));
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * isFailedToolResult — определение ошибки в результате инструмента
+ * ═══════════════════════════════════════════════════════════════ */
+describe('agent-loop.isFailedToolResult', () => {
+  test('{"error":"x"} → true', () => {
+    assert.equal(AL.isFailedToolResult('{"error":"x"}'), true);
+  });
+
+  test('{"validationError":"x"} → true', () => {
+    assert.equal(AL.isFailedToolResult('{"validationError":"x"}'), true);
+  });
+
+  test('{"ok":true} → false', () => {
+    assert.equal(AL.isFailedToolResult('{"ok":true}'), false);
+  });
+
+  test('невалидный JSON → false', () => {
+    assert.equal(AL.isFailedToolResult('это не json!!!'), false);
+  });
+
+  test('{"error":""} → false (пустая строка — не фейл)', () => {
+    assert.equal(AL.isFailedToolResult('{"error":""}'), false);
+  });
+
+  test('null/undefined/число → false', () => {
+    assert.equal(AL.isFailedToolResult(null), false);
+    assert.equal(AL.isFailedToolResult(undefined), false);
+    assert.equal(AL.isFailedToolResult(42), false);
+  });
+
+  test('массив — не фейл (не объект верхнего уровня)', () => {
+    assert.equal(AL.isFailedToolResult('[{"error":"x"}]'), false);
+  });
+
+  test('error=0 (falsy число) → false (не строка и не объект)', () => {
+    assert.equal(AL.isFailedToolResult('{"error":0}'), false);
+  });
+
+  test('validationError с объектом-значением → true', () => {
+    assert.equal(AL.isFailedToolResult('{"validationError":{"msg":"bad"}}'), true);
+  });
+
+  /* _parseError-путь: мусорный JSON аргументов → tool-результат {"error":"Невалидный JSON..."}
+     Guard засчитает как фейл → повтор того же мусора будет заблокирован */
+  test('_parseError-путь (мусорный JSON) распознаётся как фейл', () => {
+    const content = JSON.stringify({ error: 'Невалидный JSON аргументов: {мусор!!!' });
+    assert.equal(AL.isFailedToolResult(content), true);
+  });
+
+  /* Галлюцинация несуществующего инструмента → {"error":"Неизвестный инструмент: foo"}
+     Guard засчитает как фейл → 3 попытки вызвать выдуманный инструмент → блок */
+  test('«Неизвестный инструмент» распознаётся как фейл', () => {
+    const content = JSON.stringify({ error: 'Неизвестный инструмент: foo' });
+    assert.equal(AL.isFailedToolResult(content), true);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * createRetryGuard — чистая логика блокировки повторных фейлов
+ * ═══════════════════════════════════════════════════════════════ */
+describe('agent-loop.createRetryGuard', () => {
+  test('новый guard: shouldBlock всегда false', () => {
+    const g = AL.createRetryGuard();
+    assert.equal(g.shouldBlock('a:{}'), false);
+  });
+
+  test('3 фейла → shouldBlock true; 4-й вызов заблокирован', () => {
+    const g = AL.createRetryGuard();
+    g.recordResult('a:{}', true);
+    assert.equal(g.shouldBlock('a:{}'), false);
+    g.recordResult('a:{}', true);
+    assert.equal(g.shouldBlock('a:{}'), false);
+    g.recordResult('a:{}', true);
+    assert.equal(g.shouldBlock('a:{}'), true, 'после 3 фейлов должен блокировать');
+  });
+
+  test('успех сбрасывает счётчик', () => {
+    const g = AL.createRetryGuard();
+    g.recordResult('a:{}', true);
+    g.recordResult('a:{}', true);
+    g.recordResult('a:{}', false); // успех — сброс
+    assert.equal(g.shouldBlock('a:{}'), false, 'после успеха счётчик сброшен');
+    g.recordResult('a:{}', true);
+    assert.equal(g.shouldBlock('a:{}'), false, 'нужно заново набрать 3 фейла');
+  });
+
+  test('разные hash-и независимы', () => {
+    const g = AL.createRetryGuard();
+    g.recordResult('a:{}', true);
+    g.recordResult('a:{}', true);
+    g.recordResult('a:{}', true);
+    assert.equal(g.shouldBlock('a:{}'), true);
+    assert.equal(g.shouldBlock('b:{}'), false, 'другой hash не заблокирован');
+  });
+
+  test('блокированный вызов не меняет счётчик (вечный блок не возникает)', () => {
+    const g = AL.createRetryGuard();
+    g.recordResult('a:{}', true);
+    g.recordResult('a:{}', true);
+    g.recordResult('a:{}', true);
+    assert.equal(g.shouldBlock('a:{}'), true);
+    /* Не вызываем recordResult — имитируем: заблокированный вызов
+       не инкрементирует и не сбрасывает. Guard остаётся в том же состоянии. */
+    assert.equal(g.shouldBlock('a:{}'), true, 'остаётся заблокированным');
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * runAgentLoop + retry guard — интеграция
+ * ═══════════════════════════════════════════════════════════════ */
+describe('runAgentLoop retry guard (mock CloudRuClient)', () => {
+  test('4 одинаковых упавших вызова перемежая другими → 4-й заблокирован RETRY_BLOCKED', async () => {
+    /* Паттерн: A(fail), B(ok), A(fail), B(ok), A(fail), B(ok), A(block), done.
+       Cycle detection не сработает — вызовы не подряд. Guard должен заблокировать 4-й A. */
+    let callIdx = 0;
+    const { client } = makeMock(() => {
+      callIdx++;
+      if (callIdx <= 6) {
+        /* каждый шаг шлёт оба инструмента: A всегда падает, B успешен —
+           перемежающийся паттерн, который cycle detection не ловит */
+        return { choices: [{ message: { tool_calls: [
+          { id: 'a' + callIdx, function: { name: 'badTool', arguments: '{"x":1}' } },
+          { id: 'b' + callIdx, function: { name: 'goodTool', arguments: '{"y":2}' } }
+        ] } }] };
+      }
+      return { choices: [{ message: { content: 'сдался' } }] };
+    });
+    const { runAgentLoop } = loadAgentLoop(client);
+    let badCallCount = 0;
+    const res = await runAgentLoop(baseOpts({
+      toolExecutors: {
+        badTool: async () => { badCallCount++; throw new Error('сломан'); },
+        goodTool: async () => ({ ok: true })
+      },
+      maxSteps: 10
+    }));
+    /* badTool вызван 3 раза реально (1, 2, 3-й), 4-й заблокирован */
+    assert.equal(badCallCount, 3, 'badTool должен быть реально вызван ровно 3 раза');
+    /* Ищем RETRY_BLOCKED в сообщениях */
+    const blocked = res.messages.filter(
+      (m) => m.role === 'tool' && m.content && m.content.indexOf('RETRY_BLOCKED') !== -1
+    );
+    assert.ok(blocked.length >= 1, 'должно быть хотя бы одно RETRY_BLOCKED сообщение');
+    assert.equal(res.finalText, 'сдался');
+  });
+
+  test('успешный вызов после 2 фейлов сбрасывает guard', async () => {
+    /* A(fail), A(fail), A(success), A(fail), A(fail), A(fail) → 7-й блокируется.
+       Но cycle detection убьёт подряд-повторы → делаем перемежение с B. */
+    let callIdx = 0;
+    const failSeq = [true, true, false, true, true, true]; // 6 вызовов badTool
+    let badIdx = 0;
+    const { client } = makeMock(() => {
+      callIdx++;
+      if (callIdx <= 7) {
+        return { choices: [{ message: { tool_calls: [
+          { id: 'a' + callIdx, function: { name: 'flaky', arguments: '{"z":1}' } },
+          { id: 'b' + callIdx, function: { name: 'filler', arguments: '{"f":' + callIdx + '}' } }
+        ] } }] };
+      }
+      return { choices: [{ message: { content: 'done' } }] };
+    });
+    const { runAgentLoop } = loadAgentLoop(client);
+    let flakyCalls = 0;
+    const res = await runAgentLoop(baseOpts({
+      toolExecutors: {
+        flaky: async () => {
+          flakyCalls++;
+          var shouldFail = failSeq[badIdx++];
+          if (shouldFail) throw new Error('flaky error');
+          return { ok: true };
+        },
+        filler: async () => ({ filler: true })
+      },
+      maxSteps: 12
+    }));
+    /* Сброс после 3-го (success): счётчик = 0. Потом 4,5,6 — фейлы (3 шт), 7-й блок. */
+    assert.equal(flakyCalls, 6, 'flaky вызван 6 раз (3-й — успех, потом ещё 3 фейла)');
+    const blocked = res.messages.filter(
+      (m) => m.role === 'tool' && m.content && m.content.indexOf('RETRY_BLOCKED') !== -1
+    );
+    assert.ok(blocked.length >= 1, 'после 3 новых фейлов → блок');
   });
 });

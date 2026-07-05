@@ -15,6 +15,8 @@
  *   - Не моделирует поведение PP при коллизиях move_clip (shiftBlockingClips/makeRoom): помечает клип «moved».
  */
 (function (global) {
+  var MATCH_TOLERANCE_SEC = 0.5;
+
   function cloneClip(c) {
     return {
       nodeId: c.nodeId,
@@ -364,10 +366,171 @@
     return out;
   }
 
+  /* ─── Компактный дифф таймлайна после мутирующих операций ─────────── */
+
+  /**
+   * Считает max endSec по массиву клипов (= длительность секвенции с точки зрения клипов).
+   */
+  /* см. также ToolValidators.timelineSpanSec — дублирование осознанное: разные IIFE */
+  function _maxEndSec(clips) {
+    var mx = 0;
+    for (var i = 0; i < clips.length; i++) {
+      if (clips[i].endSec > mx) mx = clips[i].endSec;
+    }
+    return mx;
+  }
+
+  /**
+   * buildTimelineDiff(beforeSnap, afterSnap, expectedDeltaSec)
+   *
+   * Сравнивает состояние таймлайна до и после мутации.
+   * Возвращает компактный объект для LLM: длительности, дельту, совпадение с ожиданием.
+   *
+   * @param {object|null} beforeSnap  снимок ДО мутации (lastSnap)
+   * @param {object|null} afterSnap   снимок ПОСЛЕ мутации (свежий getTimelineSnapshot)
+   * @param {number|null} expectedDeltaSec  ожидаемое изменение длительности (null если непредсказуемо)
+   * @returns {object} { before, after, deltaDurationSec, expectedDeltaSec, match, hint }
+   */
+  function buildTimelineDiff(beforeSnap, afterSnap, expectedDeltaSec) {
+    var before = null;
+    var after = null;
+
+    if (beforeSnap && beforeSnap.ok && Array.isArray(beforeSnap.clips)) {
+      before = {
+        durationSec: Math.round(_maxEndSec(beforeSnap.clips) * 100) / 100,
+        clipCount: beforeSnap.clips.length
+      };
+    }
+
+    if (afterSnap && afterSnap.ok && Array.isArray(afterSnap.clips)) {
+      after = {
+        durationSec: Math.round(_maxEndSec(afterSnap.clips) * 100) / 100,
+        clipCount: afterSnap.clips.length
+      };
+    }
+
+    var deltaDurationSec = (before && after)
+      ? Math.round((after.durationSec - before.durationSec) * 100) / 100
+      : null;
+
+    var expDelta = (typeof expectedDeltaSec === 'number') ? expectedDeltaSec : null;
+
+    var match = null;
+    if (expDelta !== null && deltaDurationSec !== null) {
+      match = Math.abs(deltaDurationSec - expDelta) <= MATCH_TOLERANCE_SEC;
+    }
+
+    var hint = null;
+    if (match === false) {
+      hint = 'Ожидалось изменение длительности на ' + expDelta +
+        ' с, фактически ' + deltaDurationSec +
+        ' с — операция сделала не то, что планировалось. ' +
+        'Вызови get_timeline_snapshot, проверь состояние и НЕ продолжай резать по старому плану.';
+    }
+
+    return {
+      before: before,
+      after: after,
+      deltaDurationSec: deltaDurationSec,
+      expectedDeltaSec: expDelta,
+      match: match,
+      hint: hint
+    };
+  }
+
+  /* ─── Компактор снимка для контекста LLM ─────────────────────────── */
+
+  /**
+   * compactSnapshotForLlm(snap, maxClips)
+   *
+   * Возвращает компактное представление снимка для LLM-контекста:
+   * строка на клип вместо полного объекта, усечение при >maxClips.
+   *
+   * @param {object|null} snap  результат getTimelineSnapshot
+   * @param {number} [maxClips=80]  максимум клипов в выдаче
+   * @returns {object|null} { sequenceName, clipCount, clips:[], truncated, note }
+   */
+  function compactSnapshotForLlm(snap, maxClips) {
+    if (!snap || !snap.ok || !Array.isArray(snap.clips)) return null;
+    var max = (typeof maxClips === 'number' && maxClips > 0) ? maxClips : 80;
+    var clips = snap.clips;
+    var truncated = clips.length > max;
+    var shown = truncated ? clips.slice(0, max) : clips;
+    var lines = [];
+    for (var i = 0; i < shown.length; i++) {
+      var c = shown[i];
+      var start = (typeof c.startSec === 'number') ? c.startSec.toFixed(2) : '?';
+      var end = (typeof c.endSec === 'number') ? c.endSec.toFixed(2) : '?';
+      var track = c.trackType ? (c.trackType + (typeof c.trackIndex === 'number' ? c.trackIndex : '')) : (c.track || '');
+      lines.push((c.nodeId || '?') + '|' + (c.name || '') + '|' + track + '|' + start + '-' + end);
+    }
+    var note = null;
+    if (truncated) {
+      note = 'Показаны первые ' + max + ' из ' + clips.length +
+        ' — полный список через get_timeline_snapshot.';
+    }
+    return {
+      sequenceName: snap.sequenceName || null,
+      clipCount: clips.length,
+      clips: lines,
+      truncated: truncated,
+      note: note
+    };
+  }
+
+  /* ─── Ожидаемая дельта длительности для набора операций ────────── */
+
+  /**
+   * calcExpectedDeltaSec(operations)
+   *
+   * Почему null = безопасный fallback: move_clip / trim / remove_clip и прочие операции
+   * меняют длительность секвенции непредсказуемо без полной симуляции (зависят от
+   * позиции клипа, перекрытий и т.д.). Возврат null сигнализирует вызывающему коду,
+   * что проверять совпадение дельты бессмысленно — match останется null и hint не
+   * сработает, что безопаснее ложного «mismatch».
+   *
+   * @param {Array} operations  нормализованные операции (action/kind)
+   * @returns {number|null}  суммарная дельта в секундах, или null если непредсказуемо
+   */
+  function calcExpectedDeltaSec(operations) {
+    if (!Array.isArray(operations) || !operations.length) return null;
+    var delta = 0;
+    for (var i = 0; i < operations.length; i++) {
+      var op = operations[i];
+      if (!op) continue;
+      var a = op.action || op.kind || '';
+      if (a === 'ripple_delete_range' || a === 'ripple_delete_range_all_tracks' ||
+          a === 'ripple_delete_interval') {
+        if (typeof op.startSec === 'number' && typeof op.endSec === 'number' && op.endSec > op.startSec) {
+          delta -= (op.endSec - op.startSec);
+        }
+      } else if (a === 'shift_timeline_ripple' || a === 'shift_ripple') {
+        /* shift увеличивает (+deltaSec) или уменьшает (−deltaSec) длительность секвенции */
+        if (typeof op.deltaSec === 'number') {
+          delta += op.deltaSec;
+        } else {
+          return null; /* непредсказуемо */
+        }
+      } else if (a === 'lift_delete_range' || a === 'lift_delete_range_all_tracks' ||
+                 a === 'lift_delete_interval' || a === 'set_clip_enabled' ||
+                 a === 'set_clips_enabled_by_name' || a === 'mute_track' || a === 'note') {
+        /* Эти операции НЕ меняют длительность секвенции — 0-вклад */
+      } else {
+        /* move_clip, trim_in, trim_out, set_timeline_bounds, remove_clip и прочие —
+           эффект на длительность непредсказуем без полной симуляции */
+        return null;
+      }
+    }
+    return Math.round(delta * 100) / 100;
+  }
+
   global.EditPlanSimulator = {
     simulate: simulate,
     simulateUnified: simulateUnified,
     normalizeUnifiedPlan: normalizeUnifiedPlan,
-    extractRippleIntervals: extractRippleIntervals
+    extractRippleIntervals: extractRippleIntervals,
+    buildTimelineDiff: buildTimelineDiff,
+    compactSnapshotForLlm: compactSnapshotForLlm,
+    calcExpectedDeltaSec: calcExpectedDeltaSec
   };
 })(typeof window !== 'undefined' ? window : this);

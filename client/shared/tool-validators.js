@@ -145,12 +145,19 @@
       if (!cuts || !Array.isArray(cuts.removeIntervals)) {
         return { error: 'apply_transcript_cuts: нужен removeIntervals (массив)', warn: null };
       }
+      var intervals = cuts.removeIntervals;
+
+      /* P1-F #4: слишком много интервалов — host применяет каждый отдельной
+         QE-операцией, гигантские планы зависают Premiere. */
+      if (intervals.length > 100) {
+        return { error: 'Слишком много интервалов (' + intervals.length + ') — разбей на несколько вызовов (макс. 100)', warn: null };
+      }
+
       var span = snap && snap.ok ? timelineSpanSec(snap) : 0;
-      var i,
-        iv,
-        warn = null;
-      for (i = 0; i < cuts.removeIntervals.length; i++) {
-        iv = cuts.removeIntervals[i];
+      var i, iv;
+      var warns = [];
+      for (i = 0; i < intervals.length; i++) {
+        iv = intervals[i];
         if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') {
           return { error: 'Интервал ' + i + ': нужны startSec и endSec (числа)', warn: null };
         }
@@ -170,11 +177,62 @@
           return { error: 'Интервал ' + i + ': startSec=' + iv.startSec.toFixed(1) + 'с далеко за концом таймлайна (' + span.toFixed(1) + 'с)', warn: null };
         }
         if (span > 0 && iv.endSec > span + 120) {
-          warn =
-            'Предупреждение: интервал выходит далеко за конец клипов на снимке — проверьте сдвиг транскрипта.';
+          warns.push('Интервал ' + i + ' выходит далеко за конец клипов на снимке — проверьте сдвиг транскрипта');
         }
       }
-      return { error: null, warn: warn };
+
+      /* P1-F #1: дубликаты интервалов — LLM иногда дублирует интервалы в плане,
+         host вырежет дважды → двойное смещение. Допуск 0.01с на float-погрешности. */
+      var EPS = 0.01;
+      for (i = 0; i < intervals.length; i++) {
+        for (var j = i + 1; j < intervals.length; j++) {
+          if (Math.abs(intervals[i].startSec - intervals[j].startSec) < EPS &&
+              Math.abs(intervals[i].endSec - intervals[j].endSec) < EPS) {
+            return {
+              error: 'Дубликат: интервалы ' + i + ' и ' + j + ' совпадают (' +
+                intervals[i].startSec.toFixed(2) + '–' + intervals[i].endSec.toFixed(2) +
+                'с) — удали повтор',
+              warn: null
+            };
+          }
+        }
+      }
+
+      /* P1-F #2: перекрывающиеся интервалы — host применяет справа-налево,
+         перекрытие даёт непредсказуемый результат. Касание end==start (допуск
+         EPS) — НЕ ошибка (интервалы встык допустимы). */
+      for (i = 0; i < intervals.length; i++) {
+        for (var k = i + 1; k < intervals.length; k++) {
+          var a = intervals[i], b = intervals[k];
+          /* Перекрытие: start одного < end другого минус EPS (встык не считается) */
+          if (a.startSec < b.endSec - EPS && b.startSec < a.endSec - EPS) {
+            return {
+              error: 'Перекрытие: интервалы ' + i + ' (' + a.startSec.toFixed(2) + '–' +
+                a.endSec.toFixed(2) + 'с) и ' + k + ' (' + b.startSec.toFixed(2) + '–' +
+                b.endSec.toFixed(2) + 'с) пересекаются — объедини или раздели',
+              warn: null
+            };
+          }
+        }
+      }
+
+      /* P1-F #3: интервалы за пределами analyzedRegion — транскрипт там может
+         быть неточен. Опциональный параметр: если _analyzedRegion не передан —
+         пропускаем. */
+      var ar = cuts._analyzedRegion;
+      if (ar && typeof ar.fromSec === 'number' && typeof ar.toSec === 'number') {
+        for (i = 0; i < intervals.length; i++) {
+          iv = intervals[i];
+          if (iv.startSec < ar.fromSec - EPS || iv.endSec > ar.toSec + EPS) {
+            warns.push('Интервал ' + i + ' (' + iv.startSec.toFixed(2) + '–' +
+              iv.endSec.toFixed(2) + 'с) вне проанализированной области ' +
+              ar.fromSec.toFixed(1) + '–' + ar.toSec.toFixed(1) +
+              'с — транскрипт там может быть неточен');
+          }
+        }
+      }
+
+      return { error: null, warn: warns.length ? warns.join('; ') : null };
     },
 
     /**

@@ -448,3 +448,119 @@ describe('TranscriptStructure.analyzeForCutsWithLLM + local pre-labels', () => {
     assert.ok(llmSegments.length <= 1, 'LLM должен получить ≤1 сегмент, получил ' + llmSegments.length);
   });
 });
+
+/* ─── P0-C: resolveRefsToIntervals ─── */
+describe('TranscriptStructure.resolveRefsToIntervals', () => {
+  const paragraphs = [
+    { startSec: 0.0, endSec: 5.5, text: 'Привет всем.' },
+    { startSec: 6.0, endSec: 12.3, text: 'Первый пункт — структура.' },
+    { startSec: 13.0, endSec: 20.0, text: 'Второй пункт — ритм.' },
+  ];
+
+  test('валидный абзац → интервал с корректными секундами', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [{ paragraph: 1 }]);
+    assert.strictEqual(result.intervals.length, 1);
+    assert.strictEqual(result.errors.length, 0);
+    assert.strictEqual(result.intervals[0].startSec, 6.0);
+    assert.strictEqual(result.intervals[0].endSec, 12.3);
+  });
+
+  test('несколько валидных абзацев → несколько интервалов', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [
+      { paragraph: 0 },
+      { paragraph: 2, reason: 'мусор' }
+    ]);
+    assert.strictEqual(result.intervals.length, 2);
+    assert.strictEqual(result.errors.length, 0);
+    assert.strictEqual(result.intervals[0].startSec, 0.0);
+    assert.strictEqual(result.intervals[0].endSec, 5.5);
+    assert.strictEqual(result.intervals[1].startSec, 13.0);
+    assert.strictEqual(result.intervals[1].endSec, 20.0);
+    assert.strictEqual(result.intervals[1].reason, 'мусор');
+  });
+
+  test('индекс вне диапазона → errors, не роняет', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [{ paragraph: 99 }]);
+    assert.strictEqual(result.intervals.length, 0);
+    assert.strictEqual(result.errors.length, 1);
+    assert.ok(result.errors[0].includes('99'));
+    assert.ok(result.errors[0].includes('вне диапазона'));
+  });
+
+  test('отрицательный индекс → errors', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [{ paragraph: -1 }]);
+    assert.strictEqual(result.intervals.length, 0);
+    assert.strictEqual(result.errors.length, 1);
+  });
+
+  test('нечисловой paragraph → errors', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [{ paragraph: 'abc' }]);
+    assert.strictEqual(result.intervals.length, 0);
+    assert.strictEqual(result.errors.length, 1);
+    assert.ok(result.errors[0].includes('целым числом'));
+  });
+
+  test('paragraph: NaN → errors', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [{ paragraph: NaN }]);
+    assert.strictEqual(result.intervals.length, 0);
+    assert.strictEqual(result.errors.length, 1);
+    assert.ok(result.errors[0].includes('целым числом'));
+  });
+
+  test('дробный paragraph → errors', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [{ paragraph: 1.5 }]);
+    assert.strictEqual(result.intervals.length, 0);
+    assert.strictEqual(result.errors.length, 1);
+  });
+
+  test('смесь валидных и невалидных → partial intervals + errors', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [
+      { paragraph: 0 },
+      { paragraph: 100 },
+      { paragraph: 2 }
+    ]);
+    assert.strictEqual(result.intervals.length, 2);
+    assert.strictEqual(result.errors.length, 1);
+    assert.strictEqual(result.intervals[0].startSec, 0.0);
+    assert.strictEqual(result.intervals[1].startSec, 13.0);
+  });
+
+  test('пустой refs → пустой результат без ошибок', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, []);
+    assert.strictEqual(result.intervals.length, 0);
+    assert.strictEqual(result.errors.length, 0);
+  });
+
+  test('null/undefined refs → пустой результат', () => {
+    const r1 = TS.resolveRefsToIntervals(paragraphs, null);
+    assert.strictEqual(r1.intervals.length, 0);
+    assert.strictEqual(r1.errors.length, 0);
+    const r2 = TS.resolveRefsToIntervals(paragraphs, undefined);
+    assert.strictEqual(r2.intervals.length, 0);
+    assert.strictEqual(r2.errors.length, 0);
+  });
+
+  test('пустой paragraphs → ошибка', () => {
+    const result = TS.resolveRefsToIntervals([], [{ paragraph: 0 }]);
+    assert.strictEqual(result.intervals.length, 0);
+    assert.strictEqual(result.errors.length, 1);
+    assert.ok(result.errors[0].includes('пуст'));
+  });
+
+  test('sentenceFrom/sentenceTo → warning в errors, возвращает весь абзац', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [
+      { paragraph: 1, sentenceFrom: 0, sentenceTo: 1 }
+    ]);
+    assert.strictEqual(result.intervals.length, 1);
+    assert.strictEqual(result.intervals[0].startSec, 6.0);
+    assert.strictEqual(result.intervals[0].endSec, 12.3);
+    assert.strictEqual(result.errors.length, 1);
+    assert.ok(result.errors[0].includes('sentenceFrom'));
+  });
+
+  test('не объект в refs → errors', () => {
+    const result = TS.resolveRefsToIntervals(paragraphs, [null, 42, 'string']);
+    assert.strictEqual(result.intervals.length, 0);
+    assert.strictEqual(result.errors.length, 3);
+  });
+});

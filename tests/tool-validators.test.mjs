@@ -330,6 +330,152 @@ describe('validateTranscriptCuts', () => {
     assert.equal(r.error, null);
     assert.ok(r.warn);
   });
+
+  /* P1-F: дубликаты интервалов */
+  test('дубликат интервалов (точное совпадение) → error', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [
+        { startSec: 1, endSec: 3 },
+        { startSec: 5, endSec: 7 },
+        { startSec: 1, endSec: 3 }
+      ]
+    });
+    assert.ok(r.error);
+    assert.match(r.error, /[Дд]убликат/);
+    assert.match(r.error, /0/);
+    assert.match(r.error, /2/);
+  });
+
+  test('дубликат интервалов в допуске 0.01с → error', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [
+        { startSec: 2.005, endSec: 4.003 },
+        { startSec: 2.001, endSec: 4.009 }
+      ]
+    });
+    assert.ok(r.error);
+    assert.match(r.error, /[Дд]убликат/);
+  });
+
+  test('интервалы с разницей > 0.01с — не дубликат', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [
+        { startSec: 1, endSec: 3 },
+        { startSec: 4, endSec: 6 }
+      ]
+    });
+    assert.equal(r.error, null);
+  });
+
+  /* P1-F: перекрывающиеся интервалы */
+  test('перекрытие интервалов → error', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [
+        { startSec: 1, endSec: 5 },
+        { startSec: 4, endSec: 8 }
+      ]
+    });
+    assert.ok(r.error);
+    assert.match(r.error, /[Пп]ерекрытие/);
+    assert.match(r.error, /0/);
+    assert.match(r.error, /1/);
+  });
+
+  test('касание встык (end == start) — НЕ ошибка', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [
+        { startSec: 1, endSec: 3 },
+        { startSec: 3, endSec: 5 }
+      ]
+    });
+    assert.equal(r.error, null);
+  });
+
+  test('касание встык в допуске EPS — НЕ ошибка', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [
+        { startSec: 1, endSec: 3 },
+        { startSec: 2.995, endSec: 5 }
+      ]
+    });
+    assert.equal(r.error, null);
+  });
+
+  /* P1-F: слишком много интервалов */
+  test('>100 интервалов → error', () => {
+    const big = [];
+    for (let i = 0; i < 101; i++) {
+      big.push({ startSec: i * 0.1, endSec: i * 0.1 + 0.05 });
+    }
+    const r = TV.validateTranscriptCuts(snapOk, { removeIntervals: big });
+    assert.ok(r.error);
+    assert.match(r.error, /101/);
+    assert.match(r.error, /разбей/i);
+  });
+
+  test('ровно 100 интервалов — ок', () => {
+    const ok100 = [];
+    for (let i = 0; i < 100; i++) {
+      ok100.push({ startSec: i * 0.2, endSec: i * 0.2 + 0.1 });
+    }
+    const r = TV.validateTranscriptCuts(snapOk, { removeIntervals: ok100 });
+    assert.equal(r.error, null);
+  });
+
+  /* P1-F: _analyzedRegion */
+  test('_analyzedRegion: интервал внутри — нет warn', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [{ startSec: 2, endSec: 5 }],
+      _analyzedRegion: { fromSec: 0, toSec: 10 }
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.warn, null);
+  });
+
+  test('_analyzedRegion: интервал вне области → warn', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [{ startSec: 12, endSec: 15 }],
+      _analyzedRegion: { fromSec: 0, toSec: 10 }
+    });
+    assert.equal(r.error, null);
+    assert.ok(r.warn);
+    assert.match(r.warn, /вне проанализированной/);
+    assert.match(r.warn, /[Ии]нтервал 0/);
+  });
+
+  test('_analyzedRegion: частично вне области (startSec < fromSec) → warn', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [{ startSec: 0.5, endSec: 3 }],
+      _analyzedRegion: { fromSec: 1, toSec: 10 }
+    });
+    assert.equal(r.error, null);
+    assert.ok(r.warn);
+    assert.match(r.warn, /вне проанализированной/);
+  });
+
+  test('_analyzedRegion отсутствует — нет warn по этому поводу', () => {
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [{ startSec: 1, endSec: 2 }]
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.warn, null);
+  });
+
+  /* P1-F: конкатенация нескольких warn */
+  test('несколько warn конкатенируются через "; "', () => {
+    /* Два неперекрывающихся интервала вне analyzedRegion → два warn */
+    const r = TV.validateTranscriptCuts(snapOk, {
+      removeIntervals: [
+        { startSec: 11, endSec: 13 },
+        { startSec: 15, endSec: 17 }
+      ],
+      _analyzedRegion: { fromSec: 0, toSec: 10 }
+    });
+    assert.equal(r.error, null);
+    assert.ok(r.warn);
+    /* warn должен содержать "; " — значит несколько предупреждений склеены */
+    assert.ok(r.warn.indexOf('; ') >= 0, 'expected multiple warns joined by "; "');
+  });
 });
 
 describe('validateMarkersList', () => {

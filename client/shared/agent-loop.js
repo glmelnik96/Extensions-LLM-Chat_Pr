@@ -147,19 +147,102 @@
     return count >= CYCLE_THRESHOLD;
   }
 
+  /* ─── Anti-spam guard (retry-блокировка упавших вызовов) ───────
+   * Частый паттерн: модель вызывает инструмент, получает ошибку и тупо
+   * повторяет тот же вызов с теми же аргументами, сжигая шаги и время
+   * (TTFT GLM ~45с/шаг). Guard считает УПАВШИЕ повторы одного hash и
+   * после 3 фейлов блокирует 4-й без исполнения, возвращая RETRY_BLOCKED
+   * с инструкцией сменить аргументы. Диалог продолжается — модель
+   * вынуждена сменить стратегию.
+   *
+   * Взаимодействие с cycle detection:
+   * Cycle detection (выше) срабатывает на 3-м ПОДРЯД одинаковом вызове
+   * НЕЗАВИСИМО от успеха и убивает весь ход. Retry guard считает только
+   * фейлы и лишь блокирует конкретный вызов. До guard'а (порог 3 фейла
+   * → блок 4-го) при ПОДРЯД-повторах дело не дойдёт — cycle detection
+   * убьёт ход раньше. Guard закрывает паттерн «A, B, A, B, A» где A
+   * всегда падает, но перемежается с B — cycle detection это не ловит.
+   */
+  var RETRY_BLOCK_THRESHOLD = 3;
+
+  /**
+   * Определяет, является ли результат инструмента ошибочным.
+   * Критерий: contentStr парсится как JSON и на верхнем уровне есть
+   * непустое поле `error` или `validationError`. Если парс не удался — не фейл.
+   */
+  function isFailedToolResult(contentStr) {
+    if (typeof contentStr !== 'string') return false;
+    try {
+      var obj = JSON.parse(contentStr);
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+      if (obj.error && (typeof obj.error === 'string' || typeof obj.error === 'object')) return true;
+      if (obj.validationError && (typeof obj.validationError === 'string' || typeof obj.validationError === 'object')) return true;
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * Фабрика retry-guard'а. Возвращает объект с двумя методами:
+   * - shouldBlock(hash): true если hash уже набрал >= RETRY_BLOCK_THRESHOLD фейлов
+   * - recordResult(hash, failed): инкрементирует счётчик фейлов или сбрасывает при успехе
+   */
+  function createRetryGuard() {
+    var counts = {};
+    return {
+      shouldBlock: function (hash) {
+        return (counts[hash] || 0) >= RETRY_BLOCK_THRESHOLD;
+      },
+      recordResult: function (hash, failed) {
+        if (failed) {
+          counts[hash] = (counts[hash] || 0) + 1;
+        } else {
+          counts[hash] = 0;
+        }
+      }
+    };
+  }
+
+  var RETRY_BLOCKED_MSG = JSON.stringify({
+    error_code: 'RETRY_BLOCKED',
+    error: 'Этот вызов уже 3 раза подряд завершился ошибкой с теми же аргументами. ' +
+      'Повтор заблокирован. Прочитай текст предыдущей ошибки, ИЗМЕНИ аргументы или ' +
+      'обнови состояние (get_timeline_snapshot / get_transcript_structure) и попробуй иначе.'
+  });
+
   /**
    * Усечение истории сообщений: оставляем все system-сообщения + последние N не-system,
    * стараясь не разрывать пары tool_call → tool (иначе 400 от FM).
    *
    * Дополнительно: tool-результаты компрессируем — крупные снимки/транскрипты
    * (десятки КБ) забивают контекст и приводят к 413 после нескольких шагов.
-   * Свежие N tool-результатов оставляем как есть, более старые усекаем до 600 байт
-   * с пометкой «[truncated]».
+   * Свежие N tool-результатов оставляем как есть, более старые усекаем до 600 байт.
+   *
+   * Маркер усечения содержит имя инструмента и подсказку вызвать его заново.
+   * Старый маркер «данные есть выше в контексте» ВРАЛ — данные вырезаны
+   * безвозвратно, и модель галлюцинировала несуществующее продолжение.
+   * Честный маркер учит модель перечитать данные инструментом — это один
+   * из столпов самопочинки агента.
    */
   var TOOL_KEEP_FULL = 4;
   var TOOL_TRUNC_BYTES = 600;
 
   function compressToolHistory(messages) {
+    /* Карта tool_call_id → имя инструмента (один проход по assistant-сообщениям) */
+    var toolNameById = {};
+    for (var k = 0; k < messages.length; k++) {
+      var msg = messages[k];
+      if (msg.role === 'assistant' && msg.tool_calls) {
+        for (var t = 0; t < msg.tool_calls.length; t++) {
+          var tc = msg.tool_calls[t];
+          if (tc.id && tc.function && tc.function.name) {
+            toolNameById[tc.id] = tc.function.name;
+          }
+        }
+      }
+    }
+
     var seenTools = 0;
     var out = new Array(messages.length);
     for (var i = messages.length - 1; i >= 0; i--) {
@@ -175,7 +258,12 @@
       }
       var c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
       if (c.length > TOOL_TRUNC_BYTES) {
-        c = c.slice(0, TOOL_TRUNC_BYTES) + '… [truncated ' + (c.length - TOOL_TRUNC_BYTES) + ' bytes — данные есть выше в контексте]';
+        var dropped = c.length - TOOL_TRUNC_BYTES;
+        var name = toolNameById[m.tool_call_id];
+        var hint = name
+          ? '… [обрезано ' + dropped + ' байт для экономии контекста — если данные нужны, вызови ' + name + ' заново]'
+          : '… [обрезано ' + dropped + ' байт для экономии контекста — если данные нужны, вызови соответствующий get_*-инструмент заново]';
+        c = c.slice(0, TOOL_TRUNC_BYTES) + hint;
       }
       out[i] = { role: 'tool', tool_call_id: m.tool_call_id, content: c };
     }
@@ -248,6 +336,8 @@
 
     /* Cycle detection: хэши последних tool_calls */
     var callHashes = [];
+    /* Anti-spam guard: блок повторных упавших вызовов */
+    var retryGuard = createRetryGuard();
 
     while (step < maxSteps) {
       throwIfAborted(signal, abortCheck);
@@ -359,8 +449,13 @@
 
       /* ── Execute tool_calls ─────────────────────────────────── */
       /* Собираем задачи-фабрики (не запускаем сразу): режим исполнения
-         зависит от наличия мутирующих инструментов в этой пачке. */
+         зависит от наличия мутирующих инструментов в этой пачке.
+         toolTaskHashes[i] — hash для i-го таска (для retry guard);
+         toolTaskBlocked[i] — true если таск заблокирован guard'ом
+         (не инкрементировать и не сбрасывать счётчик). */
       var toolTasks = [];
+      var toolTaskHashes = [];
+      var toolTaskBlocked = [];
       var hasMutating = false;
       for (var i = 0; i < toolCalls.length; i++) {
         throwIfAborted(signal, abortCheck);
@@ -368,6 +463,7 @@
         var fn = tc.function;
         var name = fn.name;
         var args = safeParseArgs(fn.arguments);
+        var tcHash = hashToolCall(tc);
         if (mutatingTools[name]) hasMutating = true;
 
         /* If JSON repair injected _parseError, report it as tool result */
@@ -375,6 +471,18 @@
           toolTasks.push((function (tcId, perr) {
             return function () { return _makeToolResult(tcId, JSON.stringify({ error: perr })); };
           })(tc.id, args._parseError));
+          toolTaskHashes.push(tcHash);
+          toolTaskBlocked.push(false);
+          continue;
+        }
+
+        /* Anti-spam guard: блокируем 4-й+ повтор упавшего вызова */
+        if (retryGuard.shouldBlock(tcHash)) {
+          toolTasks.push((function (tcId) {
+            return function () { return _makeToolResult(tcId, RETRY_BLOCKED_MSG); };
+          })(tc.id));
+          toolTaskHashes.push(tcHash);
+          toolTaskBlocked.push(true);
           continue;
         }
 
@@ -397,6 +505,8 @@
             };
           })(exec, args, tc.id, name));
         }
+        toolTaskHashes.push(tcHash);
+        toolTaskBlocked.push(false);
       }
 
       var toolResults;
@@ -413,7 +523,14 @@
         /* Только чтение/propose — параллельно, как раньше. */
         toolResults = await Promise.all(toolTasks.map(function (t) { return t(); }));
       }
+
+      /* Anti-spam guard: обновляем счётчики ПОСЛЕ await всех результатов пачки.
+         Блокированные вызовы (toolTaskBlocked[i]) не трогаем — иначе вечный блок. */
       for (var ri = 0; ri < toolResults.length; ri++) {
+        if (!toolTaskBlocked[ri]) {
+          var isFailed = isFailedToolResult(toolResults[ri].content);
+          retryGuard.recordResult(toolTaskHashes[ri], isFailed);
+        }
         messages.push(toolResults[ri]);
       }
     }
@@ -450,6 +567,8 @@
     detectCycle: detectCycle,
     hashToolCall: hashToolCall,
     trimHistory: trimHistory,
-    compressToolHistory: compressToolHistory
+    compressToolHistory: compressToolHistory,
+    isFailedToolResult: isFailedToolResult,
+    createRetryGuard: createRetryGuard
   };
 })(window);

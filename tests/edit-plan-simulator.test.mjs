@@ -120,3 +120,215 @@ describe('EditPlanSimulator.extractRippleIntervals', () => {
     assert.deepEqual(ivs[1], { startSec: 5, endSec: 7 });
   });
 });
+
+/* ─── buildTimelineDiff ──────────────────────────────────────────── */
+
+describe('EditPlanSimulator.buildTimelineDiff', () => {
+  const beforeSnap = {
+    ok: true,
+    clips: [
+      { nodeId: 'a', startSec: 0, endSec: 30 },
+      { nodeId: 'b', startSec: 30, endSec: 60 }
+    ]
+  };
+
+  test('нормальный случай match=true', () => {
+    const afterSnap = {
+      ok: true,
+      clips: [
+        { nodeId: 'a', startSec: 0, endSec: 30 },
+        { nodeId: 'b', startSec: 30, endSec: 50 }
+      ]
+    };
+    const d = EP.buildTimelineDiff(beforeSnap, afterSnap, -10);
+    assert.deepEqual(d.before, { durationSec: 60, clipCount: 2 });
+    assert.deepEqual(d.after, { durationSec: 50, clipCount: 2 });
+    assert.equal(d.deltaDurationSec, -10);
+    assert.equal(d.expectedDeltaSec, -10);
+    assert.equal(d.match, true);
+    assert.equal(d.hint, null);
+  });
+
+  test('расхождение match=false + hint', () => {
+    const afterSnap = {
+      ok: true,
+      clips: [
+        { nodeId: 'a', startSec: 0, endSec: 30 },
+        { nodeId: 'b', startSec: 30, endSec: 55 }
+      ]
+    };
+    const d = EP.buildTimelineDiff(beforeSnap, afterSnap, -10);
+    assert.equal(d.deltaDurationSec, -5);
+    assert.equal(d.expectedDeltaSec, -10);
+    assert.equal(d.match, false);
+    assert.ok(d.hint.length > 0);
+    assert.ok(d.hint.indexOf('-10') >= 0);
+    assert.ok(d.hint.indexOf('-5') >= 0);
+  });
+
+  test('expected=null → match=null', () => {
+    const afterSnap = {
+      ok: true,
+      clips: [{ nodeId: 'a', startSec: 0, endSec: 45 }]
+    };
+    const d = EP.buildTimelineDiff(beforeSnap, afterSnap, null);
+    assert.equal(d.match, null);
+    assert.equal(d.hint, null);
+    assert.equal(d.expectedDeltaSec, null);
+    assert.equal(d.deltaDurationSec, -15);
+  });
+
+  test('before=null → before null, match null', () => {
+    const afterSnap = {
+      ok: true,
+      clips: [{ nodeId: 'x', startSec: 0, endSec: 20 }]
+    };
+    const d = EP.buildTimelineDiff(null, afterSnap, -5);
+    assert.equal(d.before, null);
+    assert.deepEqual(d.after, { durationSec: 20, clipCount: 1 });
+    assert.equal(d.deltaDurationSec, null);
+    assert.equal(d.match, null);
+  });
+
+  test('пустые clips → durationSec=0', () => {
+    const emptyBefore = { ok: true, clips: [] };
+    const emptyAfter = { ok: true, clips: [] };
+    const d = EP.buildTimelineDiff(emptyBefore, emptyAfter, 0);
+    assert.deepEqual(d.before, { durationSec: 0, clipCount: 0 });
+    assert.deepEqual(d.after, { durationSec: 0, clipCount: 0 });
+    assert.equal(d.deltaDurationSec, 0);
+    assert.equal(d.match, true);
+  });
+
+  test('допуск 0.5с: |delta−expected|=0.5 → match=true', () => {
+    const afterSnap = {
+      ok: true,
+      clips: [{ nodeId: 'a', startSec: 0, endSec: 50.5 }]
+    };
+    const d = EP.buildTimelineDiff(beforeSnap, afterSnap, -10);
+    // delta = 50.5 - 60 = -9.5; |(-9.5) - (-10)| = 0.5 → ≤ 0.5 → true
+    assert.equal(d.match, true);
+  });
+
+  test('after=null → after null, deltaDurationSec null, match null', () => {
+    const d = EP.buildTimelineDiff(beforeSnap, null, -5);
+    assert.deepEqual(d.before, { durationSec: 60, clipCount: 2 });
+    assert.equal(d.after, null);
+    assert.equal(d.deltaDurationSec, null);
+    assert.equal(d.match, null);
+  });
+});
+
+/* ─── compactSnapshotForLlm ──────────────────────────────────────── */
+
+describe('EditPlanSimulator.compactSnapshotForLlm', () => {
+  test('<80 клипов — без усечения', () => {
+    const s = {
+      ok: true,
+      sequenceName: 'My Seq',
+      clips: [
+        { nodeId: 'n1', name: 'a.mp4', trackType: 'video', trackIndex: 1, startSec: 0, endSec: 10.567 },
+        { nodeId: 'n2', name: 'b.wav', trackType: 'audio', trackIndex: 2, startSec: 10, endSec: 25.1 }
+      ]
+    };
+    const c = EP.compactSnapshotForLlm(s);
+    assert.equal(c.sequenceName, 'My Seq');
+    assert.equal(c.clipCount, 2);
+    assert.equal(c.truncated, false);
+    assert.equal(c.note, null);
+    assert.equal(c.clips[0], 'n1|a.mp4|video1|0.00-10.57');
+    assert.equal(c.clips[1], 'n2|b.wav|audio2|10.00-25.10');
+  });
+
+  test('>maxClips — усечение + note', () => {
+    const clips = [];
+    for (let i = 0; i < 100; i++) {
+      clips.push({ nodeId: 'c' + i, name: 'clip' + i, trackType: 'video', trackIndex: 1, startSec: i, endSec: i + 1 });
+    }
+    const s = { ok: true, sequenceName: 'Big', clips };
+    const c = EP.compactSnapshotForLlm(s, 50);
+    assert.equal(c.clipCount, 100);
+    assert.equal(c.clips.length, 50);
+    assert.equal(c.truncated, true);
+    assert.ok(c.note.indexOf('50') >= 0);
+    assert.ok(c.note.indexOf('100') >= 0);
+  });
+
+  test('snap null → null', () => {
+    assert.equal(EP.compactSnapshotForLlm(null), null);
+  });
+
+  test('snap не ok → null', () => {
+    assert.equal(EP.compactSnapshotForLlm({ ok: false, error: 'no seq' }), null);
+  });
+
+  test('snap без clips → null', () => {
+    assert.equal(EP.compactSnapshotForLlm({ ok: true }), null);
+  });
+});
+
+/* ─── calcExpectedDeltaSec ─────────────────────────────────────────── */
+
+describe('EditPlanSimulator.calcExpectedDeltaSec', () => {
+  test('чистый ripple-набор — сумма отрицательная', () => {
+    const ops = [
+      { action: 'ripple_delete_range', startSec: 0, endSec: 5 },
+      { action: 'ripple_delete_range', startSec: 10, endSec: 13 }
+    ];
+    assert.equal(EP.calcExpectedDeltaSec(ops), -8);
+  });
+
+  test('shift_timeline_ripple — положительный deltaSec', () => {
+    const ops = [
+      { action: 'shift_timeline_ripple', fromSec: 0, deltaSec: 4.5 }
+    ];
+    assert.equal(EP.calcExpectedDeltaSec(ops), 4.5);
+  });
+
+  test('смесь с move_clip → null (непредсказуемая операция)', () => {
+    const ops = [
+      { action: 'ripple_delete_range', startSec: 0, endSec: 3 },
+      { action: 'move_clip', nodeId: 'v1', newStartSec: 10 }
+    ];
+    assert.equal(EP.calcExpectedDeltaSec(ops), null);
+  });
+
+  test('смесь с trim → null', () => {
+    const ops = [
+      { kind: 'ripple_delete_interval', startSec: 1, endSec: 2 },
+      { action: 'set_timeline_in', nodeId: 'v1', timeSec: 5 }
+    ];
+    assert.equal(EP.calcExpectedDeltaSec(ops), null);
+  });
+
+  test('смесь с remove_clip → null', () => {
+    const ops = [
+      { action: 'ripple_delete_range', startSec: 0, endSec: 2 },
+      { action: 'remove_clip', nodeId: 'v1' }
+    ];
+    assert.equal(EP.calcExpectedDeltaSec(ops), null);
+  });
+
+  test('lift_delete / set_clip_enabled / mute_track / note — 0-вклад', () => {
+    const ops = [
+      { action: 'ripple_delete_range', startSec: 0, endSec: 5 },
+      { action: 'lift_delete_range', startSec: 10, endSec: 20 },
+      { action: 'set_clip_enabled', nodeId: 'v1', enabled: false },
+      { action: 'mute_track', trackType: 'audio', trackIndex: 0, muted: true },
+      { action: 'note', note: 'test' }
+    ];
+    // Только ripple -5, остальные 0-вклад
+    assert.equal(EP.calcExpectedDeltaSec(ops), -5);
+  });
+
+  test('пустой массив → null', () => {
+    assert.equal(EP.calcExpectedDeltaSec([]), null);
+  });
+
+  test('не массив → null', () => {
+    assert.equal(EP.calcExpectedDeltaSec(null), null);
+    assert.equal(EP.calcExpectedDeltaSec(undefined), null);
+    assert.equal(EP.calcExpectedDeltaSec('ops'), null);
+    assert.equal(EP.calcExpectedDeltaSec(42), null);
+  });
+});
