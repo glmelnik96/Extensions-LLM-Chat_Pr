@@ -1213,6 +1213,91 @@
     });
   }
 
+  // ──────────────────────────────────────────────────────────
+  // Калибровка блоков: глобальный re-rank после локальной разметки.
+  // applyCalibration / fallbackCalibration — чистые; calibrateMontageBlocks —
+  // один LLM-вызов на СВОДКУ блоков, с fallback на эвристику.
+  // ──────────────────────────────────────────────────────────
+  function applyCalibration(labeled, calib) {
+    var byBlock = {};
+    for (var c = 0; c < (calib || []).length; c++) {
+      var cc = calib[c];
+      if (cc && cc.blockId) byBlock[cc.blockId] = cc;
+    }
+    for (var i = 0; i < labeled.length; i++) {
+      var adj = byBlock[labeled[i].blockId];
+      if (!adj) continue;
+      if (typeof adj.importance === 'number') {
+        var im = Math.round(adj.importance); if (im > 3) im = 3; if (im < 0) im = 0;
+        labeled[i].importance = im;
+      }
+      if (adj.protect === 'start' || adj.protect === 'end') labeled[i].protect = adj.protect;
+    }
+    return labeled;
+  }
+
+  function fallbackCalibration(labeled) {
+    /* Первый и последний блок с importance>=2 → protect start/end */
+    var firstBlock = null, lastBlock = null;
+    for (var i = 0; i < labeled.length; i++) {
+      if (labeled[i].importance >= 2) { if (firstBlock === null) firstBlock = labeled[i].blockId; lastBlock = labeled[i].blockId; }
+    }
+    for (var j = 0; j < labeled.length; j++) {
+      if (firstBlock && labeled[j].blockId === firstBlock && !labeled[j].protect) labeled[j].protect = 'start';
+      if (lastBlock && labeled[j].blockId === lastBlock && !labeled[j].protect) labeled[j].protect = 'end';
+    }
+    return labeled;
+  }
+
+  /**
+   * calibrateMontageBlocks(labeled, entry, opt) → Promise<labeled (с protect + скорр. importance)>
+   * Один LLM-вызов на СВОДКУ блоков. Fallback на эвристику при сбое.
+   * opt: { settings, CloudRuClient, signal, abortCheck }
+   */
+  function calibrateMontageBlocks(labeled, entry, opt) {
+    opt = opt || {};
+    var CC = opt.CloudRuClient || global.CloudRuClient;
+    var settings = opt.settings || {};
+    var model = settings.analysisModel || settings.activeAgentModel || settings.chatModel;
+    if (!labeled || !labeled.length) return Promise.resolve(labeled || []);
+    if (!CC || !CC.chatCompletions) return Promise.resolve(fallbackCalibration(labeled));
+
+    /* Сводка по блокам: blockId → {theme, role(доминирующий), importance(max), durationSec, startSec} */
+    var order = [], byId = {};
+    var paras = (entry && entry.paragraphs) || [];
+    for (var i = 0; i < labeled.length; i++) {
+      var L = labeled[i]; var p = paras[L.i]; var d = p ? (p.endSec - p.startSec) : 0;
+      if (!byId[L.blockId]) { byId[L.blockId] = { blockId: L.blockId, theme: L.theme, role: L.role, importance: L.importance, durationSec: 0, startSec: p ? p.startSec : 0 }; order.push(L.blockId); }
+      var g = byId[L.blockId]; g.durationSec += d;
+      if (L.importance > g.importance) g.importance = L.importance;
+    }
+    var summary = order.map(function (id) { return byId[id]; });
+
+    var sys = [
+      'Тебе дана СВОДКА смысловых блоков видео (без полного текста).',
+      'Каждый блок: {blockId, theme, role, importance (0-3), durationSec, startSec}.',
+      'Задача: откалибруй importance ГЛОБАЛЬНО (баллы ставились по частям, теперь ты видишь целое).',
+      'Подними ядро истории и опусти проходное. Пометь protect:"start" у завязки и protect:"end" у финала/вывода.',
+      'ФОРМАТ строго JSON: {"calib":[{"blockId":"b0","importance":3,"protect":"start"},...]}. Верни только изменённые/ключевые блоки.'
+    ].join('\n');
+
+    return CC.chatCompletions({
+      baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: model,
+      messages: [ { role: 'system', content: sys }, { role: 'user', content: JSON.stringify({ blocks: summary }) } ],
+      chatParams: { max_tokens: 4000, temperature: 0.1 },
+      responseFormat: 'json_object', enableThinking: false,
+      signal: opt.signal, abortCheck: opt.abortCheck
+    }).then(function (resp) {
+      var content = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+      var m = content && String(content).match(/\{[\s\S]*\}/);
+      if (!m) return fallbackCalibration(labeled);
+      var j; try { j = JSON.parse(m[0]); } catch (e) { return fallbackCalibration(labeled); }
+      var calib = (j && j.calib) || [];
+      if (!Array.isArray(calib) || !calib.length) return fallbackCalibration(labeled);
+      return applyCalibration(labeled, calib);
+    }, function () { return fallbackCalibration(labeled); });
+  }
+
   global.TranscriptStructure = {
     buildParagraphs: buildParagraphs,
     buildSpeakers: buildSpeakers,
@@ -1221,6 +1306,9 @@
     parseMontageChunk: parseMontageChunk,
     buildMontageSystemPrompt: buildMontageSystemPrompt,
     labelMontageBlocks: labelMontageBlocks,
+    applyCalibration: applyCalibration,
+    fallbackCalibration: fallbackCalibration,
+    calibrateMontageBlocks: calibrateMontageBlocks,
     buildStructure: buildStructure,
     isParagraphsStale: isParagraphsStale,
     resolveRefsToIntervals: resolveRefsToIntervals,
