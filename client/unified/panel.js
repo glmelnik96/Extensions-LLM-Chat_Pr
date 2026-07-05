@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-07-05-montage-plan-v37'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-07-06-montage-v2'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -681,40 +681,18 @@ PanelBoot.run('ИИ: монтаж', function () {
         name: 'propose_montage_plan',
         description:
           'План монтажа по смыслам: сократить материал до целевого хронометража. ' +
-          'Блоки keep/cut покрывают ВСЕ абзацы транскрипта ровно по одному разу. ' +
-          'Плагин сам считает длительности по абзацам (не считай секунды вручную), ' +
-          'валидирует попадание в цель ±10% и показывает пользователю карточку плана на подтверждение. ' +
-          'Используй для запросов «сожми до N минут», «сократи сохранив суть», «собери по смыслу». ' +
-          'Требуется транскрипт (get_transcript_structure).',
+          'Плагин САМ размечает смыслы транскрипта второй моделью (по чанкам), ' +
+          'детерминированно собирает план keep/cut под цель ±10% и показывает карточку на подтверждение. ' +
+          'НЕ передавай blocks — плагин строит их сам. Требуется транскрипт (сначала транскрибируй In–Out). ' +
+          'Используй для «сожми до N минут», «сократи сохранив суть», «собери по смыслу».',
         parameters: {
           type: 'object',
           properties: {
             sequenceKey: { type: 'string', description: 'Имя секвенции (sequenceName из снимка)' },
             targetDurationSec: { type: 'number', description: 'Целевой хронометраж в секундах, > 0' },
-            blocks: {
-              type: 'array',
-              description: 'Блоки плана в хронологическом порядке. Каждый абзац транскрипта — ровно в одном блоке.',
-              items: {
-                type: 'object',
-                properties: {
-                  action: { type: 'string', enum: ['keep', 'cut'] },
-                  paragraphs: {
-                    type: 'object',
-                    properties: {
-                      from: { type: 'integer', description: 'Первый абзац блока (индекс i)' },
-                      to: { type: 'integer', description: 'Последний абзац блока включительно' }
-                    },
-                    required: ['from', 'to']
-                  },
-                  theme: { type: 'string', description: 'Для keep: тема/роль блока в драматургии (3-6 слов)' },
-                  reason: { type: 'string', description: 'Для cut: почему вырезаем (повтор / вода / слабый кусок / офтоп + уточнение)' }
-                },
-                required: ['action', 'paragraphs']
-              }
-            },
             summary: { type: 'string', description: '1-2 предложения: что получится' }
           },
-          required: ['sequenceKey', 'targetDurationSec', 'blocks', 'summary']
+          required: ['sequenceKey', 'targetDurationSec', 'summary']
         }
       }
     },
@@ -3083,40 +3061,57 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
     }
 
-    /* Детерминированная валидация плана */
-    var v = MontagePlan.validatePlan(args, entry);
-    if (!v.ok) {
-      return Promise.resolve({ error: 'План не прошёл проверку: ' + v.errors.join('; '), _planStats: v.stats });
-    }
+    /* v2: план строит плагин через чанкированный воркер, НЕ модель.
+       Гейт #1: функция ВСЕГДА завершается карточкой ЛИБО {error}. */
+    var settings = ContextStore.getResolvedSettings ? ContextStore.getResolvedSettings() : {};
+    var CC = typeof CloudRuClient !== 'undefined' ? CloudRuClient : null;
+    var paras = entry.paragraphs || [];
+    if (!paras.length) return Promise.resolve({ error: 'В транскрипте нет абзацев — транскрибируй материал заново.' });
 
-    /* Развернуть cut-блоки в removeRefs + собрать summaries */
-    var refs = MontagePlan.buildRemoveRefs(args.blocks);
-    var summaries = MontagePlan.buildSummaries(args.blocks, entry);
+    var wOpt = {
+      settings: settings, CloudRuClient: CC,
+      signal: runAbort ? runAbort.signal : null,
+      abortCheck: runAbort ? function () { return runAbort.aborted; } : null,
+      onProgress: function (ev) { if (ev && ev.message) statusUi.show(ev.message, true);
+        if (ev && ev.totalChunks && typeof ev.chunkIndex === 'number') statusUi.progress((ev.chunkIndex / ev.totalChunks) * 100); }
+    };
 
-    /* Проброс контекста плана в _pendingProposal через _pendingPlanContext */
-    _pendingPlanContext = { blocks: args.blocks, stats: v.stats, warnings: v.warnings };
-    var res;
-    try {
-      res = execProposeTranscriptCuts({
-        sequenceKey: sequenceKey,
-        removeRefs: refs,
-        targetDurationSec: args.targetDurationSec,
-        keepSummary: summaries.keepSummary,
-        removeSummary: summaries.removeSummary,
-        summary: args.summary
+    statusUi.show('Разметка смыслов транскрипта…', true);
+    return TranscriptStructure.labelMontageBlocks(paras, wOpt)
+      .then(function (w) {
+        if (!w || !w.labeled || !w.labeled.length) throw new Error('Воркер не вернул разметку');
+        return TranscriptStructure.calibrateMontageBlocks(w.labeled, entry, wOpt);
+      })
+      .then(function (labeled) {
+        var built = MontagePlan.buildPlanFromLabels(labeled, entry, args.targetDurationSec);
+        if (!built.blocks.length) throw new Error('Не удалось собрать план из разметки');
+        var v = MontagePlan.validatePlan(
+          { targetDurationSec: args.targetDurationSec, blocks: built.blocks, summary: args.summary }, entry);
+        if (!v.ok) {
+          /* авто-план не прошёл — редкость; отдаём агенту явную ошибку */
+          return { error: 'Авто-план не прошёл проверку: ' + v.errors.join('; '), _planStats: v.stats };
+        }
+        var refs = MontagePlan.buildRemoveRefs(built.blocks);
+        var summaries = MontagePlan.buildSummaries(built.blocks, entry);
+        _pendingPlanContext = { blocks: built.blocks, stats: v.stats, warnings: v.warnings };
+        var res;
+        try {
+          res = execProposeTranscriptCuts({
+            sequenceKey: sequenceKey, removeRefs: refs, targetDurationSec: args.targetDurationSec,
+            keepSummary: summaries.keepSummary, removeSummary: summaries.removeSummary, summary: args.summary
+          });
+        } finally { _pendingPlanContext = null; }
+        return Promise.resolve(res).then(function (r) {
+          statusUi.hide();
+          if (r && r.ok) { r._planStats = v.stats; if (v.warnings.length) r._planWarnings = v.warnings; }
+          return r;
+        });
+      })
+      .catch(function (err) {
+        statusUi.hide();
+        return { error: 'Монтаж по смыслам не удался: ' + (err && err.message ? err.message : String(err)) +
+          '. Проверь, что транскрипт готов, и попробуй снова.' };
       });
-    } finally {
-      _pendingPlanContext = null;
-    }
-    /* execProposeTranscriptCuts — sync (возвращает Promise.resolve),
-       но обрабатываем единообразно через Promise для будущей совместимости. */
-    return Promise.resolve(res).then(function (r) {
-      if (r && r.ok) {
-        r._planStats = v.stats;
-        if (v.warnings.length) r._planWarnings = v.warnings;
-      }
-      return r;
-    });
   }
 
   /**
