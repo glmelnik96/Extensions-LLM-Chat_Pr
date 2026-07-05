@@ -1097,11 +1097,130 @@
     return { intervals: intervals, errors: errors };
   }
 
+  /* ═══════════════════════════════════════════════════════════════════════
+   * МОНТАЖ ПО СМЫСЛАМ v2 — воркер разметки абзацев (2-я модель, чанки).
+   * Зеркалит analyzeForCutsWithLLM (чанкинг, CC.chatCompletions, abort/onProgress),
+   * но вход — АБЗАЦЫ {i,startSec,endSec,text}, выход на абзац —
+   * {i, importance(0-3), role(валидный или 'argument'), theme, blockId}.
+   * ═══════════════════════════════════════════════════════════════════════ */
+  var MONTAGE_ROLES = { hook: 1, argument: 1, example: 1, payoff: 1, repeat: 1, filler: 1, offtopic: 1 };
+
+  function parseMontageChunk(content, segStart, segEnd) {
+    if (!content) return [];
+    var m = String(content).match(/\{[\s\S]*\}/);
+    if (!m) return [];
+    var j;
+    try { j = JSON.parse(m[0]); } catch (e) { return []; }
+    var arr = (j && j.blocks) || [];
+    if (!Array.isArray(arr)) return [];
+    var out = [];
+    for (var k = 0; k < arr.length; k++) {
+      var b = arr[k];
+      if (!b || typeof b.i !== 'number') continue;
+      var imp = Math.round(b.importance);
+      if (!(imp >= 0)) imp = 1;
+      if (imp > 3) imp = 3;
+      if (imp < 0) imp = 0;
+      var role = String(b.role || 'argument').toLowerCase();
+      if (!MONTAGE_ROLES[role]) role = 'argument';
+      out.push({
+        i: b.i, importance: imp, role: role,
+        theme: String(b.theme || ''),
+        blockId: String(b.blockId || ('b' + b.i))
+      });
+    }
+    return out;
+  }
+
+  function buildMontageSystemPrompt() {
+    return [
+      'Ты — ассистент видеомонтажёра. Дан список АБЗАЦЕВ транскрипта.',
+      'Каждый абзац: {i: индекс, t0: начало (сек), t1: конец (сек), text: текст}.',
+      'Задача: оцени вклад КАЖДОГО абзаца в СУТЬ материала. НЕ считай секунды.',
+      'Для каждого абзаца верни:',
+      '• importance: 0=мусор/паразиты, 1=проходное, 2=важное, 3=ядро смысла (без него теряется суть).',
+      '• role: hook (завязка) | argument (мысль/факт) | example (пример/история) | payoff (вывод/кульминация) | repeat (повтор сказанного) | filler (вода/паразиты) | offtopic (офтоп).',
+      '• theme: роль абзаца в истории, 3-6 слов.',
+      '• blockId: соседние абзацы ОДНОЙ мысли объединяй одним blockId (например "b3").',
+      '  Новая мысль — новый blockId. Это нужно чтобы монтаж резал по смысловым границам.',
+      '',
+      'ФОРМАТ — строго JSON, без markdown:',
+      '{"blocks":[{"i":0,"importance":3,"role":"hook","theme":"Завязка спора","blockId":"b0"},...]}',
+      'Верни ВСЕ абзацы из входа. Ни один не пропускай.'
+    ].join('\n');
+  }
+
+  /**
+   * labelMontageBlocks(paragraphs, opt) → Promise<{labeled:Array, chunks, failedChunks}>
+   * opt: { settings, CloudRuClient, signal, abortCheck, onProgress? }
+   * Зеркалит чанкинг analyzeForCutsWithLLM, но на уровне абзацев.
+   */
+  function labelMontageBlocks(paragraphs, opt) {
+    opt = opt || {};
+    var settings = opt.settings || {};
+    var CC = opt.CloudRuClient || global.CloudRuClient;
+    var onProgress = typeof opt.onProgress === 'function' ? opt.onProgress : function () {};
+    var model = settings.analysisModel || settings.activeAgentModel || settings.chatModel;
+
+    if (!CC || !CC.chatCompletions) return Promise.reject(new Error('CloudRuClient недоступен'));
+    if (!paragraphs || !paragraphs.length) return Promise.resolve({ labeled: [], chunks: 0, failedChunks: [] });
+
+    var CHUNK = ANALYSIS_CHUNK_SIZE; /* переиспользуем константу */
+    var chunks = [];
+    for (var ci = 0; ci < paragraphs.length && chunks.length < ANALYSIS_MAX_CHUNKS; ci += CHUNK) {
+      var slice = paragraphs.slice(ci, ci + CHUNK);
+      chunks.push(slice.map(function (p, idx) {
+        return { i: (typeof p.i === 'number' ? p.i : (ci + idx)), t0: p.startSec, t1: p.endSec,
+                 text: String(p.text || '').slice(0, 600) };
+      }));
+    }
+
+    var sysPrompt = buildMontageSystemPrompt();
+    var all = [];
+    var failedChunks = [];
+    var total = chunks.length;
+    onProgress({ phase: 'start', totalChunks: total, message: 'Разметка смыслов: ' + paragraphs.length + ' абзацев, ' + total + ' чанк(ов)' });
+
+    function processOne(idx) {
+      if (idx >= chunks.length) return Promise.resolve();
+      if (opt.abortCheck && opt.abortCheck()) return Promise.resolve();
+      var chunk = chunks[idx];
+      var segStart = chunk[0].i, segEnd = chunk[chunk.length - 1].i;
+      onProgress({ phase: 'chunk', chunkIndex: idx + 1, totalChunks: total,
+        message: 'Разметка чанка ' + (idx + 1) + '/' + total + ' (абзацы ' + segStart + '–' + segEnd + ')…' });
+      return CC.chatCompletions({
+        baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: model,
+        messages: [ { role: 'system', content: sysPrompt }, { role: 'user', content: JSON.stringify({ paragraphs: chunk }) } ],
+        chatParams: { max_tokens: 8000, temperature: 0.1 },
+        responseFormat: 'json_object', enableThinking: false,
+        signal: opt.signal, abortCheck: opt.abortCheck
+      }).then(function (resp) {
+        var content = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+        var parsed = parseMontageChunk(content, segStart, segEnd);
+        if (!parsed.length) failedChunks.push({ chunkIndex: idx + 1, segStart: segStart, segEnd: segEnd });
+        for (var q = 0; q < parsed.length; q++) all.push(parsed[q]);
+        onProgress({ phase: 'chunk_done', chunkIndex: idx + 1, totalChunks: total });
+        return processOne(idx + 1);
+      }, function (err) {
+        failedChunks.push({ chunkIndex: idx + 1, segStart: segStart, segEnd: segEnd, reason: String(err && err.message || err) });
+        return processOne(idx + 1);
+      });
+    }
+
+    return processOne(0).then(function () {
+      onProgress({ phase: 'done', totalChunks: total });
+      return { labeled: all, chunks: total, failedChunks: failedChunks };
+    });
+  }
+
   global.TranscriptStructure = {
     buildParagraphs: buildParagraphs,
     buildSpeakers: buildSpeakers,
     buildTopicsWithLLM: buildTopicsWithLLM,
     analyzeForCutsWithLLM: analyzeForCutsWithLLM,
+    parseMontageChunk: parseMontageChunk,
+    buildMontageSystemPrompt: buildMontageSystemPrompt,
+    labelMontageBlocks: labelMontageBlocks,
     buildStructure: buildStructure,
     isParagraphsStale: isParagraphsStale,
     resolveRefsToIntervals: resolveRefsToIntervals,
