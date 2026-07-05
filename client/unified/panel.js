@@ -4345,10 +4345,14 @@ PanelBoot.run('ИИ: монтаж', function () {
     { id: 'markers', label: '🏷️ Маркеры',    panelId: 'markers',     hintGroup: 'markers' },
     { id: 'search',  label: '🔍 Поиск',      panelId: 'search',      hintGroup: null /* нет hints */ }
   ];
-  var _expandedCat = null; /* id развёрнутой категории, null = все свёрнуты */
+  var _expandedCat = 'text'; /* id развёрнутой категории, null = все свёрнуты.
+     Дефолт 'text' (📝 По тексту) — чтобы «Монтаж по смыслам» был виден без раскрытия
+     (обнаруживаемость #3). Явный выбор пользователя из localStorage перекрывает дефолт. */
   try {
-    _expandedCat = localStorage.getItem('extllmpr_v1_expanded_cat');
-    if (_expandedCat === 'null' || _expandedCat === '') _expandedCat = null;
+    var _storedCat = localStorage.getItem('extllmpr_v1_expanded_cat');
+    if (_storedCat === null) _expandedCat = 'text';        /* никогда не выбирал → открыть «По тексту» */
+    else if (_storedCat === 'null' || _storedCat === '') _expandedCat = null; /* явно свернул всё */
+    else _expandedCat = _storedCat;                         /* явный выбор категории */
   } catch (e) {
     console.warn('[panel] localStorage read for expanded_cat failed:', e && e.message);
   }
