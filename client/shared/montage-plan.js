@@ -279,10 +279,125 @@
     return { keepSummary: keepSummary, removeSummary: removeSummary };
   }
 
+  // ──────────────────────────────────────────────────────────
+  // buildPlanFromLabels(labeled, entry, targetSec) → {blocks, stats}
+  // Детерминированный knapsack: свернуть в блоки → отобрать под бюджет →
+  // собрать keep/cut blocks в формате validatePlan (соседние сливаются).
+  // ──────────────────────────────────────────────────────────
+  function _roleToReason(role) {
+    if (role === 'repeat') return 'повтор';
+    if (role === 'filler') return 'вода';
+    if (role === 'offtopic') return 'офтоп';
+    return 'слабый кусок';
+  }
+
+  /* Добавляет причину в список, если её там ещё нет (уникальность + порядок) */
+  function _addReason(list, reason) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] === reason) return;
+    }
+    list.push(reason);
+  }
+
+  function buildPlanFromLabels(labeled, entry, targetSec) {
+    var paras = (entry && entry.paragraphs) || [];
+    var P = paras.length;
+    var stats = { keptBlocks: 0, cutBlocks: 0, keepSec: 0, cutSec: 0 };
+    if (!P || !labeled || !labeled.length) {
+      return { blocks: [], stats: stats };
+    }
+
+    /* 1. Индексируем метку по абзацу; недостающим — importance 1, role argument */
+    var byIdx = [];
+    for (var li = 0; li < labeled.length; li++) {
+      var L = labeled[li];
+      if (typeof L.i === 'number' && L.i >= 0 && L.i < P) byIdx[L.i] = L;
+    }
+    for (var pi = 0; pi < P; pi++) {
+      if (!byIdx[pi]) byIdx[pi] = { i: pi, blockId: 'auto' + pi, importance: 1, role: 'argument', theme: '', protect: null };
+    }
+
+    /* 2. Сворачиваем по смежным одинаковым blockId в группы */
+    var groups = [];
+    var cur = null;
+    for (var g = 0; g < P; g++) {
+      var lab = byIdx[g];
+      var dur = paras[g].endSec - paras[g].startSec;
+      if (cur && cur.blockId === lab.blockId) {
+        cur.to = g; cur.dur += dur;
+        if (lab.importance > cur.importance) cur.importance = lab.importance;
+        if (lab.protect) cur.protect = lab.protect;
+      } else {
+        cur = { blockId: lab.blockId, from: g, to: g, dur: dur,
+                importance: lab.importance || 0, role: lab.role || 'argument',
+                theme: lab.theme || '', protect: lab.protect || null };
+        groups.push(cur);
+      }
+    }
+
+    /* 3. Отбор: protect start/end → keep всегда; затем по importance убыв.,
+       tie-break по from (стабильно). Добираем пока keepSec+dur ≤ target. */
+    var order = groups.slice().sort(function (a, b) {
+      var pa = a.protect ? 1 : 0, pb = b.protect ? 1 : 0;
+      if (pa !== pb) return pb - pa;
+      if (b.importance !== a.importance) return b.importance - a.importance;
+      return a.from - b.from;
+    });
+    var keepSec = 0;
+    for (var oi = 0; oi < order.length; oi++) {
+      var grp = order[oi];
+      if (grp.protect || keepSec + grp.dur <= targetSec) {
+        grp._keep = true; keepSec += grp.dur;
+      } else {
+        grp._keep = false;
+      }
+    }
+
+    /* 4. Собираем blocks в хронологическом порядке, сливая соседние одинаковые action */
+    var blocks = [];
+    var pending = null;
+    for (var gi = 0; gi < groups.length; gi++) {
+      var gg = groups[gi];
+      var action = gg._keep ? 'keep' : 'cut';
+      if (pending && pending.action === action) {
+        pending.paragraphs.to = gg.to;
+        if (action === 'keep' && gg.theme && !pending.theme) pending.theme = gg.theme;
+        if (action === 'cut') _addReason(pending._reasons, _roleToReason(gg.role));
+      } else {
+        pending = { action: action, paragraphs: { from: gg.from, to: gg.to } };
+        if (action === 'keep') {
+          pending.theme = gg.theme || 'Ключевой фрагмент';
+        } else {
+          pending._reasons = [];
+          _addReason(pending._reasons, _roleToReason(gg.role));
+        }
+        blocks.push(pending);
+      }
+    }
+
+    /* 4b. Собираем reason из накопленных причин (уникальные, в хрон. порядке) */
+    for (var ri = 0; ri < blocks.length; ri++) {
+      if (blocks[ri].action === 'cut') {
+        blocks[ri].reason = blocks[ri]._reasons.join(', ');
+        delete blocks[ri]._reasons;
+      }
+    }
+
+    /* 5. stats */
+    for (var bi = 0; bi < blocks.length; bi++) {
+      var blk = blocks[bi], d = 0;
+      for (var p2 = blk.paragraphs.from; p2 <= blk.paragraphs.to; p2++) d += paras[p2].endSec - paras[p2].startSec;
+      if (blk.action === 'keep') { stats.keepSec += d; stats.keptBlocks++; }
+      else { stats.cutSec += d; stats.cutBlocks++; }
+    }
+    return { blocks: blocks, stats: stats };
+  }
+
   global.MontagePlan = {
     validatePlan: validatePlan,
     buildRemoveRefs: buildRemoveRefs,
     buildSummaries: buildSummaries,
+    buildPlanFromLabels: buildPlanFromLabels,
     _fmtSec: fmtSec
   };
 })(typeof window !== 'undefined' ? window : this);
