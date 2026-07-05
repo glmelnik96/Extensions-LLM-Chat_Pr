@@ -1029,6 +1029,32 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
 };
 
 /**
+ * Лёгкий опрос региона: только имя активной секвенции + In/Out.
+ * Для LED/гейтов вкладки «Инструменты»: полный getTimelineSnapshot (сотни
+ * клипов) слишком тяжёл для периодического опроса, а смена In/Out в таймлайне
+ * НЕ шлёт CEP-событий — панель обязана опрашивать сама.
+ */
+$._EXT_PRM_.getSequenceRegionInfo = function () {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+    var inSec = null, outSec = null;
+    try { inSec = parseFloat(seq.getInPoint()); if (isNaN(inSec)) inSec = null; } catch (eI) {}
+    try { outSec = parseFloat(seq.getOutPoint()); if (isNaN(outSec)) outSec = null; } catch (eO) {}
+    return JSON.stringify({
+      ok: true,
+      sequenceName: seq.name || '',
+      sequenceInSec: inSec,
+      sequenceOutSec: outSec
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
  * J-cut / L-cut: сдвинуть точку монтажа аудио относительно видео.
  *
  * J-cut: аудио следующего клипа начинается ДО видео (offsetFrames < 0 на аудио-inPoint).

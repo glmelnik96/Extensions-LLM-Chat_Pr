@@ -184,6 +184,12 @@
       this.evalJson('$._EXT_PRM_.getTimelineSnapshot()', cb);
     },
 
+    /* Лёгкий опрос: имя секвенции + In/Out (без клипов). Для периодического
+       обновления LED/гейтов «Инструментов» — быстрый и с коротким таймаутом. */
+    getSequenceRegionInfo: function (cb) {
+      this.evalJson('$._EXT_PRM_.getSequenceRegionInfo()', cb, { timeoutMs: 10000 });
+    },
+
     applyTimecodeEdits: function (planObj, cb) {
       var json = escapeDoubleQuoted(JSON.stringify(planObj));
       this.evalJson('$._EXT_PRM_.applyTimecodeEdits("' + json + '")', cb, { mutating: true });

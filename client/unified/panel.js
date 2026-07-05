@@ -7,7 +7,7 @@
  *  - Стартеры группируются по категориям (таймлайн / текст / маркеры) через вкладки.
  *  - Кнопка undo для маркеров (точечное удаление), для таймкодов — Cmd+Z в Premiere.
  */
-try { window.__PANEL_BUILD__ = '2026-07-04-ripple-v33'; } catch (e) {}
+try { window.__PANEL_BUILD__ = '2026-07-05-gates-v34'; } catch (e) {}
 PanelBoot.run('ИИ: монтаж', function () {
   var cs = new CSInterface();
   try {
@@ -953,12 +953,17 @@ PanelBoot.run('ИИ: монтаж', function () {
        forceRefresh=true обходит кэш (после apply-операций). */
     var forceRefresh = argsOrBool === true || (argsOrBool && argsOrBool.forceRefresh === true);
     if (!forceRefresh && !_snapDirty && lastSnap && lastSnap.ok) {
-      if (typeof statusUi !== 'undefined') statusUi.show('Snapshot: из кэша', true);
+      /* Кэш мгновенный — статус не показываем (нечего «крутить»). */
       return Promise.resolve(lastSnap);
     }
+    /* Жизненный цикл статуса ЗДЕСЬ же: раньше show() был без парного hide() —
+       вызовы не из чата (Tools-tab, MultiCam-маппинг) оставляли «Получение
+       снимка таймлайна…» крутиться вечно (их finally прятал ДРУГОЙ статус-бар).
+       evalJson гарантирует callback (таймаут 30с) → спиннер всегда снимется. */
     if (typeof statusUi !== 'undefined') statusUi.show('Получение снимка таймлайна…', true);
     return new Promise(function (resolve, reject) {
       PremiereBridge.getTimelineSnapshot(function (err, data) {
+        if (typeof statusUi !== 'undefined') statusUi.hide();
         if (err) reject(err);
         else {
           lastSnap = data;
@@ -4621,7 +4626,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* P0-1: Auto-inject timeline snapshot — убираем 1 обязательный round-trip.
        Максимально компактный формат: только sequenceName + видео-клипы.
        Audio-клипы дублируют видео и добавляют шум. */
-    statusUi.show('Получение снимка таймлайна…', true);
+    /* Статус «Получение снимка таймлайна…» показывает сам execGetSnapshot (и сам прячет). */
     try {
       var autoSnap = await execGetSnapshot(true); /* ВСЕГДА свежий snap для каждого нового сообщения */
       if (autoSnap && autoSnap.ok) {
@@ -5442,6 +5447,20 @@ PanelBoot.run('ИИ: монтаж', function () {
         if (vt && vt.classList.contains('active')) window.toolsRefreshLed();
       } catch (e) {}
     });
+    /* 05.07.2026: focus в CEP срабатывает ненадёжно/редко — гейт «область
+       изменилась» появлялся с большой задержкой и «залипал» после обновления
+       анализа (нечему было пересчитать). Периодический опрос лёгким
+       getSequenceRegionInfo (~4с), только пока вкладка «Инструменты» видима
+       и панель свободна (не грузим однопоточный ExtendScript во время операций). */
+    setInterval(function () {
+      try {
+        var vt2 = document.getElementById('view-tools');
+        if (!vt2 || !vt2.classList.contains('active')) return;
+        if (_toolsBusy) return;
+        if (opQueue && opQueue.isBusy()) return;
+        window.toolsRefreshLed();
+      } catch (e) {}
+    }, 4000);
     /* 19.06.2026: активная секвенция сменилась — состояние инструментов (waveform-
        превью, proposal) относится к ПРЕЖНЕЙ секвенции. Сбрасываем, чтобы ползунки
        не рисовали чужой waveform, а зависшая карточка не применилась к новой
@@ -5472,9 +5491,11 @@ PanelBoot.run('ИИ: монтаж', function () {
       } catch (e) {}
     });
     /* Анализ устарел? — сравниваем In/Out, для которого считали анализ, с текущим
-       In/Out секвенции. Если монтажёр сдвинул область — анализ нужно обновить. */
-    function _regionStale(entry, snap) {
-      var ar = entry && ((entry.audioAnalysis && entry.audioAnalysis.analyzedRegion) || entry.analyzedRegion);
+       In/Out секвенции. Если монтажёр сдвинул область — анализ нужно обновить.
+       ar передаётся ЯВНО: у аудио-анализа и транскрипта СВОИ analyzedRegion
+       (например «⚡ Обновить анализ» освежает только audioAnalysis — транскрипт
+       остаётся от старой области и его карточки должны остаться под гейтом). */
+    function _regionStale(ar, snap) {
       if (!ar || !snap || typeof snap !== 'object') return false;
       /* normInOutSec: -400000-сентинел «In/Out не задан» → null с обеих сторон */
       function near(a, b) { if (a === null && b === null) return true; if (a === null || b === null) return false; return Math.abs(a - b) <= 0.5; }
@@ -5484,7 +5505,7 @@ PanelBoot.run('ИИ: монтаж', function () {
        имя секвенции и определить устаревание по In/Out. Строка = только имя (fallback). */
     function _applyToolsLedForSeq(snap) {
       var seqName = (snap && typeof snap === 'object') ? (snap.sequenceName || '') : (typeof snap === 'string' ? snap : '');
-      var hasTranscript = false, hasAudio = false, stale = false;
+      var hasTranscript = false, hasAudio = false, staleAudio = false, staleTranscript = false;
       try {
         if (seqName) {
           var f = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName);
@@ -5492,36 +5513,51 @@ PanelBoot.run('ИИ: монтаж', function () {
             hasTranscript = !!(f.entry.segments && f.entry.segments.length);
             /* P0-2: аудиоанализ (ffmpeg) без Whisper достаточен для «Тишины» */
             hasAudio = hasTranscript || !!f.entry.audioAnalysis;
-            if (hasAudio) stale = _regionStale(f.entry, snap);
+            /* Раздельные stale-флаги: «⚡ Обновить анализ» освежает ТОЛЬКО
+               audioAnalysis.analyzedRegion — раньше единый флаг разблокировал
+               заодно и транскрипт-карточки (транскрипт от СТАРОЙ области!),
+               и наоборот: старый top-level analyzedRegion удерживал гейт
+               аудио-карточек после честного обновления анализа. */
+            var arA = (f.entry.audioAnalysis && f.entry.audioAnalysis.analyzedRegion) || f.entry.analyzedRegion;
+            var arT = f.entry.analyzedRegion || (f.entry.audioAnalysis && f.entry.audioAnalysis.analyzedRegion);
+            if (hasAudio) staleAudio = _regionStale(arA, snap);
+            if (hasTranscript) staleTranscript = _regionStale(arT, snap);
           }
         }
       } catch (e) { /* findTranscriptEntry не должен падать */ }
       var seqLabel = seqName ? ' · «' + seqName + '»' : '';
       if (!hasAudio && !hasTranscript) {
         toolsSetLed('red', 'нужен анализ' + seqLabel);
-      } else if (stale) {
-        /* анализ есть, но для ДРУГОГО In/Out — для текущей области нужен заново */
+      } else if (staleAudio && (staleTranscript || !hasTranscript)) {
+        /* ВСЁ устарело для текущего In/Out — нужен заново */
         toolsSetLed('red', 'нужен анализ' + seqLabel + ' (область сменилась)');
+      } else if (staleAudio || staleTranscript) {
+        /* часть данных актуальна — жёлтый: смотри гейты на карточках */
+        toolsSetLed('busy', 'часть анализа устарела' + seqLabel);
       } else {
         toolsSetLed(hasTranscript ? 'ok' : 'audio', 'анализ готов' + seqLabel);
       }
-      toolsUpdateCards(hasTranscript, hasAudio, stale);
+      toolsUpdateCards(hasTranscript, hasAudio, staleTranscript, staleAudio);
     }
     var _ledRefreshInFlight = false;
     window.toolsRefreshLed = function () {
       /* Во время «Анализ аудио» держим busy — не перетираем индикатор прогресса. */
       if (_toolsBusy) { toolsSetLed('busy'); return; }
-      /* 19.06.2026 FIX: LED отражает АКТИВНУЮ секвенцию. ВСЕГДА запрашиваем свежий
-         снапшот — НЕ полагаемся на _snapDirty/lastSnap: CEP-событие
+      /* 19.06.2026 FIX: LED отражает АКТИВНУЮ секвенцию. ВСЕГДА запрашиваем свежее
+         состояние — НЕ полагаемся на _snapDirty/lastSnap: CEP-событие
          ActiveSequenceChanged ненадёжно («могут не работать»), при его пропуске LED
          показывал состояние СТАРОЙ секвенции (или произвольной keys[0]). in-flight
-         guard защищает от наложения частых вызовов (tab-switch/события). */
+         guard защищает от наложения частых вызовов (tab-switch/события).
+         05.07.2026: лёгкий getSequenceRegionInfo вместо полного снимка — LED нужны
+         ТОЛЬКО имя + In/Out. Полный снимок (сотни клипов) отвечал секундами и мог
+         упасть по таймауту → fallback на lastSnap со СТАРЫМ In/Out держал гейт
+         «область изменилась» даже после честного обновления анализа. */
       if (_ledRefreshInFlight) return;
       _ledRefreshInFlight = true;
       try {
-        PremiereBridge.getTimelineSnapshot(function (err, snap) {
+        PremiereBridge.getSequenceRegionInfo(function (err, info) {
           _ledRefreshInFlight = false;
-          if (!err && snap && snap.ok) { lastSnap = snap; _snapDirty = false; _applyToolsLedForSeq(snap); }
+          if (!err && info && info.ok) _applyToolsLedForSeq(info);
           else _applyToolsLedForSeq(lastSnap || '');
         });
       } catch (e) { _ledRefreshInFlight = false; _applyToolsLedForSeq(lastSnap || ''); }
@@ -5546,24 +5582,26 @@ PanelBoot.run('ИИ: монтаж', function () {
        .needs-transcript — нужны Whisper-сегменты (паразиты, jump cuts, главы);
        .needs-audio — достаточно audioAnalysis ИЛИ транскрипта («Тишина»);
        MultiCam без класса — ему нужен только снимок таймлайна + ffmpeg. */
-    function toolsUpdateCards(hasTranscript, hasAudio, stale) {
+    function toolsUpdateCards(hasTranscript, hasAudio, staleTranscript, staleAudio) {
       /* Аудит 04.07.2026: stale («область In–Out сменилась») теперь БЛОКИРУЕТ
          карточки, а не только красит LED — раньше LED говорил «нужен анализ»,
-         но кнопки оставались живыми и резали по СТАРОЙ области. */
+         но кнопки оставались живыми и резали по СТАРОЙ области.
+         05.07.2026: stale раздельный — транскрипт и аудио-анализ обновляются
+         независимо, у каждого свой analyzedRegion. */
       var i, gated;
       var cards = document.querySelectorAll('.tool-card.needs-transcript');
       for (i = 0; i < cards.length; i++) {
-        gated = !hasTranscript || stale;
+        gated = !hasTranscript || staleTranscript;
         if (gated) cards[i].classList.add('disabled');
         else cards[i].classList.remove('disabled');
-        _setCardGate(cards[i], gated, 'transcript', hasTranscript && stale);
+        _setCardGate(cards[i], gated, 'transcript', hasTranscript && staleTranscript);
       }
       var audioCards = document.querySelectorAll('.tool-card.needs-audio');
       for (i = 0; i < audioCards.length; i++) {
-        gated = !hasAudio || stale;
+        gated = !hasAudio || staleAudio;
         if (gated) audioCards[i].classList.add('disabled');
         else audioCards[i].classList.remove('disabled');
-        _setCardGate(audioCards[i], gated, 'audio', hasAudio && stale);
+        _setCardGate(audioCards[i], gated, 'audio', hasAudio && staleAudio);
       }
     }
 
@@ -5904,6 +5942,38 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
     bindToggle('filler-mode');
     bindToggle('jcut-mode');
+
+    /* ── Инвалидация предложения при смене параметров ─────────
+       05.07.2026: план в proposal строится ОДИН РАЗ по параметрам на момент
+       «Найти и вырезать». Ползунки после этого перерисовывали waveform-зоны
+       live, но «Применить» вырезал бы СТАРЫЙ план (юзер видит «16 пауз >0.3с»,
+       ставит 2.5с — apply резал бы старые 16). Любой input/change/toggle внутри
+       карточки с видимым предложением сбрасывает его: честное правило
+       «предложение всегда соответствует текущим ползункам». */
+    (function () {
+      function invalidateProposalOf(card) {
+        var area = card.querySelector('.proposal-area');
+        if (!area || area.className.indexOf('visible') === -1) return;
+        toolsHideProposal(area);
+        toolsStatusUi.show('Параметры изменились — предложение сброшено. Нажмите «Найти и вырезать» заново.', false);
+        setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+      }
+      var invCards = document.querySelectorAll('.tool-card');
+      for (var ci = 0; ci < invCards.length; ci++) {
+        (function (card) {
+          function onParamChange(ev) {
+            var t = ev.target;
+            if (!t) return;
+            /* Кнопки предложения (Применить/Отмена) и гейта — НЕ параметры. */
+            if (t.tagName === 'INPUT' || t.tagName === 'SELECT') { invalidateProposalOf(card); return; }
+            if (ev.type === 'click' && t.className && String(t.className).indexOf('toggle-btn') !== -1) invalidateProposalOf(card);
+          }
+          card.addEventListener('input', onParamChange);
+          card.addEventListener('change', onParamChange);
+          card.addEventListener('click', onParamChange);
+        })(invCards[ci]);
+      }
+    })();
 
     /* ── Proposal card ────────────────────────────────────── */
     function toolsShowProposal(areaId, proposal) {
