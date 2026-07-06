@@ -321,6 +321,7 @@
             <span id="transcript-led" class="transcript-led transcript-led--red" role="img" aria-label="Нет транскрипта"></span>
             <span id="transcript-led-text" aria-live="polite">нет</span>
           </span>
+          <span id="usage-badge" class="usage-badge" hidden title="Расход токенов и стоимость за сессию (тарифы Cloud.ru)"></span>
           <span class="grow"></span>
           <button type="button" id="btn-undo" class="secondary">Откат маркеров</button>
           <div class="more-menu" id="more-menu">
@@ -550,6 +551,7 @@
           '../shared/panel-bootstrap.js',
           '../lib/csinterface.js',
           '../shared/fm-defaults.js',
+          '../shared/usage-meter.js',
           '../shared/fm-secrets.js',
           '../shared/abort-shim.js',
           '../shared/context-store.js',

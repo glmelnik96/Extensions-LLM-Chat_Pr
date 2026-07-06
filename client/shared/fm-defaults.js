@@ -13,7 +13,7 @@
  * │ zai-org/GLM-5.1                  NEW    │  202K  │  198.86  │   829.60 │ ✓  │ ✓  │
  * │ moonshotai/Kimi-K2.6             NEW    │  262K  │  175.68  │   725.90 │ ✓  │ ✓  │
  * │ openai/gpt-oss-120b                     │  131K  │   15.86  │    61.00 │ ✓  │ ✓  │
- * │ zai-org/GLM-4.7                 Preview  │  202K  │  FREE    │   FREE   │ ✓  │ ✓  │
+ * │ zai-org/GLM-4.7                 Preview  │  202K  │  549.00  │   793.00 │ ✓  │ ✓  │
  * └─────────────────────────────────────────┴────────┴──────────┴──────────┴────┴────┘
  *
  * FC = Function Calling, SO = Structured Output
@@ -62,13 +62,13 @@
  * chapterModel     → deepseek-ai/DeepSeek-V4-Pro (1M контекст, 7× быстрее, ru OK)
  * findMomentsModel → zai-org/GLM-5.1            (thinking=false)
  * codeModel        → deepseek-ai/DeepSeek-V4-Pro (1M контекст под кодовые ризонинги)
- * fastModel        → zai-org/GLM-4.7            (Phase 3: было gpt-oss-120b)
+ * fastModel        → zai-org/GLM-4.7            (Phase 3: было gpt-oss-120b; 549/793 ₽/M)
  * ═══════════════════════════════════════════════════════════════════════
  *
  * ═══════════════════════════════════════════════════════════════════════
  * БЕНЧМАРК 18 июня 2026 (tests/integration/benchmark-models.mjs, 5 сценариев,
  * реальные вызовы, кэш seq «2»):
- *   • GLM-4.7   5/5  2.1s  13.5K ток — быстрейший, FREE, точен (включая длительность)
+ *   • GLM-4.7   5/5  2.1s  13.5K ток — быстрейший, точен (включая длительность); 549/793 ₽/M
  *   • GLM-5.1   5/5  5.2s  29.9K ток — надёжный multi-step, текущий chat/analysis
  *   • gpt-oss   5/5  4.5s  24.8K ток — НО галлюцинировал длительность (363 вместо 484с!)
  *   • Kimi-K2.6 5/5 16.0s  15.7K ток — сбалансирован, точный target
@@ -76,7 +76,7 @@
  *
  * Phase 3 (18.06.2026): fastModel gpt-oss-120b → GLM-4.7. Причина — gpt-oss
  * выдумывал длительность таймлайна в info-запросах (роль fast как раз отвечает
- * на «что/сколько» — врать там нельзя). GLM-4.7: быстрее, точнее, FREE.
+ * на «что/сколько» — врать там нельзя). GLM-4.7: быстрее, точнее (549/793 ₽/M).
  * ⚠ GLM-4.7 — preview-модель. Если её отзовут (404), верни fastModel обратно
  *   на 'openai/gpt-oss-120b' (стабильна, но проверяй факты в info-ответах).
  * ═══════════════════════════════════════════════════════════════════════
@@ -85,6 +85,25 @@
   global.FM_DEFAULTS = {
     /** Хост без суффикса /v1 — cloudru-client.js добавит /v1/chat/… и /v1/audio/… */
     baseUrl: 'https://foundation-models.api.cloud.ru',
+
+    /**
+     * Машиночитаемая карта тарифов Cloud.ru (₽ за 1M токенов, снято 2026-07-06).
+     * Читается UsageMeter (client/shared/usage-meter.js) для подсчёта расхода сессии.
+     * inPerM — вход ₽/1M токенов, outPerM — выход ₽/1M токенов.
+     * whisperPerSec — стоимость транскрипции, ₽ за секунду аудио.
+     * Модель не в карте → 0 ₽ (токены всё равно суммируются).
+     */
+    pricing: {
+      currency: '₽',
+      models: {
+        'zai-org/GLM-5.1':             { inPerM: 198.86, outPerM: 829.60 },
+        'deepseek-ai/DeepSeek-V4-Pro': { inPerM: 183.00, outPerM: 732.00 },
+        'zai-org/GLM-4.7':             { inPerM: 549.00, outPerM: 793.00 },
+        'openai/gpt-oss-120b':         { inPerM: 15.86,  outPerM: 61.00 },
+        'moonshotai/Kimi-K2.6':        { inPerM: 175.68, outPerM: 725.90 }
+      },
+      whisperPerSec: 0.01
+    },
 
     /**
      * Основная модель агента (чат + вызов инструментов).
@@ -127,7 +146,7 @@
      * «Главы» ЗАВИСАЛ на 180с+ — DeepSeek с thinking + json_object + max_tokens
      * до 32K непрактично медленный в интерактиве (TEST B 3.14s не воспроизвёлся
      * на реальном 10-мин транскрипте). GLM-4.7 — быстрый, FREE, качество глав на
-     * русском хорошее. thinkingPolicy.chapter=false (см. ниже) — для structured
+     * русском хорошее (549/793 ₽/M). thinkingPolicy.chapter=false (см. ниже) — для structured
      * JSON thinking не нужен и рискует null-content (TEST D). ⚠ preview-модель:
      * при 404 верни 'zai-org/GLM-5.1' (thinkingPolicy.chapter оставь false).
      */

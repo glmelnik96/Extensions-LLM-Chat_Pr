@@ -283,6 +283,25 @@ button.primary:disabled:hover {
   background: #2980b9;
 }
 
+/* Бейдж расхода токенов/₽ за сессию (usage-meter). Компактный, приглушённый. */
+.usage-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+  color: var(--muted);
+  background: #222;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  vertical-align: middle;
+}
+.usage-badge[hidden] {
+  display: none;
+}
+
 .transcribe-bar {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);

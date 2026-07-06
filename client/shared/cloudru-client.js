@@ -196,6 +196,7 @@
     var toolCallsMap = {}; /* index → {id, type, function: {name, arguments}} */
     var finishReason = null;
     var model = '';
+    var usage = null;
 
     try {
       while (true) {
@@ -228,6 +229,7 @@
           try { chunk = JSON.parse(jsonStr); } catch (e) { continue; }
 
           if (chunk.model) model = chunk.model;
+          if (chunk.usage) usage = chunk.usage;
           var delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
           if (!delta) {
             if (chunk.choices && chunk.choices[0] && chunk.choices[0].finish_reason) {
@@ -295,7 +297,8 @@
         finish_reason: finishReason || 'stop',
         index: 0
       }],
-      model: model
+      model: model,
+      usage: usage
     };
   }
 
@@ -354,6 +357,7 @@
       var useStreaming = !!opts.stream;
       if (useStreaming) {
         body.stream = true;
+        body.stream_options = { include_usage: true };
       }
 
       var bodyStr = JSON.stringify(body);
@@ -373,7 +377,11 @@
 
       /* Streaming response */
       if (useStreaming && res.ok && res.body) {
-        return parseSSEStream(res, opts.onChunk, opts.abortCheck);
+        var streamed = await parseSSEStream(res, opts.onChunk, opts.abortCheck);
+        if (global.UsageMeter && streamed && streamed.usage) {
+          UsageMeter.recordChat(streamed.model || model, streamed.usage);
+        }
+        return streamed;
       }
 
       var text = await res.text();
@@ -383,6 +391,9 @@
       var data = parseJsonResponse(text, 'Ответ не JSON');
       if (!res.ok) {
         throw new Error(data.error && data.error.message ? data.error.message : text.slice(0, 300));
+      }
+      if (global.UsageMeter && data && data.usage) {
+        UsageMeter.recordChat(data.model || model, data.usage);
       }
       return data;
     },
@@ -429,6 +440,9 @@
       var data = parseJsonResponse(text, 'Транскрипция: не JSON');
       if (!res.ok) {
         throw new Error(data.error && data.error.message ? data.error.message : text.slice(0, 300));
+      }
+      if (global.UsageMeter && data && typeof data.duration === 'number') {
+        UsageMeter.recordWhisper(data.duration);
       }
       return data;
     }

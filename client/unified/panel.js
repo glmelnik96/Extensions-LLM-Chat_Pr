@@ -31,6 +31,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     hintBox: document.getElementById('hint-chips'),
     startersBox: document.getElementById('starters-container'),
     ledText: document.getElementById('transcript-led-text'),
+    usageBadge: document.getElementById('usage-badge'),
     moreMenu: document.getElementById('more-menu'),
     moreBtn: document.getElementById('more-btn')
   };
@@ -174,6 +175,30 @@ PanelBoot.run('ИИ: монтаж', function () {
         try { window.toolsRefreshLed(); } catch (e) {}
       }
     }
+  }
+
+  /* ─── Бейдж расхода токенов/₽ за сессию (usage-meter) ───────────────
+   * Формат: 'Σ 12.3K↑ 4.5K↓ · 4.82 ₽'. Скрыт до первого расхода. */
+  function fmtTok(n) {
+    var v = Number(n) || 0;
+    if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+    if (v >= 1000) return (v / 1000).toFixed(1) + 'K';
+    return String(v);
+  }
+  function updateUsageBadge(s) {
+    if (!el.usageBadge || !s) return;
+    if (s.totalTokens === 0 && s.rubles === 0) {
+      el.usageBadge.hidden = true;
+      return;
+    }
+    el.usageBadge.textContent =
+      'Σ ' + fmtTok(s.inTokens) + '↑ ' + fmtTok(s.outTokens) + '↓ · ' +
+      s.rubles.toFixed(2) + ' ₽';
+    el.usageBadge.hidden = false;
+  }
+  if (window.UsageMeter && el.usageBadge) {
+    updateUsageBadge(UsageMeter.getSummary());
+    UsageMeter.onChange(function (s) { updateUsageBadge(s); });
   }
 
   /* ─── Health-check при старте (Install hardening, май 2026) ────────
@@ -4921,6 +4946,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       ContextStore.clearAllPanelCache(active.panelId);
       renderMessages([]);
       refreshUndoButton();
+      if (window.UsageMeter) { try { UsageMeter.reset(); } catch (e) {} }
       el.moreMenu.classList.remove('open');
     };
   }
