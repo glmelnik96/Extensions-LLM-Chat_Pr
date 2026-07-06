@@ -524,6 +524,79 @@
     return Math.round(delta * 100) / 100;
   }
 
+  /* ─── Гейт геометрии входа для монтажа по смыслам ──────────────── */
+
+  /**
+   * analyzeInputGeometry(snap)
+   *
+   * Проверяет, «сведён» ли вход для монтажа по смыслам. Корень всех классов сбоев —
+   * НЕ количество дорожек, а ВРЕМЕННЫ́Е ПЕРЕСЕЧЕНИЯ: несведённый мультикам = 2+
+   * видеоклипа играют одновременно; перекрывающиеся микрофоны = 2+ аудиоклипа
+   * звучат одновременно. Последовательная раскладка по нескольким дорожкам
+   * (клипы прыгают V1→V2→V1 без пересечений во времени) — это НЕ мультикам и
+   * должна проходить. Доказано экспериментом 06.07.2026: те же removeIntervals
+   * на сведённом входе дают gap=0/desync=0, на пересекающемся — 7с гэп + десинхрон.
+   *
+   * Чистая функция: работает по снимку getTimelineSnapshot, не трогает Premiere.
+   *
+   * @param {object|null} snap  результат getTimelineSnapshot
+   * @returns {{consolidated: (boolean|null), reasons: Array<{code,message}>, details: (object|null)}}
+   *   consolidated=null — снимок невалиден/пуст, определить нельзя (НЕ блокируем).
+   */
+  function analyzeInputGeometry(snap) {
+    var START_EPS = 0.1;     /* начало контента считаем «нулевым» в пределах этого допуска */
+    var OVERLAP_EPS = 0.05;  /* стык клипов (end==next.start) с точностью до кадра — НЕ пересечение */
+    if (!snap || !snap.ok || !Array.isArray(snap.clips) || !snap.clips.length) {
+      return { consolidated: null, reasons: [], details: null };
+    }
+    /* Собираем интервалы отдельно для видео и аудио (по ВСЕМ дорожкам сразу). */
+    var vids = [], auds = [], minStart = null, i, c;
+    for (i = 0; i < snap.clips.length; i++) {
+      c = snap.clips[i];
+      if (!c || typeof c.startSec !== 'number' || typeof c.endSec !== 'number') continue;
+      if (c.disabled) continue; /* выключенный клип не играет — не создаёт пересечения */
+      if (minStart === null || c.startSec < minStart) minStart = c.startSec;
+      if ((c.trackType || 'video') === 'audio') auds.push(c); else vids.push(c);
+    }
+    /* Есть ли временно́е пересечение внутри набора клипов? Сортируем по началу,
+       ведём «максимальный конец до сих пор»: если следующий стартует раньше него —
+       два клипа играют одновременно. */
+    function maxOverlap(list) {
+      if (list.length < 2) return 0;
+      var arr = list.slice().sort(function (a, b) { return a.startSec - b.startSec; });
+      var maxEnd = arr[0].endSec, worst = 0, j, ov;
+      for (j = 1; j < arr.length; j++) {
+        ov = maxEnd - arr[j].startSec;
+        if (ov > worst) worst = ov;
+        if (arr[j].endSec > maxEnd) maxEnd = arr[j].endSec;
+      }
+      return worst;
+    }
+    var vOv = maxOverlap(vids), aOv = maxOverlap(auds);
+    if (minStart === null) minStart = 0;
+    var reasons = [];
+    if (vOv > OVERLAP_EPS) {
+      reasons.push({ code: 'OVERLAP_VIDEO', message: 'Видеоклипы перекрываются во времени (до ' + (Math.round(vOv * 100) / 100) + 'с) — несведённый мультикам' });
+    }
+    if (aOv > OVERLAP_EPS) {
+      reasons.push({ code: 'OVERLAP_AUDIO', message: 'Аудиоклипы перекрываются во времени (до ' + (Math.round(aOv * 100) / 100) + 'с) — перекрывающиеся микрофоны' });
+    }
+    if (minStart > START_EPS) {
+      reasons.push({ code: 'LEAD_GAP', message: 'Контент начинается не с 0 (' + (Math.round(minStart * 100) / 100) + 'с) — будет лид-гэп' });
+    }
+    return {
+      consolidated: reasons.length === 0,
+      reasons: reasons,
+      details: {
+        videoOverlapSec: Math.round(vOv * 100) / 100,
+        audioOverlapSec: Math.round(aOv * 100) / 100,
+        leadGapSec: Math.round(minStart * 100) / 100,
+        videoClips: vids.length,
+        audioClips: auds.length
+      }
+    };
+  }
+
   global.EditPlanSimulator = {
     simulate: simulate,
     simulateUnified: simulateUnified,
@@ -531,6 +604,7 @@
     extractRippleIntervals: extractRippleIntervals,
     buildTimelineDiff: buildTimelineDiff,
     compactSnapshotForLlm: compactSnapshotForLlm,
-    calcExpectedDeltaSec: calcExpectedDeltaSec
+    calcExpectedDeltaSec: calcExpectedDeltaSec,
+    analyzeInputGeometry: analyzeInputGeometry
   };
 })(typeof window !== 'undefined' ? window : this);

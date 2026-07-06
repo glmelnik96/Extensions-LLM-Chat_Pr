@@ -684,13 +684,15 @@ PanelBoot.run('ИИ: монтаж', function () {
           'Плагин САМ размечает смыслы транскрипта второй моделью (по чанкам), ' +
           'детерминированно собирает план keep/cut под цель ±10% и показывает карточку на подтверждение. ' +
           'НЕ передавай blocks — плагин строит их сам. Требуется транскрипт (сначала транскрибируй In–Out). ' +
-          'Используй для «сожми до N минут», «сократи сохранив суть», «собери по смыслу».',
+          'Используй для «сожми до N минут», «сократи сохранив суть», «собери по смыслу». ' +
+          'Вход должен быть сведён (nest/single-cam): несведённый мультикам плагин отклонит с рекомендацией.',
         parameters: {
           type: 'object',
           properties: {
             sequenceKey: { type: 'string', description: 'Имя секвенции (sequenceName из снимка)' },
             targetDurationSec: { type: 'number', description: 'Целевой хронометраж в секундах, > 0' },
-            summary: { type: 'string', description: '1-2 предложения: что получится' }
+            summary: { type: 'string', description: '1-2 предложения: что получится' },
+            allowUnconsolidated: { type: 'boolean', description: 'Обойти гейт сведённого входа (мультикам). По умолчанию false — плагин блокирует несведённый вход. Ставь true только если пользователь явно согласился на лид-гэп/десинхрон.' }
           },
           required: ['sequenceKey', 'targetDurationSec', 'summary']
         }
@@ -3023,7 +3025,41 @@ PanelBoot.run('ИИ: монтаж', function () {
    * MontagePlan.validatePlan → removeRefs → делегирование в execProposeTranscriptCuts
    * (padding/snap/merge/карточка/apply переиспользуются целиком).
    */
+  /**
+   * Гейт геометрии входа (Layer-1). Монтаж по смыслам требует СВЕДЁННОГО входа:
+   * несведённый мультикам (несколько видеодорожек, разные старты, перекрывающиеся
+   * аудиодорожки, разная длина камер) — доказанный корень лид-гэпа и десинхрона
+   * (эксперимент 06.07.2026). По умолчанию блокируем с рекомендацией свернуть в nest;
+   * можно продолжить принудительно через allowUnconsolidated:true.
+   */
   function execProposeMontagePlan(args) {
+    args = args || {};
+    var sequenceKey = String(args.sequenceKey || '').trim();
+    if (!sequenceKey) return Promise.resolve({ error: 'propose_montage_plan: нужен sequenceKey (sequenceName из снимка)' });
+
+    function _afterGate() { return _proposeMontagePlanInner(args); }
+    return execGetSnapshot(true).then(function (snap) {
+      var geo = (typeof EditPlanSimulator !== 'undefined' && EditPlanSimulator.analyzeInputGeometry)
+        ? EditPlanSimulator.analyzeInputGeometry(snap) : null;
+      if (geo && geo.consolidated === false && args.allowUnconsolidated !== true) {
+        var msg = [];
+        for (var gi = 0; gi < geo.reasons.length; gi++) msg.push(geo.reasons[gi].message);
+        return {
+          error: 'Вход НЕ сведён для монтажа по смыслам: ' + msg.join('; ') +
+            '. Сверни мультикам в nest-секвенцию (выдели все клипы → Nest) или работай в single-cam ' +
+            'секвенции без перекрытий — иначе будет лид-гэп и десинхрон. Чтобы всё равно продолжить, ' +
+            'повтори вызов с allowUnconsolidated:true.',
+          _inputGeometry: geo
+        };
+      }
+      return _afterGate();
+    }, function () {
+      /* снимок не получить — не блокируем монтаж, идём как раньше */
+      return _afterGate();
+    });
+  }
+
+  function _proposeMontagePlanInner(args) {
     args = args || {};
     var sequenceKey = String(args.sequenceKey || '').trim();
     if (!sequenceKey) return Promise.resolve({ error: 'propose_montage_plan: нужен sequenceKey (sequenceName из снимка)' });

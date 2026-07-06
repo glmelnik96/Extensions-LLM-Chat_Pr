@@ -332,3 +332,104 @@ describe('EditPlanSimulator.calcExpectedDeltaSec', () => {
     assert.equal(EP.calcExpectedDeltaSec(42), null);
   });
 });
+
+describe('EditPlanSimulator.analyzeInputGeometry — гейт входа монтажа', () => {
+  /* Сведённый nest: одна видео- + одна аудиоклипа [0..4007.42], как после Nest. */
+  const nestSnap = {
+    ok: true,
+    sequenceName: '1_SYNCED [nest]',
+    videoTrackCount: 3,
+    audioTrackCount: 4,
+    clips: [
+      { nodeId: 'v', trackType: 'video', trackIndex: 0, startSec: 0, endSec: 4007.42 },
+      { nodeId: 'a', trackType: 'audio', trackIndex: 0, startSec: 0, endSec: 4007.42 }
+    ]
+  };
+
+  /* Несведённый мультикам: видеоклипы играют ОДНОВРЕМЕННО (пересекаются во времени). */
+  const multicamSnap = {
+    ok: true,
+    sequenceName: '1_SYNCED',
+    videoTrackCount: 3,
+    audioTrackCount: 4,
+    clips: [
+      { nodeId: 'v1', trackType: 'video', trackIndex: 0, startSec: 0, endSec: 4007.42 },
+      { nodeId: 'v3', trackType: 'video', trackIndex: 1, startSec: 6.17, endSec: 3876 },
+      { nodeId: 'v2', trackType: 'video', trackIndex: 2, startSec: 21.27, endSec: 3610 },
+      { nodeId: 'a1', trackType: 'audio', trackIndex: 0, startSec: 0, endSec: 4007.42 },
+      { nodeId: 'a2', trackType: 'audio', trackIndex: 1, startSec: 0, endSec: 3876 }
+    ]
+  };
+
+  test('сведённый nest → consolidated=true, без причин', () => {
+    const r = EP.analyzeInputGeometry(nestSnap);
+    assert.equal(r.consolidated, true);
+    assert.deepEqual(r.reasons, []);
+  });
+
+  test('мультикам (пересечение во времени) → OVERLAP_VIDEO + OVERLAP_AUDIO', () => {
+    const r = EP.analyzeInputGeometry(multicamSnap);
+    assert.equal(r.consolidated, false);
+    const codes = r.reasons.map((x) => x.code);
+    assert.ok(codes.includes('OVERLAP_VIDEO'), 'ждём OVERLAP_VIDEO');
+    assert.ok(codes.includes('OVERLAP_AUDIO'), 'ждём OVERLAP_AUDIO');
+  });
+
+  test('последовательные клипы на нескольких дорожках без пересечений → consolidated=true', () => {
+    /* Клипы прыгают V1→V2→V1 и A1→A2→A1, но во времени НЕ пересекаются — это НЕ мультикам. */
+    const r = EP.analyzeInputGeometry({
+      ok: true,
+      clips: [
+        { nodeId: 'v1', trackType: 'video', trackIndex: 0, startSec: 0, endSec: 100 },
+        { nodeId: 'v2', trackType: 'video', trackIndex: 1, startSec: 100, endSec: 250 },
+        { nodeId: 'v3', trackType: 'video', trackIndex: 0, startSec: 250, endSec: 400 },
+        { nodeId: 'a1', trackType: 'audio', trackIndex: 0, startSec: 0, endSec: 100 },
+        { nodeId: 'a2', trackType: 'audio', trackIndex: 1, startSec: 100, endSec: 250 },
+        { nodeId: 'a3', trackType: 'audio', trackIndex: 0, startSec: 250, endSec: 400 }
+      ]
+    });
+    assert.equal(r.consolidated, true);
+    assert.deepEqual(r.reasons, []);
+  });
+
+  test('стык клип-в-клип (end==next.start) не считается пересечением', () => {
+    const r = EP.analyzeInputGeometry({
+      ok: true,
+      clips: [
+        { nodeId: 'v1', trackType: 'video', trackIndex: 0, startSec: 0, endSec: 50.02 },
+        { nodeId: 'v2', trackType: 'video', trackIndex: 1, startSec: 50, endSec: 120 }
+      ]
+    });
+    assert.equal(r.consolidated, true);
+  });
+
+  test('одна V + одна A с ненулевым стартом → LEAD_GAP', () => {
+    const r = EP.analyzeInputGeometry({
+      ok: true,
+      clips: [
+        { nodeId: 'v', trackType: 'video', trackIndex: 0, startSec: 6.17, endSec: 100 },
+        { nodeId: 'a', trackType: 'audio', trackIndex: 0, startSec: 6.17, endSec: 100 }
+      ]
+    });
+    assert.equal(r.consolidated, false);
+    assert.deepEqual(r.reasons.map((x) => x.code), ['LEAD_GAP']);
+  });
+
+  test('выключенный (disabled) перекрывающий клип игнорируется', () => {
+    const r = EP.analyzeInputGeometry({
+      ok: true,
+      clips: [
+        { nodeId: 'v1', trackType: 'video', trackIndex: 0, startSec: 0, endSec: 400 },
+        { nodeId: 'v2', trackType: 'video', trackIndex: 1, startSec: 50, endSec: 120, disabled: true },
+        { nodeId: 'a1', trackType: 'audio', trackIndex: 0, startSec: 0, endSec: 400 }
+      ]
+    });
+    assert.equal(r.consolidated, true);
+  });
+
+  test('невалидный снимок → consolidated=null (не блокируем)', () => {
+    assert.equal(EP.analyzeInputGeometry(null).consolidated, null);
+    assert.equal(EP.analyzeInputGeometry({ ok: false }).consolidated, null);
+    assert.equal(EP.analyzeInputGeometry({ ok: true, clips: [] }).consolidated, null);
+  });
+});
