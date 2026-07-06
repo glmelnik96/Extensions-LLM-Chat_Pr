@@ -2109,6 +2109,79 @@ $._EXT_PRM_._audioClipsIntersecting = function (seq, t0, t1) {
 };
 
 /**
+ * Если clip — вложенная секвенция, вернуть внутреннюю Sequence по совпадению
+ * projectItem.nodeId (getSequence() отсутствует в PP 2026). Иначе null.
+ */
+$._EXT_PRM_._resolveNestInner = function (clip) {
+  try {
+    var pi = clip && clip.projectItem;
+    if (!pi) return null;
+    var isSeq = false;
+    try { isSeq = (typeof pi.isSequence === 'function') && pi.isSequence() === true; } catch (eIs) {}
+    if (!isSeq) return null;
+    var nid = null;
+    try { nid = pi.nodeId; } catch (eN) {}
+    if (!nid) return null;
+    var seqs = app.project.sequences, i, sq, sid;
+    for (i = 0; i < seqs.numSequences; i++) {
+      sq = seqs[i];
+      sid = null;
+      try { if (sq.projectItem) sid = sq.projectItem.nodeId; } catch (eS) {}
+      if (sid && sid === nid) return sq;
+    }
+    return null;
+  } catch (e) { return null; }
+};
+
+/**
+ * Перечислить СЛЫШИМЫЕ аудиосегменты внутренней секвенции, спроецированные на
+ * внешний таймлайн. audible = дорожка не muted И клип не disabled.
+ * nestIn = clip.inPoint.seconds, outerStart = clip.start.seconds,
+ * windowDur = clip.end.seconds - clip.start.seconds.
+ * Возвращает массив { mediaPath, streamIndex, srcStart, segDur, localOffset,
+ *                     outerStart, outerEnd, trackIndex }.
+ */
+$._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, windowDur) {
+  var out = [];
+  var eps = $._EXT_PRM_._EPS;
+  var winStart = nestIn, winEnd = nestIn + windowDur;
+  var ti, j, tr, c, pi, muted, innerStart, innerEnd, mediaIn, mp, vs, ve;
+  for (ti = 0; ti < inner.audioTracks.numTracks; ti++) {
+    tr = inner.audioTracks[ti];
+    muted = false;
+    try { if (typeof tr.isMuted === 'function') muted = tr.isMuted() === true; } catch (eM) {}
+    if (muted) continue;
+    for (j = 0; j < tr.clips.numItems; j++) {
+      c = tr.clips[j];
+      if (!c) continue;
+      if (c.disabled === true) continue;
+      pi = c.projectItem;
+      if (!pi) continue;
+      mp = '';
+      try { if (typeof pi.getMediaPath === 'function') mp = pi.getMediaPath(); } catch (eP) {}
+      if (!mp || !$._EXT_PRM_._fileExists(mp)) continue;
+      innerStart = c.start.seconds;
+      innerEnd = c.end.seconds;
+      mediaIn = c.inPoint ? c.inPoint.seconds : 0;
+      vs = innerStart > winStart ? innerStart : winStart;
+      ve = innerEnd < winEnd ? innerEnd : winEnd;
+      if (ve <= vs + eps) continue;
+      out.push({
+        mediaPath: String(mp).replace(/\\/g, '/'),
+        streamIndex: 0,
+        srcStart: mediaIn + (vs - innerStart),
+        segDur: ve - vs,
+        localOffset: vs - winStart,
+        outerStart: outerStart + (vs - winStart),
+        outerEnd: outerStart + (ve - winStart),
+        trackIndex: ti
+      });
+    }
+  }
+  return out;
+};
+
+/**
  * Экспорт In–Out чанками (меньше 413 на Whisper). Восстанавливает In/Out.
  */
 $._EXT_PRM_._exportInOutAsChunks = function (seq, preset, root, chunkSec, chunkExt) {
@@ -2348,6 +2421,41 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
       }
     } catch (eP) {}
     if (!mediaPath || !$._EXT_PRM_._fileExists(mediaPath)) {
+      /* Вложенная секвенция: спускаемся внутрь, собираем слышимое аудио,
+         клиент реконструирует его через ffmpeg (PP-экспорт в 2026 сломан). */
+      var inner = $._EXT_PRM_._resolveNestInner(clip);
+      if (inner) {
+        var nestIn = clip.inPoint ? clip.inPoint.seconds : 0;
+        var clipStartN = one.startSec, clipEndN = one.endSec;
+        /* Клампим окно реконструкции к In–Out (клип может быть длиннее области). */
+        var o0 = inSec > clipStartN ? inSec : clipStartN;
+        var o1 = outSec < clipEndN ? outSec : clipEndN;
+        if (o1 <= o0 + $._EXT_PRM_._EPS) {
+          return JSON.stringify({ ok: false, error: 'Область In–Out не пересекает nest-клип.', code: 'NEST_NO_INTERSECT' });
+        }
+        var winStartN = nestIn + (o0 - clipStartN);
+        var windowDurN = o1 - o0;
+        var segs = $._EXT_PRM_._enumerateNestAudibleAudio(inner, winStartN, o0, windowDurN);
+        if (!segs.length) {
+          return JSON.stringify({
+            ok: false,
+            error: 'Во вложенной секвенции нет слышимых аудиоклипов с файлом на диске (всё выключено/заглушено?).',
+            code: 'NEST_NO_AUDIBLE',
+            innerName: inner.name
+          });
+        }
+        return JSON.stringify({
+          ok: true,
+          mode: 'nest_reconstruct',
+          innerName: inner.name,
+          segments: segs,
+          workInSec: inSec,
+          workOutSec: outSec,
+          timelineOffsetSec: o0,
+          windowDurSec: windowDurN,
+          hostVersion: $._EXT_PRM_.version
+        });
+      }
       return JSON.stringify({
         ok: false,
         error:
