@@ -306,6 +306,41 @@
     return extractAll('wav');
   }
 
+  /**
+   * Реконструировать слышимое аудио вложенной секвенции в один 16k mono WAV.
+   * segments из host-манифеста (mode nest_reconstruct). Возвращает Promise<string> путь к WAV.
+   */
+  function reconstructNestAudio(segments, progress) {
+    if (typeof require === 'undefined') return Promise.reject(new Error('Node.js недоступен для ffmpeg'));
+    var ffmpegBin = findFfmpegPath();
+    if (!ffmpegBin) return Promise.reject(new Error('ffmpeg не найден (см. host/presets/README.txt / установку ffmpeg).'));
+    var builderApi = (typeof global !== 'undefined' && global.NestReconstruct) ||
+                     (typeof window !== 'undefined' && window.NestReconstruct);
+    if (!builderApi) return Promise.reject(new Error('nest-reconstruct.js не загружен'));
+    var built = builderApi.buildNestReconstructFilter(segments, { sampleRate: 16000 });
+    var os = require('os'), path = require('path');
+    var outPath = path.join(os.tmpdir(), '_llm_nestmix_' + Date.now() + '.wav');
+    var args = [];
+    for (var i = 0; i < built.inputs.length; i++) {
+      var inp = built.inputs[i];
+      args.push('-ss', String(inp.ss), '-t', String(inp.t), '-i', inp.path);
+    }
+    args.push('-filter_complex', built.filterComplex, '-map', '[' + built.outLabel + ']',
+              '-ac', '1', '-ar', '16000', '-acodec', 'pcm_s16le', '-y', outPath);
+    var execFile = require('child_process').execFile;
+    if (progress) progress('Реконструкция аудио nest через ffmpeg (' + built.inputs.length + ' сегм.)…');
+    return new Promise(function (resolve, reject) {
+      execFile(ffmpegBin, args, { timeout: 1800000 }, function (err) {
+        if (err) { reject(new Error('ffmpeg nest reconstruct error: ' + String(err.message || err))); return; }
+        var fs = require('fs');
+        if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 1024) {
+          reject(new Error('ffmpeg создал пустой nest-mix (' + outPath + ')')); return;
+        }
+        resolve(outPath);
+      });
+    });
+  }
+
   function unlinkChunkList(list) {
     if (typeof require === 'undefined' || !list) return;
     var fs = require('fs');
@@ -859,6 +894,57 @@
         mode: 'clip_queue',
         audioAnalysis: audioAnalysisCQ
       };
+    }
+
+    if (prep.mode === 'nest_reconstruct' && prep.segments && prep.segments.length) {
+      beforeAwait();
+      var nestWavPath = await reconstructNestAudio(prep.segments, progress);
+      try {
+        var chunkSecCfgN = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
+          ? settings.transcribeExportChunkSec : 90;
+        var baseOffN = (typeof prep.timelineOffsetSec === 'number') ? prep.timelineOffsetSec : 0;
+        var spanN = (typeof prep.windowDurSec === 'number') ? prep.windowDurSec : 0;
+        beforeAwait();
+        progress('Транскрибация nest: нарезка ffmpeg…');
+        var nChunks = await extractAudioChunksWithFfmpeg(nestWavPath, 0, spanN, chunkSecCfgN, progress, chunkFmt);
+        var combinedN = [], textAccN = '', nDone = 0;
+        var nTasks = nChunks.map(function (nch, nci) {
+          return function () {
+            return backendTranscribe(settings, {
+              path: nch.path,
+              fileName: 'nestmix_chunk_' + nci + '.' + (String(nch.path || '').replace(/^.*\./, '') || 'wav'),
+              signal: signal, onProgress: function () {}, CloudRuClient: CC, transcribeOptsBase: transcribeOptsBase
+            }).then(function (nData) {
+              nDone++; progress('Транскрибация nest: ' + nDone + '/' + nChunks.length + ' готово…');
+              return { index: nci, data: nData, offset: baseOffN + nch.offsetInSpanSec };
+            });
+          };
+        });
+        var nResults = await promisePool(nTasks, CLOUD_CONCURRENCY);
+        nResults.sort(function (a, b) { return a.index - b.index; });
+        for (var nri = 0; nri < nResults.length; nri++) {
+          var nNorm = normalizeWhisperExport(nResults[nri].data, nResults[nri].offset);
+          combinedN = combinedN.concat(nNorm.segments);
+          textAccN += (nNorm.text || '') + ' ';
+        }
+        var audioAnalysisN = null;
+        try {
+          audioAnalysisN = await analyzeChunksInParallel(
+            nChunks.map(function (c) { return { path: c && c.path, timelineOffsetSec: baseOffN + ((c && c.offsetInSpanSec) || 0) }; }),
+            progress
+          );
+        } catch (eAN) {}
+        return {
+          raw: { nestSegments: prep.segments.length, ffmpegChunks: nChunks.length },
+          segments: mergeSegmentLists([combinedN]),
+          text: textAccN.trim(),
+          timelineOffsetSec: baseOffN,
+          mode: 'nest_reconstruct',
+          audioAnalysis: audioAnalysisN
+        };
+      } finally {
+        try { if (typeof require !== 'undefined') require('fs').unlinkSync(nestWavPath); } catch (eUN) {}
+      }
     }
 
     if (prep.mode === 'media_file') {
