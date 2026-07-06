@@ -2329,6 +2329,51 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
     }
 
     if (hits.length > 1) {
+      /* Мульти-nest: если ВСЕ аудиоклипы в In–Out — вложенные секвенции (напр.
+         один nest, разрезанный монтажом на несколько фрагментов), у них нет пути
+         к файлу и общая multiclip-ветка ниже отвергала их (NO_MEDIA_PATH_MULTI).
+         Реконструируем звук каждого фрагмента из внутренней секвенции и сводим в
+         один WAV: localOffset — позиция во внешнем окне относительно inSec
+         (поле outerStart из _enumerateNestAudibleAudio — истинная внешняя позиция). */
+      var allNest = true, nestSegs = [], hn, hClip, hInner, hNestIn,
+        ho0, ho1, hWinStart, hWinDur, hSegs, hsi;
+      for (hn = 0; hn < hits.length; hn++) {
+        hClip = hits[hn].clip;
+        hInner = $._EXT_PRM_._resolveNestInner(hClip);
+        if (!hInner) { allNest = false; break; }
+        hNestIn = hClip.inPoint ? hClip.inPoint.seconds : 0;
+        ho0 = inSec > hits[hn].startSec ? inSec : hits[hn].startSec;
+        ho1 = outSec < hits[hn].endSec ? outSec : hits[hn].endSec;
+        if (ho1 <= ho0 + $._EXT_PRM_._EPS) continue;
+        hWinStart = hNestIn + (ho0 - hits[hn].startSec);
+        hWinDur = ho1 - ho0;
+        hSegs = $._EXT_PRM_._enumerateNestAudibleAudio(hInner, hWinStart, ho0, hWinDur);
+        for (hsi = 0; hsi < hSegs.length; hsi++) {
+          hSegs[hsi].localOffset = hSegs[hsi].outerStart - inSec;
+          nestSegs.push(hSegs[hsi]);
+        }
+      }
+      if (allNest) {
+        if (!nestSegs.length) {
+          return JSON.stringify({
+            ok: false,
+            error: 'Во вложенных секвенциях нет слышимых аудиоклипов с файлом на диске (всё выключено/заглушено?).',
+            code: 'NEST_NO_AUDIBLE_MULTI'
+          });
+        }
+        return JSON.stringify({
+          ok: true,
+          mode: 'nest_reconstruct',
+          innerName: 'multi',
+          segments: nestSegs,
+          workInSec: inSec,
+          workOutSec: outSec,
+          timelineOffsetSec: inSec,
+          windowDurSec: outSec - inSec,
+          hostVersion: $._EXT_PRM_.version
+        });
+      }
+
       var items = [];
       var hi,
         h,
