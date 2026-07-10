@@ -35,10 +35,13 @@
    🆕 Бонус: закрыт live-обнаруженный P0 «24ч-wrap» — out-of-bounds время резало реальный
    контент; `_seqEndSec`-гард в applyTranscriptCuts + applyTimecodeEdits (см. аудит, статус-секция).
 3. **Пустые Whisper-segments** ✅ **СДЕЛАНО 10.07** — assertNonEmptyTranscript на выходе runFromPrep.
-4. **Cleanup temp-файлов при abort** транскрипции (регистр очистки в abort-handler).
-5. **`_pendingProposal` / смена секвенции** — mutex + повторная `assertSequenceMatch` перед apply;
-   тест на гонку.
-6. **Утечка `_transcriptCheckpoints`** — TTL/лимит/чистка при cancel.
+4. **Cleanup temp-файлов при abort** ✅ **СДЕЛАНО 10.07** — 4 утечки (extract-пул, clip_queue,
+   nest-чанки, media_file tmp) → finally/catch-очистка + самоудаление in-flight чанков; 4 теста.
+5. **`_pendingProposal` / смена секвенции** ✅ **СДЕЛАНО 10.07** — click-time capture идентичности
+   proposal + host-side `expectedSequenceName`-гейт в applyTranscriptCuts/applyTimecodeEdits
+   (live-проверено CDP). Host 2.6.9.
+6. **Утечка `_transcriptCheckpoints`** ✅ **СДЕЛАНО 10.07** — удаление замещённого backupId +
+   кэп 8 с вытеснением старейшего.
 7. **NaN/bounds в маркерах и trackIndex** ✅ **СДЕЛАНО 10.07** — negative timeSec reject в host;
    NaN-гарды в интервалах; trackIndex-пункты аудита оказались stale (уже безопасны).
 8. **Тесты** на все дыры из аудита §6 (пустая секвенция, пересечения, abort-SSE, temp-cleanup, гонка).

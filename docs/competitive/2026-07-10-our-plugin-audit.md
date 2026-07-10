@@ -137,3 +137,29 @@ AbortController/abortableSleep (28–79). Остальное — VERIFY пере
 - ❌ **STALE (уже было исправлено до аудита):** validateTranscriptCuts ловит NaN/negative/дубликаты/пересечения (P1-F, май 2026); validateMarkersList ловит NaN+bounds; mute_track trackIndex безопасен (`!targetTrack` ловит любой мусор); внутренние trackIndex-циклы (846–875, 883) — не из пользовательского JSON.
 - ⚠️ Осталось из Волны 1: cleanup temp при abort (п.4), гонки proposal (п.5), утечка чекпоинтов (п.6), тесты §6.
 - Host bump: 2.6.7 → 2.6.8. Node-тесты: 600/600.
+
+## Верификация и статус фиксов (2026-07-10, Волна 1 п.4–6)
+- ✅ **ИСПРАВЛЕНО: cleanup temp при abort/ошибке** (timeline-transcribe.js) — 4 подтверждённые утечки:
+  (A) `extractAudioChunksWithFfmpeg`: частичные `_llm_chunk_*` при падении пула — catch-очистка
+  created + in-flight ffmpeg-колбэки самоудаляют выход после reject (у promisePool задачи доезжают
+  ПОСЛЕ reject); партиалы чанков unlink'аются и в err-ветках; (B) clip_queue: unlink
+  `allChunksForAnalysis` был вне finally → abort в backendTranscribe терял все чанки — теперь finally;
+  (C) nest_reconstruct: `nChunks` не удалялись ВООБЩЕ (даже на успехе) — добавлен в finally;
+  (D) media_file: `ffmpegTmpM` удалялся только на успехе хвоста — единый внешний finally;
+  + партиал `_llm_nestmix_*` при ffmpeg-err. 4 новых теста (фейковый require: fs/execFile),
+  экспортирован extractAudioChunksWithFfmpeg, loader принимает opts.require.
+- ✅ **ИСПРАВЛЕНО: гонки proposal (~2387, ~5019)** — (1) click-time capture: `propAtClick`/`toolsPropAtClick`
+  фиксируются на клике, в колбэке assertSequenceMatch проверка идентичности — замещённый новым ответом
+  план больше не применится «вслепую»; (2) остаточное окно ~100мс между JS-проверкой и host-apply
+  закрыто host-side: `expectedSequenceName` в payload applyTranscriptCuts/applyTimecodeEdits, host
+  сверяет seq.name ДО мутаций (last line of defense). Live-проверено CDP: mismatch → reject без
+  мутации (оба метода), match → гейт прозрачен (план дошёл до overlap-валидатора). Прим.: канонический
+  «~5019» из аудита (onSend обнуляет proposal) был НЕ багом — осознанный фикс 19.06; реальная гонка
+  была в окне assertSequenceMatch. J-cuts покрыт только JS-слоем (host-гейт не добавлялся).
+- ✅ **ИСПРАВЛЕНО: утечка `_transcriptCheckpoints` (~2782)** — deep-copy транскриптов копились всю
+  сессию: удаление было ТОЛЬКО при клике «⏪ Откатить» ровно того backupId. Теперь чекпоинт,
+  замещаемый setLastUndo той же панели, удаляется сразу + страховочный кэп 8 снимков с вытеснением
+  старейшего (_ts). Деградация мягкая: без чекпоинта откат секвенции работает, не восстанавливается
+  только транскрипт-кэш (поведение до 19.06).
+- Host bump: 2.6.8 → 2.6.9. Node-тесты: 604/604. Панель перезагружена, модули живы.
+- ⚠️ Осталось из Волны 1: п.8 — тесты по §6 (пустая секвенция, abort-SSE, смена секвенции e2e).

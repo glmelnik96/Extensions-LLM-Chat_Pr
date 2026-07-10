@@ -265,6 +265,12 @@
         : ['-acodec', 'pcm_s16le'];
       var done = 0;
       var tasks = [];
+      /* 10.07.2026 (Волна 1.4): при ошибке/abort посреди пула уже извлечённые чанки
+         раньше оставались в %TEMP% навсегда. created — все успешно созданные файлы;
+         extractFailed — флаг «пул уже упал»: in-flight ffmpeg-процессы доезжают ПОСЛЕ
+         reject пула и сами удаляют свой выход. */
+      var created = [];
+      var extractFailed = false;
       for (var i = 0; i < totalChunks; i++) {
         (function (idx) {
           var offset = idx * step;
@@ -277,14 +283,23 @@
               .concat(['-ar', '16000', '-ac', '1', '-y', outPath]);
             return new Promise(function (resolve, reject) {
               execFile(ffmpegBin, args, { timeout: 300000 }, function (err) {
+                if (extractFailed) {
+                  /* пул уже отклонён — результат никому не нужен, файл удаляем сразу */
+                  try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (eUL) {}
+                  resolve(null);
+                  return;
+                }
                 if (err) {
+                  try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (eUP) {}
                   reject(new Error('ffmpeg error (chunk ' + idx + '): ' + String(err.message || err)));
                   return;
                 }
                 if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 1024) {
+                  try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (eUP2) {}
                   reject(new Error('ffmpeg создал пустой чанк ' + idx + ' (' + outPath + ')'));
                   return;
                 }
+                created.push(outPath);
                 done++;
                 if (progress) progress('Извлечение аудио (ffmpeg) ' + done + '/' + totalChunks + '…');
                 resolve({ path: outPath, durationSec: dur, offsetInSpanSec: offset });
@@ -294,7 +309,13 @@
         })(i);
       }
       /* promisePool сохраняет порядок результатов = порядок чанков */
-      return promisePool(tasks, FFMPEG_CONCURRENCY);
+      return promisePool(tasks, FFMPEG_CONCURRENCY).catch(function (ePool) {
+        extractFailed = true;
+        for (var u = 0; u < created.length; u++) {
+          try { if (fs.existsSync(created[u])) fs.unlinkSync(created[u]); } catch (eUC) {}
+        }
+        throw ePool;
+      });
     }
 
     if (format === 'mp3') {
@@ -331,9 +352,13 @@
     if (progress) progress('Реконструкция аудио nest через ffmpeg (' + built.inputs.length + ' сегм.)…');
     return new Promise(function (resolve, reject) {
       execFile(ffmpegBin, args, { timeout: 1800000 }, function (err) {
-        if (err) { reject(new Error('ffmpeg nest reconstruct error: ' + String(err.message || err))); return; }
         var fs = require('fs');
+        if (err) {
+          try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (eUN) {}
+          reject(new Error('ffmpeg nest reconstruct error: ' + String(err.message || err))); return;
+        }
         if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 1024) {
+          try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (eUN2) {}
           reject(new Error('ffmpeg создал пустой nest-mix (' + outPath + ')')); return;
         }
         resolve(outPath);
@@ -768,132 +793,136 @@
       /* Собираем ВСЕ WAV-чанки со всех клипов для аудиоанализа ПОСЛЕ транскрибации */
       var allChunksForAnalysis = []; /* {path, timelineOffsetSec} */
       var qi, it, pathQ, szQ, blobQ, rawW, nq;
-      for (qi = 0; qi < prep.items.length; qi++) {
-        beforeAwait();
-        it = prep.items[qi];
-        pathQ = it.path;
-        progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + '…');
-        szQ = fileSizeSync(pathQ);
-        var spanQ = it.workOutSec - it.workInSec;
-        var srcStartQ = (it.clipInPointSec || 0) + (it.workInSec - (it.clipStartSec || 0));
-        /* Для cloud: видео → ffmpeg-чанкинг (предотвращает 413 и OOM).
-           Для whisper.cpp: видео → ffmpeg-чанкинг (не принимает контейнеры). */
-        var needChunkQ = spanQ > chunkSecCfgQ * 1.5 || szQ > maxBytes || !isAudioExt(pathQ);
-        if (needChunkQ) {
-          /* Нарезаем нужный диапазон через ffmpeg на короткие WAV-чанки */
+      /* 10.07.2026 (Волна 1.4): раньше чанки удалялись inline-циклом ПОСЛЕ аудиоанализа —
+         abort/ошибка посреди очереди (backendTranscribe, beforeAwait) оставляли все уже
+         извлечённые WAV в %TEMP%. Теперь единая точка очистки в finally: на успехе она
+         срабатывает в тот же момент (return вычислен, анализ завершён), на ошибке — тоже. */
+      try {
+        for (qi = 0; qi < prep.items.length; qi++) {
           beforeAwait();
-          var qChunks = await extractAudioChunksWithFfmpeg(pathQ, srcStartQ, spanQ, chunkSecCfgQ, progress, chunkFmt);
-          /* Сохраняем чанки для аудиоанализа (НЕ удаляем пока!) */
-          for (var qci2 = 0; qci2 < qChunks.length; qci2++) {
-            allChunksForAnalysis.push({
-              path: qChunks[qci2].path,
-              timelineOffsetSec: it.workInSec + qChunks[qci2].offsetInSpanSec
+          it = prep.items[qi];
+          pathQ = it.path;
+          progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + '…');
+          szQ = fileSizeSync(pathQ);
+          var spanQ = it.workOutSec - it.workInSec;
+          var srcStartQ = (it.clipInPointSec || 0) + (it.workInSec - (it.clipStartSec || 0));
+          /* Для cloud: видео → ffmpeg-чанкинг (предотвращает 413 и OOM).
+             Для whisper.cpp: видео → ffmpeg-чанкинг (не принимает контейнеры). */
+          var needChunkQ = spanQ > chunkSecCfgQ * 1.5 || szQ > maxBytes || !isAudioExt(pathQ);
+          if (needChunkQ) {
+            /* Нарезаем нужный диапазон через ffmpeg на короткие WAV-чанки */
+            beforeAwait();
+            var qChunks = await extractAudioChunksWithFfmpeg(pathQ, srcStartQ, spanQ, chunkSecCfgQ, progress, chunkFmt);
+            /* Сохраняем чанки для аудиоанализа (НЕ удаляем пока!) */
+            for (var qci2 = 0; qci2 < qChunks.length; qci2++) {
+              allChunksForAnalysis.push({
+                path: qChunks[qci2].path,
+                timelineOffsetSec: it.workInSec + qChunks[qci2].offsetInSpanSec
+              });
+            }
+            /* Параллельная транскрибация чанков клипа */
+            var qDoneCount = 0;
+            progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + ', ' + qChunks.length + ' фрагментов…');
+            var qTasks = qChunks.map(function (qch, qci) {
+              return function () {
+                return backendTranscribe(settings, {
+                  path: qch.path,
+                  fileName: 'clip_' + qi + '_chunk_' + qci + '.' + (String(qch.path || '').replace(/^.*\./, '') || 'wav'),
+                  signal: signal,
+                  onProgress: function () {},
+                  CloudRuClient: CC,
+                  transcribeOptsBase: transcribeOptsBase
+                }).then(function (qData) {
+                  qDoneCount++;
+                  progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + ', ' + qDoneCount + '/' + qChunks.length + ' готово…');
+                  return { index: qci, data: qData, offset: it.workInSec + qch.offsetInSpanSec };
+                });
+              };
+            });
+            var qResults = await promisePool(qTasks, CLOUD_CONCURRENCY);
+            qResults.sort(function (a, b) { return a.index - b.index; });
+            var qLocal = [];
+            for (var qri = 0; qri < qResults.length; qri++) {
+              var qNorm = normalizeWhisperExport(qResults[qri].data, qResults[qri].offset);
+              qLocal = qLocal.concat(qNorm.segments);
+              allText += (qNorm.text || '') + ' ';
+            }
+            segLists.push(qLocal);
+            continue;
+          }
+          /* Маленький аудиофайл — отправить напрямую */
+          if (!whisperByPath[pathQ]) {
+            beforeAwait();
+            whisperByPath[pathQ] = await backendTranscribe(settings, {
+              path: pathQ,
+              fileName: String(pathQ).replace(/^.*[\\/]/, '') || 'media',
+              signal: signal,
+              onProgress: progress,
+              CloudRuClient: CC,
+              transcribeOptsBase: transcribeOptsBase
             });
           }
-          /* Параллельная транскрибация чанков клипа */
-          var qDoneCount = 0;
-          progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + ', ' + qChunks.length + ' фрагментов…');
-          var qTasks = qChunks.map(function (qch, qci) {
-            return function () {
-              return backendTranscribe(settings, {
-                path: qch.path,
-                fileName: 'clip_' + qi + '_chunk_' + qci + '.' + (String(qch.path || '').replace(/^.*\./, '') || 'wav'),
-                signal: signal,
-                onProgress: function () {},
-                CloudRuClient: CC,
-                transcribeOptsBase: transcribeOptsBase
-              }).then(function (qData) {
-                qDoneCount++;
-                progress('Транскрибация: клип ' + (qi + 1) + '/' + prep.items.length + ', ' + qDoneCount + '/' + qChunks.length + ' готово…');
-                return { index: qci, data: qData, offset: it.workInSec + qch.offsetInSpanSec };
-              });
-            };
-          });
-          var qResults = await promisePool(qTasks, CLOUD_CONCURRENCY);
-          qResults.sort(function (a, b) { return a.index - b.index; });
-          var qLocal = [];
-          for (var qri = 0; qri < qResults.length; qri++) {
-            var qNorm = normalizeWhisperExport(qResults[qri].data, qResults[qri].offset);
-            qLocal = qLocal.concat(qNorm.segments);
-            allText += (qNorm.text || '') + ' ';
-          }
-          segLists.push(qLocal);
-          continue;
+          rawW = whisperByPath[pathQ];
+          nq = normalizeWhisperMediaFile(rawW, it.clipStartSec, it.clipInPointSec, it.workInSec, it.workOutSec);
+          segLists.push(nq.segments);
+          allText += (nq.text || '') + ' ';
+          /* Для аудиоанализа: извлечь WAV из этого аудиофайла (только нужный диапазон) */
+          try {
+            var directChunkPath = tempAudioPath(pathQ);
+            await extractAudioWithFfmpeg(pathQ, directChunkPath);
+            /* M1 (аудит 04.07.2026): extractAudioWithFfmpeg извлекает ВЕСЬ исходник,
+               т.е. t=0 в чанке — это НАЧАЛО медиафайла, а не начало клипа.
+               Источник t → таймлайн: clipStartSec + (t − clipInPointSec).
+               Старый offset clipStartSec для подрезанного клипа (inPoint>0)
+               сдвигал все тишины на +clipInPointSec. */
+            allChunksForAnalysis.push({
+              path: directChunkPath,
+              timelineOffsetSec: (it.clipStartSec || 0) - (it.clipInPointSec || 0)
+            });
+          } catch (eDirectExtract) {}
         }
-        /* Маленький аудиофайл — отправить напрямую */
-        if (!whisperByPath[pathQ]) {
-          beforeAwait();
-          whisperByPath[pathQ] = await backendTranscribe(settings, {
-            path: pathQ,
-            fileName: String(pathQ).replace(/^.*[\\/]/, '') || 'media',
-            signal: signal,
-            onProgress: progress,
-            CloudRuClient: CC,
-            transcribeOptsBase: transcribeOptsBase
-          });
-        }
-        rawW = whisperByPath[pathQ];
-        nq = normalizeWhisperMediaFile(rawW, it.clipStartSec, it.clipInPointSec, it.workInSec, it.workOutSec);
-        segLists.push(nq.segments);
-        allText += (nq.text || '') + ' ';
-        /* Для аудиоанализа: извлечь WAV из этого аудиофайла (только нужный диапазон) */
+
+        /* ── Аудиоанализ: запускаем на извлечённых WAV-чанках (не на исходных .braw/.mp3) ──
+         * Это даёт корректные тишины: анализируется реальное аудио,
+         * а offset уже в координатах таймлайна. */
+        var audioAnalysisCQ = null;
         try {
-          var directChunkPath = tempAudioPath(pathQ);
-          await extractAudioWithFfmpeg(pathQ, directChunkPath);
-          /* M1 (аудит 04.07.2026): extractAudioWithFfmpeg извлекает ВЕСЬ исходник,
-             т.е. t=0 в чанке — это НАЧАЛО медиафайла, а не начало клипа.
-             Источник t → таймлайн: clipStartSec + (t − clipInPointSec).
-             Старый offset clipStartSec для подрезанного клипа (inPoint>0)
-             сдвигал все тишины на +clipInPointSec. */
-          allChunksForAnalysis.push({
-            path: directChunkPath,
-            timelineOffsetSec: (it.clipStartSec || 0) - (it.clipInPointSec || 0)
-          });
-        } catch (eDirectExtract) {}
-      }
+          progress('Анализ аудио (silencedetect на ' + allChunksForAnalysis.length + ' чанков)…');
+          audioAnalysisCQ = await analyzeChunksInParallel(allChunksForAnalysis, progress);
+        } catch (eACQ) {}
 
-      /* ── Аудиоанализ: запускаем на извлечённых WAV-чанках (не на исходных .braw/.mp3) ──
-       * Это даёт корректные тишины: анализируется реальное аудио,
-       * а offset уже в координатах таймлайна. */
-      var audioAnalysisCQ = null;
-      try {
-        progress('Анализ аудио (silencedetect на ' + allChunksForAnalysis.length + ' чанков)…');
-        audioAnalysisCQ = await analyzeChunksInParallel(allChunksForAnalysis, progress);
-      } catch (eACQ) {}
-
-      /* Удаляем ВСЕ временные файлы (чанки) ПОСЛЕ аудиоанализа */
-      for (var cf = 0; cf < allChunksForAnalysis.length; cf++) {
-        try { if (typeof require !== 'undefined') require('fs').unlinkSync(allChunksForAnalysis[cf].path); } catch (eU) {}
-      }
-
-      /* Дедупликация сегментов: убрать перекрытия (например, музыка + речь дают
-         сегменты на одних и тех же таймкодах). Приоритет — более длинный текст. */
-      var mergedSegs = mergeSegmentLists(segLists);
-      var dedupedSegs = [];
-      for (var di = 0; di < mergedSegs.length; di++) {
-        var seg = mergedSegs[di];
-        var dominated = false;
-        for (var dj = 0; dj < mergedSegs.length; dj++) {
-          if (di === dj) continue;
-          var other = mergedSegs[dj];
-          /* seg полностью внутри other И текст other длиннее → seg дубликат */
-          if (other.startSec <= seg.startSec + 0.1 && other.endSec >= seg.endSec - 0.1 &&
-              (other.text || '').length > (seg.text || '').length) {
-            dominated = true;
-            break;
+        /* Дедупликация сегментов: убрать перекрытия (например, музыка + речь дают
+           сегменты на одних и тех же таймкодах). Приоритет — более длинный текст. */
+        var mergedSegs = mergeSegmentLists(segLists);
+        var dedupedSegs = [];
+        for (var di = 0; di < mergedSegs.length; di++) {
+          var seg = mergedSegs[di];
+          var dominated = false;
+          for (var dj = 0; dj < mergedSegs.length; dj++) {
+            if (di === dj) continue;
+            var other = mergedSegs[dj];
+            /* seg полностью внутри other И текст other длиннее → seg дубликат */
+            if (other.startSec <= seg.startSec + 0.1 && other.endSec >= seg.endSec - 0.1 &&
+                (other.text || '').length > (seg.text || '').length) {
+              dominated = true;
+              break;
+            }
           }
+          if (!dominated) dedupedSegs.push(seg);
         }
-        if (!dominated) dedupedSegs.push(seg);
-      }
 
-      return {
-        raw: whisperByPath,
-        segments: dedupedSegs,
-        text: allText.trim(),
-        timelineOffsetSec: prep.workInSec,
-        mode: 'clip_queue',
-        audioAnalysis: audioAnalysisCQ
-      };
+        return {
+          raw: whisperByPath,
+          segments: dedupedSegs,
+          text: allText.trim(),
+          timelineOffsetSec: prep.workInSec,
+          mode: 'clip_queue',
+          audioAnalysis: audioAnalysisCQ
+        };
+      } finally {
+        /* Удаляем ВСЕ временные файлы (чанки) — и на успехе (после аудиоанализа), и при abort/ошибке */
+        unlinkChunkList(allChunksForAnalysis);
+      }
     }
 
     if (prep.mode === 'nest_reconstruct' && prep.segments && prep.segments.length) {
@@ -943,6 +972,9 @@
           audioAnalysis: audioAnalysisN
         };
       } finally {
+        /* 10.07.2026 (Волна 1.4): nChunks раньше НЕ удалялись вовсе (утечка даже на успехе).
+           var-хойстинг: если нарезка упала, nChunks undefined — unlinkChunkList терпит. */
+        unlinkChunkList(nChunks);
         try { if (typeof require !== 'undefined') require('fs').unlinkSync(nestWavPath); } catch (eUN) {}
       }
     }
@@ -1014,108 +1046,114 @@
       var szM = szPre;
       var actualPathM = prep.path;
       var ffmpegTmpM = null;
-      if (szM > maxBytes) {
-        progress('Извлечение аудио через ffmpeg…');
-        ffmpegTmpM = tempAudioPath(prep.path);
-        beforeAwait();
-        await extractAudioWithFfmpeg(prep.path, ffmpegTmpM);
-        actualPathM = ffmpegTmpM;
-        szM = fileSizeSync(ffmpegTmpM);
+      /* 10.07.2026 (Волна 1.4): ffmpegTmpM раньше удалялся только на успехе хвостового
+         пути — abort/ошибка во время extract/транскрибации оставляли WAV в %TEMP%.
+         Единый finally покрывает все выходы (fallback-ветка и хвост). */
+      try {
         if (szM > maxBytes) {
-          /* Файл всё ещё слишком велик — авто-чанкование */
-          progress('Аудио ' + Math.round(szM / 1024 / 1024) + ' МБ > лимита — дополнительная нарезка…');
-          var chunkSecFB = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
-            ? settings.transcribeExportChunkSec : 90;
-          /* M2 (аудит 04.07.2026): реальная длительность через ffmpeg Duration,
-             байт-эвристика 32000 B/s — только fallback (верна лишь для 16kHz mono PCM). */
-          var spanFB = (typeof global.AudioPreprocess !== 'undefined' && global.AudioPreprocess.probeDurationSec)
-            ? await global.AudioPreprocess.probeDurationSec(ffmpegTmpM) : null;
-          if (!spanFB) spanFB = Math.max(30, Math.ceil(szM / 32000));
-          var fbChunks = await extractAudioChunksWithFfmpeg(ffmpegTmpM, 0, spanFB, chunkSecFB, progress, chunkFmt);
-          try {
-            var fbDone = 0;
-            progress('Транскрибация: отправляю ' + fbChunks.length + ' фрагментов параллельно…');
-            var fbTasks = fbChunks.map(function (fbc, fbi) {
-              return function () {
-                return backendTranscribe(settings, {
-                  path: fbc.path,
-                  fileName: 'media_fb_' + fbi + '.' + (String(fbc.path || '').replace(/^.*\./, '') || 'wav'),
-                  signal: signal,
-                  onProgress: function () {},
-                  CloudRuClient: CC,
-                  transcribeOptsBase: transcribeOptsBase
-                }).then(function (fbData) {
-                  fbDone++;
-                  progress('Транскрибация: ' + fbDone + '/' + fbChunks.length + ' готово…');
-                  return { index: fbi, data: fbData, offset: (prep.clipStartSec || 0) + fbc.offsetInSpanSec };
-                });
+          progress('Извлечение аудио через ffmpeg…');
+          ffmpegTmpM = tempAudioPath(prep.path);
+          beforeAwait();
+          await extractAudioWithFfmpeg(prep.path, ffmpegTmpM);
+          actualPathM = ffmpegTmpM;
+          szM = fileSizeSync(ffmpegTmpM);
+          if (szM > maxBytes) {
+            /* Файл всё ещё слишком велик — авто-чанкование */
+            progress('Аудио ' + Math.round(szM / 1024 / 1024) + ' МБ > лимита — дополнительная нарезка…');
+            var chunkSecFB = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
+              ? settings.transcribeExportChunkSec : 90;
+            /* M2 (аудит 04.07.2026): реальная длительность через ffmpeg Duration,
+               байт-эвристика 32000 B/s — только fallback (верна лишь для 16kHz mono PCM). */
+            var spanFB = (typeof global.AudioPreprocess !== 'undefined' && global.AudioPreprocess.probeDurationSec)
+              ? await global.AudioPreprocess.probeDurationSec(ffmpegTmpM) : null;
+            if (!spanFB) spanFB = Math.max(30, Math.ceil(szM / 32000));
+            var fbChunks = await extractAudioChunksWithFfmpeg(ffmpegTmpM, 0, spanFB, chunkSecFB, progress, chunkFmt);
+            try {
+              var fbDone = 0;
+              progress('Транскрибация: отправляю ' + fbChunks.length + ' фрагментов параллельно…');
+              var fbTasks = fbChunks.map(function (fbc, fbi) {
+                return function () {
+                  return backendTranscribe(settings, {
+                    path: fbc.path,
+                    fileName: 'media_fb_' + fbi + '.' + (String(fbc.path || '').replace(/^.*\./, '') || 'wav'),
+                    signal: signal,
+                    onProgress: function () {},
+                    CloudRuClient: CC,
+                    transcribeOptsBase: transcribeOptsBase
+                  }).then(function (fbData) {
+                    fbDone++;
+                    progress('Транскрибация: ' + fbDone + '/' + fbChunks.length + ' готово…');
+                    return { index: fbi, data: fbData, offset: (prep.clipStartSec || 0) + fbc.offsetInSpanSec };
+                  });
+                };
+              });
+              var fbResults = await promisePool(fbTasks, CLOUD_CONCURRENCY);
+              fbResults.sort(function (a, b) { return a.index - b.index; });
+              var fbSegs = [], fbText = '';
+              for (var fbr = 0; fbr < fbResults.length; fbr++) {
+                /* 19.06.2026 BUGFIX: 3-й аргумент (clipInPointSec) был 0 → fallback-путь
+                   терял «− clipInPointSec» из формулы normalizeWhisperMediaFile
+                   (clipStart + (sourceTime − clipInPoint)). Этот путь и основной
+                   media_file путь (ниже) транскрибируют ОДИН И ТОТ ЖЕ ffmpegTmpM и
+                   обязаны давать одинаковые таймкоды; основной передаёт prep.clipInPointSec.
+                   При clipInPointSec>0 (клип подрезан в источнике) весь транскрипт
+                   fallback-режима съезжал на +clipInPointSec. offset (2-й арг) уже несёт
+                   clipStartSec+offsetInSpan, поэтому здесь — именно clipInPointSec. */
+                var fbNorm = normalizeWhisperMediaFile(
+                  fbResults[fbr].data, fbResults[fbr].offset, (prep.clipInPointSec || 0), prep.workInSec, prep.workOutSec
+                );
+                fbSegs = fbSegs.concat(fbNorm.segments);
+                fbText += (fbNorm.text || '') + ' ';
+              }
+              var fbAA = null;
+              /* M1 (аудит 04.07.2026): ffmpegTmpM — аудио ВСЕГО исходника (t=0 = начало
+                 медиафайла). Источник t → таймлайн: clipStartSec + (t − clipInPointSec) —
+                 та же формула, что в normalizeWhisperMediaFile. Старый offset clipStartSec
+                 при подрезанном клипе сдвигал тишины на +clipInPointSec. */
+              try { fbAA = await computeAudioPreprocess(ffmpegTmpM, (prep.clipStartSec || 0) - (prep.clipInPointSec || 0), progress); } catch (eAFB) {}
+              return {
+                raw: { ffmpegChunks: fbChunks.length },
+                segments: mergeSegmentLists([fbSegs]),
+                text: fbText.trim(),
+                timelineOffsetSec: prep.workInSec,
+                mode: 'media_file_auto_chunked',
+                audioAnalysis: fbAA
               };
-            });
-            var fbResults = await promisePool(fbTasks, CLOUD_CONCURRENCY);
-            fbResults.sort(function (a, b) { return a.index - b.index; });
-            var fbSegs = [], fbText = '';
-            for (var fbr = 0; fbr < fbResults.length; fbr++) {
-              /* 19.06.2026 BUGFIX: 3-й аргумент (clipInPointSec) был 0 → fallback-путь
-                 терял «− clipInPointSec» из формулы normalizeWhisperMediaFile
-                 (clipStart + (sourceTime − clipInPoint)). Этот путь и основной
-                 media_file путь (ниже) транскрибируют ОДИН И ТОТ ЖЕ ffmpegTmpM и
-                 обязаны давать одинаковые таймкоды; основной передаёт prep.clipInPointSec.
-                 При clipInPointSec>0 (клип подрезан в источнике) весь транскрипт
-                 fallback-режима съезжал на +clipInPointSec. offset (2-й арг) уже несёт
-                 clipStartSec+offsetInSpan, поэтому здесь — именно clipInPointSec. */
-              var fbNorm = normalizeWhisperMediaFile(
-                fbResults[fbr].data, fbResults[fbr].offset, (prep.clipInPointSec || 0), prep.workInSec, prep.workOutSec
-              );
-              fbSegs = fbSegs.concat(fbNorm.segments);
-              fbText += (fbNorm.text || '') + ' ';
+            } finally {
+              /* ffmpegTmpM удаляет внешний finally */
+              unlinkChunkList(fbChunks);
             }
-            var fbAA = null;
-            /* M1 (аудит 04.07.2026): ffmpegTmpM — аудио ВСЕГО исходника (t=0 = начало
-               медиафайла). Источник t → таймлайн: clipStartSec + (t − clipInPointSec) —
-               та же формула, что в normalizeWhisperMediaFile. Старый offset clipStartSec
-               при подрезанном клипе сдвигал тишины на +clipInPointSec. */
-            try { fbAA = await computeAudioPreprocess(ffmpegTmpM, (prep.clipStartSec || 0) - (prep.clipInPointSec || 0), progress); } catch (eAFB) {}
-            return {
-              raw: { ffmpegChunks: fbChunks.length },
-              segments: mergeSegmentLists([fbSegs]),
-              text: fbText.trim(),
-              timelineOffsetSec: prep.workInSec,
-              mode: 'media_file_auto_chunked',
-              audioAnalysis: fbAA
-            };
-          } finally {
-            unlinkChunkList(fbChunks);
-            try { if (typeof require !== 'undefined') require('fs').unlinkSync(ffmpegTmpM); } catch (eU) {}
           }
         }
+        beforeAwait();
+        var dataM = await backendTranscribe(settings, {
+          path: actualPathM,
+          fileName: String(prep.path || 'media').replace(/^.*[\\/]/, '') || 'media',
+          signal: signal,
+          onProgress: progress,
+          CloudRuClient: CC,
+          transcribeOptsBase: transcribeOptsBase
+        });
+        var normM = normalizeWhisperMediaFile(
+          dataM,
+          prep.clipStartSec,
+          prep.clipInPointSec,
+          prep.workInSec,
+          prep.workOutSec
+        );
+        try {
+          /* Для media_file используем путь к исходнику (или tmp если был извлечён) —
+             в обоих случаях t=0 = начало МЕДИАФАЙЛА, не клипа. M1 (аудит 04.07.2026):
+             источник t → таймлайн: clipStartSec + (t − clipInPointSec), поэтому offset
+             = clipStartSec − clipInPointSec (раньше clipInPointSec терялся). */
+          normM.audioAnalysis = await computeAudioPreprocess(actualPathM, (prep.clipStartSec || 0) - (prep.clipInPointSec || 0), progress);
+        } catch (eAM) {}
+        return normM;
+      } finally {
+        if (ffmpegTmpM) {
+          try { if (typeof require !== 'undefined') require('fs').unlinkSync(ffmpegTmpM); } catch (eU2) {}
+        }
       }
-      beforeAwait();
-      var dataM = await backendTranscribe(settings, {
-        path: actualPathM,
-        fileName: String(prep.path || 'media').replace(/^.*[\\/]/, '') || 'media',
-        signal: signal,
-        onProgress: progress,
-        CloudRuClient: CC,
-        transcribeOptsBase: transcribeOptsBase
-      });
-      var normM = normalizeWhisperMediaFile(
-        dataM,
-        prep.clipStartSec,
-        prep.clipInPointSec,
-        prep.workInSec,
-        prep.workOutSec
-      );
-      try {
-        /* Для media_file используем путь к исходнику (или tmp если был извлечён) —
-           в обоих случаях t=0 = начало МЕДИАФАЙЛА, не клипа. M1 (аудит 04.07.2026):
-           источник t → таймлайн: clipStartSec + (t − clipInPointSec), поэтому offset
-           = clipStartSec − clipInPointSec (раньше clipInPointSec терялся). */
-        normM.audioAnalysis = await computeAudioPreprocess(actualPathM, (prep.clipStartSec || 0) - (prep.clipInPointSec || 0), progress);
-      } catch (eAM) {}
-      if (ffmpegTmpM) {
-        try { if (typeof require !== 'undefined') require('fs').unlinkSync(ffmpegTmpM); } catch (eU2) {}
-      }
-      return normM;
     }
 
     throw new Error('Неизвестный режим транскрибации: ' + String(prep.mode));
@@ -1248,6 +1286,8 @@
     runAudioOnlyAnalysis: runAudioOnlyAnalysis,
     computeAudioPreprocess: computeAudioPreprocess,
     mergeRmsTimelines: mergeRmsTimelines,
+    /* экспорт для тестов cleanup temp-файлов (Волна 1.4) */
+    extractAudioChunksWithFfmpeg: extractAudioChunksWithFfmpeg,
     unlinkWorkFiles: function (prep) {
       if (typeof require === 'undefined') return;
       var fs = require('fs');

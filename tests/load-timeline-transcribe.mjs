@@ -24,9 +24,7 @@ export function loadTimelineTranscribe(opts) {
   const root = {};
   if (opts.AudioPreprocess) root.AudioPreprocess = opts.AudioPreprocess;
 
-  vm.runInNewContext(
-    src,
-    {
+  const sandbox = {
       root,
       window: root,
       Promise,
@@ -46,9 +44,12 @@ export function loadTimelineTranscribe(opts) {
       clearTimeout,
       console,
       undefined
-    },
-    { filename: 'timeline-transcribe.js' }
-  );
+  };
+  /* Волна 1.4: тесты cleanup temp-файлов — фейковый require (fs/os/path/child_process).
+     Не задан → typeof require === 'undefined', как в браузере без Node. */
+  if (opts.require) sandbox.require = opts.require;
+
+  vm.runInNewContext(src, sandbox, { filename: 'timeline-transcribe.js' });
 
   if (!root.TimelineTranscribe) {
     throw new Error('TimelineTranscribe not attached to root');

@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.8';
+$._EXT_PRM_.version = '2.6.9';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -1145,6 +1145,19 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
     var seq = app.project.activeSequence;
     var plan = JSON.parse(jsonPlan);
 
+    /* 10.07.2026 (Волна 1.5): гонка смены секвенции — между assertSequenceMatch
+       в панели и этим вызовом пользователь мог переключить секвенцию; apply
+       разрушил бы чужой таймлайн. Панель передаёт expectedSequenceName из
+       snapshot'а плана; host сверяет сам (last line of defense) ДО мутаций. */
+    if (plan.expectedSequenceName && String(seq.name) !== String(plan.expectedSequenceName)) {
+      return JSON.stringify({
+        ok: false,
+        error: 'Активная секвенция «' + seq.name + '» не та, для которой построен план («' +
+          plan.expectedSequenceName + '») — план отклонён, таймлайн не изменён. Откройте нужную секвенцию и повторите.',
+        hostVersion: $._EXT_PRM_.version
+      });
+    }
+
     /* Preflight: если план содержит интервальные операции (razor+remove на ВСЕХ
        дорожках) — заранее проверяем locked-дорожки. Razor/remove на заблокированной
        дорожке молча не сработает → ripple рассинхронизирует дорожки между собой.
@@ -1748,6 +1761,16 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
     }
     var seq = app.project.activeSequence;
     var cuts = JSON.parse(jsonCuts);
+
+    /* 10.07.2026 (Волна 1.5): сверка секвенции host-side — см. applyTimecodeEdits. */
+    if (cuts.expectedSequenceName && String(seq.name) !== String(cuts.expectedSequenceName)) {
+      return JSON.stringify({
+        ok: false,
+        error: 'Активная секвенция «' + seq.name + '» не та, для которой построен план («' +
+          cuts.expectedSequenceName + '») — план отклонён, таймлайн не изменён. Откройте нужную секвенцию и повторите.',
+        hostVersion: $._EXT_PRM_.version
+      });
+    }
 
     /* Preflight: заблокированные дорожки. Razor/remove на locked-дорожке молча
        не сработает → рассинхрон видео/аудио. Не трогаем таймлайн вообще. */

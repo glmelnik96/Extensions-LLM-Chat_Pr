@@ -184,3 +184,99 @@ describe('TimelineTranscribe.assertNonEmptyTranscript', () => {
     assert.equal(TT.assertNonEmptyTranscript(res), res);
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * Волна 1.4 (10.07.2026): cleanup temp-чанков при ошибке/abort
+ * extractAudioChunksWithFfmpeg. Фейковый require: fs — Set «существующих»
+ * файлов, execFile — контролируемые исходы по индексу чанка.
+ * ═══════════════════════════════════════════════════════════════ */
+
+function makeFakeFfmpegEnv(chunkBehavior) {
+  const files = new Set();
+  const unlinked = [];
+  const fakeFs = {
+    existsSync: (p) => p === '/opt/homebrew/bin/ffmpeg' || files.has(p),
+    statSync: (p) => ({ size: files.has(p) ? 999999 : 0 }),
+    unlinkSync: (p) => {
+      if (!files.has(p)) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; }
+      files.delete(p);
+      unlinked.push(p);
+    }
+  };
+  const fakeExecFile = (bin, args, o, cb) => {
+    const outPath = args[args.length - 1];
+    const m = /_(\d+)\.(wav|mp3)$/.exec(outPath);
+    const idx = m ? Number(m[1]) : -1;
+    chunkBehavior(idx, outPath, files, cb);
+  };
+  const modules = {
+    fs: fakeFs,
+    os: { tmpdir: () => '/tmp' },
+    path: {
+      join: (...a) => a.join('/'),
+      extname: (p) => { const i = p.lastIndexOf('.'); return i >= 0 ? p.slice(i) : ''; },
+      basename: (p, ext) => {
+        let b = p.replace(/^.*[\/]/, '');
+        if (ext && b.endsWith(ext)) b = b.slice(0, -ext.length);
+        return b;
+      }
+    },
+    child_process: { execFile: fakeExecFile, execSync: () => { throw new Error('нет ffmpeg в PATH'); } }
+  };
+  return { require: (name) => modules[name], files, unlinked };
+}
+
+describe('TimelineTranscribe.extractAudioChunksWithFfmpeg — cleanup при сбое (Волна 1.4)', () => {
+  it('успех: чанки созданы и НЕ удалены', async () => {
+    const env = makeFakeFfmpegEnv((idx, outPath, files, cb) => {
+      setTimeout(() => { files.add(outPath); cb(null); }, 1);
+    });
+    const TT = loadTimelineTranscribe({ require: env.require });
+    /* span 200с, chunk 90с → 3 чанка */
+    const chunks = await TT.extractAudioChunksWithFfmpeg('/media/in.mov', 0, 200, 90, null, 'wav');
+    assert.equal(chunks.length, 3);
+    assert.equal(env.files.size, 3);
+    assert.equal(env.unlinked.length, 0);
+  });
+
+  it('ошибка одного чанка → уже созданные удалены, промис отклонён', async () => {
+    const env = makeFakeFfmpegEnv((idx, outPath, files, cb) => {
+      if (idx === 1) { setTimeout(() => cb(new Error('boom')), 5); return; }
+      setTimeout(() => { files.add(outPath); cb(null); }, 1); /* 0 и 2 успевают раньше */
+    });
+    const TT = loadTimelineTranscribe({ require: env.require });
+    await assert.rejects(
+      TT.extractAudioChunksWithFfmpeg('/media/in.mov', 0, 200, 90, null, 'wav'),
+      /ffmpeg error \(chunk 1\)/
+    );
+    assert.equal(env.files.size, 0, 'все созданные чанки должны быть удалены');
+    assert.equal(env.unlinked.length, 2);
+  });
+
+  it('in-flight чанк доезжает ПОСЛЕ падения пула → сам удаляет свой файл', async () => {
+    const env = makeFakeFfmpegEnv((idx, outPath, files, cb) => {
+      if (idx === 0) { setTimeout(() => cb(new Error('boom')), 1); return; }  /* падает первым */
+      setTimeout(() => { files.add(outPath); cb(null); }, 15);                /* доезжают позже */
+    });
+    const TT = loadTimelineTranscribe({ require: env.require });
+    await assert.rejects(
+      TT.extractAudioChunksWithFfmpeg('/media/in.mov', 0, 200, 90, null, 'wav'),
+      /ffmpeg error \(chunk 0\)/
+    );
+    /* даём in-flight callback'ам доехать */
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(env.files.size, 0, 'поздние чанки должны самоудалиться');
+  });
+
+  it('пустой выход ffmpeg (файл не создан) → reject без мусора', async () => {
+    const env = makeFakeFfmpegEnv((idx, outPath, files, cb) => {
+      setTimeout(() => cb(null), 1); /* «успех» ffmpeg, но файла нет */
+    });
+    const TT = loadTimelineTranscribe({ require: env.require });
+    await assert.rejects(
+      TT.extractAudioChunksWithFfmpeg('/media/in.mov', 0, 100, 90, null, 'wav'),
+      /пустой чанк/
+    );
+    assert.equal(env.files.size, 0);
+  });
+});

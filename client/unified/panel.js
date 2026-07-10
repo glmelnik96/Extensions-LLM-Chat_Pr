@@ -2319,8 +2319,18 @@ PanelBoot.run('ИИ: монтаж', function () {
          иначе apply разрушит чужой таймлайн. */
       applyBtn.disabled = true;
       cancelBtn.disabled = true;
-      var pSnap = _pendingProposal && _pendingProposal.snapshot;
+      /* 10.07.2026 (Волна 1.5): фиксируем proposal НА МОМЕНТ КЛИКА. Пока
+         assertSequenceMatch летает к host (~100мс), _pendingProposal мог быть
+         заменён новым ответом/отменён — без проверки идентичности применился бы
+         план, который пользователь не видел и не подтверждал. */
+      var propAtClick = _pendingProposal;
+      var pSnap = propAtClick && propAtClick.snapshot;
       assertSequenceMatch(pSnap, function (err, ok) {
+        if (_pendingProposal !== propAtClick) {
+          /* карточка устарела — кнопки НЕ оживляем */
+          showErr('План изменился, пока шла проверка секвенции — эта карточка устарела. Проверьте актуальную карточку плана.');
+          return;
+        }
         if (!ok) {
           applyBtn.disabled = false;
           cancelBtn.disabled = false;
@@ -2432,7 +2442,8 @@ PanelBoot.run('ИИ: монтаж', function () {
       /* B2-9: checkpoint перед атомарным apply */
       _makeSequenceCheckpoint('EditPlan', function () {
       PremiereBridge.applyTimecodeEdits(
-        { operations: normOpsE, summary: prop.summary || '' },
+        { operations: normOpsE, summary: prop.summary || '',
+          expectedSequenceName: (prop.snapshot && prop.snapshot.sequenceName) || '' },
         function (errE, dataE) {
           if (errE) {
             statusUi.hide();
@@ -2497,7 +2508,8 @@ PanelBoot.run('ИИ: монтаж', function () {
       /* B2-9: checkpoint перед правками таймлайна */
       _makeSequenceCheckpoint('правки таймлайна', function () {
       PremiereBridge.applyTimecodeEdits(
-        { operations: prop.operations, summary: prop.summary },
+        { operations: prop.operations, summary: prop.summary,
+          expectedSequenceName: (prop.snapshot && prop.snapshot.sequenceName) || '' },
         function (err, data) {
           if (err) {
             statusUi.hide();
@@ -2648,7 +2660,10 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* B2-9: checkpoint — клон секвенции перед ripple-удалениями */
     _makeSequenceCheckpoint('монтаж по тексту', function () {
     PremiereBridge.applyTranscriptCuts(
-      { removeIntervals: prop.removeIntervals, summary: prop.summary },
+      /* Волна 1.5: host сверит секвенцию сам — закрывает окно между
+         assertSequenceMatch и фактическим apply. */
+      { removeIntervals: prop.removeIntervals, summary: prop.summary,
+        expectedSequenceName: (prop.snapshot && prop.snapshot.sequenceName) || '' },
       function (err, data) {
         if (err) {
           statusUi.hide();
@@ -2778,6 +2793,10 @@ PanelBoot.run('ИИ: монтаж', function () {
         return;
       }
       try {
+        /* 10.07.2026 (Волна 1.6): backupId, который сейчас будет замещён в lastUndo
+           этой панели, больше недостижим для «⏪ Откатить» — его чекпоинт транскрипта
+           удаляем, иначе deep-copy транскриптов копятся в памяти всю сессию. */
+        var _prevU = ContextStore.getLastUndo(active.panelId);
         ContextStore.setLastUndo(active.panelId, 1, label || 'монтаж', data.originalName || '', {
           mode: 'sequence_backup',
           backupId: data.backupId,
@@ -2791,7 +2810,23 @@ PanelBoot.run('ИИ: монтаж', function () {
           var _ck = data.originalName || '';
           if (_ck && ContextStore.getTranscriptEntry) {
             var _ent = ContextStore.getTranscriptEntry(TRANSCRIPT_PID, _ck);
-            if (_ent) _transcriptCheckpoints[data.backupId] = { key: _ck, entry: JSON.parse(JSON.stringify(_ent)) };
+            if (_ent) _transcriptCheckpoints[data.backupId] = { key: _ck, entry: JSON.parse(JSON.stringify(_ent)), _ts: Date.now() };
+          }
+          if (_prevU && _prevU.backupId && _prevU.backupId !== data.backupId) {
+            delete _transcriptCheckpoints[_prevU.backupId];
+          }
+          /* Страховочный лимит (мульти-панель, clearAllPanelCache-сироты):
+             держим не больше 8 снимков, вытесняем самый старый. */
+          var _ckIds = Object.keys(_transcriptCheckpoints);
+          while (_ckIds.length > 8) {
+            var _oldestId = null, _oldestTs = Infinity;
+            for (var _ci = 0; _ci < _ckIds.length; _ci++) {
+              var _cts = _transcriptCheckpoints[_ckIds[_ci]]._ts || 0;
+              if (_cts < _oldestTs) { _oldestTs = _cts; _oldestId = _ckIds[_ci]; }
+            }
+            if (!_oldestId) break;
+            delete _transcriptCheckpoints[_oldestId];
+            _ckIds = Object.keys(_transcriptCheckpoints);
           }
         } catch (eTc) {}
         refreshUndoButton();
@@ -6575,8 +6610,15 @@ PanelBoot.run('ИИ: монтаж', function () {
         /* HIGH #1: sequence-switch guard. Пользователь мог переключиться на
            другую секвенцию между proposal и apply — apply убил бы её таймлайн. */
         applyB.disabled = true;
-        var pSnap = _toolsProposal && _toolsProposal.snapshot;
+        /* 10.07.2026 (Волна 1.5): та же гонка, что в чате — _toolsProposal мог
+           смениться, пока assertSequenceMatch летал к host. */
+        var toolsPropAtClick = _toolsProposal;
+        var pSnap = toolsPropAtClick && toolsPropAtClick.snapshot;
         assertSequenceMatch(pSnap, function (err, ok) {
+          if (_toolsProposal !== toolsPropAtClick) {
+            toolsShowErr('План изменился, пока шла проверка секвенции — карточка устарела.');
+            return;
+          }
           applyB.disabled = false;
           if (!ok) {
             toolsShowErr(err && err.message ? err.message : 'Sequence mismatch');
@@ -6627,7 +6669,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         /* B2-9: checkpoint перед ripple-удалениями */
         _makeSequenceCheckpoint('монтаж (tools)', function () {
         PremiereBridge.applyTranscriptCuts(
-          { removeIntervals: prop.removeIntervals, summary: prop.summary },
+          { removeIntervals: prop.removeIntervals, summary: prop.summary,
+            expectedSequenceName: (prop.snapshot && prop.snapshot.sequenceName) || '' },
           function (err, dataTC) {
             toolsDisableRun(false);
             endOperation();
