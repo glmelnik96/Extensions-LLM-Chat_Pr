@@ -461,6 +461,38 @@ describe('validateTranscriptCuts', () => {
     assert.equal(r.warn, null);
   });
 
+  /* Волна 1 п.8 (аудит §6): пустая секвенция — 0 клипов/дорожек.
+     span=0 → bounds-проверки JS-слоя тихо пропускаются (осознанно: снимок
+     пустой секвенции не должен блокировать план «в никуда» ошибкой границ) —
+     last line of defense остаётся host 2.6.9 (_seqEndSec-гард). Контракт
+     здесь: НЕ падать и давать осмысленные ошибки на nodeId. */
+  test('пустая секвенция (clips: []) — не падает, валидный интервал проходит', () => {
+    const snapEmpty = { ok: true, sequenceName: 'Empty', clips: [] };
+    const r = TV.validateTranscriptCuts(snapEmpty, {
+      removeIntervals: [{ startSec: 1, endSec: 2 }]
+    });
+    assert.equal(r.error, null);
+  });
+
+  test('снимок без clips вообще — не падает', () => {
+    const r = TV.validateTranscriptCuts({ ok: true, sequenceName: 'NoClips' }, {
+      removeIntervals: [{ startSec: 0, endSec: 1 }]
+    });
+    assert.equal(r.error, null);
+  });
+
+  test('пустая секвенция: структурные ошибки интервалов ловятся как обычно', () => {
+    const snapEmpty = { ok: true, sequenceName: 'Empty', clips: [] };
+    const r = TV.validateTranscriptCuts(snapEmpty, {
+      removeIntervals: [{ startSec: 5, endSec: 3 }]
+    });
+    assert.ok(r.error);
+    const r2 = TV.validateTranscriptCuts(snapEmpty, {
+      removeIntervals: [{ startSec: 1, endSec: 4 }, { startSec: 2, endSec: 6 }]
+    });
+    assert.match(r2.error, /[Пп]ерекрытие/);
+  });
+
   /* P1-F: конкатенация нескольких warn */
   test('несколько warn конкатенируются через "; "', () => {
     /* Два неперекрывающихся интервала вне analyzedRegion → два warn */
@@ -475,6 +507,52 @@ describe('validateTranscriptCuts', () => {
     assert.ok(r.warn);
     /* warn должен содержать "; " — значит несколько предупреждений склеены */
     assert.ok(r.warn.indexOf('; ') >= 0, 'expected multiple warns joined by "; "');
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * Пустая секвенция для остальных валидаторов (аудит §6, Волна 1 п.8)
+ * ═══════════════════════════════════════════════════════════════ */
+describe('пустая секвенция (0 клипов) — остальные валидаторы', () => {
+  const snapEmpty = { ok: true, sequenceName: 'Empty', clips: [] };
+
+  test('validateEditPlan: remove_clip по любому nodeId → «не найден», не падение', () => {
+    const err = TV.validateEditPlan(snapEmpty, {
+      ops: [{ kind: 'remove_clip', nodeId: 'ghost' }]
+    });
+    assert.match(err, /не найден/);
+  });
+
+  test('validateEditPlan: ripple_delete_interval на пустом таймлайне проходит JS-слой (host отклонит)', () => {
+    const err = TV.validateEditPlan(snapEmpty, {
+      ops: [{ kind: 'ripple_delete_interval', startSec: 0, endSec: 5 }]
+    });
+    assert.equal(err, null);
+  });
+
+  test('validateTimecodePlan: remove_clip по nodeId на пустом снимке → ошибка', () => {
+    const err = TV.validateTimecodePlan(snapEmpty, {
+      operations: [{ action: 'remove_clip', nodeId: 'ghost' }]
+    });
+    assert.match(err, /не найден/);
+  });
+
+  test('validateTimecodePlan: ripple_delete_range на пустом снимке не падает', () => {
+    const err = TV.validateTimecodePlan(snapEmpty, {
+      operations: [{ action: 'ripple_delete_range', startSec: 0, endSec: 3 }]
+    });
+    assert.equal(err, null);
+  });
+
+  test('validateMarkersList: маркер на пустом снимке — bounds-проверка пропускается (span=0), host ловит', () => {
+    assert.equal(TV.validateMarkersList(snapEmpty, [{ timeSec: 999999, name: 'x' }]), null);
+    /* но структурные проверки живы */
+    assert.ok(TV.validateMarkersList(snapEmpty, [{ timeSec: -1, name: 'x' }]));
+    assert.ok(TV.validateMarkersList(snapEmpty, [{ timeSec: NaN, name: 'x' }]));
+  });
+
+  test('validateMarkersList: snap == null — не падает', () => {
+    assert.equal(TV.validateMarkersList(null, [{ timeSec: 5, name: 'x' }]), null);
   });
 });
 

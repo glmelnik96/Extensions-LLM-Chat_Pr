@@ -9,14 +9,17 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export function loadContextStoreWithTempRoot() {
+export function loadContextStoreWithTempRoot(opts) {
+  opts = opts || {};
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'llmpr-ctx-'));
   const fakeHome = path.join(tmpRoot, 'fake-home');
   fs.mkdirSync(fakeHome, { recursive: true });
   const mockOs = { homedir: function () { return fakeHome; } };
   const mem = new Map();
+  /* opts.localStorage — подмена (например, бросающая SecurityError/QuotaExceeded,
+     как в CEF при отключённом/переполненном localStorage). */
   const root = {
-    localStorage: {
+    localStorage: opts.localStorage || {
       getItem(k) {
         return mem.has(k) ? mem.get(k) : null;
       },

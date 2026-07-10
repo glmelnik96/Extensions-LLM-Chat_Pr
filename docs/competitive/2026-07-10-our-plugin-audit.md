@@ -163,3 +163,24 @@ AbortController/abortableSleep (28–79). Остальное — VERIFY пере
   только транскрипт-кэш (поведение до 19.06).
 - Host bump: 2.6.8 → 2.6.9. Node-тесты: 604/604. Панель перезагружена, модули живы.
 - ⚠️ Осталось из Волны 1: п.8 — тесты по §6 (пустая секвенция, abort-SSE, смена секвенции e2e).
+
+## Верификация и статус фиксов (2026-07-10, Волна 1 п.8 — тесты §6)
+Ревизия каждого пункта §6:
+- ❌ **STALE: пересекающиеся removeIntervals** — уже покрыто (tool-validators.test.mjs:
+  перекрытие/дубликаты/встык/EPS); host-слой live-проверен в п.2.
+- ❌ **STALE: abort во время SSE-read** — уже покрыто (cloudru-client.test.mjs:166
+  «abortCheck прерывает стрим до завершения»).
+- ❌ **STALE: «известный падающий тест» scenarios-validation.test.mjs:250** — проходит
+  (24/24), починен ранними волнами.
+- ✅ **Cleanup temp при abort** — закрыто в п.4 (4 теста).
+- ✅ **ДОБАВЛЕНО: пустая секвенция (0 клипов)** — 9 тестов: validateTranscriptCuts /
+  validateEditPlan / validateTimecodePlan / validateMarkersList не падают; nodeId → «не найден»;
+  span=0 → bounds-пропуск осознан (last line of defense = host 2.6.9 _seqEndSec).
+- ✅ **ДОБАВЛЕНО + ФИКС: localStorage недоступен** — 7 тестов (бросающий QuotaExceeded-стаб,
+  loader принимает opts.localStorage). Найдено и исправлено: `setMessages` (зовётся из ~14 мест
+  агент-циклов panel.js) и `clearChat` были БЕЗ try/catch — бросок LS ронял весь флоу. Теперь
+  паттерн setLastUndo: try/catch + console.warn, деградация мягкая; транскрипт-кэш живёт через файлы.
+- ✅ **Смена секвенции между proposal/apply** — покрыто live-e2e через CDP в п.5 (mismatch →
+  reject без мутаций, match → гейт прозрачен); unit-тест непрактичен (логика в замыканиях
+  panel.js + ES3 host), решено не рефакторить ради теста.
+- Node-тесты: 620/620 (+16). **Волна 1 полностью завершена.**

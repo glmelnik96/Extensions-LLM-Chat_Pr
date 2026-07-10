@@ -310,7 +310,18 @@
       }
     },
     setMessages: function (panelId, messages) {
-      localStorage.setItem(keyMessages(panelId), JSON.stringify(messages));
+      /* Волна 1 п.8 (аудит §6): localStorage в CEF может бросать (SecurityError/
+         QuotaExceeded). setMessages зовётся из середины агент-циклов panel.js —
+         бросок ронял весь флоу. История чата — nicety: деградируем с warn. */
+      try {
+        localStorage.setItem(keyMessages(panelId), JSON.stringify(messages));
+        return true;
+      } catch (e) {
+        if (typeof console !== 'undefined' && console.warn) {
+          console.warn('[context-store] save chat history failed (LS quota?):', e && e.message);
+        }
+        return false;
+      }
     },
     appendMessage: function (panelId, msg) {
       var m = this.getMessages(panelId);
@@ -506,7 +517,7 @@
     },
 
     clearChat: function (panelId) {
-      localStorage.removeItem(keyMessages(panelId));
+      try { localStorage.removeItem(keyMessages(panelId)); } catch (e) {}
     },
     clearTranscriptCache: function (panelId) {
       if (transcriptCacheFilePaths().length) {

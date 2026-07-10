@@ -74,3 +74,71 @@ describe('ContextStore (файловый кэш + ключи секвенции)
     c3();
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * localStorage недоступен (аудит §6, Волна 1 п.8).
+ * В CEF localStorage может бросать SecurityError (отключён) или
+ * QuotaExceededError (переполнен). ContextStore зовётся из середины
+ * агент-циклов panel.js (~14 мест setMessages) — бросок роняет весь флоу.
+ * Контракт: деградировать мягко (пустые значения/false), НЕ бросать.
+ * ═══════════════════════════════════════════════════════════════ */
+describe('ContextStore — localStorage недоступен (бросает)', () => {
+  function makeThrowingLS() {
+    const boom = () => {
+      const e = new Error('The quota has been exceeded.');
+      e.name = 'QuotaExceededError';
+      throw e;
+    };
+    return { getItem: boom, setItem: boom, removeItem: boom };
+  }
+
+  const { ContextStore: CS, tmpRoot, cleanup } = loadContextStoreWithTempRoot({
+    localStorage: makeThrowingLS()
+  });
+  after(() => cleanup());
+
+  test('getMessages → [] вместо исключения', () => {
+    /* массив создаётся в vm-realm — deepStrictEqual падает на прототипе */
+    const m = CS.getMessages('markers');
+    assert.ok(Array.isArray(m));
+    assert.equal(m.length, 0);
+  });
+
+  test('setMessages не бросает (история чата — nicety, не блокер)', () => {
+    assert.doesNotThrow(() => CS.setMessages('markers', [{ role: 'user', content: 'hi' }]));
+  });
+
+  test('appendMessage не бросает', () => {
+    assert.doesNotThrow(() => CS.appendMessage('markers', { role: 'user', content: 'hi' }));
+  });
+
+  test('clearChat не бросает', () => {
+    assert.doesNotThrow(() => CS.clearChat('markers'));
+  });
+
+  test('getLastUndo → null, setLastUndo/clearLastUndoCount не бросают', () => {
+    assert.equal(CS.getLastUndo('markers'), null);
+    assert.doesNotThrow(() => CS.setLastUndo('markers', 3, 'label', 'Seq'));
+    assert.doesNotThrow(() => CS.clearLastUndoCount('markers'));
+  });
+
+  test('транскрипт-кэш живёт через файлы даже с мёртвым localStorage', () => {
+    CS.setExtensionRoot(tmpRoot);
+    assert.equal(CS.setTranscriptEntry('markers', 'SeqLS', { v: 42 }), true);
+    assert.equal(CS.getTranscriptEntry('markers', 'SeqLS').v, 42);
+  });
+
+  test('setTranscriptCache без файловых путей и с мёртвым LS → false, не бросает', () => {
+    const { ContextStore: CS2, cleanup: c2 } = loadContextStoreWithTempRoot({
+      localStorage: makeThrowingLS()
+    });
+    CS2.setExtensionRoot('');
+    /* homedir подменён на tmp — но setExtensionRoot('') оставляет home-путь;
+       эмулируем полное отсутствие путей нельзя без правки кода, поэтому
+       проверяем только «не бросает» + boolean-результат. */
+    let r;
+    assert.doesNotThrow(() => { r = CS2.setTranscriptCache('markers', { a: 1 }); });
+    assert.equal(typeof r, 'boolean');
+    c2();
+  });
+});
