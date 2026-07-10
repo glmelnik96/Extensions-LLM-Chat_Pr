@@ -6971,10 +6971,125 @@ PanelBoot.run('ИИ: монтаж', function () {
       toolsShowErr('Неизвестный тип: ' + prop.kind);
     }
 
+    /* ── «🗣 Спикеры»: локальная диаризация транскрипта по RMS микрофонов
+       (Волна 3 п.3, 10.07.2026). Whisper Cloud.ru спикеров не отдаёт —
+       размечаем сами: host перечисляет мики (direct-дорожки И inner-треки
+       nest), ffmpeg считает RMS каждого файла один раз, assignSpeakersByRms
+       ставит segment.speaker, buildStructure подхватывает метки в
+       entry.speakers → агент видит их в get_transcript_structure. ─────── */
+    async function toolsRunDiarize() {
+      if (!beginOperation('tools:speakers')) {
+        toolsShowErr('Идёт обработка в чате — дождитесь завершения (кнопка «Стоп» на вкладке «Чат»).');
+        return;
+      }
+      toolsDisableRun(true);
+      toolsStatusUi.show('Ищу микрофоны…', true);
+      var resEl = document.getElementById('dz-result');
+      if (resEl) { resEl.textContent = ''; }
+      var keepStatus = false;
+      try {
+        var snap = await execGetSnapshot(true);
+        if (!snap || !snap.ok) {
+          toolsShowErr(snap && snap.error ? snap.error : 'Не удалось получить снимок таймлайна.');
+          return;
+        }
+        var seqKey = snap.sequenceName || '';
+        var found = seqKey ? ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqKey) : { entry: null };
+        var entry = found && found.entry;
+        if (!entry || !entry.segments || !entry.segments.length) {
+          toolsShowErr('Нет транскрипта для «' + seqKey + '» — сначала транскрибируйте In–Out (вкладка «Чат»).');
+          return;
+        }
+        var src = await new Promise(function (resolve, reject) {
+          PremiereBridge.getDiarizeMicSources(function (err, data) {
+            if (err) reject(err); else resolve(data);
+          });
+        });
+        if (!src || !src.ok) {
+          toolsShowErr((src && src.error) || 'Не удалось перечислить микрофоны.');
+          return;
+        }
+        /* Снимок и мики должны быть с ОДНОЙ секвенции — иначе метки уедут
+           в чужой транскрипт. */
+        if (String(src.sequenceName || '') !== seqKey) {
+          toolsShowErr('Активная секвенция сменилась («' + src.sequenceName + '») — откройте «' + seqKey + '» и повторите.');
+          return;
+        }
+        var mics = src.mics || [];
+        var dzTracksEl = document.getElementById('dz-tracks');
+        var filter = DeterministicPipelines.parseAudioTrackFilter(dzTracksEl ? dzTracksEl.value : '');
+        if (filter) {
+          mics = mics.filter(function (m) { return filter.indexOf(m.trackNumber) !== -1; });
+        }
+        if (mics.length < 2) {
+          toolsShowErr('Нужно минимум 2 микрофона, найдено: ' +
+            (mics.length ? mics.map(function (m) { return m.label; }).join(', ') : '0') +
+            '. Проверьте фильтр дорожек и mute (камерный звук лучше исключить фильтром, напр. «4-6»).');
+          return;
+        }
+        /* RMS на ФАЙЛ один раз: разрезанный nest даёт много частей одного файла. */
+        var pathSet = {};
+        for (var mi = 0; mi < mics.length; mi++) {
+          for (var pj = 0; pj < mics[mi].parts.length; pj++) pathSet[mics[mi].parts[pj].mediaPath] = 1;
+        }
+        var paths = Object.keys(pathSet);
+        var doneCount = 0;
+        var showMicStatus = function () {
+          toolsStatusUi.show('Анализ микрофонов: готово ' + doneCount + ' из ' + paths.length + '…', true);
+        };
+        showMicStatus();
+        var rmsByPath = {};
+        await Promise.all(paths.map(function (p) {
+          return AudioPreprocess.computeRmsTimeline(p, { windowSec: 0.05 })
+            .then(function (tl) {
+              doneCount++;
+              showMicStatus();
+              rmsByPath[p] = tl;
+            }, function (e) {
+              var fname = String(p).split(/[\\\/]/).pop();
+              throw new Error(fname + ': ' + String(e && e.message || e));
+            });
+        }));
+        var labels = [];
+        var timelines = [];
+        for (var li = 0; li < mics.length; li++) {
+          labels.push('Спикер ' + (li + 1) + ' (' + mics[li].label + ')');
+          timelines.push(DeterministicPipelines.micPartsToTimeline(mics[li].parts, rmsByPath));
+        }
+        var res = DeterministicPipelines.assignSpeakersByRms(entry.segments, timelines, { labels: labels });
+        entry.segments = res.segments;
+        try { TranscriptStructure.buildStructure(entry); } catch (eB) {}
+        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, entry);
+        var lines = ['Размечено ' + res.labeled + ' из ' + res.total + ' сегментов.'];
+        for (var si = 0; si < labels.length; si++) {
+          lines.push(labels[si] + ' — ' + (res.perSpeaker[labels[si]] || 0));
+        }
+        var unlabeled = res.total - res.labeled;
+        if (unlabeled > 0) lines.push('Без метки (перекрытие/тишина): ' + unlabeled);
+        if (resEl) {
+          resEl.style.whiteSpace = 'pre-line';
+          resEl.textContent = lines.join('\n');
+        }
+        toolsStatusUi.show('Спикеры размечены ✓', false);
+        keepStatus = true;
+        setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+      } catch (e) {
+        toolsShowErr(String(e.message || e));
+      } finally {
+        endOperation();
+        toolsDisableRun(false);
+        if (!keepStatus) toolsStatusUi.hide();
+      }
+    }
+
     /* ── Run tool ─────────────────────────────────────────── */
     async function toolsRunTool(toolName) {
       toolsShowErr('');
       toolsHideAllProposals();
+
+      /* «🗣 Спикеры» — не proposal-пайплайн (ничего не режет): своя ветка
+         с записью меток прямо в кэш транскрипта. */
+      if (toolName === 'speakers') { await toolsRunDiarize(); return; }
 
       var pipelineFn, params = {}, proposalId;
 

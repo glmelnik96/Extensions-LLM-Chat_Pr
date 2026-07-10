@@ -250,6 +250,11 @@
       this.evalJson('$._EXT_PRM_.backupActiveSequence()', cb);
     },
 
+    /** Диаризация: перечислить микрофоны активной секвенции (read-only). */
+    getDiarizeMicSources: function (cb) {
+      this.evalJson('$._EXT_PRM_.getDiarizeMicSources()', cb);
+    },
+
     /** B2-9: Revert — активировать бэкап-секвенцию по sequenceID. */
     activateSequenceById: function (seqId, cb) {
       var s = String(seqId).replace(/"/g, '\\"');

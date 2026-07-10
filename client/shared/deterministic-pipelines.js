@@ -1398,6 +1398,132 @@
   }
 
   /**
+   * Локальная диаризация транскрипта по per-mic RMS (Волна 3 п.3, 10.07.2026).
+   * Whisper Cloud.ru не возвращает спикеров — размечаем сами: для каждого
+   * сегмента транскрипта средний RMS каждого микрофона в окне сегмента;
+   * лидер должен быть громче тишины (silenceDb) и громче второго на marginDb
+   * (отсекает bleed — чужой мик слышит речь тише). Неуверенные сегменты
+   * (перекрытие, тишина) остаются без метки — buildSpeakers их пропустит.
+   *
+   * segments:     [{startSec, endSec, ...}] — транскрипт (sequence-time).
+   * micTimelines: [[{t, rms}], ...] — по одному на микрофон (sequence-time,
+   *               уже после remapRmsToSequenceTime).
+   * opts: { labels: ['Спикер 1', ...], marginDb (default 6), silenceDb (default -55) }
+   *
+   * Возвращает { segments: копии с .speaker у уверенных, labeled, total, perSpeaker }.
+   * Чистая функция — вход не мутируется.
+   */
+  function assignSpeakersByRms(segments, micTimelines, opts) {
+    opts = opts || {};
+    var segs = Array.isArray(segments) ? segments : [];
+    var mics = Array.isArray(micTimelines) ? micTimelines : [];
+    var marginDb = typeof opts.marginDb === 'number' ? opts.marginDb : 6;
+    var silenceDb = typeof opts.silenceDb === 'number' ? opts.silenceDb : -55;
+    var labels = opts.labels || [];
+    var FLOOR = -120;
+
+    /* Сегменты транскрипта идут по возрастанию — держим по указателю на мик,
+       чтобы весь проход был O(segments + samples), не O(segments × samples). */
+    var ptr = [];
+    for (var m = 0; m < mics.length; m++) ptr[m] = 0;
+
+    var out = [];
+    var labeled = 0;
+    var perSpeaker = {};
+    for (var i = 0; i < segs.length; i++) {
+      var s = segs[i];
+      var copy = Object.assign({}, s);
+      var t0 = s && s.startSec;
+      var t1 = s && s.endSec;
+      if (mics.length && typeof t0 === 'number' && typeof t1 === 'number' && t1 > t0) {
+        var best = -1, bestDb = -Infinity, secondDb = -Infinity;
+        for (var k = 0; k < mics.length; k++) {
+          var tlk = mics[k] || [];
+          /* сегменты могут идти с перекрытием границ — откатываем указатель не дальше t0 */
+          while (ptr[k] > 0 && tlk[ptr[k] - 1] && tlk[ptr[k] - 1].t >= t0) ptr[k]--;
+          while (ptr[k] < tlk.length && tlk[ptr[k]].t < t0) ptr[k]++;
+          var sum = 0, n = 0;
+          var j = ptr[k];
+          while (j < tlk.length && tlk[j].t <= t1) {
+            var v = tlk[j].rms;
+            if (typeof v === 'number' && isFinite(v)) { sum += v; n++; }
+            j++;
+          }
+          var mean = n > 0 ? sum / n : FLOOR;
+          if (mean > bestDb) { secondDb = bestDb; bestDb = mean; best = k; }
+          else if (mean > secondDb) { secondDb = mean; }
+        }
+        if (best >= 0 && bestDb >= silenceDb && bestDb - secondDb >= marginDb) {
+          var label = labels[best] || ('Спикер ' + (best + 1));
+          copy.speaker = label;
+          labeled++;
+          perSpeaker[label] = (perSpeaker[label] || 0) + 1;
+        }
+      }
+      out.push(copy);
+    }
+    return { segments: out, labeled: labeled, total: segs.length, perSpeaker: perSpeaker };
+  }
+
+  /**
+   * Сборка sequence-time RMS-таймлайна одного микрофона из «частей».
+   * Часть = кусок медиафайла, лежащий на таймлайне: direct-клип аудиодорожки
+   * ИЛИ nest-сегмент одного inner-трека (host getDiarizeMicSources отдаёт
+   * унифицированно): {mediaPath, srcStartSec, outerStartSec, outerEndSec}.
+   * rmsByPath: {[mediaPath]: [{t, rms}]} — media-time RMS файла целиком
+   * (считается ОДИН раз на файл, части его переиспользуют).
+   * Части без RMS пропускаются; результат отсортирован по t.
+   */
+  function micPartsToTimeline(parts, rmsByPath) {
+    if (!Array.isArray(parts) || !rmsByPath) return [];
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (!p || !p.mediaPath) continue;
+      var tl = rmsByPath[p.mediaPath];
+      if (!tl || !tl.length) continue;
+      var mapped = remapRmsToSequenceTime(tl, {
+        inPointSec: p.srcStartSec,
+        startSec: p.outerStartSec,
+        endSec: p.outerEndSec
+      });
+      for (var j = 0; j < mapped.length; j++) out.push(mapped[j]);
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+    return out;
+  }
+
+  /**
+   * Фильтр «какие аудиодорожки — микрофоны» для карточки «🗣 Спикеры».
+   * Принимает «4-6», «A4, A6», «1,3-4»; пусто/«авто»/мусор → null (= без
+   * фильтра, берём все найденные мики). Возвращает отсортированный массив
+   * УНИКАЛЬНЫХ 1-based номеров дорожек либо null.
+   */
+  function parseAudioTrackFilter(raw) {
+    var s = String(raw == null ? '' : raw).trim();
+    if (!s || /^авто$/i.test(s) || /^auto$/i.test(s)) return null;
+    var seen = {};
+    var out = [];
+    var tokens = s.split(',');
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i].replace(/[aаAА]/g, '').trim(); /* «A4»/«а4» → «4» */
+      if (!t) return null;
+      var m = t.match(/^(\d+)\s*[-–]\s*(\d+)$/);
+      var lo, hi;
+      if (m) { lo = parseInt(m[1], 10); hi = parseInt(m[2], 10); }
+      else if (/^\d+$/.test(t)) { lo = hi = parseInt(t, 10); }
+      else return null;
+      if (lo < 1 || hi < lo) return null;
+      for (var n = lo; n <= hi; n++) {
+        if (!seen[n]) { seen[n] = 1; out.push(n); }
+      }
+    }
+    if (!out.length) return null;
+    out.sort(function (a, b) { return a - b; });
+    return out;
+  }
+
+  /**
    * Кастомный маппинг дорожек по спикерам (AutoPod-паттерн «теги дорожек»,
    * live-запрос 12 июня 2026): авто-схема «V1 wide, A(i)→V(i+1)» ломается,
    * когда микрофоны не на первых аудиодорожках (камерный звук BRAW) или
@@ -1670,6 +1796,9 @@
     multicamFromTranscript: multicamFromTranscript,
     multicamFromAudio: multicamFromAudio,
     remapRmsToSequenceTime: remapRmsToSequenceTime,
+    assignSpeakersByRms: assignSpeakersByRms,
+    micPartsToTimeline: micPartsToTimeline,
+    parseAudioTrackFilter: parseAudioTrackFilter,
     _normalizeMulticamMapping: _normalizeMulticamMapping,
     detectSilenceIntervals: detectSilenceIntervals,
     silenceIntervalsFromRms: silenceIntervalsFromRms,

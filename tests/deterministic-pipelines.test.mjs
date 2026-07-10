@@ -1689,3 +1689,180 @@ describe('DeterministicPipelines.parsePipelineCommand (русские алиас
     assert.equal(DP.parsePipelineCommand('/несуществует'), null);
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * assignSpeakersByRms — локальная диаризация транскрипта по per-mic RMS
+ * (Волна 3 п.3, 10.07.2026). Whisper Cloud.ru не отдаёт спикеров;
+ * размечаем сегменты сами: чей микрофон громче в окне сегмента —
+ * тот и говорит. Порог лидера отсекает bleed, порог тишины — шум.
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('DeterministicPipelines.assignSpeakersByRms', () => {
+  /* mic-таймлайн: rmsFn(t) → дБ, каждые 0.1с на [0, durSec) */
+  function tl(durSec, rmsFn) {
+    const out = [];
+    for (let t = 0.05; t < durSec; t += 0.1) {
+      out.push({ t: +t.toFixed(2), rms: rmsFn(t) });
+    }
+    return out;
+  }
+  const SEGS = [
+    { startSec: 0, endSec: 4, text: 'привет' },
+    { startSec: 4, endSec: 8, text: 'здравствуйте' },
+    { startSec: 8, endSec: 12, text: 'как дела' }
+  ];
+
+  it('поочерёдная речь → сегменты размечаются правильными спикерами', () => {
+    const mic1 = tl(12, (t) => (t < 4 || t >= 8 ? -12 : -48));
+    const mic2 = tl(12, (t) => (t >= 4 && t < 8 ? -14 : -50));
+    const r = DP.assignSpeakersByRms(SEGS, [mic1, mic2], { labels: ['Спикер 1', 'Спикер 2'] });
+    assert.equal(r.segments[0].speaker, 'Спикер 1');
+    assert.equal(r.segments[1].speaker, 'Спикер 2');
+    assert.equal(r.segments[2].speaker, 'Спикер 1');
+    assert.equal(r.labeled, 3);
+    assert.equal(r.total, 3);
+  });
+
+  it('bleed: чужой мик слышит речь тише на 12 дБ → лидер всё равно размечается', () => {
+    const mic1 = tl(4, () => -10);
+    const mic2 = tl(4, () => -22); /* пролез звук первого */
+    const r = DP.assignSpeakersByRms([SEGS[0]], [mic1, mic2], {});
+    assert.equal(r.segments[0].speaker, 'Спикер 1');
+  });
+
+  it('перекрытие: оба мика громкие в пределах маржи → сегмент НЕ размечается', () => {
+    const mic1 = tl(4, () => -12);
+    const mic2 = tl(4, () => -13);
+    const r = DP.assignSpeakersByRms([SEGS[0]], [mic1, mic2], {});
+    assert.equal(r.segments[0].speaker, undefined);
+    assert.equal(r.labeled, 0);
+  });
+
+  it('тишина: все мики ниже порога → сегмент НЕ размечается', () => {
+    const mic1 = tl(4, () => -70);
+    const mic2 = tl(4, () => -75);
+    const r = DP.assignSpeakersByRms([SEGS[0]], [mic1, mic2], {});
+    assert.equal(r.segments[0].speaker, undefined);
+  });
+
+  it('нет сэмплов мика в окне сегмента → мик считается тихим, не выигрывает', () => {
+    const mic1 = tl(4, () => -10);      /* кончается на 4с */
+    const mic2 = tl(12, () => -30);
+    const r = DP.assignSpeakersByRms([SEGS[2]], [mic1, mic2], {}); /* окно 8–12с */
+    assert.equal(r.segments[0].speaker, 'Спикер 2');
+  });
+
+  it('дефолтные лейблы «Спикер N», perSpeaker-статистика', () => {
+    const mic1 = tl(12, (t) => (t < 8 ? -10 : -50));
+    const mic2 = tl(12, (t) => (t >= 8 ? -10 : -50));
+    const r = DP.assignSpeakersByRms(SEGS, [mic1, mic2], {});
+    assert.equal(r.perSpeaker['Спикер 1'], 2);
+    assert.equal(r.perSpeaker['Спикер 2'], 1);
+  });
+
+  it('чистота: входные сегменты не мутируются, выход — копии', () => {
+    const src = [{ startSec: 0, endSec: 4, text: 'привет' }];
+    const mic1 = tl(4, () => -10);
+    const mic2 = tl(4, () => -40);
+    const r = DP.assignSpeakersByRms(src, [mic1, mic2], {});
+    assert.equal(src[0].speaker, undefined, 'вход мутирован');
+    assert.equal(r.segments[0].speaker, 'Спикер 1');
+    assert.equal(r.segments[0].text, 'привет');
+  });
+
+  it('пустые входы → labeled 0, сегменты без спикеров', () => {
+    const r1 = DP.assignSpeakersByRms([], [tl(4, () => -10)], {});
+    assert.equal(r1.total, 0);
+    const r2 = DP.assignSpeakersByRms(SEGS, [], {});
+    assert.equal(r2.labeled, 0);
+    assert.equal(r2.segments.length, 3);
+  });
+
+  it('кастомная маржа: marginDb 20 строже дефолта — bleed −22 дБ уже не проходит', () => {
+    const mic1 = tl(4, () => -10);
+    const mic2 = tl(4, () => -22);
+    const r = DP.assignSpeakersByRms([SEGS[0]], [mic1, mic2], { marginDb: 20 });
+    assert.equal(r.segments[0].speaker, undefined);
+  });
+});
+
+/* ═══ micPartsToTimeline: сборка sequence-time RMS-таймлайна мика из
+ * «частей» (direct-клипы дорожки ИЛИ nest-сегменты одного inner-трека).
+ * Часть: {mediaPath, srcStartSec, outerStartSec, outerEndSec};
+ * rmsByPath: {[mediaPath]: [{t, rms}]} — media-time RMS файла целиком. ═══ */
+
+describe('DeterministicPipelines.micPartsToTimeline', () => {
+  /* media-time RMS: сэмпл каждую секунду, rms = -t (различимо по времени) */
+  const rms10 = [];
+  for (let t = 0; t < 10; t++) rms10.push({ t, rms: -t });
+
+  it('одна часть: ремап media→sequence c учётом srcStart и окна', () => {
+    /* медиа [2..5) → sequence [100..103) */
+    const out = DP.micPartsToTimeline(
+      [{ mediaPath: '/m.wav', srcStartSec: 2, outerStartSec: 100, outerEndSec: 103 }],
+      { '/m.wav': rms10 }
+    );
+    const pts = [...out].map((f) => f.t + ':' + f.rms);
+    assert.equal(pts.join(','), '100:-2,101:-3,102:-4,103:-5');
+  });
+
+  it('две части (разрезанный nest) конкатенируются и сортируются по t', () => {
+    const out = DP.micPartsToTimeline(
+      [
+        { mediaPath: '/m.wav', srcStartSec: 5, outerStartSec: 20, outerEndSec: 22 },
+        { mediaPath: '/m.wav', srcStartSec: 0, outerStartSec: 10, outerEndSec: 12 }
+      ],
+      { '/m.wav': rms10 }
+    );
+    const ts = [...out].map((f) => f.t);
+    assert.equal(ts.join(','), '10,11,12,20,21,22');
+  });
+
+  it('часть без RMS в rmsByPath пропускается, остальные живут', () => {
+    const out = DP.micPartsToTimeline(
+      [
+        { mediaPath: '/нет.wav', srcStartSec: 0, outerStartSec: 0, outerEndSec: 5 },
+        { mediaPath: '/m.wav', srcStartSec: 0, outerStartSec: 50, outerEndSec: 51 }
+      ],
+      { '/m.wav': rms10 }
+    );
+    assert.equal([...out].every((f) => f.t >= 50 && f.t <= 51), true);
+    assert.equal(out.length > 0, true);
+  });
+
+  it('пустые входы → пустой таймлайн', () => {
+    assert.equal(DP.micPartsToTimeline([], { '/m.wav': rms10 }).length, 0);
+    assert.equal(DP.micPartsToTimeline(null, {}).length, 0);
+    assert.equal(DP.micPartsToTimeline([{ mediaPath: '/m.wav', srcStartSec: 0, outerStartSec: 0, outerEndSec: 5 }], null).length, 0);
+  });
+});
+
+/* ═══ parseAudioTrackFilter: пользовательский фильтр «какие дорожки — мики»
+ * для карточки «🗣 Спикеры» («4-6», «A4, A6», пусто = авто). ═══ */
+
+describe('DeterministicPipelines.parseAudioTrackFilter', () => {
+  it('пусто / null / «авто» → null (без фильтра)', () => {
+    assert.equal(DP.parseAudioTrackFilter(''), null);
+    assert.equal(DP.parseAudioTrackFilter(null), null);
+    assert.equal(DP.parseAudioTrackFilter('  '), null);
+    assert.equal(DP.parseAudioTrackFilter('авто'), null);
+  });
+
+  it('диапазон «4-6» → [4,5,6]', () => {
+    assert.equal([...DP.parseAudioTrackFilter('4-6')].join(','), '4,5,6');
+  });
+
+  it('«A4, A6» (с префиксом A и пробелами) → [4,6]', () => {
+    assert.equal([...DP.parseAudioTrackFilter('A4, A6')].join(','), '4,6');
+  });
+
+  it('смешанное «1,3-4» → [1,3,4]; дубли схлопываются', () => {
+    assert.equal([...DP.parseAudioTrackFilter('1,3-4,3')].join(','), '1,3,4');
+  });
+
+  it('мусор / перевёрнутый диапазон → null (как авто, не тихий пустой фильтр)', () => {
+    assert.equal(DP.parseAudioTrackFilter('abc'), null);
+    assert.equal(DP.parseAudioTrackFilter('6-4'), null);
+    assert.equal(DP.parseAudioTrackFilter('0'), null);
+  });
+});

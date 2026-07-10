@@ -569,6 +569,24 @@
             <div class="proposal-area" id="proposal-multicam"></div>
           </div>
 
+          <!-- 5b. Диаризация спикеров (Волна 3 п.3, 10.07.2026) — локальная
+               RMS-разметка «кто говорит» по микрофонам, без LLM/облака.
+               needs-transcript: метки пишутся в сегменты Whisper-транскрипта. -->
+          <div class="tool-card needs-transcript" id="card-speakers">
+            <div class="tool-card-title">🗣 Спикеры</div>
+            <div class="tool-card-desc">
+              Разметка «кто говорит» по громкости микрофонов (ffmpeg RMS,
+              локально). Метки попадают в структуру транскрипта — агент
+              видит спикеров и может монтировать «по говорящим».
+            </div>
+            <div class="param-row" title="Какие аудиодорожки считать микрофонами: «4-6», «A4, A6». Пусто = все слышимые дорожки с файлами. Для nest — номера ВНУТРЕННИХ дорожек.">
+              <span class="param-label">Дорожки миков</span>
+              <input type="text" id="dz-tracks" placeholder="авто: все со звуком" style="flex:1;min-width:0;" />
+            </div>
+            <button class="tool-run" data-tool="speakers">Разметить спикеров</button>
+            <div class="proposal-area" id="dz-result"></div>
+          </div>
+
           <!-- 6. J-cuts / L-cuts — ОТКЛЮЧЕНО (ограничение ExtendScript) -->
           <div class="tool-card" id="card-jcuts" style="opacity:0.5;pointer-events:none;">
             <div class="tool-card-title">🎬 J-cuts / L-cuts</div>

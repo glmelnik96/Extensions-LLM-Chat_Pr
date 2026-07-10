@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.7.0';
+$._EXT_PRM_.version = '2.7.1';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -2306,6 +2306,96 @@ $._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, wi
 };
 
 /**
+ * Диаризация (Волна 3 п.3, 10.07.2026): перечислить микрофоны активной
+ * секвенции для локальной RMS-разметки спикеров. Read-only.
+ * Мик = НЕ-muted аудиодорожка с файловыми клипами (direct) ЛИБО inner-трек
+ * вложенной секвенции (nest — та же логика audible, что у транскрипции).
+ * Части унифицированы: {mediaPath, srcStartSec, outerStartSec, outerEndSec} —
+ * панель считает RMS файла один раз и ремапит в sequence-time.
+ * Возвращает { ok, sequenceName, mics: [{trackNumber, label, parts}] }.
+ */
+$._EXT_PRM_.getDiarizeMicSources = function () {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+    var micByKey = {};
+    var order = [];
+    function pushPart(key, trackNumber, label, part) {
+      if (!micByKey[key]) {
+        micByKey[key] = { trackNumber: trackNumber, label: label, parts: [] };
+        order.push(key);
+      }
+      micByKey[key].parts.push(part);
+    }
+    var ti, j, tr, c, pi, muted, mp;
+    for (ti = 0; ti < seq.audioTracks.numTracks; ti++) {
+      tr = seq.audioTracks[ti];
+      muted = false;
+      try { if (typeof tr.isMuted === 'function') muted = tr.isMuted() === true; } catch (eM) {}
+      if (muted) continue;
+      for (j = 0; j < tr.clips.numItems; j++) {
+        c = tr.clips[j];
+        if (!c || c.disabled === true) continue;
+        pi = c.projectItem;
+        if (!pi) continue;
+        mp = '';
+        try { if (typeof pi.getMediaPath === 'function') mp = pi.getMediaPath(); } catch (eP) {}
+        if (mp && $._EXT_PRM_._fileExists(mp)) {
+          pushPart('a' + ti, ti + 1, 'A' + (ti + 1), {
+            mediaPath: String(mp).replace(/\\/g, '/'),
+            srcStartSec: c.inPoint ? c.inPoint.seconds : 0,
+            outerStartSec: c.start.seconds,
+            outerEndSec: c.end.seconds
+          });
+          continue;
+        }
+        /* Вложенная секвенция: мики — это ВНУТРЕННИЕ дорожки (по одной на
+           спикера), группируем nest-сегменты по inner trackIndex. Разрезанный
+           монтажом nest даёт несколько частей одного мика. */
+        var inner = $._EXT_PRM_._resolveNestInner(c);
+        if (!inner) continue;
+        var innerId = '';
+        try { innerId = String(inner.sequenceID || inner.name || ''); } catch (eSid) {}
+        var nestIn = c.inPoint ? c.inPoint.seconds : 0;
+        var outerStart = c.start.seconds;
+        var winDur = c.end.seconds - outerStart;
+        if (winDur <= $._EXT_PRM_._EPS) continue;
+        var segs = $._EXT_PRM_._enumerateNestAudibleAudio(inner, nestIn, outerStart, winDur);
+        for (var si = 0; si < segs.length; si++) {
+          var sg = segs[si];
+          pushPart('n' + innerId + ':' + sg.trackIndex, sg.trackIndex + 1,
+            'A' + (sg.trackIndex + 1) + ' (nest)', {
+              mediaPath: sg.mediaPath,
+              srcStartSec: sg.srcStart,
+              outerStartSec: sg.outerStart,
+              outerEndSec: sg.outerEnd
+            });
+        }
+      }
+    }
+    var mics = [];
+    for (var oi = 0; oi < order.length; oi++) mics.push(micByKey[order[oi]]);
+    if (!mics.length) {
+      return JSON.stringify({
+        ok: false,
+        code: 'NO_MICS',
+        error: 'Не нашёл ни одной слышимой аудиодорожки с файлом на диске (всё muted/disabled или медиа offline).'
+      });
+    }
+    return JSON.stringify({
+      ok: true,
+      sequenceName: seq.name || '',
+      mics: mics,
+      hostVersion: $._EXT_PRM_.version
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
  * Экспорт In–Out чанками (меньше 413 на Whisper). Восстанавливает In/Out.
  */
 $._EXT_PRM_._exportInOutAsChunks = function (seq, preset, root, chunkSec, chunkExt) {
@@ -3204,7 +3294,8 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     'applyMulticamCuts',
     'setPlayheadSec',
     'backupActiveSequence',
-    'activateSequenceById'
+    'activateSequenceById',
+    'getDiarizeMicSources'
   ];
   for (var i = 0; i < EXPORTED.length; i++) {
     var name = EXPORTED[i];
