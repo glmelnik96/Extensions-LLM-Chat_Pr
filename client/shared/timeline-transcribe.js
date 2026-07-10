@@ -582,7 +582,7 @@
    * prep — ответ prepareTranscribeFromTimeline (ok, mode, …).
    * opt: { settings, signal, abortCheck, onProgress(str), CloudRuClient }
    */
-  async function runFromPrep(prep, opt) {
+  async function runFromPrepInner(prep, opt) {
     if (!prep || !prep.ok) {
       throw new Error((prep && prep.error) || 'prepareTranscribe failed');
     }
@@ -1211,6 +1211,32 @@
     };
   }
 
+  /* 10.07.2026 (Волна 1.3): пустой транскрипт (тишина/шум/не тот аудиотрек)
+     раньше уходил дальше в пайплайн → LLM галлюцинировал по пустому тексту и
+     тратил токены. Единая точка проверки для ВСЕХ режимов runFromPrep
+     (export_wav / export_chunks / media_file / nest). Результаты только-анализа
+     (analysisOnly) идут через runAudioOnlyAnalysis и пустые сегменты для них норма. */
+  function assertNonEmptyTranscript(res) {
+    if (!res || res.analysisOnly) return res;
+    var segs = res.segments || [];
+    var hasText = false;
+    for (var i = 0; i < segs.length; i++) {
+      if (segs[i] && segs[i].text && /\S/.test(segs[i].text)) { hasText = true; break; }
+    }
+    if (!hasText && !(res.text && /\S/.test(res.text))) {
+      throw new Error(
+        'Whisper не распознал речь в выбранном диапазоне — похоже на тишину, шум или не тот аудиотрек. ' +
+        'Проверьте In–Out, громкость и mute дорожек, затем повторите.'
+      );
+    }
+    return res;
+  }
+
+  async function runFromPrep(prep, opt) {
+    var res = await runFromPrepInner(prep, opt);
+    return assertNonEmptyTranscript(res);
+  }
+
   global.TimelineTranscribe = {
     normalizeWhisperExport: normalizeWhisperExport,
     normalizeWhisperMediaFile: normalizeWhisperMediaFile,
@@ -1218,6 +1244,7 @@
     guessMime: guessMime,
     mergeSegmentLists: mergeSegmentLists,
     runFromPrep: runFromPrep,
+    assertNonEmptyTranscript: assertNonEmptyTranscript,
     runAudioOnlyAnalysis: runAudioOnlyAnalysis,
     computeAudioPreprocess: computeAudioPreprocess,
     mergeRmsTimelines: mergeRmsTimelines,

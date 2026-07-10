@@ -10,7 +10,7 @@ import vm from 'node:vm';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export function loadCloudRuClient() {
+export function loadCloudRuClient(sandboxExtras) {
   const filePath = path.join(__dirname, '..', 'client', 'shared', 'cloudru-client.js');
   let src = fs.readFileSync(filePath, 'utf8');
   const marker = '})(window);';
@@ -21,29 +21,27 @@ export function loadCloudRuClient() {
   src = src.slice(0, idx) + '})(root);' + src.slice(idx + marker.length);
 
   const root = {};
-  vm.runInNewContext(
-    src,
-    {
-      root,
-      window: root,
-      Promise,
-      Date,
-      Array,
-      Object,
-      Math,
-      String,
-      Number,
-      JSON,
-      Error,
-      RegExp,
-      TextDecoder,
-      setTimeout,
-      clearTimeout,
-      console,
-      undefined
-    },
-    { filename: 'cloudru-client.js' }
-  );
+  const sandbox = {
+    root,
+    window: root,
+    Promise,
+    Date,
+    Array,
+    Object,
+    Math,
+    String,
+    Number,
+    JSON,
+    Error,
+    RegExp,
+    TextDecoder,
+    setTimeout,
+    clearTimeout,
+    console,
+    undefined
+  };
+  if (sandboxExtras) Object.assign(sandbox, sandboxExtras);
+  vm.runInNewContext(src, sandbox, { filename: 'cloudru-client.js' });
 
   if (!root._cloudRuInternals) {
     throw new Error('_cloudRuInternals not attached to root');

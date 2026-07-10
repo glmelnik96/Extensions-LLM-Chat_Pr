@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.7';
+$._EXT_PRM_.version = '2.6.8';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -434,6 +434,37 @@ $._EXT_PRM_._trackIsLocked = function (track) {
   try { return track.isLocked() === true; } catch (eL0) {}
   try { return track.isLocked === true; } catch (eL1) {}
   return false;
+};
+
+/**
+ * Реальный конец секвенции в секундах.
+ * seq.end.seconds на ряде сборок PP возвращает 0 (мультикам/вложенные) —
+ * поэтому берём максимум из seq.end и концов всех клипов по всем дорожкам.
+ * 0 = определить не удалось (пустая секвенция) — вызывающий код пропускает гард.
+ */
+$._EXT_PRM_._seqEndSec = function (seq) {
+  var endSec = 0;
+  try { endSec = seq.end.seconds || 0; } catch (eE) {}
+  var ti, j, track, item, n;
+  try {
+    for (ti = 0; ti < seq.videoTracks.numTracks; ti++) {
+      track = seq.videoTracks[ti];
+      n = track.clips.numItems;
+      for (j = 0; j < n; j++) {
+        item = track.clips[j];
+        if (item && item.end && item.end.seconds > endSec) endSec = item.end.seconds;
+      }
+    }
+    for (ti = 0; ti < seq.audioTracks.numTracks; ti++) {
+      track = seq.audioTracks[ti];
+      n = track.clips.numItems;
+      for (j = 0; j < n; j++) {
+        item = track.clips[j];
+        if (item && item.end && item.end.seconds > endSec) endSec = item.end.seconds;
+      }
+    }
+  } catch (eT) {}
+  return endSec;
 };
 
 /**
@@ -1139,6 +1170,11 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
       }
     }
 
+    /* 10.07.2026: конец секвенции для out-of-bounds-гарда ripple/lift —
+       QE-таймкод за 24ч заворачивается и режет реальный контент (см.
+       applyTranscriptCuts). 0 = не определён → гард пропускаем. */
+    var seqEndTE = $._EXT_PRM_._seqEndSec(seq);
+
     if (typeof app.beginUndoGroup === 'function') {
       app.beginUndoGroup('ИИ: таймкоды');
       undoOpened = true;
@@ -1160,7 +1196,8 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
       a = op.action || op.kind || op.type;
 
       if (a === 'ripple_delete_range' || a === 'ripple_delete_range_all_tracks') {
-        if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number') {
+        if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number' ||
+            isNaN(op.startSec) || isNaN(op.endSec)) {
           results.push({ op: a, ok: false, error: 'Нужны startSec и endSec' });
           continue;
         }
@@ -1177,6 +1214,10 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           results.push({ op: a, ok: false, error: 'endSec должен быть > startSec' });
           continue;
         }
+        if (seqEndTE > 0 && (op.startSec >= seqEndTE || op.endSec > seqEndTE + 120)) {
+          results.push({ op: a, ok: false, error: 'Интервал за концом секвенции (' + seqEndTE + 'с)' });
+          continue;
+        }
         var lgR = [];
         $._EXT_PRM_._applyOneTimelineInterval(seq, op.startSec, op.endSec, lgR, true, rangeStats);
         results.push({ op: a, ok: true, log: lgR });
@@ -1184,7 +1225,8 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
       }
 
       if (a === 'lift_delete_range' || a === 'lift_delete_range_all_tracks') {
-        if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number') {
+        if (typeof op.startSec !== 'number' || typeof op.endSec !== 'number' ||
+            isNaN(op.startSec) || isNaN(op.endSec)) {
           results.push({ op: a, ok: false, error: 'Нужны startSec и endSec' });
           continue;
         }
@@ -1194,6 +1236,10 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         }
         if (op.endSec <= op.startSec) {
           results.push({ op: a, ok: false, error: 'endSec должен быть > startSec' });
+          continue;
+        }
+        if (seqEndTE > 0 && (op.startSec >= seqEndTE || op.endSec > seqEndTE + 120)) {
+          results.push({ op: a, ok: false, error: 'Интервал за концом секвенции (' + seqEndTE + 'с)' });
           continue;
         }
         var lgL = [];
@@ -1714,11 +1760,6 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       });
     }
 
-    if (typeof app.beginUndoGroup === 'function') {
-      app.beginUndoGroup('ИИ: монтаж по тексту');
-      undoOpened = true;
-    }
-    $._EXT_PRM_._resetOps();
     var intervals = cuts.removeIntervals || [];
     /* Запоминаем оригинальный индекс ВХОДНОГО массива (модель ссылается
        на свои интервалы по порядку; внутренняя сортировка его не ломает). */
@@ -1731,6 +1772,46 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
        более позднего интервала НЕ сдвигает координаты более ранних,
        поэтому интервалы независимы → fail-soft безопасен. */
     tagged.sort(function (x, y) { return y.startSec - x.startSec; });
+    /* 10.07.2026: пересекающиеся интервалы ломают инвариант «справа-налево =
+       независимость»: razor правого интервала съедает часть левого, и левый
+       режет уже дрейфнувший таймлайн → удаляются не те сегменты (P0 из аудита).
+       JS-слой (validateTranscriptCuts P1-F #2) это ловит, но host обязан
+       валидировать сам как last line of defense. Отклоняем ВЕСЬ план ДО
+       beginUndoGroup (не клампим и не fail-soft: непонятно, какой из двух
+       пересекающихся интервалов «неправильный»). Встык (endSec == startSec
+       следующего) — допустимо, EPS 0.01с как в JS-валидаторе. */
+    var ovPrev = null;
+    var ovK, ovIv;
+    for (ovK = 0; ovK < tagged.length; ovK++) {
+      ovIv = tagged[ovK];
+      if (typeof ovIv.startSec !== 'number' || typeof ovIv.endSec !== 'number') continue;
+      if (isNaN(ovIv.startSec) || isNaN(ovIv.endSec)) continue;
+      if (ovIv.startSec < 0 || ovIv.endSec <= ovIv.startSec) continue;
+      if (ovPrev !== null && ovIv.endSec > ovPrev.startSec + 0.01) {
+        return JSON.stringify({
+          ok: false,
+          error: 'Интервалы #' + ovIv._origIdx + ' [' + ovIv.startSec + '–' + ovIv.endSec +
+            '] и #' + ovPrev._origIdx + ' [' + ovPrev.startSec + '–' + ovPrev.endSec +
+            '] пересекаются — план отклонён целиком, таймлайн не изменён. Объедините или разведите интервалы.',
+          overlapIdxs: [ovIv._origIdx, ovPrev._origIdx],
+          hostVersion: $._EXT_PRM_.version
+        });
+      }
+      ovPrev = ovIv;
+    }
+
+    /* 10.07.2026: live-обнаруженный P0 — время за концом секвенции QE-razor
+       заворачивает по модулю 24ч таймкода (99990с → 27:46:30 → 3:46:30 =
+       13590с) и режет РЕАЛЬНЫЙ контент в неожиданном месте. Host обязан сам
+       знать конец секвенции и отклонять такие интервалы (fail-soft,
+       per-interval). 0 = конец не определён → гард пропускаем. */
+    var seqEndSec = $._EXT_PRM_._seqEndSec(seq);
+
+    if (typeof app.beginUndoGroup === 'function') {
+      app.beginUndoGroup('ИИ: монтаж по тексту');
+      undoOpened = true;
+    }
+    $._EXT_PRM_._resetOps();
     var allLog = [];
     /* Сводный счётчик razor/remove/trim по всем интервалам (см. _statFail). */
     var stats = { applied: 0, failed: 0, reasons: [] };
@@ -1742,7 +1823,8 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       lg;
     for (k = 0; k < tagged.length; k++) {
       iv = tagged[k];
-      if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') {
+      if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number' ||
+          isNaN(iv.startSec) || isNaN(iv.endSec)) {
         perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: false, error: 'startSec/endSec не числа' });
         ivFail++;
         continue;
@@ -1759,6 +1841,19 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       }
       if (iv.endSec <= iv.startSec) {
         perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: false, error: 'endSec <= startSec' });
+        ivFail++;
+        continue;
+      }
+      /* Out-of-bounds: за концом секвенции QE-таймкод заворачивается (24ч) и
+         razor режет не там. startSec за концом = нечего вырезать; endSec с
+         запасом +120с (погрешность транскрипта допустима, дальше — баг вызова). */
+      if (seqEndSec > 0 && iv.startSec >= seqEndSec) {
+        perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: false, error: 'startSec за концом секвенции (' + seqEndSec + 'с)' });
+        ivFail++;
+        continue;
+      }
+      if (seqEndSec > 0 && iv.endSec > seqEndSec + 120) {
+        perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: false, error: 'endSec далеко за концом секвенции (' + seqEndSec + 'с)' });
         ivFail++;
         continue;
       }
@@ -1857,6 +1952,12 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
     for (i = 0; i < list.length; i++) {
       m = list[i];
       if (typeof m.timeSec !== 'number' || isNaN(m.timeSec)) continue;
+      /* 10.07.2026 (Волна 1.4): негативный timeSec — createMarker молча ставит
+         в 0 или падает в зависимости от сборки. Отклоняем явно (last line). */
+      if (m.timeSec < 0) {
+        failed.push({ timeSec: m.timeSec, name: m.name || '', error: 'timeSec отрицательный' });
+        continue;
+      }
       var ticksNum = Math.round(m.timeSec * tps);
       mk = null;
       var lastErr = null;

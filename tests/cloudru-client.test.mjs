@@ -188,3 +188,71 @@ describe('cloudru-client.parseSSEStream', () => {
     assert.equal(res.choices[0].message.content, 'ok');
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * Retry-After (429 rate limit) — Волна 1.1 плана усиления
+ * ═══════════════════════════════════════════════════════════════ */
+describe('cloudru-client.parseRetryAfterMs', () => {
+  test('секунды → миллисекунды', () => {
+    assert.equal(CR.parseRetryAfterMs('7'), 7000);
+    assert.equal(CR.parseRetryAfterMs(' 2 '), 2000);
+  });
+  test('кап 60с против абсурдных значений сервера', () => {
+    assert.equal(CR.parseRetryAfterMs('3600'), 60000);
+  });
+  test('HTTP-date в будущем → положительная задержка с капом', () => {
+    const future = new Date(Date.now() + 5000).toUTCString();
+    const ms = CR.parseRetryAfterMs(future);
+    assert.ok(ms > 3000 && ms <= 60000, 'got ' + ms);
+  });
+  test('прошедшая дата / мусор / пусто → 0', () => {
+    assert.equal(CR.parseRetryAfterMs(new Date(Date.now() - 5000).toUTCString()), 0);
+    assert.equal(CR.parseRetryAfterMs('abc'), 0);
+    assert.equal(CR.parseRetryAfterMs(''), 0);
+    assert.equal(CR.parseRetryAfterMs(null), 0);
+    assert.equal(CR.parseRetryAfterMs('-5'), 0);
+  });
+});
+
+describe('cloudru-client.fetchWithRetry + Retry-After', () => {
+  function make429Then200(retryAfterHeader) {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      if (calls === 1) {
+        return {
+          status: 429,
+          ok: false,
+          headers: { get: (name) => (/^retry-after$/i.test(name) ? retryAfterHeader : null) }
+        };
+      }
+      return { status: 200, ok: true, headers: { get: () => null } };
+    };
+    return { fetchImpl, getCalls: () => calls };
+  }
+
+  test('ждёт не меньше Retry-After (7с > базового backoff 1с)', async () => {
+    const delays = [];
+    /* setTimeout-шпион: записывает задержку, срабатывает мгновенно */
+    const fakeSetTimeout = (fn, ms) => setTimeout(() => fn(), 0) && delays.push(ms || 0);
+    const { fetchImpl, getCalls } = make429Then200('7');
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl, setTimeout: fakeSetTimeout });
+    const res = await CR2.fetchWithRetry('http://x', {}, null);
+    assert.equal(res.status, 200);
+    assert.equal(getCalls(), 2);
+    const maxDelay = Math.max(...delays, 0);
+    assert.ok(maxDelay >= 7000, 'ожидали задержку ≥7000мс, получили ' + maxDelay);
+  });
+
+  test('429 без Retry-After — обычный exp-backoff (~1с ±20%)', async () => {
+    const delays = [];
+    const fakeSetTimeout = (fn, ms) => setTimeout(() => fn(), 0) && delays.push(ms || 0);
+    const { fetchImpl, getCalls } = make429Then200(null);
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl, setTimeout: fakeSetTimeout });
+    const res = await CR2.fetchWithRetry('http://x', {}, null);
+    assert.equal(res.status, 200);
+    assert.equal(getCalls(), 2);
+    const maxDelay = Math.max(...delays, 0);
+    assert.ok(maxDelay >= 700 && maxDelay <= 1300, 'ожидали ~1000мс, получили ' + maxDelay);
+  });
+});

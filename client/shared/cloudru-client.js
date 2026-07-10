@@ -47,6 +47,26 @@
     return status >= 500 || status === 429;
   }
 
+  /* Волна 1.1 (10.07.2026): 429 приходит с заголовком Retry-After (секунды или
+     HTTP-date), но backoff был чисто экспоненциальным (1/2/4с) — при лимите
+     60с мы долбили API раньше времени и снова ловили 429 до исчерпания retry.
+     Теперь ждём max(backoff, Retry-After) с капом — защита от абсурдного
+     значения сервера и вечного ожидания. */
+  var RETRY_AFTER_CAP_MS = 60000;
+  function parseRetryAfterMs(headerVal) {
+    if (!headerVal) return 0;
+    var s = String(headerVal).trim();
+    if (/^\d+$/.test(s)) {
+      return Math.min(parseInt(s, 10) * 1000, RETRY_AFTER_CAP_MS);
+    }
+    var dt = Date.parse(s);
+    if (!isNaN(dt)) {
+      var ms = dt - Date.now();
+      if (ms > 0) return Math.min(ms, RETRY_AFTER_CAP_MS);
+    }
+    return 0;
+  }
+
   function sleep(ms) {
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
@@ -108,6 +128,7 @@
     }
     for (var attempt = 0; attempt < MAX_RETRIES; attempt++) {
       throwIfAbortCheck(abortCheck);
+      var retryAfterMs = 0; /* Волна 1.1: из заголовка Retry-After при 429/5xx */
 
       /* Per-attempt AbortController — отдельный, чтобы внешний signal
          от caller'а продолжал работать параллельно. */
@@ -149,6 +170,11 @@
         }
         /* Retryable error — wait and try again */
         lastErr = new Error('HTTP ' + res.status);
+        try {
+          if (res.headers && typeof res.headers.get === 'function') {
+            retryAfterMs = parseRetryAfterMs(res.headers.get('Retry-After'));
+          }
+        } catch (_ra) {}
       } catch (fetchErr) {
         _cleanupAttempt();
         /* AbortError от внешнего abortCheck — пробрасываем. */
@@ -172,7 +198,9 @@
       if (/fetch failed|network|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(errMsg)) {
         extraDelay = NETWORK_TRANSIENT_DELAY_MS;
       }
-      await abortableSleep(Math.round(base + jitter + extraDelay), abortCheck);
+      var waitMs = Math.round(base + jitter + extraDelay);
+      if (retryAfterMs > waitMs) waitMs = retryAfterMs; /* уважаем rate-limit сервера */
+      await abortableSleep(waitMs, abortCheck);
     }
     throw lastErr || new Error('Retry exhausted');
   }
@@ -455,6 +483,8 @@
     parseJsonResponse: parseJsonResponse,
     isPayloadTooLarge: isPayloadTooLarge,
     isRetryable: isRetryable,
+    parseRetryAfterMs: parseRetryAfterMs,
+    fetchWithRetry: fetchWithRetry,
     parseSSEStream: parseSSEStream
   };
 })(window);

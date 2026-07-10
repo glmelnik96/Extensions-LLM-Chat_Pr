@@ -132,3 +132,55 @@ describe('TimelineTranscribe.mergeRmsTimelines', () => {
     assert.equal(out[1].rms, -90, 'бакет с -inf → floor -90');
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * Волна 1.3 (10.07.2026): assertNonEmptyTranscript — пустой Whisper-результат
+ * (тишина/шум) не должен уходить дальше в LLM-пайплайн.
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('TimelineTranscribe.assertNonEmptyTranscript', () => {
+  const TT = loadTimelineTranscribe({});
+
+  it('пустые segments + пустой text → бросает честную ошибку', () => {
+    assert.throws(
+      () => TT.assertNonEmptyTranscript({ segments: [], text: '', mode: 'export_wav' }),
+      /не распознал речь/
+    );
+  });
+
+  it('segments только с whitespace-текстами → бросает', () => {
+    assert.throws(
+      () => TT.assertNonEmptyTranscript({
+        segments: [
+          { startSec: 0, endSec: 1, text: '' },
+          { startSec: 1, endSec: 2, text: '   ' }
+        ],
+        text: ' \n ',
+        mode: 'export_chunks'
+      }),
+      /не распознал речь/
+    );
+  });
+
+  it('хотя бы один сегмент с текстом → результат проходит как есть', () => {
+    const res = {
+      segments: [
+        { startSec: 0, endSec: 1, text: '' },
+        { startSec: 1, endSec: 2, text: 'привет' }
+      ],
+      text: 'привет',
+      mode: 'export_wav'
+    };
+    assert.equal(TT.assertNonEmptyTranscript(res), res);
+  });
+
+  it('segments пусты, но есть общий text → проходит (fallback-режим)', () => {
+    const res = { segments: [], text: 'сплошной текст без сегментов', mode: 'media_file' };
+    assert.equal(TT.assertNonEmptyTranscript(res), res);
+  });
+
+  it('analysisOnly (аудиоанализ без транскрипции) → пустые segments — норма', () => {
+    const res = { segments: [], text: '', analysisOnly: true, mode: 'audio-only' };
+    assert.equal(TT.assertNonEmptyTranscript(res), res);
+  });
+});
