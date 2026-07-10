@@ -6740,6 +6740,8 @@ PanelBoot.run('ИИ: монтаж', function () {
       area.className = 'proposal-area visible';
       var sum = document.createElement('div');
       sum.className = 'proposal-summary';
+      /* UX 10.07.2026: многострочные сводки (мультикам: экранное время/батчи) */
+      sum.style.whiteSpace = 'pre-line';
       sum.textContent = proposal.summary || 'Готово.';
       area.appendChild(sum);
       /* B1-7: pre-flight варнинги пайплайна (общий звук, дубль файла и т.п.) */
@@ -7077,8 +7079,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           rmsExtractor: async function (innerCtx, mapping, p) {
             var windowSec = typeof p.frameSec === 'number' ? p.frameSec : 0.05;
             var allClips = snap.clips || [];
-            var timelines = [];
-            var mediaPaths = [];
+            /* Сначала собираем клипы/пути всех микрофонов (дешёвые ошибки — до ffmpeg). */
+            var mics = [];
             for (var si = 0; si < mapping.speakers.length; si++) {
               var aIdx = mapping.speakers[si].audioTrack;
               var clip = null;
@@ -7091,16 +7093,34 @@ PanelBoot.run('ИИ: монтаж', function () {
               if (!mediaPath) {
                 throw new Error('Аудиодорожка ' + (aIdx + 1) + ': нет файла на диске (нужен один синхронизированный клип на дорожку).');
               }
-              var tl = await AudioPreprocess.computeRmsTimeline(mediaPath, { windowSec: windowSec });
-              /* media-time → sequence-time: клип на таймлайне подрезан (inPoint),
-                 а RMS считается по всему файлу — без ремапа план уезжает
-                 на величину inPoint и выходит за конец секвенции. */
-              tl = DeterministicPipelines.remapRmsToSequenceTime(tl, clip);
-              timelines.push(tl);
-              mediaPaths.push(mediaPath);
+              mics.push({ aIdx: aIdx, clip: clip, mediaPath: mediaPath });
             }
+            /* UX 10.07.2026: анализ микрофонов ПАРАЛЛЕЛЬНО (на 1.2ч подкасте
+               последовательный ffmpeg по 2–4 микам — минуты молчания) +
+               живой статус «готово m из n». */
+            var doneCount = 0;
+            var showMicStatus = function () {
+              toolsStatusUi.show('Анализ микрофонов: готово ' + doneCount + ' из ' + mics.length + '…', true);
+            };
+            showMicStatus();
+            var timelines = await Promise.all(mics.map(function (mic) {
+              return AudioPreprocess.computeRmsTimeline(mic.mediaPath, { windowSec: windowSec })
+                .then(function (tl) {
+                  doneCount++;
+                  showMicStatus();
+                  /* media-time → sequence-time: клип на таймлайне подрезан (inPoint),
+                     а RMS считается по всему файлу — без ремапа план уезжает
+                     на величину inPoint и выходит за конец секвенции. */
+                  return DeterministicPipelines.remapRmsToSequenceTime(tl, mic.clip);
+                }, function (e) {
+                  /* Ошибку атрибутируем конкретному микрофону — иначе на 4 миках
+                     непонятно, какой файл сломан. */
+                  var fname = String(mic.mediaPath).split(/[\\\/]/).pop();
+                  throw new Error('A' + (mic.aIdx + 1) + ' (' + fname + '): ' + String(e && e.message || e));
+                });
+            }));
             /* B1-7: mediaPaths нужны пайплайну для pre-flight детекта общего файла */
-            return { timelines: timelines, mediaPaths: mediaPaths };
+            return { timelines: timelines, mediaPaths: mics.map(function (m) { return m.mediaPath; }) };
           }
         };
 

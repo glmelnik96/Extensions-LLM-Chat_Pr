@@ -1620,13 +1620,41 @@
       segments: built.segments
     };
 
+    /* UX 10.07.2026: сводка — экранное время по камерам + оценка применения. */
+    function fmtMMSS(sec) {
+      var s = Math.max(0, Math.round(sec));
+      var m = Math.floor(s / 60);
+      var r = s % 60;
+      return m + ':' + (r < 10 ? '0' : '') + r;
+    }
+    var totalSec = 0;
+    for (var ptk in perTrack) { if (perTrack.hasOwnProperty(ptk)) totalSec += perTrack[ptk]; }
+    var screenParts = [];
+    function screenPart(label, vIdx) {
+      var sec = perTrack[String(vIdx)] || 0;
+      var pct = totalSec > 0 ? Math.round(sec / totalSec * 100) : 0;
+      screenParts.push(label + ' (V' + (vIdx + 1) + ') ' + fmtMMSS(sec) + ' (' + pct + '%)');
+    }
+    screenPart('Общий план', mapping.wideVideoTrack);
+    for (var sli = 0; sli < speakers.length; sli++) {
+      screenPart(speakers[sli].label || ('Гость ' + (sli + 1)), speakers[sli].videoTrack);
+    }
+    var summary = 'Авто-MultiCam (по голосу): ' + built.segments.length + ' сегментов, ' +
+      built.switchCount + ' переключений. Спикеров: ' + speakerCount + '.' +
+      '\nЭкранное время: ' + screenParts.join(' · ');
+    /* Длинный план применяется батчами — честно предупредим о времени. */
+    var batchCount = MulticamPlan.splitPlanIntoBatches(plan).length;
+    if (batchCount > 1) {
+      summary += '\nПрименение: ' + batchCount + ' батчей, ≈' + (batchCount * 3) +
+        ' с (прогресс будет виден; при сбое — откат кнопкой ⏪).';
+    }
+
     return {
       ok: true,
       proposal: {
         kind: 'multicam_cuts',
         plan: plan,
-        summary: 'Авто-MultiCam (по голосу): ' + built.segments.length + ' сегментов, ' +
-          built.switchCount + ' переключений. Спикеров: ' + speakerCount + '.',
+        summary: summary,
         warnings: warnings,
         stats: { perTrackSeconds: perTrack, switchCount: built.switchCount }
       }

@@ -563,7 +563,9 @@
               <input type="range" id="mc-jitter" min="0" max="0.5" step="0.05" value="0" />
               <span class="param-val" id="mc-jitter-val">выкл</span>
             </div>
-            <button class="tool-run" data-tool="multicam">Проанализировать и применить</button>
+            <!-- UX 10.07.2026: кнопка ПРЕДЛАГАЕТ план (Apply — отдельным шагом
+                 в карточке предпросмотра), старое «и применить» вводило в заблуждение -->
+            <button class="tool-run" data-tool="multicam">Проанализировать и предложить нарезку</button>
             <div class="proposal-area" id="proposal-multicam"></div>
           </div>
 

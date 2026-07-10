@@ -1461,6 +1461,78 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
       'ожидали реальные номера дорожек: ' + JSON.stringify(res.proposal.warnings)
     );
   });
+
+  /* ── Сводка пропозала (UX 10.07.2026): экранное время + оценка применения ── */
+
+  function alternatingTimelines(nSpeakers, durSec, periodSec) {
+    /* Спикеры говорят по очереди блоками periodSec — даёт много сегментов. */
+    const fs = 0.05;
+    const total = Math.round(durSec / fs);
+    const out = [];
+    for (let s = 0; s < nSpeakers; s++) {
+      const tl = [];
+      for (let i = 1; i <= total; i++) {
+        const t = +(i * fs).toFixed(3);
+        const активный = Math.floor(t / periodSec) % nSpeakers;
+        tl.push({ t, rms: активный === s ? -10 : -50 });
+      }
+      out.push(tl);
+    }
+    return out;
+  }
+
+  it('summary: экранное время по камерам с mm:ss и процентами', async () => {
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: alternatingTimelines(2, 8, 4) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.match(res.proposal.summary, /Экранное время/);
+    assert.match(res.proposal.summary, /Гость 1 \(V2\)/);
+    assert.match(res.proposal.summary, /Гость 2 \(V3\)/);
+    assert.match(res.proposal.summary, /\d+:\d{2} \(\d+%\)/);
+  });
+
+  it('summary: длинный план (>40 сегментов) предупреждает о батчах с оценкой времени', async () => {
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: alternatingTimelines(2, 240, 2) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.ok(res.proposal.plan.segments.length > 40,
+      'ожидали >40 сегментов, получили ' + res.proposal.plan.segments.length);
+    assert.match(res.proposal.summary, /батч/i);
+    assert.match(res.proposal.summary, /≈\s*\d+\s*с/);
+  });
+
+  it('summary: короткий план — без упоминания батчей', async () => {
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: alternatingTimelines(2, 8, 4) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.ok(!/батч/i.test(res.proposal.summary),
+      'короткий план не должен пугать батчами: ' + res.proposal.summary);
+  });
+
+  it('summary: кастомные лейблы спикеров попадают в экранное время', async () => {
+    const ctx = {
+      snapshot: snapNvMa(3, 5),
+      rmsExtractor: () => Promise.resolve({ timelines: alternatingTimelines(2, 8, 4) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {
+      mapping: { wideVideoTrack: 0, speakers: [
+        { audioTrack: 3, videoTrack: 1, label: 'Ведущий' },
+        { audioTrack: 4, videoTrack: 2, label: 'Эксперт' }
+      ] }
+    });
+    assert.equal(res.ok, true);
+    assert.match(res.proposal.summary, /Ведущий \(V2\)/);
+    assert.match(res.proposal.summary, /Эксперт \(V3\)/);
+  });
 });
 
 /* ═══════════════════════════════════════════════════════════════
