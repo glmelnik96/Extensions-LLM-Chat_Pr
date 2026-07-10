@@ -540,10 +540,41 @@
     return out;
   }
 
+  /**
+   * Разбить длинный план applyMulticamCuts на батчи по batchSegments сегментов
+   * (2026-07-10): один evalScript на сотни сегментов упирался в 120с-watchdog
+   * клиента. Каждый батч — самостоятельный план (version/mapping/params/
+   * expectedSequenceName копируются); у всех, кроме последнего,
+   * razorTrailingEdge=true — host рэйзорит и tEnd последнего сегмента батча,
+   * чтобы следующий батч начинался с готовой границы.
+   */
+  function splitPlanIntoBatches(plan, opts) {
+    if (!plan || !Array.isArray(plan.segments) || plan.segments.length === 0) return [];
+    opts = opts || {};
+    var size = typeof opts.batchSegments === 'number' && !isNaN(opts.batchSegments)
+      ? Math.max(1, Math.floor(opts.batchSegments))
+      : 40;
+    var batches = [];
+    for (var i = 0; i < plan.segments.length; i += size) {
+      var chunk = plan.segments.slice(i, i + size);
+      var batch = {
+        version: plan.version,
+        mapping: plan.mapping,
+        params: plan.params,
+        segments: chunk,
+        razorTrailingEdge: i + size < plan.segments.length
+      };
+      if (plan.expectedSequenceName) batch.expectedSequenceName = plan.expectedSequenceName;
+      batches.push(batch);
+    }
+    return batches;
+  }
+
   var api = {
     DEFAULTS: DEFAULTS,
     buildSwitchPlan: buildSwitchPlan,
     framesFromRmsTimelines: framesFromRmsTimelines,
+    splitPlanIntoBatches: splitPlanIntoBatches,
     /* Экспортируем internals для unit-тестов */
     _decideActiveMic: decideActiveMic,
     _resolveShortOverlaps: resolveShortOverlaps,

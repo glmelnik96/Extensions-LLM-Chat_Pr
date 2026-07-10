@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.6.9';
+$._EXT_PRM_.version = '2.7.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -2941,6 +2941,12 @@ $._EXT_PRM_.activateSequenceById = function (seqId) {
  *
  * Аудиодорожки НЕ трогаем — пользователь выбирает что слышно через A1/A2 микшер.
  *
+ * 10.07.2026 (батчи): plan может быть ЧАСТЬЮ полного плана
+ * (MulticamPlan.splitPlanIntoBatches). Доп. поля:
+ *   plan.razorTrailingEdge — рэйзорить и tEnd последнего сегмента (стык батчей);
+ *   plan.expectedSequenceName — гейт против смены секвенции между батчами.
+ * Клипы вне сегментов плана не трогаем.
+ *
  * Возвращает: {ok, cutsApplied, segmentsApplied, mode, undoSteps}.
  *
  * См. .omc/plans/multicam-phase1-mvp.md и .omc/research/multicam-podcast-feature.md.
@@ -2965,6 +2971,18 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
   var mode = (plan.params && plan.params.mode) === 'delete' ? 'delete' : 'disable';
   var seq = app.project.activeSequence;
   var eps = $._EXT_PRM_._EPS;
+
+  /* 10.07.2026: сверка секвенции host-side — см. applyTranscriptCuts. Особенно
+     критично для батчевого применения: между батчами пользователь может
+     переключить секвенцию, и хвост плана порезал бы чужой таймлайн. */
+  if (plan.expectedSequenceName && String(seq.name) !== String(plan.expectedSequenceName)) {
+    return JSON.stringify({
+      ok: false,
+      error: 'Активная секвенция «' + seq.name + '» не та, для которой построен план («' +
+        plan.expectedSequenceName + '») — план отклонён, таймлайн не изменён. Откройте нужную секвенцию и повторите.',
+      hostVersion: $._EXT_PRM_.version
+    });
+  }
 
   /* Открываем undo group если поддерживается. */
   var undoOpened = false;
@@ -3042,6 +3060,13 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
       if (typeof t !== 'number') continue;
       cutTimes.push(t);
     }
+    /* 10.07.2026 (батчи): razorTrailingEdge — рэйзорим и tEnd ПОСЛЕДНЕГО
+       сегмента: это стык со следующим батчем, следующий вызов начнёт
+       с готовой границы и не тронет уже обработанные клипы слева. */
+    if (plan.razorTrailingEdge) {
+      var tTail = plan.segments[plan.segments.length - 1].tEnd;
+      if (typeof tTail === 'number') cutTimes.push(tTail);
+    }
     /* Дедупликация (на случай если соседние сегменты одинаковые). */
     cutTimes.sort(function (a, b) { return a - b; });
     var dedup = [];
@@ -3065,50 +3090,74 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
       }
     }
 
-    /* Шаг 2: для каждого сегмента — disable неактивные V-track'и. */
+    /* Шаг 2 (переписан 10.07.2026): раньше — для КАЖДОГО сегмента полный проход
+       по клипам каждой дорожки: O(segments × clips) обращений к медленному
+       DOM-мосту (clip.start.seconds и т.п.). На 1.2ч подкасте (сотни сегментов ×
+       сотни клипов после razor) это минуты работы → клиентский watchdog 120с.
+       Теперь: ОДИН проход по клипам дорожки + бинарный поиск сегмента по
+       середине клипа — O(clips × log segments). */
+    var validSegs = [];
     for (var sgi = 0; sgi < plan.segments.length; sgi++) {
       var seg = plan.segments[sgi];
-      var t0 = seg.tStart;
-      var t1 = seg.tEnd;
-      var activeV = seg.activeVideoTrack;
-      if (typeof t0 !== 'number' || typeof t1 !== 'number' || typeof activeV !== 'number') continue;
+      if (seg && typeof seg.tStart === 'number' && typeof seg.tEnd === 'number' &&
+          typeof seg.activeVideoTrack === 'number') {
+        validSegs.push(seg);
+      }
+    }
+    validSegs.sort(function (a, b) { return a.tStart - b.tStart; });
 
-      for (var mvt = 0; mvt < managedTracks.length; mvt++) {
-        var trk = managedTracks[mvt];
-        if (trk >= seq.videoTracks.numTracks) continue;
-        var isActive = (trk === activeV);
-        var vTrack = seq.videoTracks[trk];
-
-        /* Идём по клипам в обратном порядке (если delete-mode — индексы не сбьются). */
-        for (var ci = vTrack.clips.numItems - 1; ci >= 0; ci--) {
-          try {
-            var clip = vTrack.clips[ci];
-            if (!clip) continue;
-            var cs = clip.start.seconds;
-            var ce = clip.end.seconds;
-            /* Клип попадает в [t0, t1] — целиком внутри сегмента (после razor так и должно быть). */
-            if (cs >= t0 - eps && ce <= t1 + eps) {
-              if (isActive) {
-                /* Активная — гарантируем что enabled. */
-                try {
-                  if (clip.disabled) { clip.disabled = false; $._EXT_PRM_._bump(); }
-                } catch (eEn) {}
-              } else {
-                /* Неактивная — disable или удалить. */
-                if (mode === 'delete') {
-                  try { clip.remove(0, 0); $._EXT_PRM_._bump(); deletedCount++; } catch (eRm) { $._EXT_PRM_._statFail(mcStats, eRm); }
-                } else {
-                  try {
-                    if (!clip.disabled) { clip.disabled = true; $._EXT_PRM_._bump(); disabledCount++; }
-                  } catch (eDi) { $._EXT_PRM_._statFail(mcStats, eDi); }
-                }
-              }
-            }
-          } catch (eC) {}
+    /* Сегмент, целиком содержащий клип [cs, ce], или null (клип вне плана —
+       не трогаем: важно для батчей, где план покрывает лишь часть таймлайна). */
+    var findSegForClip = function (cs, ce) {
+      var mid = (cs + ce) / 2;
+      var lo = 0;
+      var hi = validSegs.length - 1;
+      while (lo <= hi) {
+        var m = (lo + hi) >> 1;
+        var sg = validSegs[m];
+        if (mid < sg.tStart - eps) { hi = m - 1; }
+        else if (mid > sg.tEnd + eps) { lo = m + 1; }
+        else {
+          if (cs >= sg.tStart - eps && ce <= sg.tEnd + eps) return sg;
+          return null; /* клип шире сегмента (razor не прошёл?) — не трогаем */
         }
       }
-      segmentsApplied++;
+      return null;
+    };
+
+    for (var mvt = 0; mvt < managedTracks.length; mvt++) {
+      var trk = managedTracks[mvt];
+      if (trk >= seq.videoTracks.numTracks) continue;
+      var vTrack = seq.videoTracks[trk];
+
+      /* Обратный порядок: в delete-mode индексы не сбиваются. */
+      for (var ci = vTrack.clips.numItems - 1; ci >= 0; ci--) {
+        try {
+          var clip = vTrack.clips[ci];
+          if (!clip) continue;
+          var cs = clip.start.seconds;
+          var ce = clip.end.seconds;
+          var segHit = findSegForClip(cs, ce);
+          if (!segHit) continue;
+          if (trk === segHit.activeVideoTrack) {
+            /* Активная — гарантируем что enabled. */
+            try {
+              if (clip.disabled) { clip.disabled = false; $._EXT_PRM_._bump(); }
+            } catch (eEn) {}
+          } else {
+            /* Неактивная — disable или удалить. */
+            if (mode === 'delete') {
+              try { clip.remove(0, 0); $._EXT_PRM_._bump(); deletedCount++; } catch (eRm) { $._EXT_PRM_._statFail(mcStats, eRm); }
+            } else {
+              try {
+                if (!clip.disabled) { clip.disabled = true; $._EXT_PRM_._bump(); disabledCount++; }
+              } catch (eDi) { $._EXT_PRM_._statFail(mcStats, eDi); }
+            }
+          }
+        } catch (eC) {}
+      }
     }
+    segmentsApplied = validSegs.length;
   } finally {
     /* GUARANTEED endUndoGroup даже на throw из горячего пути. */
     if (undoOpened) try { app.endUndoGroup(); } catch (eEU2) {}

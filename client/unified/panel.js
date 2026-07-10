@@ -6896,25 +6896,72 @@ PanelBoot.run('ИИ: монтаж', function () {
         toolsDisableRun(true);
         _snapDirty = true;
         lastSnap = null;
-        /* B2-9: checkpoint — razor режет клипы даже в режиме disable */
-        _makeSequenceCheckpoint('MultiCam', function () {
-        PremiereBridge.applyMulticamCuts(prop.plan, function (err, data) {
+        /* 10.07.2026: длинный план (1.2ч подкаст → сотни сегментов) в один
+           evalScript упирался в 120с-watchdog моста. Бьём на батчи по ~40
+           сегментов: каждый вызов host короткий, у каждого свой таймаут,
+           между батчами — прогресс. Host сам сверяет expectedSequenceName
+           перед КАЖДЫМ батчем (пользователь мог переключить секвенцию). */
+        var mcPlan = Object.assign({}, prop.plan, {
+          expectedSequenceName: (prop.snapshot && prop.snapshot.sequenceName) || ''
+        });
+        var mcBatches = MulticamPlan.splitPlanIntoBatches(mcPlan);
+        var mcTotalSegs = mcPlan.segments.length;
+        var mcTotals = { cutsApplied: 0, cutsFailed: 0, segmentsApplied: 0, disabledCount: 0, deletedCount: 0 };
+        var mcDoneSegs = 0;
+
+        var mcFinish = function (failMsg) {
           toolsDisableRun(false);
           endOperation();
           toolsStatusUi.hide();
-          if (err) { toolsShowErr('Ошибка: ' + String(err.message || err)); return; }
-          toolsHideProposal(area);
-          if (data && data.ok) {
-            var msg = 'MultiCam: ' + (data.cutsApplied || 0) + ' разрезов, ' +
-              (data.segmentsApplied || 0) + ' сегментов, ' +
-              (data.disabledCount || 0) + ' клипов отключено. Откат: Cmd+Z';
-            toolsStatusUi.show(msg, false);
-          } else {
-            toolsShowErr('Ошибка: ' + ((data && data.error) || 'неизвестная'));
+          if (failMsg) {
+            toolsShowErr(failMsg);
+            return;
           }
+          toolsHideProposal(area);
+          var msg = 'MultiCam: ' + mcTotals.cutsApplied + ' разрезов, ' +
+            mcTotals.segmentsApplied + ' сегментов, ' +
+            (mcTotals.deletedCount ? mcTotals.deletedCount + ' клипов удалено.' :
+              mcTotals.disabledCount + ' клипов отключено.') + ' Откат: ⏪';
+          toolsStatusUi.show(msg, false);
           setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+        };
+
+        var mcRunBatch = function (bi) {
+          if (bi >= mcBatches.length) { mcFinish(null); return; }
+          var b = mcBatches[bi];
+          if (mcBatches.length > 1) {
+            toolsStatusUi.show('MultiCam: батч ' + (bi + 1) + '/' + mcBatches.length +
+              ' (сегменты ' + (mcDoneSegs + 1) + '–' + (mcDoneSegs + b.segments.length) +
+              ' из ' + mcTotalSegs + ')…', true);
+          }
+          PremiereBridge.applyMulticamCuts(b, function (err, data) {
+            var failed = err || !data || !data.ok;
+            if (!failed) {
+              mcTotals.cutsApplied += data.cutsApplied || 0;
+              mcTotals.cutsFailed += data.cutsFailed || 0;
+              mcTotals.segmentsApplied += data.segmentsApplied || 0;
+              mcTotals.disabledCount += data.disabledCount || 0;
+              mcTotals.deletedCount += data.deletedCount || 0;
+              mcDoneSegs += b.segments.length;
+              mcRunBatch(bi + 1);
+              return;
+            }
+            /* Fail-stop: НЕ продолжаем на следующем батче — таймлайн в
+               частично применённом состоянии, пользователь откатывает ⏪. */
+            var reason = err ? String(err.message || err) : ((data && data.error) || 'неизвестная');
+            var applied = mcDoneSegs > 0
+              ? ' Применено ' + mcDoneSegs + ' из ' + mcTotalSegs +
+                ' сегментов — откатите таймлайн кнопкой ⏪ и повторите.'
+              : ' Таймлайн не изменён.';
+            mcFinish('Ошибка MultiCam (батч ' + (bi + 1) + '/' + mcBatches.length + '): ' +
+              reason + applied);
+          });
+        };
+
+        /* B2-9: checkpoint — razor режет клипы даже в режиме disable */
+        _makeSequenceCheckpoint('MultiCam', function () {
+          mcRunBatch(0);
         });
-        }); /* конец _makeSequenceCheckpoint */
         return;
       }
 

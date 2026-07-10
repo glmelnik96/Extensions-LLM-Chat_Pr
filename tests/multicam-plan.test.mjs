@@ -530,3 +530,90 @@ describe('MulticamPlan._resolveShortOverlaps (B2-10: политика кросс
     assert.ok(plan.segments.length >= 1);
   });
 });
+
+/* ──────────────────────────────────────────────────────────────
+ * splitPlanIntoBatches — батчевое применение длинных планов
+ * (2026-07-10: 1.2ч подкаст → сотни сегментов → один evalScript
+ * упирался в 120с watchdog; план бьётся на пачки, host зовётся
+ * несколько раз, стык между батчами рэйзорит предыдущий батч
+ * через razorTrailingEdge).
+ * ────────────────────────────────────────────────────────────── */
+
+describe('splitPlanIntoBatches', () => {
+  function mkPlan(nSegments, extra) {
+    const segments = [];
+    let t = 0;
+    for (let i = 0; i < nSegments; i++) {
+      segments.push({ tStart: t, tEnd: t + 2, activeVideoTrack: i % 3 });
+      t += 2;
+    }
+    return Object.assign({
+      version: 1,
+      rangeSec: [0, t],
+      mapping: STD_MAPPING,
+      params: { mode: 'disable' },
+      segments
+    }, extra || {});
+  }
+
+  it('бьёт 100 сегментов на батчи по 40: [40, 40, 20]', () => {
+    const batches = MP.splitPlanIntoBatches(mkPlan(100), { batchSegments: 40 });
+    assert.equal(batches.length, 3);
+    /* спред → native-массив (vm-prototype mismatch, см. выше) */
+    assert.deepEqual([...batches].map((b) => b.segments.length), [40, 40, 20]);
+  });
+
+  it('razorTrailingEdge: true у всех, кроме последнего батча', () => {
+    const batches = MP.splitPlanIntoBatches(mkPlan(100), { batchSegments: 40 });
+    assert.deepEqual([...batches].map((b) => b.razorTrailingEdge === true), [true, true, false]);
+  });
+
+  it('план, влезающий в один батч → 1 батч без razorTrailingEdge', () => {
+    const batches = MP.splitPlanIntoBatches(mkPlan(15), { batchSegments: 40 });
+    assert.equal(batches.length, 1);
+    assert.equal(batches[0].razorTrailingEdge, false);
+    assert.equal(batches[0].segments.length, 15);
+  });
+
+  it('конкатенация сегментов батчей === исходные сегменты (порядок цел)', () => {
+    const plan = mkPlan(97);
+    const batches = MP.splitPlanIntoBatches(plan, { batchSegments: 40 });
+    const glued = [].concat(...batches.map((b) => b.segments));
+    assert.deepEqual(glued, plan.segments);
+  });
+
+  it('mapping/params/version копируются в каждый батч', () => {
+    const batches = MP.splitPlanIntoBatches(mkPlan(50), { batchSegments: 40 });
+    for (const b of batches) {
+      assert.deepEqual(b.mapping, STD_MAPPING);
+      assert.deepEqual(b.params, { mode: 'disable' });
+      assert.equal(b.version, 1);
+    }
+  });
+
+  it('expectedSequenceName прокидывается в каждый батч', () => {
+    const batches = MP.splitPlanIntoBatches(
+      mkPlan(50, { expectedSequenceName: 'Podcast 16' }),
+      { batchSegments: 40 }
+    );
+    for (const b of batches) assert.equal(b.expectedSequenceName, 'Podcast 16');
+  });
+
+  it('дефолтный batchSegments = 40 (без opts)', () => {
+    const batches = MP.splitPlanIntoBatches(mkPlan(81));
+    assert.deepEqual([...batches].map((b) => b.segments.length), [40, 40, 1]);
+  });
+
+  it('пустой/битый план → []', () => {
+    /* Не deepEqual([], []) — vm-prototype mismatch */
+    assert.equal(MP.splitPlanIntoBatches(null).length, 0);
+    assert.equal(MP.splitPlanIntoBatches({}).length, 0);
+    assert.equal(MP.splitPlanIntoBatches({ segments: [] }).length, 0);
+  });
+
+  it('batchSegments < 1 клампится к 1 (защита от мусора)', () => {
+    const batches = MP.splitPlanIntoBatches(mkPlan(3), { batchSegments: 0 });
+    assert.equal(batches.length, 3);
+    assert.deepEqual([...batches].map((b) => b.segments.length), [1, 1, 1]);
+  });
+});
