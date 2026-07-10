@@ -10,7 +10,15 @@
  *                               Unknown model → 0 ₽ (tokens still accumulate).
  *                               Broken/missing usage → no-op.
  *   recordWhisper(seconds)    — adds seconds; ₽ += seconds * whisperPerSec.
- *   getSummary()              — { inTokens, outTokens, totalTokens, whisperSec, rubles }.
+ *   getSummary()              — { inTokens, outTokens, totalTokens, whisperSec, rubles,
+ *                                 lastModel, lastPromptTokens, lastCompletionTokens }.
+ *   getContextInfo()          — состояние окна контекста ПОСЛЕДНЕГО запроса
+ *                               (Волна 2 п.2): { model, promptTokens, ctxTokens,
+ *                               pct|null, baseTokens, dialogTokens } или null,
+ *                               если чат-запросов ещё не было. baseTokens —
+ *                               минимальный prompt по модели за сессию
+ *                               (≈ system+tools), dialogTokens — остальное
+ *                               (история диалога + результаты инструментов).
  *   reset()                   — zeroes everything.
  *   onChange(cb)              — registers a callback fired after each record/reset.
  */
@@ -21,6 +29,11 @@
   var outTokens = 0;
   var whisperSec = 0;
   var rubles = 0;
+  var lastModel = '';
+  var lastPromptTokens = 0;
+  var lastCompletionTokens = 0;
+  var hasChat = false;
+  var minPromptByModel = {};
   var callbacks = [];
 
   function isFiniteNumber(n) {
@@ -37,7 +50,30 @@
       outTokens: outTokens,
       totalTokens: inTokens + outTokens,
       whisperSec: whisperSec,
-      rubles: rubles
+      rubles: rubles,
+      lastModel: lastModel,
+      lastPromptTokens: lastPromptTokens,
+      lastCompletionTokens: lastCompletionTokens
+    };
+  }
+
+  /** Окно контекста последнего запроса; null — если чат-запросов не было. */
+  function getContextInfo() {
+    if (!hasChat) return null;
+    var ctx = 0;
+    var pricing = getPricing();
+    if (pricing && pricing.models && pricing.models[lastModel]) {
+      ctx = Number(pricing.models[lastModel].ctxTokens) || 0;
+    }
+    var base = Number(minPromptByModel[lastModel]) || 0;
+    return {
+      model: lastModel,
+      promptTokens: lastPromptTokens,
+      completionTokens: lastCompletionTokens,
+      ctxTokens: ctx,
+      pct: ctx > 0 ? Math.min(100, Math.round((lastPromptTokens / ctx) * 100)) : null,
+      baseTokens: base,
+      dialogTokens: Math.max(0, lastPromptTokens - base)
     };
   }
 
@@ -74,6 +110,17 @@
     inTokens += prompt;
     outTokens += completion;
     rubles += rub;
+
+    /* Контекст последнего запроса + baseline (минимальный prompt по модели
+       за сессию ≈ system+tools без истории). */
+    lastModel = String(model || '');
+    lastPromptTokens = prompt;
+    lastCompletionTokens = completion;
+    hasChat = true;
+    var prevMin = minPromptByModel[lastModel];
+    if (!isFiniteNumber(prevMin) || prompt < prevMin) {
+      minPromptByModel[lastModel] = prompt;
+    }
     fireChange();
   }
 
@@ -97,6 +144,11 @@
     outTokens = 0;
     whisperSec = 0;
     rubles = 0;
+    lastModel = '';
+    lastPromptTokens = 0;
+    lastCompletionTokens = 0;
+    hasChat = false;
+    minPromptByModel = {};
     fireChange();
   }
 
@@ -110,6 +162,7 @@
     recordChat: recordChat,
     recordWhisper: recordWhisper,
     getSummary: getSummary,
+    getContextInfo: getContextInfo,
     reset: reset,
     onChange: onChange
   };

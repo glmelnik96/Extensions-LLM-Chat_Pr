@@ -114,3 +114,77 @@ test('one bad onChange callback does not break others', () => {
   m.recordWhisper(10);
   assert.equal(goodFired, true);
 });
+
+/* ── getContextInfo — Волна 2 п.2 (контекст/токен-поповер) ─────────── */
+
+test('getContextInfo: null до первого чат-запроса (Whisper не считается)', () => {
+  const m = loadUsageMeter();
+  assert.equal(m.getContextInfo(), null);
+  m.recordWhisper(60);
+  assert.equal(m.getContextInfo(), null);
+});
+
+test('getContextInfo: % окна и модель последнего запроса', () => {
+  const m = loadUsageMeter();
+  m.recordChat('zai-org/GLM-5.1', { prompt_tokens: 101_000, completion_tokens: 500 });
+  const c = m.getContextInfo();
+  assert.equal(c.model, 'zai-org/GLM-5.1');
+  assert.equal(c.promptTokens, 101_000);
+  assert.equal(c.ctxTokens, 202_000);
+  assert.equal(c.pct, 50);
+});
+
+test('getContextInfo: baseline = минимальный prompt, диалог = остальное', () => {
+  const m = loadUsageMeter();
+  /* первый запрос сессии: system+tools без истории */
+  m.recordChat('zai-org/GLM-5.1', { prompt_tokens: 8000, completion_tokens: 100 });
+  /* дальше история растёт */
+  m.recordChat('zai-org/GLM-5.1', { prompt_tokens: 20_000, completion_tokens: 300 });
+  const c = m.getContextInfo();
+  assert.equal(c.baseTokens, 8000);
+  assert.equal(c.dialogTokens, 12_000);
+});
+
+test('getContextInfo: baseline трекается per-model (fastModel не портит chatModel)', () => {
+  const m = loadUsageMeter();
+  m.recordChat('zai-org/GLM-4.7', { prompt_tokens: 2000, completion_tokens: 50 });
+  m.recordChat('zai-org/GLM-5.1', { prompt_tokens: 9000, completion_tokens: 100 });
+  m.recordChat('zai-org/GLM-5.1', { prompt_tokens: 15_000, completion_tokens: 100 });
+  const c = m.getContextInfo();
+  assert.equal(c.model, 'zai-org/GLM-5.1');
+  assert.equal(c.baseTokens, 9000);
+  assert.equal(c.dialogTokens, 6000);
+});
+
+test('getContextInfo: неизвестная модель → ctxTokens 0, pct null', () => {
+  const m = loadUsageMeter();
+  m.recordChat('foo/bar', { prompt_tokens: 5000, completion_tokens: 100 });
+  const c = m.getContextInfo();
+  assert.equal(c.ctxTokens, 0);
+  assert.equal(c.pct, null);
+});
+
+test('getContextInfo: pct капится на 100', () => {
+  const m = loadUsageMeter();
+  m.recordChat('openai/gpt-oss-120b', { prompt_tokens: 500_000, completion_tokens: 10 });
+  assert.equal(m.getContextInfo().pct, 100);
+});
+
+test('getSummary: включает lastModel/lastPromptTokens/lastCompletionTokens', () => {
+  const m = loadUsageMeter();
+  m.recordChat('zai-org/GLM-5.1', { prompt_tokens: 111, completion_tokens: 22 });
+  const s = m.getSummary();
+  assert.equal(s.lastModel, 'zai-org/GLM-5.1');
+  assert.equal(s.lastPromptTokens, 111);
+  assert.equal(s.lastCompletionTokens, 22);
+});
+
+test('reset(): getContextInfo снова null, baseline очищен', () => {
+  const m = loadUsageMeter();
+  m.recordChat('zai-org/GLM-5.1', { prompt_tokens: 8000, completion_tokens: 100 });
+  m.reset();
+  assert.equal(m.getContextInfo(), null);
+  /* после reset новый первый запрос становится новым baseline */
+  m.recordChat('zai-org/GLM-5.1', { prompt_tokens: 30_000, completion_tokens: 10 });
+  assert.equal(m.getContextInfo().baseTokens, 30_000);
+});

@@ -9,11 +9,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const defaultPricing = {
   currency: '₽',
   models: {
-    'zai-org/GLM-5.1':             { inPerM: 198.86, outPerM: 829.60 },
-    'deepseek-ai/DeepSeek-V4-Pro': { inPerM: 183.00, outPerM: 732.00 },
-    'zai-org/GLM-4.7':             { inPerM: 549.00, outPerM: 793.00 },
-    'openai/gpt-oss-120b':         { inPerM: 15.86,  outPerM: 61.00 },
-    'moonshotai/Kimi-K2.6':        { inPerM: 175.68, outPerM: 725.90 }
+    'zai-org/GLM-5.1':             { inPerM: 198.86, outPerM: 829.60, ctxTokens: 202000 },
+    'deepseek-ai/DeepSeek-V4-Pro': { inPerM: 183.00, outPerM: 732.00, ctxTokens: 1048000 },
+    'zai-org/GLM-4.7':             { inPerM: 549.00, outPerM: 793.00, ctxTokens: 202000 },
+    'openai/gpt-oss-120b':         { inPerM: 15.86,  outPerM: 61.00,  ctxTokens: 131000 },
+    'moonshotai/Kimi-K2.6':        { inPerM: 175.68, outPerM: 725.90, ctxTokens: 262000 }
   },
   whisperPerSec: 0.01
 };

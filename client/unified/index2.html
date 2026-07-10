@@ -80,6 +80,32 @@
       .more-menu .more-popover button.danger:hover { background: rgba(196,43,43,0.18); color: #ff8888; }
       .more-menu .more-popover hr { border: none; border-top: 1px solid var(--border); margin: 4px 2px; }
 
+      /* ── Usage/контекст-поповер (Волна 2 п.2) ───────────────────── */
+      .usage-menu .usage-badge { cursor: pointer; }
+      .usage-popover {
+        left: 0; right: auto;
+        min-width: 230px;
+        font-size: 11px;
+        line-height: 1.5;
+        color: var(--text);
+        padding: 8px 10px;
+        cursor: default;
+      }
+      .usage-popover .up-row { display: flex; justify-content: space-between; gap: 12px; }
+      .usage-popover .up-row .up-label { color: var(--muted); }
+      .usage-popover .up-bar {
+        height: 4px; border-radius: 2px; background: #1a1a1a;
+        border: 1px solid var(--border); margin: 4px 0 6px; overflow: hidden;
+      }
+      .usage-popover .up-bar > i {
+        display: block; height: 100%; background: #4a8f4a;
+      }
+      .usage-popover .up-bar > i.warn { background: #b8860b; }
+      .usage-popover .up-bar > i.crit { background: #c42b2b; }
+      .usage-popover .up-hint { color: var(--muted); margin-top: 6px; }
+      .usage-popover .up-hint.warn { color: #e0b34c; }
+      .usage-popover hr { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
+
       /* ── Starters category tabs ─────────────────────────────────── */
       .starters-cat-bar {
         display: flex;
@@ -321,7 +347,10 @@
             <span id="transcript-led" class="transcript-led transcript-led--red" role="img" aria-label="Нет транскрипта"></span>
             <span id="transcript-led-text" aria-live="polite">нет</span>
           </span>
-          <span id="usage-badge" class="usage-badge" hidden title="Расход токенов и стоимость за сессию (тарифы Cloud.ru)"></span>
+          <span class="more-menu usage-menu" id="usage-menu">
+            <span id="usage-badge" class="usage-badge" hidden title="Расход токенов и стоимость за сессию (тарифы Cloud.ru). Клик — детали контекста."></span>
+            <div class="more-popover usage-popover" id="usage-popover"></div>
+          </span>
           <span class="grow"></span>
           <button type="button" id="btn-undo" class="secondary">Откат маркеров</button>
           <div class="more-menu" id="more-menu">

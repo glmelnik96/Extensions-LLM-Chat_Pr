@@ -32,6 +32,8 @@ PanelBoot.run('ИИ: монтаж', function () {
     startersBox: document.getElementById('starters-container'),
     ledText: document.getElementById('transcript-led-text'),
     usageBadge: document.getElementById('usage-badge'),
+    usageMenu: document.getElementById('usage-menu'),
+    usagePopover: document.getElementById('usage-popover'),
     moreMenu: document.getElementById('more-menu'),
     moreBtn: document.getElementById('more-btn')
   };
@@ -186,16 +188,99 @@ PanelBoot.run('ИИ: монтаж', function () {
     if (!el.usageBadge || !s) return;
     if (s.totalTokens === 0 && s.rubles === 0) {
       el.usageBadge.hidden = true;
+      if (el.usageMenu) el.usageMenu.classList.remove('open');
       return;
     }
     el.usageBadge.textContent =
       'Σ ' + fmtTok(s.inTokens) + '↑ ' + fmtTok(s.outTokens) + '↓ · ' +
       s.rubles.toFixed(2) + ' ₽';
     el.usageBadge.hidden = false;
+    /* Если поповер открыт — обновляем на лету */
+    if (el.usageMenu && el.usageMenu.classList.contains('open')) renderUsagePopover();
+  }
+
+  /* Поповер контекста (Волна 2 п.2): % окна контекста последнего запроса,
+   * разбивка system+tools (baseline) vs диалог, подсказка «начните новый чат».
+   * DOM строится через textContent — без innerHTML. */
+  function _upRow(label, value) {
+    var row = document.createElement('div');
+    row.className = 'up-row';
+    var l = document.createElement('span');
+    l.className = 'up-label';
+    l.textContent = label;
+    var v = document.createElement('span');
+    v.textContent = value;
+    row.appendChild(l);
+    row.appendChild(v);
+    return row;
+  }
+  function renderUsagePopover() {
+    if (!el.usagePopover || !window.UsageMeter) return;
+    var box = el.usagePopover;
+    while (box.firstChild) box.removeChild(box.firstChild);
+    var s = UsageMeter.getSummary();
+    var ctx = UsageMeter.getContextInfo ? UsageMeter.getContextInfo() : null;
+
+    if (ctx && ctx.ctxTokens > 0) {
+      box.appendChild(_upRow('Контекст (' + ctx.model.replace(/^.*\//, '') + ')',
+        fmtTok(ctx.promptTokens) + ' / ' + fmtTok(ctx.ctxTokens) + ' · ' + ctx.pct + '%'));
+      var bar = document.createElement('div');
+      bar.className = 'up-bar';
+      var fill = document.createElement('i');
+      fill.style.width = Math.max(1, ctx.pct) + '%';
+      if (ctx.pct >= 80) fill.className = 'crit';
+      else if (ctx.pct >= 50) fill.className = 'warn';
+      bar.appendChild(fill);
+      box.appendChild(bar);
+      box.appendChild(_upRow('система + инструменты', '≈' + fmtTok(ctx.baseTokens)));
+      box.appendChild(_upRow('диалог + результаты', '≈' + fmtTok(ctx.dialogTokens)));
+    } else if (ctx) {
+      box.appendChild(_upRow('Последний запрос', fmtTok(ctx.promptTokens) + '↑ ' +
+        fmtTok(ctx.completionTokens) + '↓'));
+    } else {
+      var none = document.createElement('div');
+      none.className = 'up-hint';
+      none.textContent = 'Чат-запросов ещё не было (только Whisper).';
+      box.appendChild(none);
+    }
+
+    var sep = document.createElement('hr');
+    box.appendChild(sep);
+    box.appendChild(_upRow('Сессия', fmtTok(s.inTokens) + '↑ ' + fmtTok(s.outTokens) + '↓'));
+    if (s.whisperSec > 0) {
+      box.appendChild(_upRow('Whisper', Math.round(s.whisperSec) + ' с'));
+    }
+    box.appendChild(_upRow('Стоимость', s.rubles.toFixed(2) + ' ₽'));
+
+    if (ctx && ctx.pct !== null && ctx.pct >= 50) {
+      var hint = document.createElement('div');
+      hint.className = 'up-hint' + (ctx.pct >= 80 ? ' warn' : '');
+      hint.textContent = ctx.pct >= 80
+        ? 'Контекст почти полон: начните новый чат («Очистить чат»), иначе модель начнёт терять историю.'
+        : 'Контекст заполняется: для длинной работы лучше начать новый чат.';
+      box.appendChild(hint);
+    }
   }
   if (window.UsageMeter && el.usageBadge) {
     updateUsageBadge(UsageMeter.getSummary());
     UsageMeter.onChange(function (s) { updateUsageBadge(s); });
+    if (el.usageMenu && el.usagePopover) {
+      el.usageBadge.onclick = function (e) {
+        e.stopPropagation();
+        var opening = !el.usageMenu.classList.contains('open');
+        el.usageMenu.classList.toggle('open');
+        if (opening) renderUsagePopover();
+      };
+      /* Закрытие по клику вне — install-once guard, как у more-menu */
+      if (!window.__omcUsageMenuClickInstalled) {
+        window.__omcUsageMenuClickInstalled = true;
+        document.addEventListener('click', function (e) {
+          if (el.usageMenu && !el.usageMenu.contains(e.target)) {
+            el.usageMenu.classList.remove('open');
+          }
+        });
+      }
+    }
   }
 
   /* ─── Health-check при старте (Install hardening, май 2026) ────────

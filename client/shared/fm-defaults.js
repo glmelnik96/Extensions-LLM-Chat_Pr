@@ -90,17 +90,19 @@
      * Машиночитаемая карта тарифов Cloud.ru (₽ за 1M токенов, снято 2026-07-06).
      * Читается UsageMeter (client/shared/usage-meter.js) для подсчёта расхода сессии.
      * inPerM — вход ₽/1M токенов, outPerM — выход ₽/1M токенов.
+     * ctxTokens — окно контекста модели (токены, из каталога выше) — для
+     *   индикатора «% окна контекста» (Волна 2 п.2 плана усиления).
      * whisperPerSec — стоимость транскрипции, ₽ за секунду аудио.
      * Модель не в карте → 0 ₽ (токены всё равно суммируются).
      */
     pricing: {
       currency: '₽',
       models: {
-        'zai-org/GLM-5.1':             { inPerM: 198.86, outPerM: 829.60 },
-        'deepseek-ai/DeepSeek-V4-Pro': { inPerM: 183.00, outPerM: 732.00 },
-        'zai-org/GLM-4.7':             { inPerM: 549.00, outPerM: 793.00 },
-        'openai/gpt-oss-120b':         { inPerM: 15.86,  outPerM: 61.00 },
-        'moonshotai/Kimi-K2.6':        { inPerM: 175.68, outPerM: 725.90 }
+        'zai-org/GLM-5.1':             { inPerM: 198.86, outPerM: 829.60, ctxTokens: 202000 },
+        'deepseek-ai/DeepSeek-V4-Pro': { inPerM: 183.00, outPerM: 732.00, ctxTokens: 1048000 },
+        'zai-org/GLM-4.7':             { inPerM: 549.00, outPerM: 793.00, ctxTokens: 202000 },
+        'openai/gpt-oss-120b':         { inPerM: 15.86,  outPerM: 61.00,  ctxTokens: 131000 },
+        'moonshotai/Kimi-K2.6':        { inPerM: 175.68, outPerM: 725.90, ctxTokens: 262000 }
       },
       whisperPerSec: 0.01
     },
