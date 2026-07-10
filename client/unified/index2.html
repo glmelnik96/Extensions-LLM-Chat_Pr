@@ -106,6 +106,19 @@
       .usage-popover .up-hint.warn { color: #e0b34c; }
       .usage-popover hr { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
 
+      /* ── Стек чекпоинтов — поповер мультиотката (Волна 2 п.3) ────── */
+      .undo-popover {
+        left: 0; right: auto;
+        min-width: 240px;
+        max-width: 320px;
+      }
+      .undo-popover .up-title {
+        color: var(--muted); font-size: 10px; padding: 2px 10px 4px;
+      }
+      .undo-popover button .u-when {
+        color: var(--muted); font-size: 10px; margin-left: 6px;
+      }
+
       /* ── Starters category tabs ─────────────────────────────────── */
       .starters-cat-bar {
         display: flex;
@@ -352,7 +365,10 @@
             <div class="more-popover usage-popover" id="usage-popover"></div>
           </span>
           <span class="grow"></span>
-          <button type="button" id="btn-undo" class="secondary">Откат маркеров</button>
+          <span class="more-menu undo-menu" id="undo-menu">
+            <button type="button" id="btn-undo" class="secondary">Откат маркеров</button>
+            <div class="more-popover undo-popover" id="undo-popover"></div>
+          </span>
           <div class="more-menu" id="more-menu">
             <button type="button" class="more-btn" id="more-btn">Ещё ▾</button>
             <div class="more-popover">

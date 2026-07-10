@@ -142,3 +142,121 @@ describe('ContextStore — localStorage недоступен (бросает)', 
     c2();
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * Стек undo-чекпоинтов (Волна 2 п.3: мультиоткат).
+ * Контракт: getLastUndo = вершина (совместимость со старым кодом),
+ * getUndoStack — новые первыми, clearLastUndoCount — pop вершины,
+ * removeUndoEntry(ts) — из середины, cap 8 с возвратом вытесненных.
+ * ═══════════════════════════════════════════════════════════════ */
+describe('ContextStore — стек undo-чекпоинтов (мультиоткат)', () => {
+  const PID = 'unified';
+
+  function freshCS() {
+    return loadContextStoreWithTempRoot();
+  }
+
+  test('push двух чекпоинтов: getLastUndo = последний, getUndoStack новые первыми', () => {
+    const { ContextStore: CS, cleanup } = freshCS();
+    CS.setLastUndo(PID, 1, 'монтаж A', 'Seq', { mode: 'sequence_backup', backupId: 'b1' });
+    CS.setLastUndo(PID, 1, 'монтаж B', 'Seq', { mode: 'sequence_backup', backupId: 'b2' });
+    const top = CS.getLastUndo(PID);
+    assert.equal(top.label, 'монтаж B');
+    const stack = CS.getUndoStack(PID);
+    assert.equal(stack.length, 2);
+    assert.equal(stack[0].label, 'монтаж B');
+    assert.equal(stack[1].label, 'монтаж A');
+    cleanup();
+  });
+
+  test('clearLastUndoCount = pop: предыдущая точка снова вершина', () => {
+    const { ContextStore: CS, cleanup } = freshCS();
+    CS.setLastUndo(PID, 3, 'маркеры', 'Seq', { mode: 'markers', markerSeconds: [1, 2, 3] });
+    CS.setLastUndo(PID, 1, 'монтаж', 'Seq', { mode: 'sequence_backup', backupId: 'b1' });
+    CS.clearLastUndoCount(PID);
+    const top = CS.getLastUndo(PID);
+    assert.equal(top.mode, 'markers');
+    assert.equal(top.count, 3);
+    CS.clearLastUndoCount(PID);
+    assert.equal(CS.getLastUndo(PID), null);
+    cleanup();
+  });
+
+  test('removeUndoEntry(ts) удаляет из середины, соседи целы', () => {
+    const { ContextStore: CS, cleanup } = freshCS();
+    CS.setLastUndo(PID, 1, 'A', 'Seq', { mode: 'sequence_backup', backupId: 'a' });
+    CS.setLastUndo(PID, 1, 'B', 'Seq', { mode: 'sequence_backup', backupId: 'b' });
+    CS.setLastUndo(PID, 1, 'C', 'Seq', { mode: 'sequence_backup', backupId: 'c' });
+    const mid = CS.getUndoStack(PID)[1]; /* B */
+    CS.removeUndoEntry(PID, mid.ts);
+    const stack = CS.getUndoStack(PID);
+    assert.equal(stack.length, 2);
+    assert.equal(stack[0].label, 'C');
+    assert.equal(stack[1].label, 'A');
+    cleanup();
+  });
+
+  test('cap 8: девятый push вытесняет старейший и возвращает его', () => {
+    const { ContextStore: CS, cleanup } = freshCS();
+    for (let i = 1; i <= 8; i++) {
+      const ev = CS.setLastUndo(PID, 1, 'op' + i, 'Seq', { mode: 'sequence_backup', backupId: 'id' + i });
+      assert.equal(ev.length, 0, 'до cap вытеснений нет');
+    }
+    const evicted = CS.setLastUndo(PID, 1, 'op9', 'Seq', { mode: 'sequence_backup', backupId: 'id9' });
+    assert.equal(evicted.length, 1);
+    assert.equal(evicted[0].backupId, 'id1');
+    const stack = CS.getUndoStack(PID);
+    assert.equal(stack.length, 8);
+    assert.equal(stack[0].label, 'op9');
+    assert.equal(stack[7].label, 'op2');
+    cleanup();
+  });
+
+  test('миграция: старый одиночный формат в LS читается как стек из 1', () => {
+    const { ContextStore: CS, root, cleanup } = freshCS();
+    /* пишем старый формат напрямую в LS-стаб */
+    root.localStorage.setItem('extllmpr_v1_undo_' + PID, JSON.stringify({
+      count: 2, label: 'старые маркеры', sequenceName: 'Seq', ts: 123,
+      mode: 'markers', markerSeconds: [5, 6]
+    }));
+    const top = CS.getLastUndo(PID);
+    assert.equal(top.count, 2);
+    assert.equal(top.label, 'старые маркеры');
+    assert.equal(CS.getUndoStack(PID).length, 1);
+    /* push поверх мигрированного работает */
+    CS.setLastUndo(PID, 1, 'новый', 'Seq', { mode: 'sequence_backup', backupId: 'n1' });
+    assert.equal(CS.getUndoStack(PID).length, 2);
+    cleanup();
+  });
+
+  test('ts уникален даже при пушах в одну миллисекунду', () => {
+    const { ContextStore: CS, cleanup } = freshCS();
+    CS.setLastUndo(PID, 1, 'A', 'Seq', { mode: 'sequence_backup', backupId: 'a' });
+    CS.setLastUndo(PID, 1, 'B', 'Seq', { mode: 'sequence_backup', backupId: 'b' });
+    CS.setLastUndo(PID, 1, 'C', 'Seq', { mode: 'sequence_backup', backupId: 'c' });
+    const st = CS.getUndoStack(PID);
+    const ts = st.map((u) => u.ts);
+    assert.equal(new Set(ts).size, 3, 'все ts различны: ' + ts.join(','));
+    cleanup();
+  });
+
+  test('count <= 0 → clearLastUndoCount-поведение (pop), возвращает []', () => {
+    const { ContextStore: CS, cleanup } = freshCS();
+    CS.setLastUndo(PID, 1, 'A', 'Seq', { mode: 'sequence_backup', backupId: 'a' });
+    const r = CS.setLastUndo(PID, 0, 'x', 'Seq');
+    assert.ok(Array.isArray(r));
+    assert.equal(r.length, 0);
+    assert.equal(CS.getLastUndo(PID), null);
+    cleanup();
+  });
+
+  test('clearUndoStack очищает всё (clearAllPanelCache)', () => {
+    const { ContextStore: CS, cleanup } = freshCS();
+    CS.setLastUndo(PID, 1, 'A', 'Seq', { mode: 'sequence_backup', backupId: 'a' });
+    CS.setLastUndo(PID, 1, 'B', 'Seq', { mode: 'sequence_backup', backupId: 'b' });
+    CS.clearUndoStack(PID);
+    assert.equal(CS.getLastUndo(PID), null);
+    assert.equal(CS.getUndoStack(PID).length, 0);
+    cleanup();
+  });
+});

@@ -2875,11 +2875,10 @@ PanelBoot.run('ИИ: монтаж', function () {
         return;
       }
       try {
-        /* 10.07.2026 (Волна 1.6): backupId, который сейчас будет замещён в lastUndo
-           этой панели, больше недостижим для «⏪ Откатить» — его чекпоинт транскрипта
-           удаляем, иначе deep-copy транскриптов копятся в памяти всю сессию. */
-        var _prevU = ContextStore.getLastUndo(active.panelId);
-        ContextStore.setLastUndo(active.panelId, 1, label || 'монтаж', data.originalName || '', {
+        /* Волна 2 п.3 (10.07.2026): setLastUndo теперь СТЕК (мультиоткат) —
+           предыдущие чекпоинты остаются достижимыми, их снимки транскрипта
+           НЕ удаляем. Чистим только по вытесненным из стека (cap 8). */
+        var _evicted = ContextStore.setLastUndo(active.panelId, 1, label || 'монтаж', data.originalName || '', {
           mode: 'sequence_backup',
           backupId: data.backupId,
           backupName: data.backupName
@@ -2894,8 +2893,10 @@ PanelBoot.run('ИИ: монтаж', function () {
             var _ent = ContextStore.getTranscriptEntry(TRANSCRIPT_PID, _ck);
             if (_ent) _transcriptCheckpoints[data.backupId] = { key: _ck, entry: JSON.parse(JSON.stringify(_ent)), _ts: Date.now() };
           }
-          if (_prevU && _prevU.backupId && _prevU.backupId !== data.backupId) {
-            delete _transcriptCheckpoints[_prevU.backupId];
+          if (_evicted && _evicted.length) {
+            for (var _ei = 0; _ei < _evicted.length; _ei++) {
+              if (_evicted[_ei] && _evicted[_ei].backupId) delete _transcriptCheckpoints[_evicted[_ei].backupId];
+            }
           }
           /* Страховочный лимит (мульти-панель, clearAllPanelCache-сироты):
              держим не больше 8 снимков, вытесняем самый старый. */
@@ -4706,88 +4707,154 @@ PanelBoot.run('ИИ: монтаж', function () {
    */
 
   var btnUndo = document.getElementById('btn-undo');
+  var undoMenuEl = document.getElementById('undo-menu');
+  var undoPopoverEl = document.getElementById('undo-popover');
   function refreshUndoButton() {
     if (!btnUndo) return;
     btnUndo.style.display = '';
-    var u = ContextStore.getLastUndo(active.panelId);
+    var stack = ContextStore.getUndoStack ? ContextStore.getUndoStack(active.panelId) : [];
+    var u = stack.length ? stack[0] : null;
+    /* Волна 2 п.3: >1 чекпоинта → кнопка открывает список точек отката */
+    var multi = stack.length > 1 ? ' (' + stack.length + ') ▾' : '';
     if (u && u.count > 0 && u.mode === 'markers') {
       btnUndo.textContent =
-        'Откатить ' + u.count + ' маркер' + (u.count === 1 ? '' : u.count >= 2 && u.count <= 4 ? 'а' : 'ов');
-      btnUndo.title = 'Удалить добавленные маркеры через markers.deleteMarker';
+        'Откатить ' + u.count + ' маркер' + (u.count === 1 ? '' : u.count >= 2 && u.count <= 4 ? 'а' : 'ов') + multi;
+      btnUndo.title = 'Удалить добавленные маркеры через markers.deleteMarker' +
+        (multi ? '. Клик — список из ' + stack.length + ' точек отката.' : '');
       btnUndo.disabled = false;
     } else if (u && u.count > 0 && u.mode === 'sequence_backup' && u.backupId) {
       /* B2-9: Revert на бэкап-секвенцию (checkpoint перед apply) */
-      btnUndo.textContent = '⏪ Откатить: ' + (u.label || 'монтаж');
+      btnUndo.textContent = '⏪ Откатить: ' + (u.label || 'монтаж') + multi;
       btnUndo.title = 'Открыть бэкап-секвенцию «' + (u.backupName || '') +
-        '» с состоянием ДО применения. Изменённая секвенция останется в проекте.';
+        '» с состоянием ДО применения. Изменённая секвенция останется в проекте.' +
+        (multi ? ' Клик — список из ' + stack.length + ' точек отката.' : '');
       btnUndo.disabled = false;
     } else {
       btnUndo.textContent = 'Откат маркеров';
       btnUndo.title = 'Нет маркеров для отката';
       btnUndo.disabled = true;
     }
+    if (!stack.length && undoMenuEl) undoMenuEl.classList.remove('open');
   }
-  if (btnUndo) {
-    btnUndo.onclick = function () {
-      var u = ContextStore.getLastUndo(active.panelId);
-      /* B2-9: Revert — активировать бэкап-секвенцию */
-      if (u && u.count > 0 && u.mode === 'sequence_backup' && u.backupId) {
-        PremiereBridge.activateSequenceById(u.backupId, function (errB, dataB) {
-          if (errB || !dataB || !dataB.ok) {
-            showErr('Откат не удался: ' + String((errB && errB.message) || (dataB && dataB.error) || 'бэкап не найден'));
-            setTimeout(function () { showErr(''); }, 3500);
-            return;
-          }
-          _snapDirty = true;
-          lastSnap = null;
-          /* 19.06.2026: восстанавливаем транскрипт-кэш до состояния перед apply,
-             иначе чат «видит» rippled-транскрипт, не совпадающий с восстановленным
-             таймлайном. Кладём и под ключ оригинала, и под имя бэкап-секвенции. */
-          try {
-            var _tc = _transcriptCheckpoints[u.backupId];
-            if (_tc && _tc.entry && ContextStore.setTranscriptEntry) {
-              ContextStore.setTranscriptEntry(TRANSCRIPT_PID, _tc.key, JSON.parse(JSON.stringify(_tc.entry)));
-              var _bn = dataB.name || u.backupName || '';
-              if (_bn && _bn !== _tc.key) ContextStore.setTranscriptEntry(TRANSCRIPT_PID, _bn, JSON.parse(JSON.stringify(_tc.entry)));
-              delete _transcriptCheckpoints[u.backupId];
-            }
-          } catch (eRt) {}
-          showErr('Открыта бэкап-секвенция «' + (dataB.name || u.backupName || '') +
-            '» — состояние до монтажа. Изменённая версия осталась в проекте.');
-          ContextStore.clearLastUndoCount(active.panelId);
-          /* Аудит 04.07.2026: CEP-событие ActiveSequenceChanged ненадёжно —
-             после отката вручную сбрасываем tools-состояние (waveform/proposal
-             от ПРЕЖНЕЙ секвенции) тем же слушателем. */
-          try { document.dispatchEvent(new CustomEvent('omc:active-sequence-changed')); } catch (eEvU) {}
-          refreshUndoButton();
-          setTimeout(function () { showErr(''); }, 5000);
-        });
-        return;
-      }
-      if (!u || !u.count || u.mode !== 'markers' || !u.markerSeconds || !u.markerSeconds.length) return;
-      PremiereBridge.removeMarkersBySeconds(u.markerSeconds, function (err, data) {
-        if (err) {
-          showErr(String(err.message || err));
+
+  /** Выполнить откат для конкретного чекпоинта стека (Волна 2 п.3). */
+  function performUndoEntry(u) {
+    if (!u || !u.count) return;
+    /* B2-9: Revert — активировать бэкап-секвенцию */
+    if (u.mode === 'sequence_backup' && u.backupId) {
+      PremiereBridge.activateSequenceById(u.backupId, function (errB, dataB) {
+        if (errB || !dataB || !dataB.ok) {
+          showErr('Откат не удался: ' + String((errB && errB.message) || (dataB && dataB.error) || 'бэкап не найден'));
+          setTimeout(function () { showErr(''); }, 3500);
           return;
         }
-        if (data && data.ok) {
-          showErr(
-            'Удалено маркеров: ' +
-              (data.removed || 0) +
-              ' из ' +
-              (data.requested || u.markerSeconds.length) +
-              '.'
-          );
-          ContextStore.clearLastUndoCount(active.panelId);
-          refreshUndoButton();
-        } else {
-          showErr((data && data.error) || 'Не удалось удалить маркеры.');
-        }
-        setTimeout(function () {
-          showErr('');
-        }, 3500);
+        _snapDirty = true;
+        lastSnap = null;
+        /* 19.06.2026: восстанавливаем транскрипт-кэш до состояния перед apply,
+           иначе чат «видит» rippled-транскрипт, не совпадающий с восстановленным
+           таймлайном. Кладём и под ключ оригинала, и под имя бэкап-секвенции. */
+        try {
+          var _tc = _transcriptCheckpoints[u.backupId];
+          if (_tc && _tc.entry && ContextStore.setTranscriptEntry) {
+            ContextStore.setTranscriptEntry(TRANSCRIPT_PID, _tc.key, JSON.parse(JSON.stringify(_tc.entry)));
+            var _bn = dataB.name || u.backupName || '';
+            if (_bn && _bn !== _tc.key) ContextStore.setTranscriptEntry(TRANSCRIPT_PID, _bn, JSON.parse(JSON.stringify(_tc.entry)));
+            delete _transcriptCheckpoints[u.backupId];
+          }
+        } catch (eRt) {}
+        showErr('Открыта бэкап-секвенция «' + (dataB.name || u.backupName || '') +
+          '» — состояние до монтажа. Изменённая версия осталась в проекте.');
+        ContextStore.removeUndoEntry(active.panelId, u.ts);
+        /* Аудит 04.07.2026: CEP-событие ActiveSequenceChanged ненадёжно —
+           после отката вручную сбрасываем tools-состояние (waveform/proposal
+           от ПРЕЖНЕЙ секвенции) тем же слушателем. */
+        try { document.dispatchEvent(new CustomEvent('omc:active-sequence-changed')); } catch (eEvU) {}
+        refreshUndoButton();
+        setTimeout(function () { showErr(''); }, 5000);
       });
+      return;
+    }
+    if (u.mode !== 'markers' || !u.markerSeconds || !u.markerSeconds.length) return;
+    PremiereBridge.removeMarkersBySeconds(u.markerSeconds, function (err, data) {
+      if (err) {
+        showErr(String(err.message || err));
+        return;
+      }
+      if (data && data.ok) {
+        showErr(
+          'Удалено маркеров: ' +
+            (data.removed || 0) +
+            ' из ' +
+            (data.requested || u.markerSeconds.length) +
+            '.'
+        );
+        ContextStore.removeUndoEntry(active.panelId, u.ts);
+        refreshUndoButton();
+      } else {
+        showErr((data && data.error) || 'Не удалось удалить маркеры.');
+      }
+      setTimeout(function () {
+        showErr('');
+      }, 3500);
+    });
+  }
+
+  /** Список точек отката (новые первыми) в поповере. DOM через textContent. */
+  function renderUndoPopover(stack) {
+    if (!undoPopoverEl) return;
+    while (undoPopoverEl.firstChild) undoPopoverEl.removeChild(undoPopoverEl.firstChild);
+    var title = document.createElement('div');
+    title.className = 'up-title';
+    title.textContent = 'Точки отката (новые сверху):';
+    undoPopoverEl.appendChild(title);
+    for (var i = 0; i < stack.length; i++) {
+      (function (u) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        var name = (u.mode === 'markers')
+          ? (u.count + ' маркер' + (u.count === 1 ? '' : u.count >= 2 && u.count <= 4 ? 'а' : 'ов'))
+          : '⏪ ' + (u.label || 'монтаж');
+        b.textContent = name + (u.sequenceName ? ' — ' + u.sequenceName : '');
+        var when = document.createElement('span');
+        when.className = 'u-when';
+        try {
+          var d = new Date(u.ts);
+          when.textContent = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+        } catch (eW) {}
+        b.appendChild(when);
+        b.title = (u.mode === 'sequence_backup')
+          ? 'Открыть бэкап-секвенцию «' + (u.backupName || '') + '» (состояние до этой правки)'
+          : 'Удалить эти маркеры с таймлайна';
+        b.onclick = function (ev) {
+          ev.stopPropagation();
+          if (undoMenuEl) undoMenuEl.classList.remove('open');
+          performUndoEntry(u);
+        };
+        undoPopoverEl.appendChild(b);
+      })(stack[i]);
+    }
+  }
+
+  if (btnUndo) {
+    btnUndo.onclick = function (e) {
+      var stack = ContextStore.getUndoStack ? ContextStore.getUndoStack(active.panelId) : [];
+      if (!stack.length) return;
+      if (stack.length === 1 || !undoMenuEl || !undoPopoverEl) {
+        performUndoEntry(stack[0]);
+        return;
+      }
+      /* Волна 2 п.3: несколько чекпоинтов — показываем список */
+      e.stopPropagation();
+      var opening = !undoMenuEl.classList.contains('open');
+      undoMenuEl.classList.toggle('open');
+      if (opening) renderUndoPopover(stack);
     };
+    if (undoMenuEl && !window.__omcUndoMenuClickInstalled) {
+      window.__omcUndoMenuClickInstalled = true;
+      document.addEventListener('click', function (e) {
+        if (undoMenuEl && !undoMenuEl.contains(e.target)) undoMenuEl.classList.remove('open');
+      });
+    }
   }
 
   /* ─── Меню «Ещё» ─────────────────────────────────────────────────── */

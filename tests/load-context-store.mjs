@@ -65,5 +65,5 @@ export function loadContextStoreWithTempRoot(opts) {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 
-  return { ContextStore: root.ContextStore, tmpRoot, cleanup };
+  return { ContextStore: root.ContextStore, tmpRoot, cleanup, root };
 }

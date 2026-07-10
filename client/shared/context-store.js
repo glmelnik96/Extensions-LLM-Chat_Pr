@@ -532,43 +532,100 @@
     clearAllPanelCache: function (panelId) {
       this.clearChat(panelId);
       this.clearTranscriptCache(panelId);
-      this.clearLastUndoCount(panelId);
+      this.clearUndoStack(panelId);
     },
 
-    /* --- Счётчик последних undo-шагов панели (см. host $._EXT_PRM_._opCounter). --- */
+    /* --- Стек undo-чекпоинтов панели (Волна 2 п.3: мультиоткат, как
+       rewindPointsStack у PremiereGPT). LS-ключ прежний ('undo_'): старый
+       формат (одиночный объект) мигрирует в массив при чтении. Порядок
+       хранения: старые → новые. Вершина (последний) = getLastUndo —
+       контракт для старых вызовов сохранён. --- */
     _undoKey: function (panelId) { return PREFIX + 'undo_' + panelId; },
-    getLastUndo: function (panelId) {
+    UNDO_STACK_MAX: 8,
+    _readUndoStack: function (panelId) {
       try {
         var raw = localStorage.getItem(this._undoKey(panelId));
-        if (!raw) return null;
-        var obj = JSON.parse(raw);
-        if (!obj || typeof obj.count !== 'number' || obj.count <= 0) return null;
-        return obj;
-      } catch (e) { return null; }
-    },
-    setLastUndo: function (panelId, count, label, sequenceName, opts) {
-      try {
-        if (typeof count !== 'number' || count <= 0) {
-          this.clearLastUndoCount(panelId);
-          return;
+        if (!raw) return [];
+        var parsed = JSON.parse(raw);
+        var arr = Array.isArray(parsed) ? parsed : [parsed]; /* миграция одиночного формата */
+        var out = [];
+        for (var i = 0; i < arr.length; i++) {
+          var o = arr[i];
+          if (o && typeof o.count === 'number' && o.count > 0) out.push(o);
         }
-        var payload = {
-          count: count,
-          label: label || '',
-          sequenceName: sequenceName || '',
-          ts: Date.now()
-        };
-        if (opts && opts.mode) payload.mode = opts.mode;
-        if (opts && opts.markerSeconds && opts.markerSeconds.length) payload.markerSeconds = opts.markerSeconds;
-        /* B2-9: данные бэкап-секвенции для Revert */
-        if (opts && opts.backupId) payload.backupId = String(opts.backupId);
-        if (opts && opts.backupName) payload.backupName = String(opts.backupName);
-        localStorage.setItem(this._undoKey(panelId), JSON.stringify(payload));
+        return out;
+      } catch (e) { return []; }
+    },
+    _writeUndoStack: function (panelId, stack) {
+      try {
+        if (!stack || !stack.length) {
+          localStorage.removeItem(this._undoKey(panelId));
+        } else {
+          localStorage.setItem(this._undoKey(panelId), JSON.stringify(stack));
+        }
       } catch (e) {
         console.warn('[context-store] save undo state failed (LS quota?):', e && e.message);
       }
     },
+    /** Вершина стека (последний чекпоинт) или null — старый контракт. */
+    getLastUndo: function (panelId) {
+      var st = this._readUndoStack(panelId);
+      return st.length ? st[st.length - 1] : null;
+    },
+    /** Весь стек, НОВЫЕ ПЕРВЫМИ (для списка в поповере). */
+    getUndoStack: function (panelId) {
+      return this._readUndoStack(panelId).slice().reverse();
+    },
+    /**
+     * Push чекпоинта в стек (cap UNDO_STACK_MAX, старейшие вытесняются).
+     * @returns {Array} вытесненные записи — panel.js чистит по ним свои
+     *          транскрипт-снимки (_transcriptCheckpoints).
+     */
+    setLastUndo: function (panelId, count, label, sequenceName, opts) {
+      if (typeof count !== 'number' || count <= 0) {
+        this.clearLastUndoCount(panelId);
+        return [];
+      }
+      var payload = {
+        count: count,
+        label: label || '',
+        sequenceName: sequenceName || '',
+        ts: Date.now()
+      };
+      if (opts && opts.mode) payload.mode = opts.mode;
+      if (opts && opts.markerSeconds && opts.markerSeconds.length) payload.markerSeconds = opts.markerSeconds;
+      /* B2-9: данные бэкап-секвенции для Revert */
+      if (opts && opts.backupId) payload.backupId = String(opts.backupId);
+      if (opts && opts.backupName) payload.backupName = String(opts.backupName);
+      var st = this._readUndoStack(panelId);
+      /* ts — идентификатор записи в стеке (removeUndoEntry); гарантируем уникальность */
+      for (var i = 0; i < st.length; i++) {
+        if (st[i].ts >= payload.ts) payload.ts = st[i].ts + 1;
+      }
+      st.push(payload);
+      var evicted = [];
+      while (st.length > this.UNDO_STACK_MAX) evicted.push(st.shift());
+      this._writeUndoStack(panelId, st);
+      return evicted;
+    },
+    /** Снять вершину стека (после успешного отката) — предыдущие точки снова доступны. */
     clearLastUndoCount: function (panelId) {
+      var st = this._readUndoStack(panelId);
+      if (!st.length) return;
+      st.pop();
+      this._writeUndoStack(panelId, st);
+    },
+    /** Удалить конкретный чекпоинт по ts (откат из середины списка). */
+    removeUndoEntry: function (panelId, ts) {
+      var st = this._readUndoStack(panelId);
+      var out = [];
+      for (var i = 0; i < st.length; i++) {
+        if (st[i].ts !== ts) out.push(st[i]);
+      }
+      this._writeUndoStack(panelId, out);
+    },
+    /** Полная очистка стека («Сбросить всё»). */
+    clearUndoStack: function (panelId) {
       try { localStorage.removeItem(this._undoKey(panelId)); } catch (e) {}
     }
   };
