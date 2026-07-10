@@ -128,21 +128,18 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   /**
    * MEDIUM #20: классификация ошибок для адаптивных подсказок.
-   * Возвращает {kind, hint} — kind: 'network' | 'auth' | 'quota' | 'cancel' | 'other'.
+   * Волна 2 п.1 (10.07.2026): каталог вынесен в shared/error-humanizer.js
+   * (сетевые коды, HTTP-статусы Cloud.ru, ffmpeg, Whisper). Здесь — делегат
+   * с минимальным fallback на случай не загрузившегося модуля.
+   * Возвращает {kind, hint}.
    */
   function _classifyError(err) {
+    if (typeof ErrorHumanizer !== 'undefined' && ErrorHumanizer && typeof ErrorHumanizer.classify === 'function') {
+      return ErrorHumanizer.classify(err);
+    }
     var msg = String(err && err.message || err || '').toLowerCase();
     if (/abort|cancel/.test(msg)) {
       return { kind: 'cancel', hint: 'Операция отменена пользователем.' };
-    }
-    if (/401|unauthorized|invalid api|api[ -]?key/.test(msg)) {
-      return { kind: 'auth', hint: 'Похоже, неверный API-ключ. Проверьте Settings → API key.' };
-    }
-    if (/429|rate limit|quota|exceed/.test(msg)) {
-      return { kind: 'quota', hint: 'Превышены лимиты API. Подождите минуту перед повтором.' };
-    }
-    if (/fetch|network|timeout|econnreset|enotfound|net::|socket/.test(msg)) {
-      return { kind: 'network', hint: 'Похоже, проблема с сетью. Проверь VPN/интернет и нажми «Повторить».' };
     }
     return { kind: 'other', hint: '' };
   }
@@ -5584,7 +5581,8 @@ PanelBoot.run('ИИ: монтаж', function () {
            сетевых ошибок. Для auth/quota retry бесполезен, показываем hint без кнопки. */
         var cls = _classifyError(e);
         var opts = { hint: cls.hint };
-        if (cls.kind === 'network' || cls.kind === 'other') {
+        /* server (5xx) — временные, retry уместен; auth/quota/model — нет. */
+        if (cls.kind === 'network' || cls.kind === 'server' || cls.kind === 'other') {
           opts.retry = function () { onTranscribeTimeline(); };
         }
         showErr('Транскрибация: ' + String(e.message || e), opts);
