@@ -1088,8 +1088,43 @@ PanelBoot.run('ИИ: монтаж', function () {
   TOOLS_TEXTMONTAGE = TOOLS_TEXTMONTAGE.concat(UNIFIED_EDIT_PLAN_TOOLS);
 
   /* ═══ Единый набор инструментов: дедупликация по имени ═══ */
+  /* Волна 3 п.1 (11 июля 2026): vision — «глаза» агента. Кадры извлекаются
+     ffmpeg-ом из исходников клипов (host getFrameSources + DP.planFrameSources),
+     описывает vision-модель Cloud.ru (visionModel, дефолт MiniMax-M3).
+     BRAW ffmpeg не декодирует — для таких проектов агент передаёт sourceFile
+     (черновой экспорт/прокси секвенции). */
+  var TOOLS_VISION = [
+    {
+      type: 'function',
+      'function': {
+        name: 'describe_frames',
+        description:
+          'Посмотреть кадры таймлайна «глазами»: извлекает JPEG-кадры по секундам таймлайна (ffmpeg из исходников клипов) и описывает их vision-моделью. Используй когда нужно понять ЧТО В КАДРЕ: план (крупный/общий), кто/что в кадре, композиция, текст на экране. До 8 кадров за вызов. Если исходники BRAW (ffmpeg не декодирует) — инструмент вернёт ошибку с подсказкой; тогда попроси у пользователя путь к черновому экспорту/прокси и передай его в sourceFile.',
+        parameters: {
+          type: 'object',
+          properties: {
+            timelineSeconds: {
+              type: 'array',
+              items: { type: 'number' },
+              description: 'Секунды таймлайна активной секвенции (до 8 за вызов).'
+            },
+            question: {
+              type: 'string',
+              description: 'Что именно узнать о кадрах (по умолчанию — общее описание каждого кадра).'
+            },
+            sourceFile: {
+              type: 'string',
+              description: 'Необязательный абсолютный путь к видеофайлу-источнику кадров (черновой экспорт секвенции / прокси). Если задан — кадры берутся из него по этим же таймлайн-секундам, минуя исходники клипов. Нужен для BRAW-проектов.'
+            }
+          },
+          required: ['timelineSeconds']
+        }
+      }
+    }
+  ];
+
   var TOOLS_UNIFIED = (function () {
-    var all = [].concat(TOOLS_TEXTMONTAGE, TOOLS_MARKERS, TOOLS_TIMECODE, UNIFIED_EDIT_PLAN_TOOLS);
+    var all = [].concat(TOOLS_TEXTMONTAGE, TOOLS_MARKERS, TOOLS_TIMECODE, UNIFIED_EDIT_PLAN_TOOLS, TOOLS_VISION);
     var seen = {};
     var out = [];
     for (var i = 0; i < all.length; i++) {
@@ -4160,6 +4195,104 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   /* ─── Сборщики executors по пресету ─────────────────────────────── */
 
+  /* ─── Vision: describe_frames (Волна 3 п.1, 11 июля 2026) ─────────────
+     Таймлайн-секунды → host getFrameSources (клипы+nest) → DP.planFrameSources
+     (верхний клип, source-секунда) → ffmpeg extractFrameJpeg (768px, data URL)
+     → visionModel (MiniMax-M3, thinking=false) с OpenAI-style image_url.
+     sourceFile — обход для BRAW: секунда таймлайна = секунда файла.
+     ВАЖНО: dataUrl НЕ возвращаем агенту (base64 раздул бы контекст). */
+  var VISION_MAX_FRAMES = 8;
+
+  async function execDescribeFrames(args) {
+    var times = (args && args.timelineSeconds) || [];
+    if (!Array.isArray(times) || !times.length) {
+      return { ok: false, error: 'timelineSeconds: нужен непустой массив секунд таймлайна.' };
+    }
+    if (times.length > VISION_MAX_FRAMES) {
+      return { ok: false, error: 'Слишком много кадров: ' + times.length + ' (максимум ' + VISION_MAX_FRAMES + ' за вызов). Выбери ключевые моменты или разбей на несколько вызовов.' };
+    }
+    var settings = ContextStore.getResolvedSettings();
+    if (!settings.apiKey) return { ok: false, error: 'Не задан API-ключ Cloud.ru (Настройки).' };
+    var model = settings.visionModel || 'MiniMaxAI/MiniMax-M3';
+
+    try {
+      /* 1. Маппинг таймлайн-секунда → файл+секунда источника */
+      var items = [];
+      var skipped = [];
+      if (args.sourceFile) {
+        var sf = String(args.sourceFile).replace(/\\/g, '/');
+        for (var i = 0; i < times.length; i++) {
+          var t = Number(times[i]);
+          if (!isFinite(t) || t < 0) { skipped.push({ timelineSec: times[i], reason: 'некорректное время' }); continue; }
+          items.push({ timelineSec: t, mediaPath: sf, sourceSec: t, clipName: '' });
+        }
+      } else {
+        statusUi.show('Кадры: перечисление видеоклипов…', true);
+        var fsrc = await new Promise(function (resolve, reject) {
+          PremiereBridge.getFrameSources(function (err, data) {
+            if (err) reject(err); else resolve(data);
+          });
+        });
+        if (!fsrc || !fsrc.ok) return { ok: false, error: (fsrc && fsrc.error) || 'getFrameSources: нет ответа хоста.' };
+        var plan = DeterministicPipelines.planFrameSources(fsrc.clips, fsrc.nestClips, times);
+        items = plan.items;
+        skipped = plan.skipped;
+      }
+      if (!items.length) {
+        return { ok: false, error: 'Ни для одной секунды не найден видеоклип.', skipped: skipped };
+      }
+
+      /* 2. ffmpeg: извлечение JPEG-кадров */
+      var frames = [];
+      for (var k = 0; k < items.length; k++) {
+        var it = items[k];
+        statusUi.show('Кадр ' + (k + 1) + '/' + items.length + ' (' + it.timelineSec + 'с)…', true);
+        try {
+          var dataUrl = await AudioPreprocess.extractFrameJpeg(it.mediaPath, it.sourceSec, {});
+          frames.push({ timelineSec: it.timelineSec, clipName: it.clipName || '', dataUrl: dataUrl });
+        } catch (fe) {
+          skipped.push({ timelineSec: it.timelineSec, reason: String((fe && fe.message) || fe) });
+        }
+      }
+      if (!frames.length) {
+        return { ok: false, error: 'ffmpeg не извлёк ни одного кадра. Причины по кадрам — в skipped. Если исходники BRAW — нужен sourceFile (черновой экспорт/прокси).', skipped: skipped };
+      }
+
+      /* 3. Vision-модель: один вызов на все кадры */
+      statusUi.show('Vision (' + model + '): описание ' + frames.length + ' кадров…', true);
+      var q = String(args.question || '').trim();
+      var content = [{
+        type: 'text',
+        text: 'Ниже ' + frames.length + ' кадров из видеомонтажа (Premiere Pro). Для КАЖДОГО кадра дай описание строкой:\n[N] таймлайн Xс: описание\n\nОписывай: план (крупный/средний/общий), кто/что в кадре, композиция, текст на экране если есть. Кратко, по-русски.' + (q ? '\n\nДополнительный вопрос пользователя (ответь после описаний): ' + q : '')
+      }];
+      for (var f = 0; f < frames.length; f++) {
+        content.push({ type: 'text', text: '[' + (f + 1) + '] таймлайн ' + frames[f].timelineSec + 'с' + (frames[f].clipName ? ' (клип «' + frames[f].clipName + '»)' : '') + ':' });
+        content.push({ type: 'image_url', image_url: { url: frames[f].dataUrl } });
+      }
+      var resp = await CloudRuClient.chatCompletions({
+        baseUrl: settings.baseUrl,
+        apiKey: settings.apiKey,
+        model: model,
+        temperature: 0.2,
+        chatParams: { max_tokens: 2048 },
+        enableThinking: false, /* MiniMax-M3: reasoning_optional — выключаем, описания не требуют CoT */
+        messages: [{ role: 'user', content: content }]
+      });
+      var text = '';
+      if (resp && resp.choices && resp.choices[0] && resp.choices[0].message) {
+        text = String(resp.choices[0].message.content || '');
+      }
+      if (!text) return { ok: false, error: 'Vision-модель вернула пустой ответ.', skipped: skipped };
+      var out = { ok: true, model: model, framesDescribed: frames.length, descriptions: text };
+      if (skipped.length) out.skipped = skipped;
+      return out;
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    } finally {
+      statusUi.hide();
+    }
+  }
+
   function buildExecutorsForPreset(preset) {
     var pid = preset.panelId;
     /* Единый набор: все экзекуторы доступны всегда */
@@ -4185,7 +4318,9 @@ PanelBoot.run('ИИ: монтаж', function () {
       find_moments: execFindMoments,
       analyze_transcript_for_cuts: execAnalyzeTranscriptForCuts,
       propose_audio_ducking: execProposeAudioDucking,
-      propose_loudness_normalization: execProposeLoudness
+      propose_loudness_normalization: execProposeLoudness,
+      /* vision */
+      describe_frames: execDescribeFrames
     };
   }
 

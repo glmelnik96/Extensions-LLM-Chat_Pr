@@ -1708,6 +1708,79 @@
   }
 
   /**
+   * Vision по кадрам (Волна 3 п.1, 11.07.2026): маппинг таймлайн-секунд в
+   * (mediaPath, sourceSec) для ffmpeg-экстракции кадров. Видимый кадр в
+   * момент t — верхний не-disabled видеоклип, накрывающий t; sourceSec =
+   * inPoint + (t − start). Nest разрешается на ОДИН уровень через nestClips
+   * (карта host'а: 'nest:<id>' → inner видео file-клипы) — той же формулой,
+   * но во времени inner-секвенции. Чистая функция.
+   *
+   * clips:     [{trackIndex, name, mediaPath, startSec, endSec, inPointSec, disabled}]
+   *            mediaPath 'nest:<id>' — вложенная секвенция.
+   * nestClips: {'nest:<id>': [клипы того же вида, файлы]}
+   * times:     [сек таймлайна]
+   * → { items: [{timelineSec, mediaPath, sourceSec, clipName}], skipped: [{timelineSec, reason}] }
+   */
+  function planFrameSources(clips, nestClips, times) {
+    var cs = Array.isArray(clips) ? clips : [];
+    var nests = nestClips || {};
+    var ts = Array.isArray(times) ? times : [];
+    var items = [];
+    var skipped = [];
+
+    function topClipAt(list, t) {
+      var best = null;
+      for (var i = 0; i < list.length; i++) {
+        var c = list[i];
+        if (!c || c.disabled) continue;
+        var st = Number(c.startSec);
+        var en = Number(c.endSec);
+        if (!isFinite(st) || !isFinite(en)) continue;
+        if (t < st || t >= en) continue;
+        if (!best || (c.trackIndex || 0) > (best.trackIndex || 0)) best = c;
+      }
+      return best;
+    }
+
+    function sourceTimeIn(c, t) {
+      var inPt = typeof c.inPointSec === 'number' && isFinite(c.inPointSec) ? c.inPointSec : 0;
+      return inPt + (t - Number(c.startSec));
+    }
+
+    for (var k = 0; k < ts.length; k++) {
+      var t = Number(ts[k]);
+      if (!isFinite(t) || t < 0) {
+        skipped.push({ timelineSec: ts[k], reason: 'некорректное время' });
+        continue;
+      }
+      var c = topClipAt(cs, t);
+      if (!c) {
+        skipped.push({ timelineSec: t, reason: 'нет видеоклипа в этот момент' });
+        continue;
+      }
+      var mp = String(c.mediaPath || '');
+      var srcSec = sourceTimeIn(c, t);
+      if (mp.indexOf('nest:') === 0) {
+        var inner = topClipAt(nests[mp] || [], srcSec);
+        if (!inner) {
+          skipped.push({ timelineSec: t, reason: 'внутри вложенной секвенции нет клипа (' + (c.name || mp) + ')' });
+          continue;
+        }
+        srcSec = sourceTimeIn(inner, srcSec);
+        mp = String(inner.mediaPath || '');
+        c = inner;
+      }
+      items.push({
+        timelineSec: t,
+        mediaPath: mp,
+        sourceSec: Math.round(srcSec * 1000) / 1000,
+        clipName: String(c.name || '')
+      });
+    }
+    return { items: items, skipped: skipped };
+  }
+
+  /**
    * Кастомный маппинг дорожек по спикерам (AutoPod-паттерн «теги дорожек»,
    * live-запрос 12 июня 2026): авто-схема «V1 wide, A(i)→V(i+1)» ломается,
    * когда микрофоны не на первых аудиодорожках (камерный звук BRAW) или
@@ -1987,6 +2060,7 @@
     planVerticalReframe: planVerticalReframe,
     segmentsToSrtCues: segmentsToSrtCues,
     cuesToSrt: cuesToSrt,
+    planFrameSources: planFrameSources,
     _normalizeMulticamMapping: _normalizeMulticamMapping,
     detectSilenceIntervals: detectSilenceIntervals,
     silenceIntervalsFromRms: silenceIntervalsFromRms,

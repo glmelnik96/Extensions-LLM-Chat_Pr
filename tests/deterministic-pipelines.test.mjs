@@ -2081,3 +2081,59 @@ describe('DeterministicPipelines.cuesToSrt', () => {
     assert.equal(DP.cuesToSrt([]), '');
   });
 });
+
+describe('DeterministicPipelines.planFrameSources', () => {
+  const clip = (o) => Object.assign(
+    { trackIndex: 0, name: 'c', mediaPath: 'D:/a.mp4', startSec: 0, endSec: 10, inPointSec: 0, disabled: false }, o);
+
+  it('базовый маппинг: sourceSec = inPoint + (t − start)', () => {
+    const out = DP.planFrameSources(
+      [clip({ startSec: 5, endSec: 15, inPointSec: 100 })], {}, [7.5]);
+    assert.equal(out.items.length, 1);
+    assert.deepEqual({ ...out.items[0] },
+      { timelineSec: 7.5, mediaPath: 'D:/a.mp4', sourceSec: 102.5, clipName: 'c' });
+    assert.equal(out.skipped.length, 0);
+  });
+
+  it('верхняя дорожка выигрывает; disabled игнорируется', () => {
+    const out = DP.planFrameSources([
+      clip({ trackIndex: 0, mediaPath: 'D:/low.mp4' }),
+      clip({ trackIndex: 2, mediaPath: 'D:/off.mp4', disabled: true }),
+      clip({ trackIndex: 1, mediaPath: 'D:/top.mp4' })
+    ], {}, [3]);
+    assert.equal(out.items[0].mediaPath, 'D:/top.mp4');
+  });
+
+  it('время вне клипов и битые времена → skipped с причиной', () => {
+    const out = DP.planFrameSources([clip({})], {}, [20, NaN, -1]);
+    assert.equal(out.items.length, 0);
+    assert.equal(out.skipped.length, 3);
+    for (const s of out.skipped) assert.equal(typeof s.reason, 'string');
+  });
+
+  it('nest: один уровень вложенности, тайм внутрь через inPoint nest-клипа', () => {
+    const out = DP.planFrameSources(
+      [clip({ mediaPath: 'nest:99', startSec: 10, endSec: 40, inPointSec: 60 })],
+      { 'nest:99': [clip({ startSec: 50, endSec: 90, inPointSec: 7 })] },
+      [15]);
+    /* t=15 → innerT = 60 + (15−10) = 65 → source = 7 + (65−50) = 22 */
+    assert.equal(out.items.length, 1);
+    assert.equal(out.items[0].mediaPath, 'D:/a.mp4');
+    assert.equal(out.items[0].sourceSec, 22);
+  });
+
+  it('nest: дырка внутри inner-секвенции → skipped', () => {
+    const out = DP.planFrameSources(
+      [clip({ mediaPath: 'nest:99', startSec: 0, endSec: 30, inPointSec: 0 })],
+      { 'nest:99': [clip({ startSec: 20, endSec: 30 })] },
+      [5]);
+    assert.equal(out.items.length, 0);
+    assert.equal(out.skipped.length, 1);
+  });
+
+  it('inPointSec null трактуется как 0; sourceSec округлён до 3 знаков', () => {
+    const out = DP.planFrameSources(
+      [clip({ inPointSec: null, startSec: 1.0001 })], {}, [2.00015]);
+    assert.equal(out.items[0].sourceSec, 1);
+  });
+});

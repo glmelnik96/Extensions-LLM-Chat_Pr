@@ -102,7 +102,10 @@
         'deepseek-ai/DeepSeek-V4-Pro': { inPerM: 183.00, outPerM: 732.00, ctxTokens: 1048000 },
         'zai-org/GLM-4.7':             { inPerM: 549.00, outPerM: 793.00, ctxTokens: 202000 },
         'openai/gpt-oss-120b':         { inPerM: 15.86,  outPerM: 61.00,  ctxTokens: 131000 },
-        'moonshotai/Kimi-K2.6':        { inPerM: 175.68, outPerM: 725.90, ctxTokens: 262000 }
+        'moonshotai/Kimi-K2.6':        { inPerM: 175.68, outPerM: 725.90, ctxTokens: 262000 },
+        /* Vision-модели (цены из /v1/models metadata, 2026-07-11) */
+        'MiniMaxAI/MiniMax-M3':        { inPerM: 240.22, outPerM: 1008.85, ctxTokens: 524000 },
+        'Qwen/Qwen3.5-397B-A17B':      { inPerM: 915.00, outPerM: 1085.80, ctxTokens: 262000 }
       },
       whisperPerSec: 0.01
     },
@@ -172,6 +175,16 @@
      * FREE, 2.1s, точен. ⚠ preview: при 404 верни 'openai/gpt-oss-120b'.
      */
     fastModel: 'zai-org/GLM-4.7',
+
+    /**
+     * Vision-модель (describe_frames — описание кадров таймлайна).
+     * Live-проба 11.07.2026: из 70 моделей каталога картинки реально понимают
+     * только MiniMax-M3 и Qwen3.5-397B-A17B (DeepSeek-OCR-2 отвечает 200, но
+     * мусор; внешние vision — 403 RBAC). MiniMax-M3: вход в ~4 раза дешевле
+     * Qwen3.5 (240 vs 915 ₽/M), thinking отключаем (reasoning_optional=true).
+     * ⚠ при 404 верни 'Qwen/Qwen3.5-397B-A17B'.
+     */
+    visionModel: 'MiniMaxAI/MiniMax-M3',
 
     /**
      * Whisper для облачной транскрибации (Cloud.ru Foundation Models).

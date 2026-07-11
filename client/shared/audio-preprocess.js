@@ -356,11 +356,54 @@
     });
   }
 
+  /**
+   * Кадр видео в момент sourceSec → data URL JPEG (Волна 3 п.1, vision).
+   * Через временный файл: runFfmpeg отдаёт stdout строкой, бинарь через pipe
+   * порежется. Даунскейл до maxWidth (по умолчанию 768 — достаточно для
+   * vision-модели, экономит токены). BRAW ffmpeg НЕ декодирует («no decoder
+   * found») — для таких проектов кадры берут из черновика/прокси (sourceFile).
+   * Promise<string> 'data:image/jpeg;base64,…'; reject с понятной причиной.
+   */
+  function extractFrameJpeg(inputPath, sourceSec, opts) {
+    var o = opts || {};
+    var maxW = o.maxWidth > 0 ? Math.floor(o.maxWidth) : 768;
+    var sec = Number(sourceSec);
+    if (!isFinite(sec) || sec < 0) return Promise.reject(new Error('Некорректное время кадра: ' + sourceSec));
+    if (!hasNode()) return Promise.reject(new Error('Node.js недоступен'));
+    var fs = require('fs');
+    var path = require('path');
+    var os = require('os');
+    var tmp = path.join(os.tmpdir(), '_llm_frame_' + Date.now() + '_' + Math.floor(Math.random() * 1e6) + '.jpg');
+    /* -ss ДО -i — быстрый seek по ключевым кадрам; для превью сцены точности хватает. */
+    var args = [
+      '-hide_banner', '-ss', String(sec), '-i', inputPath,
+      '-frames:v', '1', '-vf', 'scale=min(' + maxW + '\\,iw):-2',
+      '-q:v', '3', '-y', tmp
+    ];
+    return runFfmpeg(args, 60000).then(function (res) {
+      var buf = null;
+      try { if (fs.existsSync(tmp)) buf = fs.readFileSync(tmp); } catch (eR) {}
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (eU) {}
+      if (!buf || !buf.length) {
+        var stderr = String(res && res.stderr || '');
+        var hint = /no decoder found|Decoding requested/i.test(stderr)
+          ? 'кодек не декодируется ffmpeg (BRAW?) — укажите файл-источник кадров (черновой экспорт/прокси)'
+          : 'ffmpeg не выдал кадр (время за концом файла?)';
+        throw new Error(hint);
+      }
+      return 'data:image/jpeg;base64,' + buf.toString('base64');
+    }, function (e) {
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (eU2) {}
+      throw e;
+    });
+  }
+
   global.AudioPreprocess = {
     hasNode: hasNode,
     findFfmpegPath: findFfmpegPath,
     probeDurationSec: probeDurationSec,
     probeVideoDimensions: probeVideoDimensions,
+    extractFrameJpeg: extractFrameJpeg,
     detectSilences: detectSilences,
     analyzeLoudness: analyzeLoudness,
     computeRmsTimeline: computeRmsTimeline,

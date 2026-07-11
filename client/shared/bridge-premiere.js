@@ -272,6 +272,11 @@
       this.evalJson('$._EXT_PRM_.importSrtAsCaptions("' + json + '")', cb, { mutating: true });
     },
 
+    /** Vision: перечислить видеоклипы активной секвенции с таймингом и mediaPath (read-only). */
+    getFrameSources: function (cb) {
+      this.evalJson('$._EXT_PRM_.getFrameSources()', cb);
+    },
+
     /** B2-9: Revert — активировать бэкап-секвенцию по sequenceID. */
     activateSequenceById: function (seqId, cb) {
       var s = String(seqId).replace(/"/g, '\\"');

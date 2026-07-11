@@ -77,15 +77,28 @@
 ### 🌊 Волна 3 — Новые возможности (по ценности для «монтажа по смыслам»)
 > ~~❌ Решение пользователя 10.07: vision по кадрам и смарт-субтитры НЕ делаем.~~
 > ✅ **11.07 пользователь ВЕРНУЛ оба пункта в объём** — vision (п.1) и смарт-субтитры (п.4).
-1. **⭐ Vision по кадрам** — 🔄 В РАБОТЕ 11.07 (возвращён). Физибилити live-проверено:
-   Cloud.ru `/v1/models` вырос до 70 моделей; внешние вендоры (anthropic/openai/gemini/GLM)
-   отдают `403 RBAC: Access Denied`; **vision работает на Qwen/Qwen3.5-397B-A17B и
-   MiniMaxAI/MiniMax-M3** (обе верно описали тест-картинку через OpenAI-style
-   `content:[{type:'image_url',…}]`). Источник кадров: ffmpeg (BRAW НЕ декодирует —
-   «no decoder found»; QE `exportFramePNG/JPEG` на PP 26.2.2 всегда false — экспортёр
-   сломан как и exportAsMediaDirect) → для BRAW-проектов нужен decodable-фоллбэк
-   (черновой экспорт/прокси). План: экстрактор кадров + инструмент агента
-   `describe_frames` + цены Qwen3.5/MiniMax в pricing-карту.
+1. **⭐ Vision по кадрам** ✅ **СДЕЛАНО 11.07** (возвращён и реализован). Физибилити
+   live-проверено: Cloud.ru `/v1/models` вырос до 70 моделей; внешние вендоры
+   (anthropic/openai/gemini/GLM) отдают `403 RBAC: Access Denied`; **vision работает на
+   Qwen/Qwen3.5-397B-A17B и MiniMaxAI/MiniMax-M3** (OpenAI-style `content:[{type:'image_url',…}]`).
+   Реализация: инструмент агента **`describe_frames`** (panel.js: TOOLS_VISION +
+   execDescribeFrames) — таймлайн-секунды (≤8) → host `getFrameSources` 2.10.0 (видеоклипы
+   с таймингом+mediaPath, nest → 'nest:<id>'+nestClips) → чистый планировщик
+   `DP.planFrameSources` (верхний недисейбленный клип, source-секунда = inPoint+(t−start),
+   nest один уровень; 6 юнит-тестов) → `AudioPreprocess.extractFrameJpeg` (ffmpeg -ss,
+   768px JPEG q3, temp-файл — runFfmpeg отдаёт stdout строкой) → visionModel одним вызовом
+   (все кадры в одном content). **visionModel = MiniMaxAI/MiniMax-M3** (вход 240 vs 915 ₽/M
+   у Qwen3.5, reasoning_optional → thinking=false; цены обеих из `/v1/models` metadata в
+   pricing-карте, учёт ₽ автоматом через UsageMeter). BRAW ffmpeg НЕ декодирует
+   («no decoder found»; QE exportFramePNG/JPEG на PP 26.2.2 всегда false — экспортёр сломан
+   как и exportAsMediaDirect) → параметр **`sourceFile`** (черновой экспорт/прокси,
+   таймлайн-сек = сек файла); ошибка BRAW несёт подсказку, tool-description учит агента
+   запросить путь у пользователя. dataUrl агенту НЕ возвращается (base64 раздул бы контекст) —
+   только текст описаний. 727/727 тестов; live e2e на 6_SYNCED (3 BRAW): агент сам вызвал
+   describe_frames с sourceFile PODCAST_Тимур_draft.mp4, MiniMax верно описал кадры
+   60/600/1200с (планы, спикер, студия), 2 кадра ≈ 1062 prompt-токена (≈0.5 ₽/вызов);
+   во втором запросе агент переиспользовал sourceFile из истории. Попутный фикс:
+   `getResolvedSettings` не пробрасывал visionModel (context-store.js).
 2. ~~**Джамп-каты по тишине**~~ ✅ **ЗАКРЫТО 10.07 — УЖЕ РЕАЛИЗОВАНО** (пункт плана оказался stale):
    в tools-табе с 26.06 есть карточки «🔇 Убрать тишины» (`card-silences`) и «⚡ Jump cuts»
    (`card-jumps`), обе `needs-audio` — работают по RMS-таймлайну без Whisper через «⚡ Анализ аудио»

@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.9.0';
+$._EXT_PRM_.version = '2.10.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -2471,6 +2471,98 @@ $._EXT_PRM_.getVerticalReframeSources = function () {
 };
 
 /**
+ * Vision по кадрам (Волна 3 п.1, 11.07.2026), read-only перечисление.
+ * Видеоклипы активной секвенции С ГЕОМЕТРИЕЙ (start/end/inPoint) для
+ * planFrameSources: file-клипы — mediaPath, nest — псевдо-путь «nest:<id>»
+ * + inner видео file-клипы в nestClips (разрешение на один уровень).
+ */
+$._EXT_PRM_.getFrameSources = function () {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+
+    function clipInfo(c, ti, mp) {
+      var disabled = false;
+      try { disabled = c.disabled ? true : false; } catch (eD) {}
+      return {
+        trackIndex: ti,
+        name: String(c.name || ''),
+        mediaPath: mp,
+        startSec: c.start.seconds,
+        endSec: c.end.seconds,
+        inPointSec: c.inPoint ? c.inPoint.seconds : null,
+        disabled: disabled
+      };
+    }
+
+    function fileClipsOf(sq) {
+      var out = [];
+      var ti2, ci2, tr2, c2, pi2, mp2;
+      for (ti2 = 0; ti2 < sq.videoTracks.numTracks; ti2++) {
+        tr2 = sq.videoTracks[ti2];
+        for (ci2 = 0; ci2 < tr2.clips.numItems; ci2++) {
+          c2 = tr2.clips[ci2];
+          if (!c2) continue;
+          pi2 = c2.projectItem;
+          mp2 = '';
+          try { if (pi2 && typeof pi2.getMediaPath === 'function') mp2 = pi2.getMediaPath(); } catch (eP2) {}
+          if (mp2 && $._EXT_PRM_._fileExists(mp2)) {
+            out.push(clipInfo(c2, ti2, String(mp2).replace(/\\/g, '/')));
+          }
+        }
+      }
+      return out;
+    }
+
+    var clips = [];
+    var nestClips = {};
+    var ti, ci, tr, c, pi, mp;
+    for (ti = 0; ti < seq.videoTracks.numTracks; ti++) {
+      tr = seq.videoTracks[ti];
+      for (ci = 0; ci < tr.clips.numItems; ci++) {
+        c = tr.clips[ci];
+        if (!c) continue;
+        pi = c.projectItem;
+        mp = '';
+        try { if (pi && typeof pi.getMediaPath === 'function') mp = pi.getMediaPath(); } catch (eP) {}
+        if (mp && $._EXT_PRM_._fileExists(mp)) {
+          clips.push(clipInfo(c, ti, String(mp).replace(/\\/g, '/')));
+          continue;
+        }
+        var inner = $._EXT_PRM_._resolveNestInner(c);
+        if (inner) {
+          var innerId = '';
+          try { innerId = String(inner.sequenceID || inner.name || ''); } catch (eSid) {}
+          var key = 'nest:' + innerId;
+          if (!nestClips[key]) nestClips[key] = fileClipsOf(inner);
+          clips.push(clipInfo(c, ti, key));
+        }
+        /* Клип без медиа и не nest — просто не попадает в план (planFrameSources
+           отдаст skipped «нет видеоклипа», если время накрывает только его). */
+      }
+    }
+    if (!clips.length) {
+      return JSON.stringify({
+        ok: false,
+        code: 'NO_VIDEO_CLIPS',
+        error: 'В активной секвенции нет видеоклипов с медиа (файлы offline или дорожки пустые).'
+      });
+    }
+    return JSON.stringify({
+      ok: true,
+      sequenceName: seq.name || '',
+      clips: clips,
+      nestClips: nestClips,
+      hostVersion: $._EXT_PRM_.version
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
  * Вертикаль 9:16 — применение плана. Исходная секвенция НЕ трогается:
  * clone() → переименование → setSettings(targetW×targetH) → Motion
  * Scale/Position по items из planVerticalReframe. Самовалидация ВСЕГО
@@ -3638,7 +3730,8 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     'getDiarizeMicSources',
     'getVerticalReframeSources',
     'applyVerticalReframe',
-    'importSrtAsCaptions'
+    'importSrtAsCaptions',
+    'getFrameSources'
   ];
   for (var i = 0; i < EXPORTED.length; i++) {
     var name = EXPORTED[i];

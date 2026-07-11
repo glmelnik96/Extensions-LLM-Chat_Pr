@@ -297,7 +297,9 @@
             : 24,
         chatParams: shallowCopy(d.chatParams || {}),
         transcribeParams: shallowCopy(d.transcribeParams || {}),
-        fastModel: String(d.fastModel || '').trim()
+        fastModel: String(d.fastModel || '').trim(),
+        /* Волна 3 п.1 (11 июля 2026): vision-модель для describe_frames. */
+        visionModel: String(d.visionModel || '').trim()
       };
     },
 
