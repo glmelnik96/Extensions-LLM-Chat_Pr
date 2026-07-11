@@ -5513,44 +5513,16 @@ PanelBoot.run('ИИ: монтаж', function () {
     var ac = runAbort;
 
     /* P0-1: Auto-inject timeline snapshot — убираем 1 обязательный round-trip.
-       Максимально компактный формат: только sequenceName + видео-клипы.
-       Audio-клипы дублируют видео и добавляют шум. */
+       11.07.2026: логика вынесена в EditPlanSimulator.buildAutoSnapshotText
+       (чистая, под тестами) + кап на плотные таймлайны: 11 429 видеоклипов на
+       пост-мультикам 6_SYNCED давали ~170K токенов → Cloud.ru 400
+       «maximum context length» и чат был непригоден на такой секвенции. */
     /* Статус «Получение снимка таймлайна…» показывает сам execGetSnapshot (и сам прячет). */
     try {
       var autoSnap = await execGetSnapshot(true); /* ВСЕГДА свежий snap для каждого нового сообщения */
-      if (autoSnap && autoSnap.ok) {
-        var videoClips = (autoSnap.clips || []).filter(function (c) { return c.trackType === 'video'; });
-        var audioClipsAll = (autoSnap.clips || []).filter(function (c) { return c.trackType === 'audio'; });
-        /* 19.06.2026: линкованное аудио НЕ прячем полностью — иначе агент «не видит»
-           аудиоклип и не может выполнить loudness/ducking (live-баг: BRAW-аудио
-           линковано с видео → пропадало из снапшота → «нет аудиоклипа»). Вместо этого
-           привязываем audio nodeId к видео-строке маркером a=<nodeId>, а несвязанное
-           аудио показываем отдельной строкой. */
-        var linkedAudioBy = {};
-        var audioOnlyClips = [];
-        audioClipsAll.forEach(function (c) {
-          var v = null;
-          for (var vi3 = 0; vi3 < videoClips.length; vi3++) {
-            if (videoClips[vi3].name === c.name && Math.abs(videoClips[vi3].startSec - c.startSec) < 0.1) { v = videoClips[vi3]; break; }
-          }
-          if (v) { if (!linkedAudioBy[v.nodeId]) linkedAudioBy[v.nodeId] = c; }
-          else audioOnlyClips.push(c);
-        });
-        /* Вычисляем реальную длительность — sequenceEndSec бывает 0 */
-        var effectiveEndSec = autoSnap.sequenceEndSec || 0;
-        (autoSnap.clips || []).forEach(function (c) { if (c.endSec > effectiveEndSec) effectiveEndSec = c.endSec; });
-        var compactClips = videoClips.map(function (c) {
-          var la = linkedAudioBy[c.nodeId];
-          return c.nodeId + '|' + c.name + '|' + c.trackType[0] + c.trackIndex + '|' + c.startSec + '-' + c.endSec +
-            (c.disabled ? '|off' : '') + (la ? '|a=' + la.nodeId + '@' + la.trackType[0] + la.trackIndex : '');
-        }).concat(audioOnlyClips.map(function (c) {
-          return c.nodeId + '|' + c.name + '|' + c.trackType[0] + c.trackIndex + '|' + c.startSec + '-' + c.endSec + (c.disabled ? '|off' : '');
-        }));
-        apiMessages.push({
-          role: 'user',
-          content: '[auto-snapshot] seq=' + autoSnap.sequenceName + ' dur=' + effectiveEndSec.toFixed(1) + 's fps=' + autoSnap.fps +
-            '\nclips(' + compactClips.length + '):\n' + compactClips.join('\n')
-        });
+      var autoSnapText = EditPlanSimulator.buildAutoSnapshotText(autoSnap);
+      if (autoSnapText) {
+        apiMessages.push({ role: 'user', content: autoSnapText });
       }
     } catch (eSnap) { /* не критично — агент сам вызовет get_timeline_snapshot */ }
 
@@ -6428,6 +6400,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         toolsSetLed(hasTranscript ? 'ok' : 'audio', 'анализ готов' + seqLabel);
       }
       toolsUpdateCards(hasTranscript, hasAudio, staleTranscript, staleAudio);
+      /* Статусы карточек следуют за активной секвенцией (как LED/гейты). */
+      try { _renderAllCardStatuses(seqName); } catch (eS) {}
     }
     var _ledRefreshInFlight = false;
     window.toolsRefreshLed = function () {
@@ -6527,6 +6501,47 @@ PanelBoot.run('ИИ: монтаж', function () {
           : 'Нужна транскрипция (текстовый инструмент).';
         btnEl.textContent = 'Перейти в Чат';
         btnEl.onclick = function () { var t = document.querySelector('.view-tab[data-view="chat"]'); if (t) t.click(); };
+      }
+    }
+
+    /* ── Персистентный статус карточек (11.07.2026, комплексный статус-UX).
+       Раньше итог инструмента жил в toast toolsStatusUi (4с) или в .proposal-area
+       (стирается toolsHideAllProposals при смене секвенции/риппле) — «спикеры
+       размечены: плашка повисела и пропала», статус применения терялся.
+       Теперь у каждой карточки строка «последний итог» ПО СЕКВЕНЦИЯМ:
+       переключился на другую секвенцию — видишь её итоги, вернулся — прежние.
+       Хранение in-memory (сессия панели): итог — журнал действий, не данные. */
+    var _toolsCardStatus = {};   /* seqKey → { cardId: {text, kind, stamp} } */
+    var _toolsStatusSeqKey = ''; /* секвенция, чьи статусы сейчас на экране */
+    function toolsSetCardStatus(cardId, seqKey, text, kind) {
+      if (!seqKey || !cardId) return;
+      if (!_toolsCardStatus[seqKey]) _toolsCardStatus[seqKey] = {};
+      var d = new Date();
+      var stamp = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+      _toolsCardStatus[seqKey][cardId] = { text: String(text || ''), kind: kind || 'info', stamp: stamp };
+      if (seqKey === _toolsStatusSeqKey) _renderCardStatus(cardId, _toolsCardStatus[seqKey][cardId]);
+    }
+    function _renderCardStatus(cardId, st) {
+      var card = document.getElementById(cardId);
+      if (!card) return;
+      var el = card.querySelector('.tool-card-status');
+      if (!st) { if (el) el.hidden = true; return; }
+      if (!el) {
+        el = document.createElement('div');
+        card.appendChild(el);
+      }
+      el.hidden = false;
+      el.className = 'tool-card-status tool-card-status--' + st.kind;
+      el.textContent = st.stamp + ' · ' + st.text;
+    }
+    /* Перерисовать статусы всех карточек под секвенцию (зовётся из
+       _applyToolsLedForSeq — тот же жизненный цикл, что LED/гейты). */
+    function _renderAllCardStatuses(seqKey) {
+      _toolsStatusSeqKey = seqKey || '';
+      var map = _toolsCardStatus[_toolsStatusSeqKey] || {};
+      var cards = document.querySelectorAll('.tool-card[id]');
+      for (var i = 0; i < cards.length; i++) {
+        _renderCardStatus(cards[i].id, map[cards[i].id] || null);
       }
     }
 
@@ -6953,37 +6968,91 @@ PanelBoot.run('ИИ: монтаж', function () {
       if (prop.kind === 'transcript_cuts') {
         toolsStatusUi.show('Применяю монтаж…', true);
         toolsDisableRun(true);
+        /* 11.07.2026: батчинг ripple-удалений (live-находка на 6_SYNCED):
+           116 вырезок одним evalScript на плотном таймлайне (11.4K клипов после
+           мультикам-razor) шли ~15 мин → 120с-watchdog моста «падал», хотя host
+           продолжал резать. Итог: клиент в ошибке, транскрипт-ремап пропущен →
+           десинхрон кэша. Бьём на батчи по 10 (справа-налево, батчи независимы —
+           см. splitCutIntervalsIntoBatches), ремап транскрипта — после КАЖДОГО
+           успешного батча: при сбое посередине кэш согласован с уже применённым. */
+        var tcExpected = (prop.snapshot && prop.snapshot.sequenceName) || '';
+        var tcBatches = DeterministicPipelines.splitCutIntervalsIntoBatches(prop.removeIntervals || []);
+        var tcTotal = (prop.removeIntervals || []).length;
+        var tcDone = 0;      /* применённых вырезок */
+        var tcRemSec = 0;    /* суммарно вырезано, сек */
+
+        var tcSeqKey = function () {
+          return prop.seqKey || tcExpected ||
+            (lastSnap && lastSnap.sequenceName ? lastSnap.sequenceName : '');
+        };
+
+        var tcFinish = function (failMsg) {
+          toolsDisableRun(false);
+          endOperation();
+          toolsStatusUi.hide();
+          _snapDirty = true;
+          lastSnap = null; /* force chat to re-fetch snapshot */
+          if (failMsg) {
+            toolsShowErr(failMsg);
+            /* Статус-UX 11.07.2026: ошибка остаётся на карточке */
+            toolsSetCardStatus(prop.cardId, tcSeqKey(), String(failMsg).slice(0, 160), 'err');
+            try { window.toolsRefreshLed(); } catch (eLF) {}
+            return;
+          }
+          toolsHideProposal(area);
+          toolsStatusUi.show('Готово! Откат: Cmd+Z / Ctrl+Z', false);
+          /* Статус-UX 11.07.2026: итог остаётся на карточке + немедленный
+             пересчёт гейтов (не ждать 4с-интервала — гейт-гонка после ripple). */
+          toolsSetCardStatus(prop.cardId, tcSeqKey(),
+            'Применено: ' + tcDone + ' вырезок (−' + tcRemSec.toFixed(1) + 'с). Откат: Cmd+Z', 'ok');
+          try { window.toolsRefreshLed(); } catch (eL) {}
+          /* Sync chat transcript LED */
+          setTranscriptLed('ok');
+          setTimeout(function () { toolsStatusUi.hide(); }, 2500);
+        };
+
+        var tcRunBatch = function (bi) {
+          if (bi >= tcBatches.length) { tcFinish(null); return; }
+          var ivs = tcBatches[bi];
+          if (tcBatches.length > 1) {
+            toolsStatusUi.show('Монтаж: батч ' + (bi + 1) + '/' + tcBatches.length +
+              ' (вырезки ' + (tcDone + 1) + '–' + (tcDone + ivs.length) + ' из ' + tcTotal + ')…', true);
+          }
+          PremiereBridge.applyTranscriptCuts(
+            { removeIntervals: ivs, summary: prop.summary, expectedSequenceName: tcExpected },
+            function (err, dataTC) {
+              if (err || (dataTC && dataTC.ok === false)) {
+                var reason = err ? String(err.message || err) : ('НЕ применено: ' + describeHostFailure(dataTC));
+                var partial = tcDone > 0
+                  ? ' Применено ' + tcDone + ' из ' + tcTotal +
+                    ' вырезок — откатите таймлайн кнопкой ⏪ и повторите.'
+                  : ' Таймлайн не изменён.';
+                tcFinish((tcBatches.length > 1
+                  ? 'Ошибка (батч ' + (bi + 1) + '/' + tcBatches.length + '): ' : 'Ошибка: ') +
+                  reason + partial);
+                return;
+              }
+              /* Ремап транскрипта СРАЗУ после батча: батчи независимы (справа-
+                 налево), при сбое следующего кэш останется согласованным. */
+              try {
+                var sk = tcSeqKey();
+                if (sk) ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, sk, ivs);
+              } catch (eR) {
+                console.warn('[tools] applyRippleDeletionsToTranscript failed:', eR && eR.message);
+              }
+              tcDone += ivs.length;
+              for (var rvi = 0; rvi < ivs.length; rvi++) {
+                tcRemSec += Math.max(0, (ivs[rvi].endSec || 0) - (ivs[rvi].startSec || 0));
+              }
+              tcRunBatch(bi + 1);
+            }
+          );
+        };
+
         /* B2-9: checkpoint перед ripple-удалениями */
         _makeSequenceCheckpoint('монтаж (tools)', function () {
-        PremiereBridge.applyTranscriptCuts(
-          { removeIntervals: prop.removeIntervals, summary: prop.summary,
-            expectedSequenceName: (prop.snapshot && prop.snapshot.sequenceName) || '' },
-          function (err, dataTC) {
-            toolsDisableRun(false);
-            endOperation();
-            toolsStatusUi.hide();
-            if (err) { toolsShowErr('Ошибка: ' + String(err.message || err)); return; }
-            /* Host-контракт: ok:false (locked-дорожки и т.п.) приходит как data */
-            if (dataTC && dataTC.ok === false) {
-              toolsShowErr('НЕ применено: ' + describeHostFailure(dataTC));
-              return;
-            }
-            try {
-              var sk = lastSnap && lastSnap.sequenceName ? lastSnap.sequenceName : '';
-              if (sk) ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, sk, prop.removeIntervals || []);
-            } catch (e) {
-              console.warn('[tools] applyRippleDeletionsToTranscript failed:', e && e.message);
-            }
-            _snapDirty = true;
-            lastSnap = null; /* force chat to re-fetch snapshot */
-            toolsHideProposal(area);
-            toolsStatusUi.show('Готово! Откат: Cmd+Z / Ctrl+Z', false);
-            /* Sync chat transcript LED */
-            setTranscriptLed('ok');
-            setTimeout(function () { toolsStatusUi.hide(); }, 2500);
-          }
-        );
-        }); /* конец _makeSequenceCheckpoint */
+          tcRunBatch(0);
+        });
         return;
       }
 
@@ -6998,6 +7067,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           toolsHideProposal(area);
           var cnt = (data && data.createdSeconds) ? data.createdSeconds.length : 0;
           toolsStatusUi.show('Создано маркеров: ' + cnt + '. Откат: Cmd+Z', false);
+          toolsSetCardStatus(prop.cardId, prop.seqKey, 'Создано маркеров: ' + cnt, 'ok');
           setTimeout(function () { toolsStatusUi.hide(); }, 2500);
         });
         return;
@@ -7019,8 +7089,12 @@ PanelBoot.run('ИИ: монтаж', function () {
             toolsHideProposal(area);
             if (data && data.ok) {
               toolsStatusUi.show(ml + ': ' + data.applied + '/' + data.totalCuts + ' стыков. Откат: Cmd+Z', false);
+              toolsSetCardStatus(prop.cardId, prop.seqKey,
+                ml + ': ' + data.applied + '/' + data.totalCuts + ' стыков', 'ok');
             } else {
               toolsShowErr('Ошибка: ' + ((data && data.error) || 'неизвестная'));
+              toolsSetCardStatus(prop.cardId, prop.seqKey,
+                'Ошибка: ' + String((data && data.error) || 'неизвестная').slice(0, 140), 'err');
             }
             setTimeout(function () { toolsStatusUi.hide(); }, 2500);
           }
@@ -7052,6 +7126,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           toolsStatusUi.hide();
           if (failMsg) {
             toolsShowErr(failMsg);
+            toolsSetCardStatus(prop.cardId, prop.seqKey, String(failMsg).slice(0, 160), 'err');
             return;
           }
           toolsHideProposal(area);
@@ -7060,6 +7135,8 @@ PanelBoot.run('ИИ: монтаж', function () {
             (mcTotals.deletedCount ? mcTotals.deletedCount + ' клипов удалено.' :
               mcTotals.disabledCount + ' клипов отключено.') + ' Откат: ⏪';
           toolsStatusUi.show(msg, false);
+          toolsSetCardStatus(prop.cardId, prop.seqKey, msg, 'ok');
+          try { window.toolsRefreshLed(); } catch (eL) {}
           setTimeout(function () { toolsStatusUi.hide(); }, 4000);
         };
 
@@ -7220,6 +7297,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           resEl.style.whiteSpace = 'pre-line';
           resEl.textContent = lines.join('\n');
         }
+        toolsSetCardStatus('card-speakers', seqKey,
+          'Размечено ' + res.labeled + ' из ' + res.total + ' сегментов (' + labels.length + ' спикера)', 'ok');
         toolsStatusUi.show('Спикеры размечены ✓', false);
         keepStatus = true;
         setTimeout(function () { toolsStatusUi.hide(); }, 4000);
@@ -7321,6 +7400,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           resEl.style.whiteSpace = 'pre-line';
           resEl.textContent = lines.join('\n');
         }
+        toolsSetCardStatus('card-vertical', seqName,
+          'Создана «' + resp.sequenceName + '»: ' + resp.applied + ' из ' + plan.total + ' клипов', 'ok');
         toolsStatusUi.show('Вертикаль готова ✓', false);
         keepStatus = true;
         setTimeout(function () { toolsStatusUi.hide(); }, 4000);
@@ -7411,6 +7492,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           resEl.style.whiteSpace = 'pre-line';
           resEl.textContent = lines.join('\n');
         }
+        toolsSetCardStatus('card-subtitles', seqKey,
+          'Caption-трек: ' + cues.length + ' титров (~' + durMin.toFixed(1) + ' мин)', 'ok');
         toolsStatusUi.show('Субтитры готовы ✓', false);
         keepStatus = true;
         setTimeout(function () { toolsStatusUi.hide(); }, 4000);
@@ -7543,48 +7626,84 @@ PanelBoot.run('ИИ: монтаж', function () {
           rmsExtractor: async function (innerCtx, mapping, p) {
             var windowSec = typeof p.frameSec === 'number' ? p.frameSec : 0.05;
             var allClips = snap.clips || [];
-            /* Сначала собираем клипы/пути всех микрофонов (дешёвые ошибки — до ffmpeg). */
+            /* 11.07.2026 (live-провал на 6_SYNCED): раньше брали ПЕРВЫЙ клип
+               дорожки и RMS всего файла (remapRmsToSequenceTime по одному клипу).
+               Это ломалось на порезанном таймлайне (177 клипов после чисток) и
+               на BRAW-головах в начале mic-дорожек. Теперь паттерн диаризации:
+               ВСЕ клипы дорожки → части {mediaPath, srcStartSec, outer*}, RMS
+               на файл один раз, micPartsToTimeline собирает sequence-time. */
             var mics = [];
             for (var si = 0; si < mapping.speakers.length; si++) {
               var aIdx = mapping.speakers[si].audioTrack;
-              var clip = null;
+              var parts = [];
               for (var ci = 0; ci < allClips.length; ci++) {
-                // Берём первый клип на дорожке: ожидается один синхронизированный мик-клип на дорожку.
-                // Дорожки с несколькими клипами (перезапуск микрофона) не поддерживаются — берётся первый.
-                if (allClips[ci].trackType === 'audio' && allClips[ci].trackIndex === aIdx) { clip = allClips[ci]; break; }
+                var c = allClips[ci];
+                if (c.trackType === 'audio' && c.trackIndex === aIdx && c.mediaPath) {
+                  parts.push({
+                    mediaPath: c.mediaPath,
+                    srcStartSec: typeof c.inPointSec === 'number' ? c.inPointSec : 0,
+                    outerStartSec: c.startSec,
+                    outerEndSec: c.endSec
+                  });
+                }
               }
-              var mediaPath = clip && clip.mediaPath;
-              if (!mediaPath) {
-                throw new Error('Аудиодорожка ' + (aIdx + 1) + ': нет файла на диске (нужен один синхронизированный клип на дорожку).');
+              if (!parts.length) {
+                throw new Error('Аудиодорожка A' + (aIdx + 1) + ': нет клипов с файлом на диске. Настройте соответствие дорожек вручную (⚙ выбор дорожек).');
               }
-              mics.push({ aIdx: aIdx, clip: clip, mediaPath: mediaPath });
+              mics.push({ aIdx: aIdx, parts: parts });
             }
-            /* UX 10.07.2026: анализ микрофонов ПАРАЛЛЕЛЬНО (на 1.2ч подкасте
-               последовательный ffmpeg по 2–4 микам — минуты молчания) +
-               живой статус «готово m из n». */
+            /* RMS на ФАЙЛ один раз (разрезанный таймлайн = много частей одного
+               файла); недекодируемые (BRAW-головы) = тишина + варнинг, не падение. */
+            var pathSet = {};
+            for (var mi = 0; mi < mics.length; mi++) {
+              for (var pj = 0; pj < mics[mi].parts.length; pj++) pathSet[mics[mi].parts[pj].mediaPath] = 1;
+            }
+            var paths = Object.keys(pathSet);
             var doneCount = 0;
             var showMicStatus = function () {
-              toolsStatusUi.show('Анализ микрофонов: готово ' + doneCount + ' из ' + mics.length + '…', true);
+              toolsStatusUi.show('Анализ аудио: готово ' + doneCount + ' из ' + paths.length + ' файлов…', true);
             };
             showMicStatus();
-            var timelines = await Promise.all(mics.map(function (mic) {
-              return AudioPreprocess.computeRmsTimeline(mic.mediaPath, { windowSec: windowSec })
+            var rmsByPath = {};
+            var rmsFailed = [];
+            await Promise.all(paths.map(function (pth) {
+              return AudioPreprocess.computeRmsTimeline(pth, { windowSec: windowSec })
                 .then(function (tl) {
-                  doneCount++;
-                  showMicStatus();
-                  /* media-time → sequence-time: клип на таймлайне подрезан (inPoint),
-                     а RMS считается по всему файлу — без ремапа план уезжает
-                     на величину inPoint и выходит за конец секвенции. */
-                  return DeterministicPipelines.remapRmsToSequenceTime(tl, mic.clip);
+                  doneCount++; showMicStatus();
+                  rmsByPath[pth] = tl;
                 }, function (e) {
-                  /* Ошибку атрибутируем конкретному микрофону — иначе на 4 миках
-                     непонятно, какой файл сломан. */
-                  var fname = String(mic.mediaPath).split(/[\\\/]/).pop();
-                  throw new Error('A' + (mic.aIdx + 1) + ' (' + fname + '): ' + String(e && e.message || e));
+                  doneCount++; showMicStatus();
+                  rmsFailed.push(String(pth).split(/[\\\/]/).pop() + ': ' + String((e && e.message) || e));
                 });
             }));
-            /* B1-7: mediaPaths нужны пайплайну для pre-flight детекта общего файла */
-            return { timelines: timelines, mediaPaths: mics.map(function (m) { return m.mediaPath; }) };
+            if (!Object.keys(rmsByPath).length) {
+              throw new Error('Ни один аудиофайл не декодируется ffmpeg:\n' + rmsFailed.join('\n'));
+            }
+            var timelines = mics.map(function (m) {
+              return DeterministicPipelines.micPartsToTimeline(m.parts, rmsByPath);
+            });
+            /* B1-7: mediaPaths для pre-flight детекта общего файла — доминирующий
+               (по покрытой длительности) декодируемый путь каждой дорожки. */
+            var mediaPaths = mics.map(function (m) {
+              var durByPath = {};
+              for (var di = 0; di < m.parts.length; di++) {
+                var pt = m.parts[di];
+                durByPath[pt.mediaPath] = (durByPath[pt.mediaPath] || 0) + (pt.outerEndSec - pt.outerStartSec);
+              }
+              var best = '', bestDur = -1;
+              for (var k in durByPath) {
+                if (durByPath.hasOwnProperty(k) && rmsByPath[k] && durByPath[k] > bestDur) {
+                  best = k; bestDur = durByPath[k];
+                }
+              }
+              return best;
+            });
+            var extraWarnings = [];
+            if (rmsFailed.length) {
+              extraWarnings.push('⚠ Не декодируются (учтены как тишина): ' + rmsFailed.length + ' файл(а) — ' +
+                rmsFailed.map(function (s) { return s.split(':')[0]; }).join(', '));
+            }
+            return { timelines: timelines, mediaPaths: mediaPaths, warnings: extraWarnings };
           }
         };
 
@@ -7592,8 +7711,14 @@ PanelBoot.run('ИИ: монтаж', function () {
 
         if (!result.ok) {
           toolsShowErr(result.error || 'Ошибка.');
+          /* Статус-UX 11.07.2026: ошибка остаётся на карточке (toast/общий
+             блок ошибок перетирается следующим действием — «ошибка мелькнула
+             и исчезла», live-находка на мультикаме). */
+          toolsSetCardStatus('card-' + toolName, seqKey,
+            'Ошибка: ' + String(result.error || 'неизвестная').slice(0, 140), 'err');
         } else if (result.noChanges) {
           toolsStatusUi.show(result.summary || 'Изменений нет.', false);
+          toolsSetCardStatus('card-' + toolName, seqKey, result.summary || 'Изменений нет.', 'info');
           keepStatus = true;
           setTimeout(function () { toolsStatusUi.hide(); }, 4000);
         } else if (result.proposal) {
@@ -7603,11 +7728,17 @@ PanelBoot.run('ИИ: монтаж', function () {
              переключился между proposal и Apply. Теперь Apply сверит имя. */
           result.proposal.snapshot = snap;
           result.proposal.seqKey = seqKey;
+          result.proposal.cardId = 'card-' + toolName; /* статус применения → на карточку */
           toolsShowProposal(proposalId, result.proposal);
           toolsStatusUi.hide();
         }
       } catch (e) {
         toolsShowErr(String(e.message || e));
+        try {
+          /* seqKey объявлен var'ом в try — при раннем падении он undefined */
+          toolsSetCardStatus('card-' + toolName, seqKey || (lastSnap && lastSnap.sequenceName) || '',
+            'Ошибка: ' + String(e.message || e).slice(0, 140), 'err');
+        } catch (e2) {}
       } finally {
         endOperation();
         toolsDisableRun(false);

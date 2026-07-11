@@ -1462,6 +1462,140 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     );
   });
 
+  /* ── Авто-детект дорожек (live-провал 11.07.2026 на 6_SYNCED):
+     1) пустая аудиодорожка (без клипов) попадала в «запасные» и выбиралась
+        как микрофон → «Аудиодорожка 4: нет файла на диске»;
+     2) классификация по ПЕРВОМУ клипу: BRAW-голова в начале дорожки
+        прятала реальный WAV-микрофон → дорожка выкидывалась целиком. ── */
+
+  function snapWithClips(nV, nA, clipsByAudioTrack) {
+    const snap = snapNvMa(nV, nA);
+    snap.clips = [];
+    Object.keys(clipsByAudioTrack).forEach((idx) => {
+      clipsByAudioTrack[idx].forEach((mp, i) => {
+        snap.clips.push({
+          trackType: 'audio', trackIndex: Number(idx), mediaPath: mp,
+          name: 'c' + idx + '_' + i, startSec: i * 10, endSec: i * 10 + 10
+        });
+      });
+    });
+    return snap;
+  }
+  const mappingAwareExtractor = (c, mapping) =>
+    Promise.resolve({ timelines: fakeTimelines(mapping.speakers.length, 4, 0) });
+
+  it('авто-детект: пустая аудиодорожка (без клипов) НЕ выбирается как микрофон', async () => {
+    // 5V+4A: A1=BRAW (skip), A2/A3=WAV (микрофоны), A4 — пустая.
+    const ctx = {
+      snapshot: snapWithClips(5, 4, {
+        0: ['D:/f/A065_1201.braw'],
+        1: ['D:/f/mic_host.wav'],
+        2: ['D:/f/mic_guest.wav']
+        /* index 3 — клипов нет */
+      }),
+      rmsExtractor: mappingAwareExtractor
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true, 'ожидали ok: ' + (res.error || ''));
+    assert.deepEqual(
+      Array.from(res.proposal.plan.mapping.speakers.map(s => s.audioTrack)), [1, 2],
+      'пустая A4 (index 3) не должна попасть в спикеры'
+    );
+  });
+
+  it('авто-детект: дорожка классифицируется по ВСЕМ клипам — BRAW-голова не прячет WAV-микрофон', async () => {
+    // 3V+2A: A1 = [BRAW-голова, WAV-микрофон], A2 = [WAV]. Обе — микрофоны.
+    const ctx = {
+      snapshot: snapWithClips(3, 2, {
+        0: ['D:/f/A065_head.braw', 'D:/f/mic_host.wav'],
+        1: ['D:/f/mic_guest.wav']
+      }),
+      rmsExtractor: mappingAwareExtractor
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true, 'ожидали ok: ' + (res.error || ''));
+    assert.deepEqual(
+      Array.from(res.proposal.plan.mapping.speakers.map(s => s.audioTrack)), [0, 1],
+      'A1 содержит WAV-клип и должна считаться микрофоном'
+    );
+  });
+
+  it('авто-детект: дорожка только из BRAW-клипов пропускается, чистые mic-дорожки в приоритете', async () => {
+    // 4V+3A: A1 = только BRAW (все клипы), A2/A3 = WAV.
+    const ctx = {
+      snapshot: snapWithClips(4, 3, {
+        0: ['D:/f/a.braw', 'D:/f/b.braw'],
+        1: ['D:/f/mic1.wav'],
+        2: ['D:/f/cam.mp4']
+      }),
+      rmsExtractor: mappingAwareExtractor
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true, 'ожидали ok: ' + (res.error || ''));
+    assert.deepEqual(
+      Array.from(res.proposal.plan.mapping.speakers.map(s => s.audioTrack)), [1, 2],
+      'WAV-микрофон первым, MP4 вторым, BRAW-дорожка исключена'
+    );
+  });
+
+  it('тихая запись: порог тишины адаптируется, план не вырождается в один wide-сегмент', async () => {
+    // Live-провал 11.07.2026 (6_SYNCED): мик-mp3 с пиком −29 дБ и p90 −40.5 дБ
+    // при дефолтном пороге −35 дБ → все кадры «тишина» → 1 сегмент, 0 переключений.
+    // Здесь речь на −45 дБ (ниже порога), пол −70 дБ, спикеры чередуются по 5с.
+    const fs = 0.05;
+    const tlA = [], tlB = [];
+    for (let i = 1; i <= 400; i++) {
+      const t = +(i * fs).toFixed(3);
+      const first = Math.floor(t / 5) % 2 === 0;
+      tlA.push({ t, rms: first ? -45 : -70 });
+      tlB.push({ t, rms: first ? -70 : -45 });
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [tlA, tlB] })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    const segs = res.proposal.plan.segments;
+    assert.ok(
+      segs.some(s => s.activeVideoTrack === 1) && segs.some(s => s.activeVideoTrack === 2),
+      'ожидали переключения V2/V3 на тихой записи, план: ' + segs.length + ' сегментов'
+    );
+    assert.ok(
+      res.proposal.warnings.some(w => /порог тишины/i.test(w)),
+      'ожидали варнинг про адаптацию порога: ' + JSON.stringify(res.proposal.warnings)
+    );
+  });
+
+  it('громкая запись: явный params.silenceThresholdDb НЕ адаптируется', async () => {
+    // Обычная запись (речь −15 дБ) — порог не трогаем, варнинга нет.
+    const res = await DP.multicamFromAudio({
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: alternatingTimelines(2, 8, 4) })
+    }, {});
+    assert.equal(res.ok, true);
+    assert.ok(
+      !res.proposal.warnings.some(w => /порог тишины/i.test(w)),
+      'на громкой записи адаптации быть не должно: ' + JSON.stringify(res.proposal.warnings)
+    );
+  });
+
+  it('rmsExtractor может вернуть warnings — они попадают в proposal.warnings', async () => {
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({
+        timelines: fakeTimelines(2, 4, 0),
+        warnings: ['⚠ Не декодируются (учтены как тишина): 2 файла — a.braw, b.braw']
+      })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.ok(
+      res.proposal.warnings.some(w => w.includes('Не декодируются')),
+      'варнинги экстрактора должны дойти до пропозала: ' + JSON.stringify(res.proposal.warnings)
+    );
+  });
+
   /* ── Сводка пропозала (UX 10.07.2026): экранное время + оценка применения ── */
 
   function alternatingTimelines(nSpeakers, durSec, periodSec) {
@@ -1504,7 +1638,32 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     assert.ok(res.proposal.plan.segments.length > 40,
       'ожидали >40 сегментов, получили ' + res.proposal.plan.segments.length);
     assert.match(res.proposal.summary, /батч/i);
-    assert.match(res.proposal.summary, /≈\s*\d+\s*с/);
+    assert.match(res.proposal.summary, /≈\s*\d+\s*(с|мин)/);
+  });
+
+  it('summary: оценка времени ≈7 с/батч (live-замер 11.07.2026: 92 батча ≈ 11 мин, а не 3 с/батч)', async () => {
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: alternatingTimelines(2, 240, 2) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    const m = res.proposal.summary.match(/Применение: (\d+) батч[а-яё]*, ≈(\d+) с/);
+    assert.ok(m, 'ожидали строку «Применение: N батчей, ≈X с»: ' + res.proposal.summary);
+    assert.equal(Number(m[2]), Number(m[1]) * 7, 'оценка = батчи × 7 с');
+  });
+
+  it('summary: длинная оценка (>90 с) показывается в минутах', async () => {
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: alternatingTimelines(2, 1100, 2) })
+    };
+    const res = await DP.multicamFromAudio(ctx, {});
+    assert.equal(res.ok, true);
+    assert.ok(res.proposal.plan.segments.length > 520,
+      'ожидали >520 сегментов, получили ' + res.proposal.plan.segments.length);
+    assert.match(res.proposal.summary, /≈\s*\d+\s*мин/,
+      'долгое применение — в минутах: ' + res.proposal.summary.split('\n').pop());
   });
 
   it('summary: короткий план — без упоминания батчей', async () => {
@@ -1613,6 +1772,65 @@ describe('DeterministicPipelines.snapIntervalsToFrame', () => {
   it('мусорные элементы пропускаются, non-array → []', () => {
     assert.equal(DP.snapIntervalsToFrame([null, { startSec: 'x', endSec: 2 }, { startSec: 1, endSec: 2 }], 25).length, 1);
     assert.equal(DP.snapIntervalsToFrame(null, 25).length, 0);
+  });
+});
+
+/* ══════════════════════════════════════════════════════════════
+ * splitCutIntervalsIntoBatches (11.07.2026, live-находка на 6_SYNCED):
+ * 116 ripple-удалений одним evalScript на плотном таймлайне (11.4K клипов
+ * после мультикам-razor) шли ~15 мин → 120с-watchdog моста сработал, хотя
+ * host продолжал работать. Клиент бьёт интервалы на батчи (как мультикам).
+ * Инвариант host: применение справа-налево (по убыванию startSec) не сдвигает
+ * координаты более ранних интервалов → батчи, отсортированные глобально по
+ * убыванию, независимы и могут применяться последовательными вызовами.
+ * ══════════════════════════════════════════════════════════════ */
+describe('DeterministicPipelines.splitCutIntervalsIntoBatches', () => {
+  it('пусто/не-массив → []', () => {
+    assert.equal(DP.splitCutIntervalsIntoBatches([], {}).length, 0);
+    assert.equal(DP.splitCutIntervalsIntoBatches(null, {}).length, 0);
+  });
+
+  it('сортирует по убыванию startSec и режет на батчи заданного размера', () => {
+    const src = [];
+    for (let i = 0; i < 25; i++) src.push({ startSec: i * 10, endSec: i * 10 + 1 });
+    const batches = DP.splitCutIntervalsIntoBatches(src, { batchSize: 10 });
+    assert.equal(batches.length, 3);
+    assert.equal(batches[0].length, 10);
+    assert.equal(batches[1].length, 10);
+    assert.equal(batches[2].length, 5);
+    /* глобально убывающий порядок сквозь все батчи */
+    const flat = batches.flat();
+    for (let i = 1; i < flat.length; i++) {
+      assert.ok(flat[i].startSec < flat[i - 1].startSec,
+        `flat[${i}] ${flat[i].startSec} должен быть < ${flat[i - 1].startSec}`);
+    }
+    assert.equal(flat[0].startSec, 240, 'первый батч начинается с самого позднего интервала');
+  });
+
+  it('дефолтный размер батча = 10 (116 интервалов → 12 батчей)', () => {
+    const src = [];
+    for (let i = 0; i < 116; i++) src.push({ startSec: i * 5, endSec: i * 5 + 0.3 });
+    const batches = DP.splitCutIntervalsIntoBatches(src);
+    assert.equal(batches.length, 12);
+  });
+
+  it('не мутирует исходный массив, сохраняет прочие свойства интервалов', () => {
+    const src = [
+      { startSec: 5, endSec: 6, reason: 'эм' },
+      { startSec: 1, endSec: 2, reason: 'ну' }
+    ];
+    const batches = DP.splitCutIntervalsIntoBatches(src, { batchSize: 1 });
+    assert.equal(src[0].startSec, 5, 'исходный порядок не тронут');
+    assert.equal(batches[0][0].reason, 'эм');
+    assert.equal(batches[1][0].reason, 'ну');
+  });
+
+  it('один батч, если интервалов меньше размера', () => {
+    const batches = DP.splitCutIntervalsIntoBatches(
+      [{ startSec: 1, endSec: 2 }, { startSec: 3, endSec: 4 }], { batchSize: 10 });
+    assert.equal(batches.length, 1);
+    assert.equal(batches[0].length, 2);
+    assert.equal(batches[0][0].startSec, 3);
   });
 });
 

@@ -478,6 +478,93 @@
     };
   }
 
+  /**
+   * buildAutoSnapshotText(snap, opts) — текст [auto-snapshot] для чата.
+   *
+   * Извлечено из panel.js onSend (11.07.2026): инлайн-версия строила строку на
+   * КАЖДЫЙ видеоклип без капа — плотный пост-мультикам таймлайн (11 429
+   * видеоклипов на 6_SYNCED) дал ~170K токенов, Cloud.ru ответил 400
+   * «maximum context length» и чат становился непригоден на такой секвенции.
+   *
+   * Формат (как раньше): видео-строки nodeId|name|vN|start-end[|off][|a=<id>@aN],
+   * несвязанное аудио — отдельными строками. Линкованное аудио матчится по
+   * name + |ΔstartSec|<0.1 (live-баг 19.06: BRAW-аудио пропадало из снимка).
+   *
+   * При clips > maxClips (дефолт 250) список опущен: пер-дорожечная сводка +
+   * подсказка работать через транскрипт-инструменты (get_transcript_structure /
+   * propose_montage_plan) — им список клипов не нужен.
+   *
+   * @param {object|null} snap результат getTimelineSnapshot
+   * @param {object} [opts] { maxClips=250 }
+   * @returns {string|null}
+   */
+  function buildAutoSnapshotText(snap, opts) {
+    if (!snap || !snap.ok || !Array.isArray(snap.clips)) return null;
+    opts = opts || {};
+    var maxClips = (typeof opts.maxClips === 'number' && opts.maxClips > 0) ? opts.maxClips : 250;
+    var all = snap.clips;
+    var videoClips = [];
+    var audioClipsAll = [];
+    var i;
+    for (i = 0; i < all.length; i++) {
+      if (all[i].trackType === 'video') videoClips.push(all[i]);
+      else if (all[i].trackType === 'audio') audioClipsAll.push(all[i]);
+    }
+    /* Реальная длительность — sequenceEndSec бывает 0 */
+    var effectiveEndSec = snap.sequenceEndSec || 0;
+    for (i = 0; i < all.length; i++) {
+      if (all[i].endSec > effectiveEndSec) effectiveEndSec = all[i].endSec;
+    }
+    var head = '[auto-snapshot] seq=' + snap.sequenceName +
+      ' dur=' + effectiveEndSec.toFixed(1) + 's fps=' + snap.fps;
+
+    if (all.length > maxClips) {
+      var perTrack = {};
+      for (i = 0; i < all.length; i++) {
+        var tk = (all[i].trackType ? all[i].trackType[0] : '?') +
+          (typeof all[i].trackIndex === 'number' ? all[i].trackIndex : '?');
+        perTrack[tk] = (perTrack[tk] || 0) + 1;
+      }
+      var parts = [];
+      for (var k in perTrack) {
+        if (Object.prototype.hasOwnProperty.call(perTrack, k)) parts.push(k + ': ' + perTrack[k]);
+      }
+      parts.sort();
+      return head +
+        '\nПлотный таймлайн: ' + all.length + ' клипов — список опущен (не влезает в контекст).' +
+        '\nПо дорожкам: ' + parts.join(', ') + '.' +
+        '\nРаботай через транскрипт: get_transcript_structure / propose_montage_plan; ' +
+        'точечные клипы — get_timeline_snapshot не вызывай, проси пользователя указать таймкоды.';
+    }
+
+    /* Линкованное аудио НЕ прячем (live-баг 19.06.2026: BRAW-аудио линковано
+       с видео → пропадало из снапшота → «нет аудиоклипа»). */
+    var linkedAudioBy = {};
+    var audioOnlyClips = [];
+    for (i = 0; i < audioClipsAll.length; i++) {
+      var c = audioClipsAll[i];
+      var v = null;
+      for (var vi3 = 0; vi3 < videoClips.length; vi3++) {
+        if (videoClips[vi3].name === c.name && Math.abs(videoClips[vi3].startSec - c.startSec) < 0.1) { v = videoClips[vi3]; break; }
+      }
+      if (v) { if (!linkedAudioBy[v.nodeId]) linkedAudioBy[v.nodeId] = c; }
+      else audioOnlyClips.push(c);
+    }
+    var lines = [];
+    for (i = 0; i < videoClips.length; i++) {
+      var vc = videoClips[i];
+      var la = linkedAudioBy[vc.nodeId];
+      lines.push(vc.nodeId + '|' + vc.name + '|' + vc.trackType[0] + vc.trackIndex + '|' + vc.startSec + '-' + vc.endSec +
+        (vc.disabled ? '|off' : '') + (la ? '|a=' + la.nodeId + '@' + la.trackType[0] + la.trackIndex : ''));
+    }
+    for (i = 0; i < audioOnlyClips.length; i++) {
+      var ac = audioOnlyClips[i];
+      lines.push(ac.nodeId + '|' + ac.name + '|' + ac.trackType[0] + ac.trackIndex + '|' + ac.startSec + '-' + ac.endSec +
+        (ac.disabled ? '|off' : ''));
+    }
+    return head + '\nclips(' + lines.length + '):\n' + lines.join('\n');
+  }
+
   /* ─── Ожидаемая дельта длительности для набора операций ────────── */
 
   /**
@@ -604,6 +691,7 @@
     extractRippleIntervals: extractRippleIntervals,
     buildTimelineDiff: buildTimelineDiff,
     compactSnapshotForLlm: compactSnapshotForLlm,
+    buildAutoSnapshotText: buildAutoSnapshotText,
     calcExpectedDeltaSec: calcExpectedDeltaSec,
     analyzeInputGeometry: analyzeInputGeometry
   };

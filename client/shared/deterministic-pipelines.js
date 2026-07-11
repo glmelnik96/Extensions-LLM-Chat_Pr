@@ -1869,32 +1869,42 @@
       if (!nm.ok) return { ok: false, error: nm.error };
       mapping = nm.mapping;
     } else {
-      /* Авто-детект микрофонов (19.06.2026): раньше брали первые N аудиодорожек
-         (audioTrack 0,1,2…) вслепую. На реальном мультикаме первые дорожки —
-         камерное BRAW-аудио, которое ffmpeg НЕ декодирует → «0 кадров RMS», авто
-         падал. Теперь предпочитаем дорожки с декодируемым аудио: сначала чистые
-         микрофоны (WAV/MP3/FLAC), затем видео-с-аудио (MP4/MOV/MXF), BRAW/R3D
-         пропускаем. mediaPath берём из клипов снапшота (по первому клипу дорожки). */
+      /* Авто-детект микрофонов (19.06.2026, переработан 11.07.2026): раньше брали
+         первые N аудиодорожек вслепую, потом классифицировали по ПЕРВОМУ клипу
+         дорожки. Live-провал на 6_SYNCED: BRAW-голова в начале mic-дорожки прятала
+         реальный WAV → дорожка выкидывалась, а ПУСТАЯ дорожка (без клипов) попадала
+         в «запасные» и выбиралась микрофоном → «нет файла на диске». Теперь дорожка
+         классифицируется по ВСЕМ своим клипам: есть WAV/MP3 → микрофон; иначе есть
+         MP4/MOV → камера-с-аудио; только BRAW/R3D или без клипов — исключается. */
       var MIC_EXT = /\.(wav|mp3|m4a|aac|flac|ogg|opus)$/i;
       var CAM_EXT = /\.(mp4|mov|mxf|avi|mkv|m4v)$/i;
       var SKIP_EXT = /\.(braw|r3d|ari|arx)$/i;
-      var trackMedia = {};
+      var trackClips = {};
       (snap.clips || []).forEach(function (c) {
-        if (c.trackType === 'audio' && trackMedia[c.trackIndex] === undefined) {
-          trackMedia[c.trackIndex] = c.mediaPath || '';
+        if (c.trackType === 'audio') {
+          if (!trackClips[c.trackIndex]) trackClips[c.trackIndex] = [];
+          trackClips[c.trackIndex].push(c.mediaPath || '');
         }
       });
       var micTracks = [], camTracks = [], otherTracks = [];
       for (var ati = 0; ati < aTracks.length; ati++) {
         var idx = aTracks[ati].index;
-        var mp = trackMedia[idx] || '';
-        if (SKIP_EXT.test(mp)) continue;           /* BRAW/R3D — ffmpeg не извлечёт RMS */
-        if (MIC_EXT.test(mp)) micTracks.push(idx);
-        else if (CAM_EXT.test(mp)) camTracks.push(idx);
-        else otherTracks.push(idx);                /* неизвестный/пустой путь — как запасной */
+        var paths = trackClips[idx];
+        if (!paths || !paths.length) continue;     /* пустая дорожка — не кандидат */
+        var hasMic = false, hasCam = false, hasOther = false;
+        for (var pi = 0; pi < paths.length; pi++) {
+          var mp = paths[pi];
+          if (MIC_EXT.test(mp)) hasMic = true;
+          else if (CAM_EXT.test(mp)) hasCam = true;
+          else if (!SKIP_EXT.test(mp)) hasOther = true; /* неизвестный путь — запасной */
+        }
+        if (hasMic) micTracks.push(idx);
+        else if (hasCam) camTracks.push(idx);
+        else if (hasOther) otherTracks.push(idx);
+        /* только BRAW/R3D — ffmpeg не извлечёт RMS, пропускаем */
       }
       var usable = micTracks.concat(camTracks).concat(otherTracks);
-      /* Fallback: если все отсеяли (нет mediaPath) — старое поведение. */
+      /* Fallback: если все отсеяли (нет клипов/mediaPath в снапшоте) — старое поведение. */
       if (!usable.length) { for (var u = 0; u < aTracks.length; u++) usable.push(aTracks[u].index); }
       var autoCount = Math.min(usable.length, vTracks.length - 1, MAX_SPEAKERS);
       var autoSpeakers = [];
@@ -1947,6 +1957,11 @@
       return 'A' + ((s ? s.audioTrack : speakerIdx) + 1);
     }
     var warnings = [];
+    /* 11.07.2026: экстрактор может сообщить свои варнинги (например,
+       недекодируемые BRAW-головы учтены как тишина) — доносим до пропозала. */
+    if (extracted.warnings && extracted.warnings.length) {
+      for (var xw = 0; xw < extracted.warnings.length; xw++) warnings.push(String(extracted.warnings[xw]));
+    }
     for (var dpi = 0; dpi < mediaPaths.length; dpi++) {
       for (var dpj = dpi + 1; dpj < mediaPaths.length; dpj++) {
         if (mediaPaths[dpi] && mediaPaths[dpi] === mediaPaths[dpj]) {
@@ -1975,11 +1990,35 @@
       return { ok: false, error: 'Пустой аудио-анализ.' };
     }
 
+    /* Адаптивный порог тишины (live-провал 11.07.2026 на 6_SYNCED): тихая
+       mp3-запись (пик −29 дБ, p90 −40.5 дБ) при пороге −35 дБ давала «все кадры
+       тишина» → вырожденный план «1 сегмент, 0 переключений». Если 90-й
+       перцентиль громкости НИЖЕ порога (даже речь тише порога) — опускаем порог
+       к середине между шумовым полом (p10) и речью (p90) и честно предупреждаем. */
+    var silenceDb = typeof params.silenceThresholdDb === 'number' ? params.silenceThresholdDb : -35;
+    var pool = [];
+    for (var pti = 0; pti < timelines.length; pti++) {
+      var ptl = timelines[pti];
+      for (var pfi = 0; pfi < ptl.length; pfi++) pool.push(ptl[pfi].rms);
+    }
+    if (pool.length >= 20) {
+      pool.sort(function (a, b) { return a - b; });
+      var p10 = pool[Math.floor(pool.length * 0.1)];
+      var p90 = pool[Math.floor(pool.length * 0.9)];
+      if (p90 < silenceDb) {
+        var adaptedDb = (p10 + p90) / 2;
+        warnings.push('Тихая запись: даже громкие места (' + p90.toFixed(0) + ' дБ) ниже порога тишины (' +
+          silenceDb + ' дБ). Порог автоматически снижен до ' + adaptedDb.toFixed(0) +
+          ' дБ — при необходимости настройте слайдер «Порог тишины».');
+        silenceDb = adaptedDb;
+      }
+    }
+
     var planParams = {
       frameSec: frameSec,
       minHoldSec: typeof params.minHoldSec === 'number' ? params.minHoldSec : 1.5,
       bleedMarginDb: typeof params.bleedMarginDb === 'number' ? params.bleedMarginDb : 6,
-      silenceThresholdDb: typeof params.silenceThresholdDb === 'number' ? params.silenceThresholdDb : -35
+      silenceThresholdDb: silenceDb
     };
     /* Phase 2B: опциональные параметры — отдаём только если заданы,
        иначе buildSwitchPlan возьмёт свои DEFAULTS */
@@ -2025,11 +2064,15 @@
     var summary = 'Авто-MultiCam (по голосу): ' + built.segments.length + ' сегментов, ' +
       built.switchCount + ' переключений. Спикеров: ' + speakerCount + '.' +
       '\nЭкранное время: ' + screenParts.join(' · ');
-    /* Длинный план применяется батчами — честно предупредим о времени. */
+    /* Длинный план применяется батчами — честно предупредим о времени.
+       11.07.2026: live-замер на 6_SYNCED — 92 батча ≈ 11 мин (~7 с/батч),
+       старая оценка 3 с/батч занижала в 2.4 раза. Долгие планы — в минутах. */
     var batchCount = MulticamPlan.splitPlanIntoBatches(plan).length;
     if (batchCount > 1) {
-      summary += '\nПрименение: ' + batchCount + ' батчей, ≈' + (batchCount * 3) +
-        ' с (прогресс будет виден; при сбое — откат кнопкой ⏪).';
+      var estSec = batchCount * 7;
+      var estText = estSec > 90 ? '≈' + Math.round(estSec / 60) + ' мин' : '≈' + estSec + ' с';
+      summary += '\nПрименение: ' + batchCount + ' батчей, ' + estText +
+        ' (прогресс будет виден; при сбое — откат кнопкой ⏪).';
     }
 
     return {
@@ -2042,6 +2085,33 @@
         stats: { perTrackSeconds: perTrack, switchCount: built.switchCount }
       }
     };
+  }
+
+  /* ── splitCutIntervalsIntoBatches (11.07.2026) ──────────────────
+   * Live-находка на 6_SYNCED: 116 ripple-удалений одним evalScript на плотном
+   * таймлайне (11.4K клипов после мультикам-razor, ~6-8 с/ripple) шли ~15 мин →
+   * 120с-watchdog моста сработал, клиент ушёл в ошибку, host продолжал резать
+   * (десинхрон транскрипта). Решение — батчи, как у мультикама: каждый вызов
+   * host короткий, у каждого свой таймаут, между батчами прогресс.
+   * Инвариант host applyTranscriptCuts: применение справа-налево (по убыванию
+   * startSec) не сдвигает координаты более ранних интервалов → сортируем
+   * ГЛОБАЛЬНО по убыванию и режем на куски: батчи независимы, транскрипт-ремап
+   * можно применять после каждого успешного батча.
+   * batchSize 10: на плотном таймлайне ~60-80 с/батч (< 120с watchdog),
+   * на обычном — лишние roundtrip'ы копеечные. */
+  function splitCutIntervalsIntoBatches(intervals, opts) {
+    if (!Array.isArray(intervals) || !intervals.length) return [];
+    opts = opts || {};
+    var size = typeof opts.batchSize === 'number' && !isNaN(opts.batchSize) && opts.batchSize > 0
+      ? Math.floor(opts.batchSize) : 10;
+    var sorted = intervals.slice().sort(function (a, b) {
+      return (b && b.startSec || 0) - (a && a.startSec || 0);
+    });
+    var batches = [];
+    for (var i = 0; i < sorted.length; i += size) {
+      batches.push(sorted.slice(i, i + size));
+    }
+    return batches;
   }
 
   global.DeterministicPipelines = {
@@ -2068,6 +2138,7 @@
     rmsThresholdSegments: rmsThresholdSegments,
     parsePipelineCommand: parsePipelineCommand,
     snapIntervalsToFrame: snapIntervalsToFrame,
+    splitCutIntervalsIntoBatches: splitCutIntervalsIntoBatches,
     _mergeIntervals: _mergeIntervals,
     _detectSharedAudio: _detectSharedAudio,
     _detectFlatAudio: _detectFlatAudio,

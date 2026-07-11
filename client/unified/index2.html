@@ -181,6 +181,10 @@
          Раньше gated-карточка только тускнела (opacity), а кнопка «Найти и
          вырезать» оставалась кликабельной и выдавала сырую ошибку — отсюда
          ощущение «кнопки бесполезны». Теперь карточка честно объясняет гейт. */
+      /* P0 11.07.2026: author-правило display:flex ПЕРЕБИВАЕТ UA-стиль [hidden]
+         → gate.hidden=true не скрывал плашку визуально: «Нужна транскрипция»
+         висела вечно при живом транскрипте. */
+      .tool-gate[hidden] { display: none; }
       .tool-gate {
         display: flex;
         align-items: center;
@@ -194,6 +198,20 @@
         border-radius: 6px;
       }
       .tool-gate-msg { flex: 1; min-width: 0; }
+      /* Персистентный итог карточки (11.07.2026): «последнее действие» по
+         текущей секвенции — не исчезает как toast и переживает смену вкладок. */
+      .tool-card-status {
+        margin-top: 6px;
+        font-size: 11px;
+        line-height: 1.35;
+        color: var(--muted);
+        border-top: 1px dashed rgba(255, 255, 255, 0.12);
+        padding-top: 5px;
+        word-break: break-word;
+      }
+      .tool-card-status--ok { color: #34d399; }
+      .tool-card-status--err { color: #f87171; }
+      .tool-card-status[hidden] { display: none; }
       .tool-gate-btn {
         flex: none;
         padding: 4px 10px;
