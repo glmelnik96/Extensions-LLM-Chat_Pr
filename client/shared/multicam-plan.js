@@ -191,27 +191,30 @@
    */
   function enforceMinHold(segments, minHoldSec) {
     if (!segments || segments.length <= 1) return segments.slice();
-    var out = segments.slice();
-    var changed = true;
-    var safety = 0;
-    while (changed && safety++ < 1000) {
-      changed = false;
-      for (var i = 0; i < out.length; i++) {
-        var dur = out[i].tEnd - out[i].tStart;
-        if (dur >= minHoldSec) continue;
-        /* поглощаем коротыша */
-        if (i > 0) {
-          out[i - 1].tEnd = out[i].tEnd;
-          out.splice(i, 1);
-        } else if (out.length > 1) {
-          out[1].tStart = out[0].tStart;
-          out.splice(0, 1);
-        } else {
-          /* единственный сегмент — оставляем как есть */
-          break;
-        }
-        changed = true;
-        break;
+    /* Один проход слева-направо, O(n), без потолка итераций.
+       Инвариант: каждый сегмент в out (кроме единственного) в итоге ≥ minHold.
+       Правила поглощения коротыша:
+         - текущий короче minHold → отдаём его время предыдущему (prev расширяется,
+           побеждает трек prev — блип уходит к соседу, длинные сегменты не флипаются);
+         - предыдущий короче minHold, а текущий длинный (например самый первый
+           сегмент оказался коротким) → поглощаем prev в текущий: расширяем назад,
+           побеждает трек длинного.
+       Прежняя реализация имела safety<1000 (за проход поглощался ровно 1 коротыш):
+       на плотном/шумном входе цикл молча обрывался, оставляя тысячи под-minHold
+       склеек (покадровый пинг-понг), и был O(n²) из-за рескана с нуля. */
+    var out = [{ tStart: segments[0].tStart, tEnd: segments[0].tEnd, activeVideoTrack: segments[0].activeVideoTrack }];
+    for (var i = 1; i < segments.length; i++) {
+      var seg = segments[i];
+      var segDur = seg.tEnd - seg.tStart;
+      var prev = out[out.length - 1];
+      var prevDur = prev.tEnd - prev.tStart;
+      if (segDur < minHoldSec) {
+        prev.tEnd = seg.tEnd;
+      } else if (prevDur < minHoldSec) {
+        prev.tEnd = seg.tEnd;
+        prev.activeVideoTrack = seg.activeVideoTrack;
+      } else {
+        out.push({ tStart: seg.tStart, tEnd: seg.tEnd, activeVideoTrack: seg.activeVideoTrack });
       }
     }
     return out;

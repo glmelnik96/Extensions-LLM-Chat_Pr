@@ -2023,6 +2023,7 @@
     /* Phase 2B: опциональные параметры — отдаём только если заданы,
        иначе buildSwitchPlan возьмёт свои DEFAULTS */
     if (typeof params.maxHoldSec === 'number') planParams.maxHoldSec = params.maxHoldSec;
+    if (typeof params.smoothingWindow === 'number') planParams.smoothingWindow = params.smoothingWindow;
     if (typeof params.overlapWideMinSec === 'number') planParams.overlapWideMinSec = params.overlapWideMinSec;
     if (typeof params.maxAllSpeakersSec === 'number') planParams.maxAllSpeakersSec = params.maxAllSpeakersSec;
     if (typeof params.variationsJitterSec === 'number') planParams.variationsJitterSec = params.variationsJitterSec;

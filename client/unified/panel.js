@@ -6610,6 +6610,22 @@ PanelBoot.run('ИИ: монтаж', function () {
       s.addEventListener('input', upd);
       upd();
     })();
+    (function () {
+      var s = document.getElementById('mc-smooth');
+      var v = document.getElementById('mc-smooth-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = s.value + ' кадр.'; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+    (function () {
+      var s = document.getElementById('mc-overlap');
+      var v = document.getElementById('mc-overlap-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = s.value === '0' ? 'выкл' : s.value + 'с'; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
 
     /* Кастомный выбор дорожек по спикерам (AutoPod-паттерн «теги дорожек»,
        12 июня 2026): авто-схема «V1 wide, A1→V2…» включает молчащего спикера,
@@ -7576,6 +7592,11 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (mcSilenceEl) params.silenceThresholdDb = -parseInt(mcSilenceEl.value, 10);
           var mcJitterEl = document.getElementById('mc-jitter');
           if (mcJitterEl) params.variationsJitterSec = parseFloat(mcJitterEl.value);
+          /* Анти-дребезг: окно сглаживания (кадры) + порог кросс-тока (сек) */
+          var mcSmoothEl = document.getElementById('mc-smooth');
+          if (mcSmoothEl) params.smoothingWindow = parseInt(mcSmoothEl.value, 10);
+          var mcOverlapEl = document.getElementById('mc-overlap');
+          if (mcOverlapEl) params.overlapWideMinSec = parseFloat(mcOverlapEl.value);
           /* Кастомный выбор дорожек: null = авто-схема пайплайна */
           var mcMapping = toolsMcReadMapping();
           if (mcMapping) params.mapping = mcMapping;
