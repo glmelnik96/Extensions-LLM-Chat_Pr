@@ -2410,7 +2410,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       card.appendChild(ivContainer);
     }
 
-    card.appendChild(_buildButtons('✓ Применить монтаж'));
+    card.appendChild(_buildButtons('Применить монтаж'));
     el.chat.appendChild(card);
     el.chat.scrollTop = el.chat.scrollHeight;
   }
