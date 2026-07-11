@@ -116,9 +116,14 @@
    *   activeMic == -2 (overlap) → wide
    *   activeMic = N → mapping.speakers[N].videoTrack
    */
-  function micToVideoTrack(activeMic, mapping, params) {
-    if (activeMic === -1 && params.wideOnSilence) return mapping.wideVideoTrack;
-    if (activeMic === -2 && params.wideOnOverlap) return mapping.wideVideoTrack;
+  function micToVideoTrack(activeMic, mapping, params, lastSpeakerTrack) {
+    /* При wideOnSilence/wideOnOverlap=false тишина/перебивка НЕ уводят в общий
+       план, а держат последнего спикера (4-й арг). Если спикера ещё не было —
+       падаем в wide. Раньше здесь стоял безусловный fallthrough `activeMic < 0
+       → wide`, из-за которого флаги false ничего не меняли (мёртвые тумблеры). */
+    var hold = (typeof lastSpeakerTrack === 'number') ? lastSpeakerTrack : mapping.wideVideoTrack;
+    if (activeMic === -1) return params.wideOnSilence ? mapping.wideVideoTrack : hold;
+    if (activeMic === -2) return params.wideOnOverlap ? mapping.wideVideoTrack : hold;
     if (activeMic < 0) return mapping.wideVideoTrack;
     var sp = mapping.speakers && mapping.speakers[activeMic];
     if (sp && typeof sp.videoTrack === 'number') return sp.videoTrack;
@@ -275,6 +280,45 @@
   }
 
   /**
+   * Tier 3 (11.07.2026): источники привязки границ для мультикама.
+   * Из кадров RMS выводит:
+   *   silences: [{startSec, endSec}] — интервалы, где никто не говорит (mic == -1);
+   *   speechOnsets: [tSec] — моменты, где спикер начинает говорить (переход
+   *                 из тишины/перебивки в реального спикера).
+   * Раньше snap-to-onset/silence в мультикаме простаивал: не было кто их считает.
+   */
+  function computeSnapSources(audioFrames, params) {
+    var silences = [];
+    var speechOnsets = [];
+    if (!Array.isArray(audioFrames) || audioFrames.length === 0) {
+      return { silences: silences, speechOnsets: speechOnsets };
+    }
+    var p = params || {};
+    var silenceDb = typeof p.silenceThresholdDb === 'number' ? p.silenceThresholdDb : -35;
+    var margin = typeof p.bleedMarginDb === 'number' ? p.bleedMarginDb : 6;
+    var labels = new Array(audioFrames.length);
+    for (var i = 0; i < audioFrames.length; i++) {
+      labels[i] = decideActiveMic(audioFrames[i].rmsByTrack, silenceDb, margin);
+    }
+    var k = 0;
+    while (k < labels.length) {
+      if (labels[k] === -1) {
+        var start = audioFrames[k].tStart;
+        while (k < labels.length && labels[k] === -1) k++;
+        silences.push({ startSec: start, endSec: audioFrames[k - 1].tEnd });
+      } else {
+        k++;
+      }
+    }
+    for (var m = 0; m < labels.length; m++) {
+      if (labels[m] >= 0 && (m === 0 || labels[m - 1] < 0)) {
+        speechOnsets.push(audioFrames[m].tStart);
+      }
+    }
+    return { silences: silences, speechOnsets: speechOnsets };
+  }
+
+  /**
    * Главная функция Phase 1.
    *
    * Args:
@@ -316,8 +360,10 @@
     }
 
     var labels = new Array(audioFrames.length);
+    var lastSpeakerTrack = mapping.wideVideoTrack; /* для hold-last-speaker */
     for (var i = 0; i < audioFrames.length; i++) {
-      labels[i] = micToVideoTrack(micLabels[i], mapping, p);
+      labels[i] = micToVideoTrack(micLabels[i], mapping, p, lastSpeakerTrack);
+      if (micLabels[i] >= 0) lastSpeakerTrack = labels[i]; /* обновляем только на реальном спикере */
     }
 
     /* Шаг 2: smoothing */
@@ -577,6 +623,7 @@
     DEFAULTS: DEFAULTS,
     buildSwitchPlan: buildSwitchPlan,
     framesFromRmsTimelines: framesFromRmsTimelines,
+    computeSnapSources: computeSnapSources,
     splitPlanIntoBatches: splitPlanIntoBatches,
     /* Экспортируем internals для unit-тестов */
     _decideActiveMic: decideActiveMic,

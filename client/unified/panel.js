@@ -6626,6 +6626,46 @@ PanelBoot.run('ИИ: монтаж', function () {
       s.addEventListener('input', upd);
       upd();
     })();
+    bindSlider('mc-maxall', 'mc-maxall-val', 'с');
+    (function () {
+      /* Tier 1 (11.07.2026): «Шаг анализа» = frameSec, показываем в мс */
+      var s = document.getElementById('mc-framesec');
+      var v = document.getElementById('mc-framesec-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = Math.round(parseFloat(s.value) * 1000) + 'мс'; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+    (function () {
+      /* Tier 1: «Вариант» = variationsSeed, показываем как #N */
+      var s = document.getElementById('mc-seed');
+      var v = document.getElementById('mc-seed-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = '#' + s.value; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+    (function () {
+      /* Tier 3: «Привязка к паузам» = snapWindowSec, 0 = выкл */
+      var s = document.getElementById('mc-snap');
+      var v = document.getElementById('mc-snap-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = s.value === '0' ? 'выкл' : s.value + 'с'; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+    (function () {
+      /* Tier 3: «Сдвиг привязки» = frameOffsetSec, показываем в мс со знаком */
+      var s = document.getElementById('mc-snapoff');
+      var v = document.getElementById('mc-snapoff-val');
+      if (!s || !v) return;
+      function upd() {
+        var ms = Math.round(parseFloat(s.value) * 1000);
+        v.textContent = (ms > 0 ? '+' : '') + ms + 'мс';
+      }
+      s.addEventListener('input', upd);
+      upd();
+    })();
 
     /* Кастомный выбор дорожек по спикерам (AutoPod-паттерн «теги дорожек»,
        12 июня 2026): авто-схема «V1 wide, A1→V2…» включает молчащего спикера,
@@ -7597,6 +7637,23 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (mcSmoothEl) params.smoothingWindow = parseInt(mcSmoothEl.value, 10);
           var mcOverlapEl = document.getElementById('mc-overlap');
           if (mcOverlapEl) params.overlapWideMinSec = parseFloat(mcOverlapEl.value);
+          /* Tier 1 (11.07.2026): длина wide-вставки, шаг анализа, вариант разброса */
+          var mcMaxAllEl = document.getElementById('mc-maxall');
+          if (mcMaxAllEl) params.maxAllSpeakersSec = parseFloat(mcMaxAllEl.value);
+          var mcFrameSecEl = document.getElementById('mc-framesec');
+          if (mcFrameSecEl) params.frameSec = parseFloat(mcFrameSecEl.value);
+          var mcSeedEl = document.getElementById('mc-seed');
+          if (mcSeedEl) params.variationsSeed = parseInt(mcSeedEl.value, 10);
+          /* Оживлённые тумблеры: держать последнего спикера на паузах/перебивках */
+          var mcWideSilenceEl = document.getElementById('mc-wide-silence');
+          if (mcWideSilenceEl) params.wideOnSilence = mcWideSilenceEl.checked;
+          var mcWideOverlapEl = document.getElementById('mc-wide-overlap');
+          if (mcWideOverlapEl) params.wideOnOverlap = mcWideOverlapEl.checked;
+          /* Tier 3: привязка резов к паузам/onset + сдвиг */
+          var mcSnapEl = document.getElementById('mc-snap');
+          if (mcSnapEl) params.snapWindowSec = parseFloat(mcSnapEl.value);
+          var mcSnapOffEl = document.getElementById('mc-snapoff');
+          if (mcSnapOffEl) params.frameOffsetSec = parseFloat(mcSnapOffEl.value);
           /* Кастомный выбор дорожек: null = авто-схема пайплайна */
           var mcMapping = toolsMcReadMapping();
           if (mcMapping) params.mapping = mcMapping;

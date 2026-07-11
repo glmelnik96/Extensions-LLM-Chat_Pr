@@ -89,6 +89,80 @@ describe('MulticamPlan._micToVideoTrack', () => {
   test('неизвестный mic → wide (fallback)', () => {
     assert.equal(MP._micToVideoTrack(99, STD_MAPPING, params), 0);
   });
+
+  /* Tier «оживления» тумблеров (11.07.2026): раньше fallthrough
+     `if (activeMic < 0) return wide` перекрывал флаги — false ничего не менял.
+     Теперь при false тишина/перебивка держат ПОСЛЕДНЕГО спикера (4-й арг). */
+  test('wideOnSilence=false + есть последний спикер → держим его, не wide', () => {
+    const f = { wideOnSilence: false, wideOnOverlap: true };
+    assert.equal(MP._micToVideoTrack(-1, STD_MAPPING, f, 2), 2, 'тишина держит последнего спикера (track 2)');
+  });
+
+  test('wideOnOverlap=false + есть последний спикер → держим его, не wide', () => {
+    const f = { wideOnSilence: true, wideOnOverlap: false };
+    assert.equal(MP._micToVideoTrack(-2, STD_MAPPING, f, 1), 1, 'перебивка держит последнего спикера (track 1)');
+  });
+
+  test('wideOnSilence=false, но спикера ещё не было → wide (fallback)', () => {
+    const f = { wideOnSilence: false, wideOnOverlap: true };
+    assert.equal(MP._micToVideoTrack(-1, STD_MAPPING, f), 0, 'без 4-го арга падаем в wide');
+  });
+
+  test('wideOnSilence=true (дефолт) → wide, как раньше (регресс)', () => {
+    const f = { wideOnSilence: true, wideOnOverlap: true };
+    assert.equal(MP._micToVideoTrack(-1, STD_MAPPING, f, 2), 0, 'дефолт не меняется — тишина в wide');
+  });
+});
+
+/* ──────────────────────────────────────────────────────────────
+ * buildSwitchPlan — hold-last-speaker (интеграция)
+ * ────────────────────────────────────────────────────────────── */
+
+describe('MulticamPlan.buildSwitchPlan hold-last-speaker', () => {
+  test('wideOnSilence=false: тишина после спикера держит его камеру, не уходит в wide', () => {
+    /* Спикер 0 говорит 3с (track 1), затем 3с тишины. */
+    const frames = makeFrames([
+      { count: 60, rms: [-10, -50] }, // speaker 0 loud 3s
+      { count: 60, rms: [-50, -50] }  // silence 3s
+    ]);
+    const on = MP.buildSwitchPlan(frames, STD_MAPPING, { minHoldSec: 1.0, wideOnSilence: true });
+    const off = MP.buildSwitchPlan(frames, STD_MAPPING, { minHoldSec: 1.0, wideOnSilence: false });
+    // с wideOnSilence=true — появляется wide-сегмент (track 0) на тишине
+    assert.ok(on.segments.some(s => s.activeVideoTrack === 0), 'true → есть wide на тишине');
+    // с wideOnSilence=false — весь ролик держит спикера 0 (track 1), wide нет
+    assert.ok(!off.segments.some(s => s.activeVideoTrack === 0), 'false → wide на тишине нет');
+    assert.ok(off.segments.every(s => s.activeVideoTrack === 1), 'false → всё на камере спикера 0');
+  });
+});
+
+/* ──────────────────────────────────────────────────────────────
+ * computeSnapSources — источники привязки (Tier 3, 11.07.2026)
+ * ────────────────────────────────────────────────────────────── */
+
+describe('MulticamPlan.computeSnapSources', () => {
+  test('извлекает интервалы тишины и onset-ы речи из кадров', () => {
+    /* Спикер0 2с → тишина 1с → спикер1 2с. */
+    const frames = makeFrames([
+      { count: 40, rms: [-10, -50] }, // speaker 0, onset at 0
+      { count: 20, rms: [-50, -50] }, // silence [2,3]
+      { count: 40, rms: [-50, -10] }  // speaker 1, onset at 3
+    ]);
+    const src = MP.computeSnapSources(frames, { silenceThresholdDb: -35, bleedMarginDb: 6 });
+    // silences: один интервал [2,3]
+    assert.equal(src.silences.length, 1);
+    assert.ok(Math.abs(src.silences[0].startSec - 2.0) < 1e-6, 'silence start=2');
+    assert.ok(Math.abs(src.silences[0].endSec - 3.0) < 1e-6, 'silence end=3');
+    // onsets: начало речи спикера0 (0) и спикера1 (3)
+    assert.equal(src.speechOnsets.length, 2);
+    assert.ok(Math.abs(src.speechOnsets[0] - 0.0) < 1e-6, 'onset0=0');
+    assert.ok(Math.abs(src.speechOnsets[1] - 3.0) < 1e-6, 'onset1=3');
+  });
+
+  test('нет тишины/речи → пустые массивы, не падает', () => {
+    const src = MP.computeSnapSources([], { silenceThresholdDb: -35, bleedMarginDb: 6 });
+    assert.equal(src.silences.length, 0);
+    assert.equal(src.speechOnsets.length, 0);
+  });
 });
 
 /* ──────────────────────────────────────────────────────────────

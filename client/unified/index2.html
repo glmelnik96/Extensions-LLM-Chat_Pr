@@ -591,6 +591,39 @@
               <input type="range" id="mc-overlap" min="0" max="3" step="0.25" value="1" />
               <span class="param-val" id="mc-overlap-val">1с</span>
             </div>
+            <div class="param-row" title="Длина вставки общего плана, когда длинный монолог принудительно перебивается. Меньше = мелькающие короткие перебивки, больше = спокойные вставки подлиннее. Работает вместе с «Макс. план»">
+              <span class="param-label">Длина вставки</span>
+              <input type="range" id="mc-maxall" min="0.5" max="4" step="0.5" value="4" />
+              <span class="param-val" id="mc-maxall-val">4с</span>
+            </div>
+            <div class="param-row" title="Шаг анализа звука. Мельче (влево) = точнее границы резов, но анализ дольше; крупнее (вправо) = быстрее, границы грубее. По умолчанию 50мс — оптимум для речи">
+              <span class="param-label">Шаг анализа</span>
+              <input type="range" id="mc-framesec" min="0.05" max="0.2" step="0.05" value="0.05" />
+              <span class="param-val" id="mc-framesec-val">50мс</span>
+            </div>
+            <div class="param-row" title="Зерно случайной вариативности: меняет РИСУНОК разброса длительностей. Влияет ТОЛЬКО когда «Вариативность» > 0. Сдвинь, если текущий вариант нарезки не понравился — получишь другой">
+              <span class="param-label">Вариант</span>
+              <input type="range" id="mc-seed" min="1" max="20" step="1" value="1" />
+              <span class="param-val" id="mc-seed-val">#1</span>
+            </div>
+            <div class="param-row" title="На паузах (никто не говорит) переключаться на общий план. Выкл = держать камеру последнего говорившего, не прыгать на общий план в тишине">
+              <span class="param-label">Общий на паузах</span>
+              <input type="checkbox" id="mc-wide-silence" checked />
+            </div>
+            <div class="param-row" title="При перебивке (говорят разом) переключаться на общий план. Выкл = держать камеру последнего говорившего">
+              <span class="param-label">Общий на перебивках</span>
+              <input type="checkbox" id="mc-wide-overlap" checked />
+            </div>
+            <div class="param-row" title="Привязка резов к ближайшей паузе / началу речи в этом окне — чтобы переключение не падало посреди слова. 0 = выкл (резы строго по громкости). Больше = сильнее подтягивать к естественным точкам">
+              <span class="param-label">Привязка к паузам</span>
+              <input type="range" id="mc-snap" min="0" max="0.5" step="0.05" value="0" />
+              <span class="param-val" id="mc-snap-val">выкл</span>
+            </div>
+            <div class="param-row" title="Тонкий сдвиг точки привязки относительно начала речи: минус = раньше (рез до первого слова), плюс = позже. Работает только при «Привязка к паузам» > 0">
+              <span class="param-label">Сдвиг привязки</span>
+              <input type="range" id="mc-snapoff" min="-0.2" max="0.2" step="0.05" value="0" />
+              <span class="param-val" id="mc-snapoff-val">0мс</span>
+            </div>
             <!-- UX 10.07.2026: кнопка ПРЕДЛАГАЕТ план (Apply — отдельным шагом
                  в карточке предпросмотра), старое «и применить» вводило в заблуждение -->
             <button class="tool-run" data-tool="multicam">Проанализировать и предложить нарезку</button>

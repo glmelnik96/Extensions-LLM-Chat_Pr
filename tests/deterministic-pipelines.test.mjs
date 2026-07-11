@@ -1219,6 +1219,123 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     assert.notEqual(b1, b11, 'smoothingWindow должен менять план (иначе параметр не проброшен)');
   });
 
+  it('пробрасывает frameSec: сетка кадров сдвигает границы плана', async () => {
+    // Tier 1 (11.07.2026): frameSec выведен в UI. Границы сегментов кратны
+    // frameSec — переключение на не-сеточном времени (1.55с) снапится к разной
+    // сетке при 0.05 и 0.2 → разные tStart. Оба сегмента > minHold, чтобы
+    // enforceMinHold их не схлопнул.
+    const tlA = [], tlB = [];
+    for (let i = 1; i <= 400; i++) {
+      const t = +(i * 0.05).toFixed(3);
+      const aLoud = i <= 31; // A громче первые 1.55с, дальше B
+      tlA.push({ t, rms: aLoud ? -10 : -50 });
+      tlB.push({ t, rms: aLoud ? -50 : -10 });
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [tlA, tlB] })
+    };
+    const fine = await DP.multicamFromAudio(ctx, { frameSec: 0.05 });
+    const coarse = await DP.multicamFromAudio(ctx, { frameSec: 0.2 });
+    assert.equal(fine.ok, true);
+    assert.equal(coarse.ok, true);
+    const bf = fine.proposal.plan.segments.map(s => s.tStart.toFixed(3)).join(',');
+    const bc = coarse.proposal.plan.segments.map(s => s.tStart.toFixed(3)).join(',');
+    assert.notEqual(bf, bc, 'frameSec должен менять сетку границ (иначе параметр не проброшен)');
+  });
+
+  it('пробрасывает maxAllSpeakersSec: длина wide-вставки меняет план', async () => {
+    // Tier 1: maxAllSpeakersSec выведен в UI. Непрерывный спикер 20с режется
+    // maxHold=8 на куски с wide-мостами длиной min(maxHold/4, maxAllSpeakersSec).
+    // maxAllSpeakersSec=0.5 даёт мосты 0.5с (vs дефолтные 2с) → другой план.
+    const tlA = [], tlB = [];
+    for (let i = 1; i <= 400; i++) {
+      const t = +(i * 0.05).toFixed(3);
+      tlA.push({ t, rms: -10 });
+      tlB.push({ t, rms: -50 });
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [tlA, tlB] })
+    };
+    const wide2 = await DP.multicamFromAudio(ctx, {});               // bridge = min(2, 4) = 2с
+    const wideShort = await DP.multicamFromAudio(ctx, { maxAllSpeakersSec: 0.5 }); // bridge = 0.5с
+    assert.equal(wide2.ok, true);
+    assert.equal(wideShort.ok, true);
+    const b2 = wide2.proposal.plan.segments.map(s => `${s.tStart.toFixed(3)}:${s.activeVideoTrack}`).join(',');
+    const bs = wideShort.proposal.plan.segments.map(s => `${s.tStart.toFixed(3)}:${s.activeVideoTrack}`).join(',');
+    assert.notEqual(b2, bs, 'maxAllSpeakersSec должен менять длину wide-мостов (иначе не проброшен)');
+  });
+
+  it('пробрасывает variationsSeed: разный seed при том же jitter даёт разные границы', async () => {
+    // Tier 1: variationsSeed выведен в UI. При variationsJitterSec>0 seed
+    // задаёт детерминированный сдвиг границ — разный seed → разные границы.
+    const tlA = [], tlB = [];
+    for (let i = 1; i <= 400; i++) {
+      const t = +(i * 0.05).toFixed(3);
+      tlA.push({ t, rms: -10 });
+      tlB.push({ t, rms: -50 });
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [tlA, tlB] })
+    };
+    const seed1 = await DP.multicamFromAudio(ctx, { maxHoldSec: 3, variationsJitterSec: 0.4, variationsSeed: 1 });
+    const seed2 = await DP.multicamFromAudio(ctx, { maxHoldSec: 3, variationsJitterSec: 0.4, variationsSeed: 2 });
+    assert.equal(seed1.ok, true);
+    assert.equal(seed2.ok, true);
+    const b1 = seed1.proposal.plan.segments.map(s => s.tStart.toFixed(4)).join(',');
+    const b2 = seed2.proposal.plan.segments.map(s => s.tStart.toFixed(4)).join(',');
+    assert.notEqual(b1, b2, 'variationsSeed должен менять границы при jitter>0 (иначе не проброшен)');
+  });
+
+  it('пробрасывает snapWindowSec: привязка границ к паузам/onset меняет план', async () => {
+    // Tier 3 (11.07.2026): multicamFromAudio теперь СЧИТАЕТ onset-ы/тишину из RMS
+    // и прокидывает в buildSwitchPlan. Спикер0 говорит с паузами 0.2с каждые 2с;
+    // maxHold=3 режет речь на куски с wide-мостами → границы мостов при
+    // snapWindowSec>0 подтягиваются к ближайшим паузам/onset.
+    const tlA = [], tlB = [];
+    for (let i = 0; i < 480; i++) {
+      const t = +(i * 0.05).toFixed(3);
+      const inPause = (i % 40) >= 36; // 0.2с пауза каждые 2.0с
+      tlA.push({ t, rms: inPause ? -50 : -10 });
+      tlB.push({ t, rms: -50 });
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [tlA, tlB] })
+    };
+    const off = await DP.multicamFromAudio(ctx, { minHoldSec: 1.0, maxHoldSec: 3, overlapWideMinSec: 0, snapWindowSec: 0 });
+    const on = await DP.multicamFromAudio(ctx, { minHoldSec: 1.0, maxHoldSec: 3, overlapWideMinSec: 0, snapWindowSec: 0.5 });
+    assert.equal(off.ok, true);
+    assert.equal(on.ok, true);
+    const bOff = off.proposal.plan.segments.map(s => s.tStart.toFixed(3)).join(',');
+    const bOn = on.proposal.plan.segments.map(s => s.tStart.toFixed(3)).join(',');
+    assert.notEqual(bOff, bOn, 'snapWindowSec должен подтягивать границы (иначе источники не считаются/не проброшены)');
+  });
+
+  it('пробрасывает wideOnSilence=false: тишина держит спикера, а не общий план', async () => {
+    // Tier «оживления тумблеров»: спикер0 3с, затем 3с тишины.
+    const tlA = [], tlB = [];
+    for (let i = 0; i < 120; i++) {
+      const t = +(i * 0.05).toFixed(3);
+      tlA.push({ t, rms: i < 60 ? -10 : -50 });
+      tlB.push({ t, rms: -50 });
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [tlA, tlB] })
+    };
+    const on = await DP.multicamFromAudio(ctx, { minHoldSec: 1.0, wideOnSilence: true });
+    const off = await DP.multicamFromAudio(ctx, { minHoldSec: 1.0, wideOnSilence: false });
+    assert.equal(on.ok, true);
+    assert.equal(off.ok, true);
+    // wideOnSilence=true → на тишине есть общий план (track 0)
+    assert.ok(on.proposal.plan.segments.some(s => s.activeVideoTrack === 0), 'true → wide на тишине');
+    // wideOnSilence=false → тишина держит камеру спикера0 (track 1), wide нет
+    assert.ok(!off.proposal.plan.segments.some(s => s.activeVideoTrack === 0), 'false → wide на тишине нет (не проброшен?)');
+  });
+
   it('errors when fewer than 2 video tracks (need wide + ≥1 speaker)', async () => {
     const ctx = {
       snapshot: { ok: true, tracks: [{ type: 'video', index: 0 }, { type: 'audio', index: 0 }] },

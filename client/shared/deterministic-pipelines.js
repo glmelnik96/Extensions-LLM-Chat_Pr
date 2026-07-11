@@ -2029,7 +2029,23 @@
     if (typeof params.variationsJitterSec === 'number') planParams.variationsJitterSec = params.variationsJitterSec;
     if (typeof params.variationsSeed === 'number') planParams.variationsSeed = params.variationsSeed;
     if (Array.isArray(params.speechOnsets)) planParams.speechOnsets = params.speechOnsets;
-    var built = MulticamPlan.buildSwitchPlan(frames, mapping, planParams, params.silences || null);
+    /* Tier «оживления тумблеров»: тишина/перебивка держат последнего спикера */
+    if (typeof params.wideOnSilence === 'boolean') planParams.wideOnSilence = params.wideOnSilence;
+    if (typeof params.wideOnOverlap === 'boolean') planParams.wideOnOverlap = params.wideOnOverlap;
+    /* Tier 3: привязка границ. snapWindowSec>0 → считаем onset-ы/тишину из тех же
+       кадров и прокидываем; раньше snap-путь простаивал (некому было их считать). */
+    if (typeof params.snapWindowSec === 'number') planParams.snapWindowSec = params.snapWindowSec;
+    if (typeof params.frameOffsetSec === 'number') planParams.frameOffsetSec = params.frameOffsetSec;
+    var snapSilences = params.silences || null;
+    if (planParams.snapWindowSec > 0 && !Array.isArray(planParams.speechOnsets)) {
+      var snapSrc = MulticamPlan.computeSnapSources(frames, {
+        silenceThresholdDb: silenceDb,
+        bleedMarginDb: planParams.bleedMarginDb
+      });
+      planParams.speechOnsets = snapSrc.speechOnsets;
+      if (!snapSilences) snapSilences = snapSrc.silences;
+    }
+    var built = MulticamPlan.buildSwitchPlan(frames, mapping, planParams, snapSilences);
     if (!built.segments || !built.segments.length) {
       return { ok: false, error: 'Не удалось построить план переключений.' };
     }
