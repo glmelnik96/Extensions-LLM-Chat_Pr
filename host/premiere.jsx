@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.7.1';
+$._EXT_PRM_.version = '2.8.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -2396,6 +2396,251 @@ $._EXT_PRM_.getDiarizeMicSources = function () {
 };
 
 /**
+ * Вертикаль 9:16 (Волна 3 п.5, 10.07.2026), read-only перечисление.
+ * Возвращает видеоклипы активной секвенции для планировщика рефрейма:
+ * file-клипы — с mediaPath (размеры добудет панель через ffprobe),
+ * nest-клипы — с псевдо-путём «nest:<id>» и размерами inner-секвенции
+ * в nestDims (ffprobe для них невозможен и не нужен).
+ */
+$._EXT_PRM_.getVerticalReframeSources = function () {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+    var clips = [];
+    var nestDims = {};
+    var noMedia = [];
+    var ti, ci, tr, c, pi, mp;
+    for (ti = 0; ti < seq.videoTracks.numTracks; ti++) {
+      tr = seq.videoTracks[ti];
+      for (ci = 0; ci < tr.clips.numItems; ci++) {
+        c = tr.clips[ci];
+        if (!c) continue;
+        pi = c.projectItem;
+        mp = '';
+        try { if (pi && typeof pi.getMediaPath === 'function') mp = pi.getMediaPath(); } catch (eP) {}
+        if (mp && $._EXT_PRM_._fileExists(mp)) {
+          clips.push({
+            trackIndex: ti, clipIndex: ci,
+            name: String(c.name || ''),
+            mediaPath: String(mp).replace(/\\/g, '/')
+          });
+          continue;
+        }
+        var inner = $._EXT_PRM_._resolveNestInner(c);
+        if (inner) {
+          var innerId = '';
+          try { innerId = String(inner.sequenceID || inner.name || ''); } catch (eSid) {}
+          var key = 'nest:' + innerId;
+          if (!nestDims[key]) {
+            var iw = 0, ih = 0;
+            try { iw = Number(inner.frameSizeHorizontal) || 0; ih = Number(inner.frameSizeVertical) || 0; } catch (eFS) {}
+            nestDims[key] = { width: iw, height: ih };
+          }
+          clips.push({
+            trackIndex: ti, clipIndex: ci,
+            name: String(c.name || ''),
+            mediaPath: key
+          });
+          continue;
+        }
+        noMedia.push(String(c.name || ('V' + (ti + 1) + '#' + (ci + 1))));
+      }
+    }
+    if (!clips.length) {
+      return JSON.stringify({
+        ok: false,
+        code: 'NO_VIDEO_CLIPS',
+        error: 'В активной секвенции нет видеоклипов с медиа (файлы offline или дорожки пустые).'
+      });
+    }
+    return JSON.stringify({
+      ok: true,
+      sequenceName: seq.name || '',
+      frameWidth: Number(seq.frameSizeHorizontal) || 0,
+      frameHeight: Number(seq.frameSizeVertical) || 0,
+      clips: clips,
+      nestDims: nestDims,
+      noMedia: noMedia,
+      hostVersion: $._EXT_PRM_.version
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
+ * Вертикаль 9:16 — применение плана. Исходная секвенция НЕ трогается:
+ * clone() → переименование → setSettings(targetW×targetH) → Motion
+ * Scale/Position по items из planVerticalReframe. Самовалидация ВСЕГО
+ * плана до первой мутации (границы индексов по исходнику, диапазоны
+ * scale/pos) — reject, не кламп (last line of defense).
+ * plan: {expectedSequenceName, newName, targetW, targetH,
+ *        items:[{trackIndex, clipIndex, scalePct, posX, posY}]}.
+ */
+$._EXT_PRM_.applyVerticalReframe = function (jsonPlan) {
+  if (!app.project || !app.project.activeSequence) {
+    return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+  }
+  var plan;
+  try {
+    plan = JSON.parse(jsonPlan);
+  } catch (eJ) {
+    return JSON.stringify({ ok: false, error: 'Невалидный JSON плана: ' + String(eJ) });
+  }
+  if (!plan || !plan.items || !plan.items.length) {
+    return JSON.stringify({ ok: false, error: 'plan.items пустой' });
+  }
+  var newName = String(plan.newName || '');
+  if (!newName) {
+    return JSON.stringify({ ok: false, error: 'plan.newName обязателен' });
+  }
+  var targetW = Number(plan.targetW);
+  var targetH = Number(plan.targetH);
+  if (!(targetW >= 256 && targetW <= 8192) || !(targetH >= 256 && targetH <= 8192)) {
+    return JSON.stringify({ ok: false, error: 'targetW/targetH вне диапазона 256–8192: ' + targetW + 'x' + targetH });
+  }
+  var seq = app.project.activeSequence;
+  if (plan.expectedSequenceName && String(seq.name) !== String(plan.expectedSequenceName)) {
+    return JSON.stringify({
+      ok: false,
+      error: 'Активная секвенция «' + seq.name + '» не та, для которой построен план («' +
+        plan.expectedSequenceName + '») — план отклонён. Откройте нужную секвенцию и повторите.',
+      hostVersion: $._EXT_PRM_.version
+    });
+  }
+  /* Валидация ВСЕХ items по исходной секвенции ДО clone (клон идентичен). */
+  var i, it;
+  for (i = 0; i < plan.items.length; i++) {
+    it = plan.items[i];
+    var bad = null;
+    if (!it) bad = 'items[' + i + '] пустой';
+    else if (typeof it.trackIndex !== 'number' || it.trackIndex % 1 !== 0 ||
+      it.trackIndex < 0 || it.trackIndex >= seq.videoTracks.numTracks) {
+      bad = 'items[' + i + '].trackIndex=' + it.trackIndex + ' вне границ (видеодорожек: ' + seq.videoTracks.numTracks + ')';
+    } else if (typeof it.clipIndex !== 'number' || it.clipIndex % 1 !== 0 ||
+      it.clipIndex < 0 || it.clipIndex >= seq.videoTracks[it.trackIndex].clips.numItems) {
+      bad = 'items[' + i + '].clipIndex=' + it.clipIndex + ' вне границ дорожки V' + (it.trackIndex + 1);
+    } else if (!(it.scalePct > 0 && it.scalePct <= 1000)) {
+      bad = 'items[' + i + '].scalePct=' + it.scalePct + ' вне (0, 1000]';
+    } else if (!(it.posX >= -5 && it.posX <= 5) || !(it.posY >= -5 && it.posY <= 5)) {
+      bad = 'items[' + i + '] position вне [-5, 5]: ' + it.posX + ', ' + it.posY;
+    }
+    if (bad) {
+      return JSON.stringify({ ok: false, error: 'План отклонён, ничего не изменено: ' + bad });
+    }
+  }
+  /* Имя не должно совпадать с существующей секвенцией (иначе клон не найти однозначно). */
+  var seqs = app.project.sequences;
+  var existingIds = {};
+  for (i = 0; i < seqs.numSequences; i++) {
+    var sid = '';
+    try { sid = String(seqs[i].sequenceID); } catch (eSid) {}
+    if (sid) existingIds[sid] = 1;
+    if (String(seqs[i].name) === newName) {
+      return JSON.stringify({ ok: false, error: 'Секвенция «' + newName + '» уже существует — удалите или переименуйте её.' });
+    }
+  }
+  var undoOpened = false;
+  try {
+    if (typeof app.beginUndoGroup === 'function') {
+      app.beginUndoGroup('ИИ: вертикаль 9:16');
+      undoOpened = true;
+    }
+  } catch (eU) {}
+  var applied = 0;
+  var failed = [];
+  var newSeq = null;
+  try {
+    try { seq.clone(); } catch (eC) {
+      return JSON.stringify({ ok: false, error: 'clone() не удался: ' + String(eC && eC.message ? eC.message : eC) });
+    }
+    /* Ищем клон по новому sequenceID. */
+    var seqs2 = app.project.sequences;
+    for (i = 0; i < seqs2.numSequences; i++) {
+      var sid2 = '';
+      try { sid2 = String(seqs2[i].sequenceID); } catch (eS2) {}
+      if (sid2 && !existingIds[sid2]) { newSeq = seqs2[i]; break; }
+    }
+    if (!newSeq) {
+      return JSON.stringify({ ok: false, error: 'clone() прошёл, но новая секвенция не найдена' });
+    }
+    newSeq.name = newName;
+    var st = newSeq.getSettings();
+    st.videoFrameWidth = targetW;
+    st.videoFrameHeight = targetH;
+    try { st.previewFrameWidth = targetW; st.previewFrameHeight = targetH; } catch (ePv) {}
+    newSeq.setSettings(st);
+    /* Motion per клип. Порядок properties стабилен (Position=0, Scale=1),
+       displayName-матч первичен — переживает будущие перестановки. */
+    for (i = 0; i < plan.items.length; i++) {
+      it = plan.items[i];
+      var why = '';
+      try {
+        var clip = newSeq.videoTracks[it.trackIndex].clips[it.clipIndex];
+        if (!clip) { why = 'клип не найден в клоне'; }
+        else {
+          var motion = null;
+          var comps = clip.components;
+          for (var cIdx = 0; cIdx < comps.numItems; cIdx++) {
+            var mn = '';
+            try { mn = String(comps[cIdx].matchName || ''); } catch (eMn) {}
+            if (mn === 'AE.ADBE Motion' || String(comps[cIdx].displayName) === 'Motion') {
+              motion = comps[cIdx];
+              break;
+            }
+          }
+          if (!motion) { why = 'нет компонента Motion'; }
+          else {
+            var props = motion.properties;
+            var posProp = null, scaleProp = null;
+            for (var pIdx = 0; pIdx < props.numItems; pIdx++) {
+              var dn = String(props[pIdx].displayName);
+              if (dn === 'Position') posProp = props[pIdx];
+              else if (dn === 'Scale') scaleProp = props[pIdx];
+            }
+            if (!posProp && props.numItems > 0) posProp = props[0];
+            if (!scaleProp && props.numItems > 1) scaleProp = props[1];
+            if (!posProp || !scaleProp) { why = 'нет Position/Scale в Motion'; }
+            else {
+              scaleProp.setValue(it.scalePct, true);
+              posProp.setValue([it.posX, it.posY], true);
+              applied++;
+            }
+          }
+        }
+      } catch (eApply) {
+        why = String(eApply && eApply.message ? eApply.message : eApply);
+      }
+      if (why && failed.length < 5) {
+        failed.push('V' + (it.trackIndex + 1) + '#' + (it.clipIndex + 1) + ': ' + why);
+      }
+    }
+  } finally {
+    if (undoOpened) try { app.endUndoGroup(); } catch (eEU) {}
+  }
+  if (!applied) {
+    return JSON.stringify({
+      ok: false,
+      error: 'Ни один клип не отрефреймлен (' + (failed.length ? failed.join('; ') : 'причина неизвестна') +
+        '). Секвенция «' + newName + '» создана — удалите её и повторите.',
+      hostVersion: $._EXT_PRM_.version
+    });
+  }
+  return JSON.stringify({
+    ok: true,
+    sequenceName: newName,
+    frameWidth: targetW,
+    frameHeight: targetH,
+    applied: applied,
+    total: plan.items.length,
+    failed: failed,
+    hostVersion: $._EXT_PRM_.version
+  });
+};
+
+/**
  * Экспорт In–Out чанками (меньше 413 на Whisper). Восстанавливает In/Out.
  */
 $._EXT_PRM_._exportInOutAsChunks = function (seq, preset, root, chunkSec, chunkExt) {
@@ -3295,7 +3540,9 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     'setPlayheadSec',
     'backupActiveSequence',
     'activateSequenceById',
-    'getDiarizeMicSources'
+    'getDiarizeMicSources',
+    'getVerticalReframeSources',
+    'applyVerticalReframe'
   ];
   for (var i = 0; i < EXPORTED.length; i++) {
     var name = EXPORTED[i];

@@ -7082,6 +7082,107 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
     }
 
+    /* ── «📱 Вертикаль 9:16»: рефрейм для шортсов (Волна 3 п.5, 10.07.2026).
+       Исходная секвенция read-only: host clone() → setSettings 1080×1920 →
+       Motion Scale/Position по чистому плану planVerticalReframe (cover-кроп,
+       фокус — смещениями per-камера, vision исключён). Размеры исходников —
+       ffprobe локально; для nest-клипов host отдаёт размеры inner-секвенции. */
+    async function toolsRunVertical() {
+      if (!beginOperation('tools:vertical')) {
+        toolsShowErr('Идёт обработка в чате — дождитесь завершения (кнопка «Стоп» на вкладке «Чат»).');
+        return;
+      }
+      toolsDisableRun(true);
+      toolsStatusUi.show('Читаю видеоклипы секвенции…', true);
+      var resEl = document.getElementById('vt-result');
+      if (resEl) { resEl.textContent = ''; }
+      var keepStatus = false;
+      try {
+        var src = await new Promise(function (resolve, reject) {
+          PremiereBridge.getVerticalReframeSources(function (err, data) {
+            if (err) reject(err); else resolve(data);
+          });
+        });
+        if (!src || !src.ok) {
+          toolsShowErr((src && src.error) || 'Не удалось перечислить видеоклипы.');
+          return;
+        }
+        var seqName = String(src.sequenceName || '');
+        /* Размеры: nest — от host (inner-секвенция), файлы — ffprobe один раз. */
+        var dims = {};
+        var nd = src.nestDims || {};
+        for (var nk in nd) {
+          if (nd[nk] && nd[nk].width > 0 && nd[nk].height > 0) dims[nk] = nd[nk];
+        }
+        var pathSet = {};
+        for (var ci = 0; ci < src.clips.length; ci++) {
+          var mp = src.clips[ci].mediaPath || '';
+          if (mp && mp.indexOf('nest:') !== 0) pathSet[mp] = 1;
+        }
+        var paths = Object.keys(pathSet);
+        var doneCount = 0;
+        var showProbeStatus = function () {
+          toolsStatusUi.show('Определяю размеры исходников: ' + doneCount + ' из ' + paths.length + '…', true);
+        };
+        if (paths.length) showProbeStatus();
+        await Promise.all(paths.map(function (p) {
+          return AudioPreprocess.probeVideoDimensions(p).then(function (d) {
+            doneCount++;
+            showProbeStatus();
+            if (d) dims[p] = d; /* null → планировщик пропустит клип с причиной */
+          });
+        }));
+        var offsetsEl = document.getElementById('vt-offsets');
+        var offsets = DeterministicPipelines.parseVerticalOffsets(offsetsEl ? offsetsEl.value : '');
+        var plan = DeterministicPipelines.planVerticalReframe(src.clips, dims, { offsets: offsets });
+        if (!plan.items.length) {
+          toolsShowErr('Не удалось спланировать ни один клип' +
+            (plan.skipped.length ? ' (' + plan.skipped[0].name + ': ' + plan.skipped[0].reason + ')' : '') + '.');
+          return;
+        }
+        toolsStatusUi.show('Создаю вертикальную копию (' + plan.items.length + ' клипов)…', true);
+        var resp = await new Promise(function (resolve, reject) {
+          PremiereBridge.applyVerticalReframe({
+            expectedSequenceName: seqName,
+            newName: seqName + ' — 9x16',
+            targetW: 1080,
+            targetH: 1920,
+            items: plan.items
+          }, function (err, data) {
+            if (err) reject(err); else resolve(data);
+          });
+        });
+        if (!resp || !resp.ok) {
+          toolsShowErr((resp && resp.error) || 'Не удалось создать вертикальную секвенцию.');
+          return;
+        }
+        var lines = [
+          'Создана секвенция «' + resp.sequenceName + '» (1080×1920).',
+          'Отрефреймлено ' + resp.applied + ' из ' + plan.total + ' клипов.'
+        ];
+        for (var sk = 0; sk < plan.skipped.length && sk < 5; sk++) {
+          lines.push('Пропущен ' + plan.skipped[sk].name + ': ' + plan.skipped[sk].reason);
+        }
+        var fl = resp.failed || [];
+        for (var fi = 0; fi < fl.length; fi++) lines.push('Не применён ' + fl[fi]);
+        var nm = src.noMedia || [];
+        if (nm.length) lines.push('Без медиа (не тронуты): ' + nm.slice(0, 5).join(', ') + (nm.length > 5 ? '…' : ''));
+        if (resEl) {
+          resEl.style.whiteSpace = 'pre-line';
+          resEl.textContent = lines.join('\n');
+        }
+        toolsStatusUi.show('Вертикаль готова ✓', false);
+        keepStatus = true;
+        setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+      } catch (e) {
+        toolsShowErr(String(e.message || e));
+      } finally {
+        endOperation();
+        toolsDisableRun(false);
+        if (!keepStatus) toolsStatusUi.hide();
+      }
+    }
+
     /* ── Run tool ─────────────────────────────────────────── */
     async function toolsRunTool(toolName) {
       toolsShowErr('');
@@ -7090,6 +7191,10 @@ PanelBoot.run('ИИ: монтаж', function () {
       /* «🗣 Спикеры» — не proposal-пайплайн (ничего не режет): своя ветка
          с записью меток прямо в кэш транскрипта. */
       if (toolName === 'speakers') { await toolsRunDiarize(); return; }
+
+      /* «📱 Вертикаль 9:16» — тоже не proposal: исходник не трогается,
+         результат — новая секвенция (откат = удалить её). */
+      if (toolName === 'vertical') { await toolsRunVertical(); return; }
 
       var pipelineFn, params = {}, proposalId;
 

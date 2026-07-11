@@ -97,6 +97,27 @@
   }
 
   /**
+   * Размеры кадра первого видеопотока (парс «Stream #… Video: … WxH» из
+   * stderr ffmpeg). Для карточки «📱 Вертикаль 9:16»: cover-скейл считается
+   * от родных размеров исходника. Promise<{width, height}|null>.
+   */
+  function probeVideoDimensions(inputPath) {
+    return runFfmpeg(['-hide_banner', '-i', inputPath], 30000).then(function (res) {
+      var lines = String(res.stderr || '').split('\n');
+      for (var i = 0; i < lines.length; i++) {
+        if (!/Stream #\d+:\d+.*: Video:/.test(lines[i])) continue;
+        var m = lines[i].match(/\b(\d{2,5})x(\d{2,5})\b/);
+        if (m) {
+          var w = parseInt(m[1], 10);
+          var h = parseInt(m[2], 10);
+          if (w > 0 && h > 0) return { width: w, height: h };
+        }
+      }
+      return null;
+    }).catch(function () { return null; });
+  }
+
+  /**
    * silencedetect: парсим stderr ffmpeg.
    * threshold в dB (например -30 → тише -30 dBFS считается тишиной).
    * minDurationSec — минимальная длина тихого участка.
@@ -339,6 +360,7 @@
     hasNode: hasNode,
     findFfmpegPath: findFfmpegPath,
     probeDurationSec: probeDurationSec,
+    probeVideoDimensions: probeVideoDimensions,
     detectSilences: detectSilences,
     analyzeLoudness: analyzeLoudness,
     computeRmsTimeline: computeRmsTimeline,

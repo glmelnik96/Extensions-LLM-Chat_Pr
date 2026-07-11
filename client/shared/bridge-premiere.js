@@ -255,6 +255,17 @@
       this.evalJson('$._EXT_PRM_.getDiarizeMicSources()', cb);
     },
 
+    /** Вертикаль 9:16: перечислить видеоклипы активной секвенции (read-only). */
+    getVerticalReframeSources: function (cb) {
+      this.evalJson('$._EXT_PRM_.getVerticalReframeSources()', cb);
+    },
+
+    /** Вертикаль 9:16: clone → setSettings 1080×1920 → Motion Scale/Position по плану. */
+    applyVerticalReframe: function (planObj, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify(planObj));
+      this.evalJson('$._EXT_PRM_.applyVerticalReframe("' + json + '")', cb, { mutating: true });
+    },
+
     /** B2-9: Revert — активировать бэкап-секвенцию по sequenceID. */
     activateSequenceById: function (seqId, cb) {
       var s = String(seqId).replace(/"/g, '\\"');

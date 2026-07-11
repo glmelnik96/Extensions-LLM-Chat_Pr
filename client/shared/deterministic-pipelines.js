@@ -1524,6 +1524,89 @@
   }
 
   /**
+   * Смещения кадрирования по камерам для карточки «📱 Вертикаль 9:16».
+   * Формат: «имя: сдвиг%[; имя: сдвиг%…]» (разделители «;» или перенос
+   * строки). Сдвиг — позиция фокуса в % ширины исходника относительно
+   * центра (− влево, + вправо). Матч имени — case-insensitive substring
+   * по имени клипа. Пусто/целиком мусор → null (все клипы — центр-кроп).
+   */
+  function parseVerticalOffsets(raw) {
+    var s = String(raw == null ? '' : raw).trim();
+    if (!s) return null;
+    var out = [];
+    var entries = s.split(/[;\n]+/);
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i].trim();
+      if (!e) continue;
+      var m = e.match(/^(.+?)\s*[:=]\s*(-?\d+(?:[.,]\d+)?)\s*%?$/);
+      if (!m) continue;
+      var name = m[1].trim().toLowerCase();
+      var pct = parseFloat(m[2].replace(',', '.'));
+      if (!name || !isFinite(pct)) continue;
+      out.push({ match: name, offsetPct: pct });
+    }
+    return out.length ? out : null;
+  }
+
+  /**
+   * Чистый планировщик рефрейма горизонтальной секвенции в вертикальную
+   * (обычно 16:9 → 9:16 1080×1920). Cover-скейл: кадр заполняет target без
+   * полей, излишек кропится позицией. Vision исключён — фокус задаётся
+   * смещением per-камера (substring-матч имени клипа), окно кропа
+   * клампится в границы исходника; вертикальный излишек всегда по центру.
+   *
+   * clips: [{trackIndex, clipIndex, name, mediaPath}] (host-перечисление);
+   * dimsByPath: {[mediaPath]: {width, height}} (ffprobe на панели);
+   * opts: {targetW=1080, targetH=1920, offsets: parseVerticalOffsets()|null}.
+   * Возвращает {items:[{trackIndex, clipIndex, scalePct, posX, posY}],
+   * skipped:[{name, reason}], total}. Position — нормированные координаты
+   * НОВОГО кадра ([0.5, 0.5] = центр, ось X растёт вправо).
+   */
+  function planVerticalReframe(clips, dimsByPath, opts) {
+    var o = opts || {};
+    var targetW = o.targetW > 0 ? o.targetW : 1080;
+    var targetH = o.targetH > 0 ? o.targetH : 1920;
+    var offsets = o.offsets || null;
+    var res = { items: [], skipped: [], total: 0 };
+    if (!clips || !clips.length || !dimsByPath) return res;
+    res.total = clips.length;
+    for (var i = 0; i < clips.length; i++) {
+      var c = clips[i];
+      if (!c) continue;
+      var dims = c.mediaPath ? dimsByPath[c.mediaPath] : null;
+      if (!dims || !(dims.width > 0) || !(dims.height > 0)) {
+        res.skipped.push({ name: String(c.name || c.mediaPath || '?'), reason: 'неизвестны размеры кадра исходника' });
+        continue;
+      }
+      var scale = Math.max(targetW / dims.width, targetH / dims.height);
+      var displayedW = dims.width * scale;
+      /* фокус f ∈ [0..1] по ширине исходника; клампим окно кропа в кадр */
+      var f = 0.5;
+      if (offsets) {
+        var nameLc = String(c.name || '').toLowerCase();
+        for (var j = 0; j < offsets.length; j++) {
+          if (nameLc.indexOf(offsets[j].match) !== -1) {
+            f = 0.5 + offsets[j].offsetPct / 100;
+            break;
+          }
+        }
+      }
+      var halfWin = Math.min(0.5, (targetW / displayedW) / 2);
+      if (f < halfWin) f = halfWin;
+      if (f > 1 - halfWin) f = 1 - halfWin;
+      var posX = 0.5 + (0.5 - f) * displayedW / targetW;
+      res.items.push({
+        trackIndex: c.trackIndex,
+        clipIndex: c.clipIndex,
+        scalePct: Math.round(scale * 10000) / 100,
+        posX: Math.round(posX * 10000) / 10000,
+        posY: 0.5
+      });
+    }
+    return res;
+  }
+
+  /**
    * Кастомный маппинг дорожек по спикерам (AutoPod-паттерн «теги дорожек»,
    * live-запрос 12 июня 2026): авто-схема «V1 wide, A(i)→V(i+1)» ломается,
    * когда микрофоны не на первых аудиодорожках (камерный звук BRAW) или
@@ -1799,6 +1882,8 @@
     assignSpeakersByRms: assignSpeakersByRms,
     micPartsToTimeline: micPartsToTimeline,
     parseAudioTrackFilter: parseAudioTrackFilter,
+    parseVerticalOffsets: parseVerticalOffsets,
+    planVerticalReframe: planVerticalReframe,
     _normalizeMulticamMapping: _normalizeMulticamMapping,
     detectSilenceIntervals: detectSilenceIntervals,
     silenceIntervalsFromRms: silenceIntervalsFromRms,

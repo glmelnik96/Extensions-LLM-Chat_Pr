@@ -587,6 +587,25 @@
             <div class="proposal-area" id="dz-result"></div>
           </div>
 
+          <!-- 5c. Вертикаль 9:16 (Волна 3 п.5, 10.07.2026) — рефрейм для
+               шортсов. Исходник НЕ трогается: clone → 1080×1920 → Motion
+               Scale/Position per клип (cover-кроп). Vision исключён:
+               фокус задаётся смещениями per-камера. -->
+          <div class="tool-card" id="card-vertical">
+            <div class="tool-card-title">📱 Вертикаль 9:16</div>
+            <div class="tool-card-desc">
+              Копия активной секвенции в 1080×1920 для шортсов: каждый клип
+              масштабируется на весь кадр (cover), горизонтальный излишек
+              кропится. Исходная секвенция не меняется.
+            </div>
+            <div class="param-row" title="Куда смотреть в кадре у каждой камеры: «имя клипа: сдвиг%». Сдвиг — в % ширины кадра от центра, минус = левее, плюс = правее. Пример: «Гость: -20; Ведущий: 15». Пусто = центр у всех.">
+              <span class="param-label">Фокус камер</span>
+              <input type="text" id="vt-offsets" placeholder="Гость: -20; Ведущий: 15 (пусто = центр)" style="flex:1;min-width:0;" />
+            </div>
+            <button class="tool-run" data-tool="vertical">Создать вертикальную копию</button>
+            <div class="proposal-area" id="vt-result"></div>
+          </div>
+
           <!-- 6. J-cuts / L-cuts — ОТКЛЮЧЕНО (ограничение ExtendScript) -->
           <div class="tool-card" id="card-jcuts" style="opacity:0.5;pointer-events:none;">
             <div class="tool-card-title">🎬 J-cuts / L-cuts</div>

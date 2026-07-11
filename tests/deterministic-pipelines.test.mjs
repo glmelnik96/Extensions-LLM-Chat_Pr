@@ -1866,3 +1866,125 @@ describe('DeterministicPipelines.parseAudioTrackFilter', () => {
     assert.equal(DP.parseAudioTrackFilter('0'), null);
   });
 });
+
+/* ═══ parseVerticalOffsets: пользовательские смещения кадрирования по камерам
+ * для карточки «📱 Вертикаль 9:16». Формат: «имя: сдвиг%[; имя: сдвиг%…]»,
+ * сдвиг — фокус в % ширины исходника (− влево, + вправо, 0 = центр). ═══ */
+
+describe('DeterministicPipelines.parseVerticalOffsets', () => {
+  it('пусто / null → null (все клипы центр-кроп)', () => {
+    assert.equal(DP.parseVerticalOffsets(''), null);
+    assert.equal(DP.parseVerticalOffsets(null), null);
+    assert.equal(DP.parseVerticalOffsets('   '), null);
+  });
+
+  it('«Гость: -20; Ведущий: 15» → 2 записи, match в lower-case', () => {
+    const out = DP.parseVerticalOffsets('Гость: -20; Ведущий: 15');
+    const pairs = [...out].map((o) => o.match + '=' + o.offsetPct);
+    assert.equal(pairs.join('|'), 'гость=-20|ведущий=15');
+  });
+
+  it('перенос строки как разделитель, дробные проценты', () => {
+    const out = DP.parseVerticalOffsets('Cam A: 12.5\nCam B: -7.5');
+    const pairs = [...out].map((o) => o.match + '=' + o.offsetPct);
+    assert.equal(pairs.join('|'), 'cam a=12.5|cam b=-7.5');
+  });
+
+  it('мусорные записи отбрасываются; целиком мусор → null', () => {
+    const out = DP.parseVerticalOffsets('чушь без числа; Гость: -20');
+    assert.equal(out.length, 1);
+    assert.equal(out[0].match, 'гость');
+    assert.equal(DP.parseVerticalOffsets('просто текст'), null);
+  });
+});
+
+/* ═══ planVerticalReframe: чистый планировщик рефрейма 16:9 → 9:16.
+ * Cover-скейл (кадр заполняет 1080×1920 без полей), горизонтальный излишек
+ * кропится позицией; фокус по смещению камеры (substring-матч имени клипа),
+ * окно кропа клампится в границы исходника. Position — нормированные
+ * координаты нового кадра ([0.5,0.5] = центр). ═══ */
+
+describe('DeterministicPipelines.planVerticalReframe', () => {
+  const DIMS = { '/uhd.braw': { width: 3840, height: 2160 } };
+  const clip = (name, path, ti, ci) => ({
+    trackIndex: ti == null ? 0 : ti, clipIndex: ci == null ? 0 : ci,
+    name, mediaPath: path
+  });
+
+  it('UHD 3840×2160 → 1080×1920: cover-скейл 88.89, центр [0.5, 0.5]', () => {
+    const r = DP.planVerticalReframe([clip('Общий план', '/uhd.braw')], DIMS, {});
+    assert.equal(r.items.length, 1);
+    assert.equal(r.items[0].scalePct, 88.89);
+    assert.equal(r.items[0].posX, 0.5);
+    assert.equal(r.items[0].posY, 0.5);
+    assert.equal(r.items[0].trackIndex, 0);
+    assert.equal(r.items[0].clipIndex, 0);
+  });
+
+  it('смещение камеры по substring-матчу имени: «гость» −20% → фокус левее, контент вправо', () => {
+    const r = DP.planVerticalReframe(
+      [clip('Гость 1.braw', '/uhd.braw')], DIMS,
+      { offsets: [{ match: 'гость', offsetPct: -20 }] }
+    );
+    /* displayedW = 3840·(1920/2160) = 3413.33; posX = 0.5 + 0.2·3413.33/1080 */
+    assert.equal(r.items[0].posX, 1.1321);
+  });
+
+  it('экстремальное смещение клампится: −100% → левый край исходника у левого края кадра', () => {
+    const r = DP.planVerticalReframe(
+      [clip('Гость 1', '/uhd.braw')], DIMS,
+      { offsets: [{ match: 'гость', offsetPct: -100 }] }
+    );
+    /* halfWin = 540/3413.33 → f=0.1582 → posX = 0.5 + 0.3418·3413.33/1080 */
+    assert.equal(r.items[0].posX, 1.5802);
+    /* левый край медиа: posX·1080 − displayedW/2 ≈ 0 */
+    const leftEdge = r.items[0].posX * 1080 - (3840 * (r.items[0].scalePct / 100)) / 2;
+    assert.equal(Math.abs(leftEdge) < 1, true);
+  });
+
+  it('уже вертикальный исходник 1080×1920 → скейл 100, смещение игнорируется (нет излишка)', () => {
+    const r = DP.planVerticalReframe(
+      [clip('Vert', '/v.mp4')], { '/v.mp4': { width: 1080, height: 1920 } },
+      { offsets: [{ match: 'vert', offsetPct: 50 }] }
+    );
+    assert.equal(r.items[0].scalePct, 100);
+    assert.equal(r.items[0].posX, 0.5);
+  });
+
+  it('исходник у́же 9:16 (900×1920) → cover по ширине, скейл 120, центр', () => {
+    const r = DP.planVerticalReframe(
+      [clip('Narrow', '/n.mp4')], { '/n.mp4': { width: 900, height: 1920 } }, {}
+    );
+    assert.equal(r.items[0].scalePct, 120);
+    assert.equal(r.items[0].posX, 0.5);
+    assert.equal(r.items[0].posY, 0.5);
+  });
+
+  it('клип без известных размеров → в skipped с причиной, в items не попадает', () => {
+    const r = DP.planVerticalReframe(
+      [clip('Загадка.mov', '/нет-в-dims.mov'), clip('Общий', '/uhd.braw', 0, 1)],
+      DIMS, {}
+    );
+    assert.equal(r.items.length, 1);
+    assert.equal(r.items[0].clipIndex, 1);
+    assert.equal(r.skipped.length, 1);
+    assert.equal(r.skipped[0].name, 'Загадка.mov');
+    assert.equal(typeof r.skipped[0].reason, 'string');
+    assert.equal(r.total, 2);
+  });
+
+  it('кастомный target (опции targetW/targetH) уважается', () => {
+    const r = DP.planVerticalReframe(
+      [clip('Общий', '/uhd.braw')], DIMS, { targetW: 1920, targetH: 1080 }
+    );
+    /* 16:9 в 16:9 → cover = 0.5 → 50% */
+    assert.equal(r.items[0].scalePct, 50);
+    assert.equal(r.items[0].posX, 0.5);
+  });
+
+  it('пустые входы → пустой план', () => {
+    assert.equal(DP.planVerticalReframe([], DIMS, {}).items.length, 0);
+    assert.equal(DP.planVerticalReframe(null, DIMS, {}).items.length, 0);
+    assert.equal(DP.planVerticalReframe([clip('x', '/uhd.braw')], null, {}).items.length, 0);
+  });
+});
