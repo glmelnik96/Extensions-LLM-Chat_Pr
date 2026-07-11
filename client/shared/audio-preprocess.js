@@ -67,6 +67,13 @@
             return reject(new Error('ffmpeg прерван по таймауту (' + (err.signal || 'kill') + ', лимит ' +
               Math.round((timeoutMs || 180000) / 1000) + 'с) — результат неполный. Файл слишком длинный или диск занят.'));
           }
+          /* Live e2e 11.07 (RMS 80-мин мика): превышение maxBuffer даёт err.code
+             СТРОКОЙ при непустом stderr → старый код резолвил ОБРЕЗАННЫЙ stdout
+             как успех (RMS-таймлайн молча заканчивался на ~890с из 4837с,
+             диаризация размечала только начало). Обрыв буфера — всегда ошибка. */
+          if (err && /maxbuffer/i.test(String(err.message || ''))) {
+            return reject(new Error('вывод ffmpeg превысил буфер (32 МБ) — результат неполный. Файл слишком длинный для этого анализа.'));
+          }
           /* ffmpeg даже при "успехе" пишет метрики в stderr и иногда выходит с кодом 0.
              Также для -f null детектор выходит с кодом 0 и всей информацией в stderr. */
           var exitCode = (err && (err.code != null)) ? err.code : 0;
@@ -250,7 +257,10 @@
     var nsamp = Math.max(1, Math.round(win * RMS_RATE));
     var args = [
       '-hide_banner', '-nostats', '-i', inputPath,
-      '-af', 'aresample=' + RMS_RATE + ',asetnsamples=' + nsamp + ':p=0,astats=metadata=1:reset=1,ametadata=print:file=-',
+      /* measure_perchannel=none + measure_overall=RMS+Peak (11.07.2026): печатаем
+         ТОЛЬКО две нужные метрики (3 строки/окно вместо ~30) — иначе 80-мин файл
+         при окне 0.05с давал >32 МБ вывода и упирался в maxBuffer execFile. */
+      '-af', 'aresample=' + RMS_RATE + ',asetnsamples=' + nsamp + ':p=0,astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level+Peak_level,ametadata=print:file=-',
       '-f', 'null', '-'
     ];
     return runFfmpeg(args, 300000).then(function (res) {

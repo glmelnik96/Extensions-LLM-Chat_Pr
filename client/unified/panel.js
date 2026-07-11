@@ -7174,6 +7174,11 @@ PanelBoot.run('ИИ: монтаж', function () {
         };
         showMicStatus();
         var rmsByPath = {};
+        /* Live e2e 11.07 (6_SHORTS): на синхроне мик-дорожки содержат короткие
+           скрэтч-хвосты BRAW (ffmpeg их не декодирует) — падение одного файла
+           не должно валить диаризацию. Недекодируемый файл = тишина
+           (micPartsToTimeline пропускает пути без RMS), предупреждаем. */
+        var rmsFailed = [];
         await Promise.all(paths.map(function (p) {
           return AudioPreprocess.computeRmsTimeline(p, { windowSec: 0.05 })
             .then(function (tl) {
@@ -7181,10 +7186,16 @@ PanelBoot.run('ИИ: монтаж', function () {
               showMicStatus();
               rmsByPath[p] = tl;
             }, function (e) {
+              doneCount++;
+              showMicStatus();
               var fname = String(p).split(/[\\\/]/).pop();
-              throw new Error(fname + ': ' + String(e && e.message || e));
+              rmsFailed.push(fname + ': ' + String((e && e.message) || e));
             });
         }));
+        if (!Object.keys(rmsByPath).length) {
+          toolsShowErr('Ни один аудиофайл не декодируется ffmpeg:\n' + rmsFailed.join('\n'));
+          return;
+        }
         var labels = [];
         var timelines = [];
         for (var li = 0; li < mics.length; li++) {
@@ -7201,6 +7212,10 @@ PanelBoot.run('ИИ: монтаж', function () {
         }
         var unlabeled = res.total - res.labeled;
         if (unlabeled > 0) lines.push('Без метки (перекрытие/тишина): ' + unlabeled);
+        if (rmsFailed.length) {
+          lines.push('⚠ Не декодируются (учтены как тишина): ' + rmsFailed.length + ' файл(а) — ' +
+            rmsFailed.map(function (s) { return s.split(':')[0]; }).join(', '));
+        }
         if (resEl) {
           resEl.style.whiteSpace = 'pre-line';
           resEl.textContent = lines.join('\n');

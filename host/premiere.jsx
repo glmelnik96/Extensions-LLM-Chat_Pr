@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.10.0';
+$._EXT_PRM_.version = '2.10.1';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -1893,11 +1893,61 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       }
       allLog.push({ interval: iv, log: lg });
     }
+    /* 11.07.2026 (live-находка дуги шортсов): ripple-удаление НЕ сдвигает
+       In/Out секвенции — Out остаётся за концом нового таймлайна (4847с при
+       длине 60с), и клиентский stale-гейт блокирует субтитры/карточки сразу
+       после монтажа. Сдвигаем In/Out той же математикой, что клиент ремапит
+       analyzedRegion (context-store.applyRippleDeletionsToTranscript).
+       Сентинел «точка не задана» (отрицательное значение) не трогаем.
+       Ошибка синка не фатальна для applied-монтажа. */
+    var inOutSynced = null;
+    if (ivOk > 0) {
+      try {
+        var okIv = [];
+        var pr2, pi2;
+        for (pi2 = 0; pi2 < perResults.length; pi2++) {
+          pr2 = perResults[pi2];
+          if (pr2.ok && typeof pr2.startSec === 'number' && typeof pr2.endSec === 'number') {
+            okIv.push({ s: pr2.startSec, e: pr2.endSec });
+          }
+        }
+        okIv.sort(function (x2, y2) { return x2.s - y2.s; });
+        /* сколько секунд вырезано строго ДО момента t (интервалы не
+           пересекаются — overlap-гард выше отклонил бы план) */
+        var _shiftBefore = function (t) {
+          var accS = 0, mS;
+          for (mS = 0; mS < okIv.length; mS++) {
+            if (okIv[mS].e <= t) accS += (okIv[mS].e - okIv[mS].s);
+            else if (okIv[mS].s < t) accS += (t - okIv[mS].s);
+            else break;
+          }
+          return accS;
+        };
+        var newEndSec = $._EXT_PRM_._seqEndSec(seq);
+        var oldInS = parseFloat(seq.getInPoint());
+        var oldOutS = parseFloat(seq.getOutPoint());
+        var nInS = null, nOutS = null;
+        if (!isNaN(oldInS) && oldInS >= 0) {
+          nInS = oldInS - _shiftBefore(oldInS);
+          if (nInS < 0) nInS = 0;
+          if (newEndSec > 0 && nInS > newEndSec) nInS = newEndSec;
+          seq.setInPoint(nInS); /* ЧИСЛО: setInPoint(String) молча игнорируется */
+        }
+        if (!isNaN(oldOutS) && oldOutS >= 0) {
+          nOutS = oldOutS - _shiftBefore(oldOutS);
+          if (nOutS < 0) nOutS = 0;
+          if (newEndSec > 0 && nOutS > newEndSec) nOutS = newEndSec;
+          seq.setOutPoint(nOutS);
+        }
+        if (nInS !== null || nOutS !== null) inOutSynced = { inSec: nInS, outSec: nOutS };
+      } catch (eIO) {}
+    }
     /* Все операции провалились (например, дорожки заблокировали после preflight,
        или QE отказал) — честный ok:false вместо тихого «успеха». */
     var globalOk = ivOk > 0 || ivFail === 0;
     return JSON.stringify({
       ok: globalOk,
+      inOutSynced: inOutSynced || undefined,
       error: globalOk ? undefined : 'ни одна операция не применилась — проверьте, не заблокированы ли дорожки',
       appliedIntervals: tagged.length,
       appliedCount: stats.applied,
