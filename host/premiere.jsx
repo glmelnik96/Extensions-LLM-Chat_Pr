@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.8.0';
+$._EXT_PRM_.version = '2.9.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -2641,6 +2641,101 @@ $._EXT_PRM_.applyVerticalReframe = function (jsonPlan) {
 };
 
 /**
+ * Импорт .srt как caption-трек активной секвенции (Волна 3 п.4, смарт-субтитры).
+ * JSON: { srtPath, expectedSequenceName }
+ * PP 26.2.2: createCaptionTrack(projectItem, startAtTime) возвращает boolean;
+ * прочитать caption-треки назад API не даёт (ни DOM reflect, ни QE) —
+ * подтверждение только визуальное. Project item .srt НЕ удаляем:
+ * caption-трек ссылается на него.
+ */
+$._EXT_PRM_.importSrtAsCaptions = function (jsonStr) {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var p;
+    try {
+      p = JSON.parse(jsonStr);
+    } catch (eJ) {
+      return JSON.stringify({ ok: false, error: 'Невалидный JSON: ' + String(eJ) });
+    }
+    var srtPath = String((p && p.srtPath) || '').replace(/\\/g, '/');
+    if (!srtPath) {
+      return JSON.stringify({ ok: false, error: 'srtPath обязателен' });
+    }
+    if (!$._EXT_PRM_._fileExists(srtPath)) {
+      return JSON.stringify({ ok: false, error: 'Файл субтитров не найден: ' + srtPath });
+    }
+    var seq = app.project.activeSequence;
+    if (p.expectedSequenceName && String(seq.name) !== String(p.expectedSequenceName)) {
+      return JSON.stringify({
+        ok: false,
+        error: 'Активная секвенция «' + seq.name + '» не та, для которой построены субтитры («' +
+          p.expectedSequenceName + '») — отклонено. Откройте нужную секвенцию и повторите.',
+        hostVersion: $._EXT_PRM_.version
+      });
+    }
+    if (typeof seq.createCaptionTrack !== 'function') {
+      return JSON.stringify({ ok: false, error: 'createCaptionTrack недоступен в этой версии Premiere Pro' });
+    }
+    var root = app.project.rootItem;
+    var before = {};
+    var i, nid;
+    for (i = 0; i < root.children.numItems; i++) {
+      nid = '';
+      try { nid = String(root.children[i].nodeId); } catch (eB) {}
+      if (nid) before[nid] = 1;
+    }
+    var undoOpened = false;
+    try { app.beginUndoGroup('ИИ: субтитры'); undoOpened = true; } catch (eBU) {}
+    try {
+      var impOk = false;
+      try {
+        impOk = app.project.importFiles([srtPath], true, root, false);
+      } catch (eI) {
+        return JSON.stringify({ ok: false, error: 'importFiles: ' + String(eI && eI.message ? eI.message : eI) });
+      }
+      /* Новый элемент — diff по nodeId (импорт кладёт в конец, но не гарантированно). */
+      var item = null;
+      for (i = root.children.numItems - 1; i >= 0; i--) {
+        nid = '';
+        try { nid = String(root.children[i].nodeId); } catch (eN) {}
+        if (nid && !before[nid]) { item = root.children[i]; break; }
+      }
+      if (!item) {
+        return JSON.stringify({
+          ok: false,
+          error: 'Импорт .srt не добавил элемент в проект (importFiles=' + impOk + ')'
+        });
+      }
+      var created = false;
+      try {
+        created = seq.createCaptionTrack(item, 0);
+      } catch (eC) {
+        return JSON.stringify({ ok: false, error: 'createCaptionTrack: ' + String(eC && eC.message ? eC.message : eC) });
+      }
+      if (!created) {
+        return JSON.stringify({
+          ok: false,
+          error: 'createCaptionTrack вернул false — caption-трек не создан',
+          imported: String(item.name)
+        });
+      }
+      return JSON.stringify({
+        ok: true,
+        sequenceName: String(seq.name),
+        imported: String(item.name),
+        hostVersion: $._EXT_PRM_.version
+      });
+    } finally {
+      if (undoOpened) try { app.endUndoGroup(); } catch (eEU) {}
+    }
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
  * Экспорт In–Out чанками (меньше 413 на Whisper). Восстанавливает In/Out.
  */
 $._EXT_PRM_._exportInOutAsChunks = function (seq, preset, root, chunkSec, chunkExt) {
@@ -3542,7 +3637,8 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     'activateSequenceById',
     'getDiarizeMicSources',
     'getVerticalReframeSources',
-    'applyVerticalReframe'
+    'applyVerticalReframe',
+    'importSrtAsCaptions'
   ];
   for (var i = 0; i < EXPORTED.length; i++) {
     var name = EXPORTED[i];

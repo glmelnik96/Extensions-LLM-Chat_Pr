@@ -266,6 +266,12 @@
       this.evalJson('$._EXT_PRM_.applyVerticalReframe("' + json + '")', cb, { mutating: true });
     },
 
+    /** Субтитры: импорт .srt + createCaptionTrack на активной секвенции. */
+    importSrtAsCaptions: function (payloadObj, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify(payloadObj));
+      this.evalJson('$._EXT_PRM_.importSrtAsCaptions("' + json + '")', cb, { mutating: true });
+    },
+
     /** B2-9: Revert — активировать бэкап-секвенцию по sequenceID. */
     activateSequenceById: function (seqId, cb) {
       var s = String(seqId).replace(/"/g, '\\"');

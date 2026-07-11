@@ -1988,3 +1988,96 @@ describe('DeterministicPipelines.planVerticalReframe', () => {
     assert.equal(DP.planVerticalReframe([clip('x', '/uhd.braw')], null, {}).items.length, 0);
   });
 });
+
+/* ═══ segmentsToSrtCues / cuesToSrt: смарт-субтитры из Whisper-сегментов.
+ * Титры: ≤2 строки по ≤42 символа, ≤5с; длинные сегменты режутся по словам
+ * с линейным таймингом. cuesToSrt — стандартный SRT (HH:MM:SS,mmm). ═══ */
+
+describe('DeterministicPipelines.segmentsToSrtCues', () => {
+  it('короткий сегмент → один титр, тайминг и текст без изменений', () => {
+    const out = DP.segmentsToSrtCues(
+      [{ startSec: 1.5, endSec: 3.2, text: 'Привет, как дела?' }], {});
+    assert.equal(out.length, 1);
+    assert.equal(out[0].startSec, 1.5);
+    assert.equal(out[0].endSec, 3.2);
+    assert.equal(out[0].text, 'Привет, как дела?');
+  });
+
+  it('длинный сегмент режется по maxDurSec с линейным таймингом, слова не теряются', () => {
+    const words = [];
+    for (let i = 0; i < 20; i++) words.push('слово');
+    const out = DP.segmentsToSrtCues(
+      [{ startSec: 0, endSec: 20, text: words.join(' ') }],
+      { maxDurSec: 5 });
+    assert.equal(out.length, 4);
+    assert.equal(out[0].startSec, 0);
+    assert.equal(out[0].endSec, 5);
+    assert.equal(out[3].startSec, 15);
+    assert.equal(out[3].endSec, 20);
+    const joined = [...out].map((c) => c.text.replace(/\n/g, ' ')).join(' ');
+    assert.equal(joined, words.join(' '));
+  });
+
+  it('перенос строк: ≤2 строки по ≤42 символа', () => {
+    /* 12 слов по 6 симв = 83 символа с пробелами — влезает в 2 строки, 1 титр */
+    const words = [];
+    for (let i = 0; i < 12; i++) words.push('слово' + (i % 10));
+    const out = DP.segmentsToSrtCues(
+      [{ startSec: 0, endSec: 4, text: words.join(' ') }], {});
+    assert.equal(out.length, 1);
+    const lines = out[0].text.split('\n');
+    assert.equal(lines.length <= 2, true);
+    for (const l of lines) assert.equal(l.length <= 42, true, 'строка >42: ' + l);
+  });
+
+  it('текст шире 2×42 → несколько титров даже без лимита длительности', () => {
+    const words = [];
+    for (let i = 0; i < 30; i++) words.push('слово' + (i % 10));
+    const out = DP.segmentsToSrtCues(
+      [{ startSec: 0, endSec: 4, text: words.join(' ') }], { maxDurSec: 60 });
+    assert.equal(out.length > 1, true);
+    for (const c of out) {
+      const lines = c.text.split('\n');
+      assert.equal(lines.length <= 2, true);
+      for (const l of lines) assert.equal(l.length <= 42, true);
+    }
+  });
+
+  it('withSpeakers: тире «— » на смене спикера, без тире при том же спикере', () => {
+    const out = DP.segmentsToSrtCues([
+      { startSec: 0, endSec: 2, text: 'Первый вопрос', speaker: 'Спикер 1' },
+      { startSec: 2, endSec: 4, text: 'Первый ответ', speaker: 'Спикер 2' },
+      { startSec: 4, endSec: 6, text: 'Продолжение ответа', speaker: 'Спикер 2' }
+    ], { withSpeakers: true });
+    assert.equal(out[0].text.indexOf('— '), 0);
+    assert.equal(out[1].text.indexOf('— '), 0);
+    assert.equal(out[2].text.indexOf('— '), -1);
+  });
+
+  it('пустые/битые сегменты пропускаются', () => {
+    const out = DP.segmentsToSrtCues([
+      null,
+      { startSec: 0, endSec: 2, text: '   ' },
+      { startSec: 5, endSec: 3, text: 'инвертирован' },
+      { startSec: 0, endSec: 2, text: 'живой' }
+    ], {});
+    assert.equal(out.length, 1);
+    assert.equal(out[0].text, 'живой');
+  });
+});
+
+describe('DeterministicPipelines.cuesToSrt', () => {
+  it('стандартный формат: номер, HH:MM:SS,mmm --> …, пустая строка-разделитель', () => {
+    const srt = DP.cuesToSrt([
+      { startSec: 0, endSec: 2.5, text: 'Первый' },
+      { startSec: 3661.25, endSec: 3662, text: 'Второй\nдвумя строками' }
+    ]);
+    assert.equal(srt,
+      '1\n00:00:00,000 --> 00:00:02,500\nПервый\n\n' +
+      '2\n01:01:01,250 --> 01:01:02,000\nВторой\nдвумя строками\n');
+  });
+
+  it('пустой вход → пустая строка', () => {
+    assert.equal(DP.cuesToSrt([]), '');
+  });
+});

@@ -606,6 +606,24 @@
             <div class="proposal-area" id="vt-result"></div>
           </div>
 
+          <!-- 5d. Субтитры (Волна 3 п.4, 11.07.2026) — транскрипт → SRT-кьюи
+               (перенос ≤2×42, ≤5с, линейный тайминг по словам) → .srt →
+               importFiles → createCaptionTrack. needs-transcript. -->
+          <div class="tool-card needs-transcript" id="card-subtitles">
+            <div class="tool-card-title">💬 Субтитры</div>
+            <div class="tool-card-desc">
+              Caption-трек из транскрипта активной секвенции: реплики бьются
+              на титры до 2 строк × 42 символа и до 5 секунд. Если размечены
+              спикеры — смена говорящего помечается тире.
+            </div>
+            <div class="param-row" title="Ставить «— » в начале титра при смене говорящего. Требует разметки спикеров (карточка «🗣 Спикеры»).">
+              <span class="param-label">Метки спикеров</span>
+              <input type="checkbox" id="st-speakers" checked />
+            </div>
+            <button class="tool-run" data-tool="subtitles">Создать субтитры</button>
+            <div class="proposal-area" id="st-result"></div>
+          </div>
+
           <!-- 6. J-cuts / L-cuts — ОТКЛЮЧЕНО (ограничение ExtendScript) -->
           <div class="tool-card" id="card-jcuts" style="opacity:0.5;pointer-events:none;">
             <div class="tool-card-title">🎬 J-cuts / L-cuts</div>

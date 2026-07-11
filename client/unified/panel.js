@@ -7183,6 +7183,96 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
     }
 
+    /* ── «💬 Субтитры»: caption-трек из транскрипта (Волна 3 п.4, 11.07.2026).
+       Кьюи считает чистый segmentsToSrtCues (≤2×42, ≤5с, линейный тайминг по
+       словам — Whisper не отдаёт пословные метки), SRT пишется из Node-контекста
+       панели (MSIX: файлы, записанные извне, host может не видеть), host
+       импортирует и вызывает createCaptionTrack. Read-back caption-треков
+       у PP 26.2.2 нет — подтверждение визуальное. */
+    async function toolsRunSubtitles() {
+      if (!beginOperation('tools:subtitles')) {
+        toolsShowErr('Идёт обработка в чате — дождитесь завершения (кнопка «Стоп» на вкладке «Чат»).');
+        return;
+      }
+      toolsDisableRun(true);
+      toolsStatusUi.show('Готовлю субтитры…', true);
+      var resEl = document.getElementById('st-result');
+      if (resEl) { resEl.textContent = ''; }
+      var keepStatus = false;
+      try {
+        var snap = await execGetSnapshot(true);
+        if (!snap || !snap.ok) {
+          toolsShowErr(snap && snap.error ? snap.error : 'Не удалось получить снимок таймлайна.');
+          return;
+        }
+        var seqKey = snap.sequenceName || '';
+        var found = seqKey ? ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqKey) : { entry: null };
+        var entry = found && found.entry;
+        if (!entry || !entry.segments || !entry.segments.length) {
+          toolsShowErr('Нет транскрипта для «' + seqKey + '» — сначала транскрибируйте In–Out (вкладка «Чат»).');
+          return;
+        }
+        var spEl = document.getElementById('st-speakers');
+        var wantSpeakers = !spEl || spEl.checked;
+        var hasSpeakers = false;
+        for (var si = 0; si < entry.segments.length; si++) {
+          if (entry.segments[si] && entry.segments[si].speaker) { hasSpeakers = true; break; }
+        }
+        var cues = DeterministicPipelines.segmentsToSrtCues(entry.segments, {
+          withSpeakers: wantSpeakers && hasSpeakers
+        });
+        if (!cues.length) {
+          toolsShowErr('Из транскрипта не получилось ни одного титра (пустые сегменты?).');
+          return;
+        }
+        var srt = DeterministicPipelines.cuesToSrt(cues);
+        var fs = require('fs');
+        var path = require('path');
+        var os = require('os');
+        var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'subtitles');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        /* Имя = секвенция + время: item остаётся в проекте (caption-трек
+           ссылается на него), повторный запуск не должен конфликтовать. */
+        var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        var srtPath = path.join(dir, seqKey.replace(/[\\\/:*?"<>|]/g, '_') + '_' + ts + '.srt');
+        fs.writeFileSync(srtPath, '\uFEFF' + srt, 'utf8');
+        toolsStatusUi.show('Создаю caption-трек (' + cues.length + ' титров)…', true);
+        var resp = await new Promise(function (resolve, reject) {
+          PremiereBridge.importSrtAsCaptions({
+            srtPath: srtPath.replace(/\\/g, '/'),
+            expectedSequenceName: seqKey
+          }, function (err, data) {
+            if (err) reject(err); else resolve(data);
+          });
+        });
+        if (!resp || !resp.ok) {
+          toolsShowErr((resp && resp.error) || 'Не удалось создать caption-трек.');
+          return;
+        }
+        var durMin = cues[cues.length - 1].endSec / 60;
+        var lines = [
+          'Создан caption-трек: ' + cues.length + ' титров (~' + durMin.toFixed(1) + ' мин).',
+          (wantSpeakers && hasSpeakers)
+            ? 'Смена говорящего помечена «— ».'
+            : (wantSpeakers ? 'Спикеры не размечены — без меток (карточка «🗣 Спикеры»).' : 'Метки спикеров выключены.'),
+          'Файл «' + resp.imported + '» добавлен в проект — не удаляйте, трек ссылается на него.'
+        ];
+        if (resEl) {
+          resEl.style.whiteSpace = 'pre-line';
+          resEl.textContent = lines.join('\n');
+        }
+        toolsStatusUi.show('Субтитры готовы ✓', false);
+        keepStatus = true;
+        setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+      } catch (e) {
+        toolsShowErr(String(e.message || e));
+      } finally {
+        endOperation();
+        toolsDisableRun(false);
+        if (!keepStatus) toolsStatusUi.hide();
+      }
+    }
+
     /* ── Run tool ─────────────────────────────────────────── */
     async function toolsRunTool(toolName) {
       toolsShowErr('');
@@ -7195,6 +7285,10 @@ PanelBoot.run('ИИ: монтаж', function () {
       /* «📱 Вертикаль 9:16» — тоже не proposal: исходник не трогается,
          результат — новая секвенция (откат = удалить её). */
       if (toolName === 'vertical') { await toolsRunVertical(); return; }
+
+      /* «💬 Субтитры» — не proposal: добавляет caption-трек поверх, ничего
+         не режет (откат = удалить трек / Ctrl+Z). */
+      if (toolName === 'subtitles') { await toolsRunSubtitles(); return; }
 
       var pipelineFn, params = {}, proposalId;
 

@@ -1607,6 +1607,107 @@
   }
 
   /**
+   * Перенос списка слов в ≤maxLines строк по ≤maxChars символов (greedy).
+   * null — не влезает (слишком много слов или одно слово шире строки).
+   */
+  function _wrapWords(words, maxChars, maxLines) {
+    var lines = [''];
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      var cur = lines[lines.length - 1];
+      if (!cur.length) {
+        if (w.length > maxChars) return null;
+        lines[lines.length - 1] = w;
+      } else if (cur.length + 1 + w.length <= maxChars) {
+        lines[lines.length - 1] = cur + ' ' + w;
+      } else {
+        if (lines.length >= maxLines || w.length > maxChars) return null;
+        lines.push(w);
+      }
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * Смарт-субтитры (Волна 3 п.4, 11.07.2026): Whisper-сегменты → титры.
+   * Норматив читаемости: ≤maxLines (2) строк по ≤maxCharsPerLine (42)
+   * символа, ≤maxDurSec (5с) на титр. Длинные сегменты режутся по словам
+   * с ЛИНЕЙНЫМ таймингом (у Whisper нет пословных таймкодов — равномерное
+   * распределение слов по длительности сегмента). withSpeakers — тире «— »
+   * на смене спикера (метки из диаризации «🗣 Спикеры»).
+   * Возвращает [{startSec, endSec, text}] (text с '\n' между строками).
+   */
+  function segmentsToSrtCues(segments, opts) {
+    var o = opts || {};
+    var maxChars = o.maxCharsPerLine > 0 ? o.maxCharsPerLine : 42;
+    var maxLines = o.maxLines > 0 ? o.maxLines : 2;
+    var maxDur = o.maxDurSec > 0 ? o.maxDurSec : 5;
+    var withSpeakers = !!o.withSpeakers;
+    var cues = [];
+    if (!segments || !segments.length) return cues;
+    var prevSpeaker = null;
+    for (var i = 0; i < segments.length; i++) {
+      var sg = segments[i];
+      if (!sg) continue;
+      var text = String(sg.text == null ? '' : sg.text).replace(/\s+/g, ' ');
+      text = text.replace(/^\s+|\s+$/g, '');
+      if (!text) continue;
+      var start = Number(sg.startSec);
+      var end = Number(sg.endSec);
+      if (!isFinite(start) || !isFinite(end) || end <= start) continue;
+      var words = text.split(' ');
+      if (withSpeakers) {
+        var sp = sg.speaker || null;
+        if (sp && sp !== prevSpeaker) words[0] = '— ' + words[0];
+        if (sp) prevSpeaker = sp;
+      }
+      var wordDur = (end - start) / words.length;
+      var idx = 0;
+      while (idx < words.length) {
+        var cueStartIdx = idx;
+        var take = [];
+        while (idx < words.length) {
+          var wrapped = _wrapWords(take.concat([words[idx]]), maxChars, maxLines);
+          var candDur = (idx + 1 - cueStartIdx) * wordDur;
+          if (take.length && (wrapped === null || candDur > maxDur + 1e-9)) break;
+          take.push(words[idx]);
+          idx++;
+          if (wrapped === null) break; /* одно сверхдлинное слово — титром целиком */
+        }
+        var cueText = _wrapWords(take, maxChars, maxLines);
+        if (cueText === null) cueText = take.join(' ');
+        cues.push({
+          startSec: Math.round((start + cueStartIdx * wordDur) * 1000) / 1000,
+          endSec: Math.round((start + idx * wordDur) * 1000) / 1000,
+          text: cueText
+        });
+      }
+    }
+    return cues;
+  }
+
+  /** Титры → текст .srt (HH:MM:SS,mmm, нумерация с 1, разделение пустой строкой). */
+  function cuesToSrt(cues) {
+    function tc(sec) {
+      var ms = Math.round(sec * 1000);
+      var h = Math.floor(ms / 3600000); ms -= h * 3600000;
+      var m = Math.floor(ms / 60000); ms -= m * 60000;
+      var s = Math.floor(ms / 1000); ms -= s * 1000;
+      function p(n, w) { n = String(n); while (n.length < w) n = '0' + n; return n; }
+      return p(h, 2) + ':' + p(m, 2) + ':' + p(s, 2) + ',' + p(ms, 3);
+    }
+    if (!cues || !cues.length) return '';
+    var out = [];
+    for (var i = 0; i < cues.length; i++) {
+      out.push(String(i + 1));
+      out.push(tc(cues[i].startSec) + ' --> ' + tc(cues[i].endSec));
+      out.push(cues[i].text);
+      out.push('');
+    }
+    return out.join('\n');
+  }
+
+  /**
    * Кастомный маппинг дорожек по спикерам (AutoPod-паттерн «теги дорожек»,
    * live-запрос 12 июня 2026): авто-схема «V1 wide, A(i)→V(i+1)» ломается,
    * когда микрофоны не на первых аудиодорожках (камерный звук BRAW) или
@@ -1884,6 +1985,8 @@
     parseAudioTrackFilter: parseAudioTrackFilter,
     parseVerticalOffsets: parseVerticalOffsets,
     planVerticalReframe: planVerticalReframe,
+    segmentsToSrtCues: segmentsToSrtCues,
+    cuesToSrt: cuesToSrt,
     _normalizeMulticamMapping: _normalizeMulticamMapping,
     detectSilenceIntervals: detectSilenceIntervals,
     silenceIntervalsFromRms: silenceIntervalsFromRms,
