@@ -1183,6 +1183,42 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     assert.notEqual(bounds0, bounds1, 'variationsJitterSec должен изменить границы сегментов');
   });
 
+  it('пробрасывает smoothingWindow: разное окно сглаживания даёт разный план', async () => {
+    // Регресс 11.07.2026: multicamFromAudio форвардил whitelist параметров в
+    // buildSwitchPlan, но smoothingWindow в нём не было — ползунок «Сглаживание»
+    // молча игнорировался (всегда DEFAULT 5). Тест: покадровый фликкер A/B в
+    // середине; окно=1 и окно=11 обязаны дать разные планы.
+    const frameSec = 0.05;
+    const tlA = [], tlB = [];
+    for (let i = 1; i <= 400; i++) {
+      const t = +(i * frameSec).toFixed(3);
+      if (i >= 100 && i < 240) {
+        // зона B-доминантного фликкера: B громче 2 кадра из 3 (паттерн BBA).
+        // Без сглаживания коротыши схлопываются в предыдущий A (first-wins);
+        // со сглаживанием majority-vote видит B → длинный B-сегмент выживает.
+        const bLoud = (i % 3 !== 0);
+        tlA.push({ t, rms: bLoud ? -50 : -10 });
+        tlB.push({ t, rms: bLoud ? -10 : -50 });
+      } else {
+        tlA.push({ t, rms: -10 });
+        tlB.push({ t, rms: -50 });
+      }
+    }
+    const ctx = {
+      snapshot: snap3v2a(),
+      rmsExtractor: () => Promise.resolve({ timelines: [tlA, tlB] })
+    };
+    // overlapWideMinSec=0 — убираем взаимодействие с политикой кросс-тока,
+    // изолируем эффект сглаживания.
+    const s1 = await DP.multicamFromAudio(ctx, { smoothingWindow: 1, overlapWideMinSec: 0 });
+    const s11 = await DP.multicamFromAudio(ctx, { smoothingWindow: 11, overlapWideMinSec: 0 });
+    assert.equal(s1.ok, true);
+    assert.equal(s11.ok, true);
+    const b1 = s1.proposal.plan.segments.map(s => `${s.tStart}:${s.activeVideoTrack}`).join(',');
+    const b11 = s11.proposal.plan.segments.map(s => `${s.tStart}:${s.activeVideoTrack}`).join(',');
+    assert.notEqual(b1, b11, 'smoothingWindow должен менять план (иначе параметр не проброшен)');
+  });
+
   it('errors when fewer than 2 video tracks (need wide + ≥1 speaker)', async () => {
     const ctx = {
       snapshot: { ok: true, tracks: [{ type: 'video', index: 0 }, { type: 'audio', index: 0 }] },

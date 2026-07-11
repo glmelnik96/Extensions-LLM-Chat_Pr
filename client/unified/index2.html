@@ -581,6 +581,16 @@
               <input type="range" id="mc-jitter" min="0" max="0.5" step="0.05" value="0" />
               <span class="param-val" id="mc-jitter-val">выкл</span>
             </div>
+            <div class="param-row" title="Окно сглаживания меток (majority-vote): гасит покадровое дрожание камеры. Больше = плавнее, устойчивее к дребезгу на тихой/шумной записи">
+              <span class="param-label">Сглаживание</span>
+              <input type="range" id="mc-smooth" min="1" max="15" step="2" value="5" />
+              <span class="param-val" id="mc-smooth-val">5 кадр.</span>
+            </div>
+            <div class="param-row" title="Кратковременная перебивка (кросс-ток) короче этого порога НЕ уводит в общий план — держим камеру говорящего. Больше = терпимее к перебиваниям (анти-пинг-понг). 0 = выкл">
+              <span class="param-label">Анти-перебивка</span>
+              <input type="range" id="mc-overlap" min="0" max="3" step="0.25" value="1" />
+              <span class="param-val" id="mc-overlap-val">1с</span>
+            </div>
             <!-- UX 10.07.2026: кнопка ПРЕДЛАГАЕТ план (Apply — отдельным шагом
                  в карточке предпросмотра), старое «и применить» вводило в заблуждение -->
             <button class="tool-run" data-tool="multicam">Проанализировать и предложить нарезку</button>
