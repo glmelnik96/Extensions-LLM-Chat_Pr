@@ -279,6 +279,28 @@
         min-width: 32px;
         text-align: right;
       }
+      .mc-advanced { margin: 8px 0 4px; border-top: 1px solid var(--border); padding-top: 6px; }
+      .mc-advanced > summary {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--muted);
+        cursor: pointer;
+        list-style: none;
+        padding: 2px 0;
+        user-select: none;
+      }
+      .mc-advanced > summary::-webkit-details-marker { display: none; }
+      .mc-advanced > summary::before { content: '▸ '; }
+      .mc-advanced[open] > summary::before { content: '▾ '; }
+      .mc-section-title {
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+        opacity: 0.7;
+        margin: 8px 0 4px;
+      }
       .toggle-group {
         display: flex;
         border-radius: 4px;
@@ -537,7 +559,7 @@
             <!-- Кастомный выбор дорожек (AutoPod-паттерн «теги дорожек»):
                  авто-схема ломается, когда микрофоны не на первых A-дорожках
                  или аудио не засинхронено с порядком видео -->
-            <div class="param-row">
+            <div class="param-row" title="Где общий план, какие микрофоны → каким гостям. Авто подходит, если A1→V2, A2→V3… Микрофоны не по порядку — выбери «Вручную».">
               <span class="param-label">Дорожки</span>
               <select id="mc-map-mode" style="flex:1;min-width:0;">
                 <option value="auto">Авто: V1 общий, A1→V2, A2→V3…</option>
@@ -546,7 +568,7 @@
             </div>
             <div id="mc-mapping" style="display:none;"></div>
             <!-- B1-4/B1-6: пресеты шоу (AutoPod-паттерн «конфигурации») -->
-            <div class="param-row">
+            <div class="param-row" title="Готовый набор: «Спокойный» — редкие плавные переключения (интервью), «Динамичный» — частые (живой подкаст). 💾 сохранит текущие слайдеры.">
               <span class="param-label">Пресет</span>
               <select id="mc-preset" style="flex:1;min-width:0;">
                 <option value="">— свой —</option>
@@ -556,74 +578,85 @@
               </select>
               <button type="button" id="mc-preset-save" class="secondary" style="padding:2px 8px;" title="Сохранить текущие слайдеры как «Мой пресет»">💾</button>
             </div>
-            <div class="param-row" title="Минимальная длительность одного плана. Меньше = чаще переключения камер">
+            <div class="param-row" title="Минимум секунд на одной камере. Влево = чаще режем, живее. Вправо = спокойнее, реже.">
               <span class="param-label">Мин. план</span>
               <input type="range" id="mc-minhold" min="0.5" max="4" step="0.1" value="1.5" />
               <span class="param-val" id="mc-minhold-val">1.5с</span>
             </div>
-            <div class="param-row" title="Если один спикер говорит дольше — принудительно перебиваем общим планом, чтобы картинка не застывала">
-              <span class="param-label">Макс. план</span>
-              <input type="range" id="mc-maxhold" min="3" max="15" step="0.5" value="8" />
-              <span class="param-val" id="mc-maxhold-val">8с</span>
-            </div>
-            <div class="param-row" title="Насколько микрофон должен быть громче остальных, чтобы «взять» план. Больше = реже переключения, устойчивее к перебиваниям">
+            <div class="param-row" title="Насколько микрофон громче остальных, чтобы забрать план. Вправо = увереннее держим одного, реже дёргаемся на чужой звук.">
               <span class="param-label">Порог лидера</span>
               <input type="range" id="mc-margin" min="3" max="12" step="1" value="6" />
               <span class="param-val" id="mc-margin-val">6 dB</span>
             </div>
-            <div class="param-row" title="Тише этого уровня микрофон считается молчащим (никто не говорит → общий план). Ползунок вправо = порог ниже (строже)">
-              <span class="param-label">Порог тишины</span>
-              <input type="range" id="mc-silence" min="20" max="50" step="1" value="35" />
-              <span class="param-val" id="mc-silence-val">-35 dB</span>
-            </div>
-            <div class="param-row" title="Случайный разброс длительности планов, чтобы нарезка не выглядела механически ровной. 0 = выкл">
-              <span class="param-label">Вариативность</span>
-              <input type="range" id="mc-jitter" min="0" max="0.5" step="0.05" value="0" />
-              <span class="param-val" id="mc-jitter-val">выкл</span>
-            </div>
-            <div class="param-row" title="Окно сглаживания меток (majority-vote): гасит покадровое дрожание камеры. Больше = плавнее, устойчивее к дребезгу на тихой/шумной записи">
-              <span class="param-label">Сглаживание</span>
-              <input type="range" id="mc-smooth" min="1" max="15" step="2" value="5" />
-              <span class="param-val" id="mc-smooth-val">5 кадр.</span>
-            </div>
-            <div class="param-row" title="Кратковременная перебивка (кросс-ток) короче этого порога НЕ уводит в общий план — держим камеру говорящего. Больше = терпимее к перебиваниям (анти-пинг-понг). 0 = выкл">
-              <span class="param-label">Анти-перебивка</span>
-              <input type="range" id="mc-overlap" min="0" max="3" step="0.25" value="1" />
-              <span class="param-val" id="mc-overlap-val">1с</span>
-            </div>
-            <div class="param-row" title="Длина вставки общего плана, когда длинный монолог принудительно перебивается. Меньше = мелькающие короткие перебивки, больше = спокойные вставки подлиннее. Работает вместе с «Макс. план»">
-              <span class="param-label">Длина вставки</span>
-              <input type="range" id="mc-maxall" min="0.5" max="4" step="0.5" value="4" />
-              <span class="param-val" id="mc-maxall-val">4с</span>
-            </div>
-            <div class="param-row" title="Шаг анализа звука. Мельче (влево) = точнее границы резов, но анализ дольше; крупнее (вправо) = быстрее, границы грубее. По умолчанию 50мс — оптимум для речи">
-              <span class="param-label">Шаг анализа</span>
-              <input type="range" id="mc-framesec" min="0.05" max="0.2" step="0.05" value="0.05" />
-              <span class="param-val" id="mc-framesec-val">50мс</span>
-            </div>
-            <div class="param-row" title="Зерно случайной вариативности: меняет РИСУНОК разброса длительностей. Влияет ТОЛЬКО когда «Вариативность» > 0. Сдвинь, если текущий вариант нарезки не понравился — получишь другой">
-              <span class="param-label">Вариант</span>
-              <input type="range" id="mc-seed" min="1" max="20" step="1" value="1" />
-              <span class="param-val" id="mc-seed-val">#1</span>
-            </div>
-            <div class="param-row" title="На паузах (никто не говорит) переключаться на общий план. Выкл = держать камеру последнего говорившего, не прыгать на общий план в тишине">
-              <span class="param-label">Общий на паузах</span>
-              <input type="checkbox" id="mc-wide-silence" checked />
-            </div>
-            <div class="param-row" title="При перебивке (говорят разом) переключаться на общий план. Выкл = держать камеру последнего говорившего">
-              <span class="param-label">Общий на перебивках</span>
-              <input type="checkbox" id="mc-wide-overlap" checked />
-            </div>
-            <div class="param-row" title="Привязка резов к ближайшей паузе / началу речи в этом окне — чтобы переключение не падало посреди слова. 0 = выкл (резы строго по громкости). Больше = сильнее подтягивать к естественным точкам">
-              <span class="param-label">Привязка к паузам</span>
-              <input type="range" id="mc-snap" min="0" max="0.5" step="0.05" value="0" />
-              <span class="param-val" id="mc-snap-val">выкл</span>
-            </div>
-            <div class="param-row" title="Тонкий сдвиг точки привязки относительно начала речи: минус = раньше (рез до первого слова), плюс = позже. Работает только при «Привязка к паузам» > 0">
-              <span class="param-label">Сдвиг привязки</span>
-              <input type="range" id="mc-snapoff" min="-0.2" max="0.2" step="0.05" value="0" />
-              <span class="param-val" id="mc-snapoff-val">0мс</span>
-            </div>
+            <details class="mc-advanced">
+              <summary>⚙ Тонкая настройка</summary>
+
+              <div class="mc-section-title">Ритм и перебивки</div>
+              <div class="param-row" title="Дольше этого один спикер в кадре не держится — вставляем общий план, чтобы картинка не застыла.">
+                <span class="param-label">Макс. план</span>
+                <input type="range" id="mc-maxhold" min="3" max="15" step="0.5" value="8" />
+                <span class="param-val" id="mc-maxhold-val">8с</span>
+              </div>
+              <div class="param-row" title="Короткие реплики поверх (кросс-ток) короче этого НЕ уводят в общий план — держим говорящего. Больше = терпимее. 0 = выкл.">
+                <span class="param-label">Терпеть перебивки</span>
+                <input type="range" id="mc-overlap" min="0" max="3" step="0.25" value="1" />
+                <span class="param-val" id="mc-overlap-val">1с</span>
+              </div>
+              <div class="param-row" title="Сколько длится общий план, вставленный в длинный монолог. Меньше = короткие мелькания, больше = спокойные вставки.">
+                <span class="param-label">Длина общего плана</span>
+                <input type="range" id="mc-maxall" min="0.5" max="4" step="0.5" value="4" />
+                <span class="param-val" id="mc-maxall-val">4с</span>
+              </div>
+              <div class="param-row" title="Пауза (никто не говорит) → общий план. Выкл = держим камеру последнего говорившего.">
+                <span class="param-label">Общий на паузах</span>
+                <input type="checkbox" id="mc-wide-silence" checked />
+              </div>
+              <div class="param-row" title="Говорят разом → общий план. Выкл = держим последнего говорившего.">
+                <span class="param-label">Общий на перебивках</span>
+                <input type="checkbox" id="mc-wide-overlap" checked />
+              </div>
+
+              <div class="mc-section-title">Чувствительность звука</div>
+              <div class="param-row" title="Тише этого микрофон считается молчащим. Вправо = порог ниже (строже, реже слышим тишину).">
+                <span class="param-label">Порог тишины</span>
+                <input type="range" id="mc-silence" min="20" max="50" step="1" value="35" />
+                <span class="param-val" id="mc-silence-val">-35 dB</span>
+              </div>
+              <div class="param-row" title="Гасит покадровое дрожание камеры. Больше = плавнее; слишком много = проспим быстрые реплики.">
+                <span class="param-label">Сглаживание</span>
+                <input type="range" id="mc-smooth" min="1" max="15" step="2" value="5" />
+                <span class="param-val" id="mc-smooth-val">5 кадр.</span>
+              </div>
+
+              <div class="mc-section-title">Точность резов</div>
+              <div class="param-row" title="Подтягивает рез к ближайшей паузе / началу слова, чтобы не резать посреди слова. 0 = выкл. Больше = сильнее.">
+                <span class="param-label">Привязка к паузам</span>
+                <input type="range" id="mc-snap" min="0" max="0.5" step="0.05" value="0" />
+                <span class="param-val" id="mc-snap-val">выкл</span>
+              </div>
+              <div class="param-row" title="Тонкий сдвиг реза: минус = раньше (до первого слова), плюс = позже. Только при «Привязка» > 0.">
+                <span class="param-label">Сдвиг привязки</span>
+                <input type="range" id="mc-snapoff" min="-0.2" max="0.2" step="0.05" value="0" />
+                <span class="param-val" id="mc-snapoff-val">0мс</span>
+              </div>
+
+              <div class="mc-section-title">Вариативность и анализ</div>
+              <div class="param-row" title="Случайный разброс длины планов, чтобы нарезка не была механически ровной. 0 = выкл.">
+                <span class="param-label">Вариативность</span>
+                <input type="range" id="mc-jitter" min="0" max="0.5" step="0.05" value="0" />
+                <span class="param-val" id="mc-jitter-val">выкл</span>
+              </div>
+              <div class="param-row" title="Перетасовка рисунка разброса. Не понравился прогон → сдвинь, получишь другой. Только при «Вариативность» > 0.">
+                <span class="param-label">Дубль</span>
+                <input type="range" id="mc-seed" min="1" max="20" step="1" value="1" />
+                <span class="param-val" id="mc-seed-val">#1</span>
+              </div>
+              <div class="param-row" title="Шаг анализа звука. Влево = точнее границы резов, но дольше. 50мс — оптимум для речи.">
+                <span class="param-label">Шаг анализа</span>
+                <input type="range" id="mc-framesec" min="0.05" max="0.2" step="0.05" value="0.05" />
+                <span class="param-val" id="mc-framesec-val">50мс</span>
+              </div>
+            </details>
             <!-- UX 10.07.2026: кнопка ПРЕДЛАГАЕТ план (Apply — отдельным шагом
                  в карточке предпросмотра), старое «и применить» вводило в заблуждение -->
             <button class="tool-run" data-tool="multicam">Проанализировать и предложить нарезку</button>
