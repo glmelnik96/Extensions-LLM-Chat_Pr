@@ -177,6 +177,41 @@ describe('MulticamPlan._enforceMinHold', () => {
     const out = MP._enforceMinHold(segs, 1.5);
     assert.equal(out.length, 2);
   });
+
+  test('плотный вход (>1000 коротышей) — НИ ОДНОГО под-minHold сегмента на выходе', () => {
+    /* Регрессия 11.07.2026: live-тест на 6_SYNCED (80 мин, тихая запись) дал
+       3799 сегментов, 74% короче minHold. Причина — потолок safety<1000 в
+       цикле: за проход поглощался ровно 1 коротыш, после 1000 удалений цикл
+       молча обрывался, оставляя тысячи под-minHold склеек (покадровый пинг-понг). */
+    const segs = [];
+    for (let i = 0; i < 3000; i++) {
+      segs.push({ tStart: i * 0.1, tEnd: (i + 1) * 0.1, activeVideoTrack: i % 2 });
+    }
+    const out = MP._enforceMinHold(segs, 1.5);
+    for (const s of out) {
+      const dur = s.tEnd - s.tStart;
+      assert.ok(dur >= 1.5 - 1e-9 || out.length === 1,
+        `сегмент ${dur.toFixed(3)}c < minHold 1.5c остался после enforceMinHold`);
+    }
+  });
+
+  test('покрытие сохраняется — суммарная длительность и границы не рвутся', () => {
+    const segs = [];
+    for (let i = 0; i < 500; i++) {
+      segs.push({ tStart: i * 0.2, tEnd: (i + 1) * 0.2, activeVideoTrack: i % 3 });
+    }
+    const totalIn = segs[segs.length - 1].tEnd - segs[0].tStart;
+    const out = MP._enforceMinHold(segs, 1.5);
+    /* Границы стыкуются без дыр/нахлёстов */
+    for (let i = 1; i < out.length; i++) {
+      assert.equal(out[i].tStart, out[i - 1].tEnd);
+    }
+    /* Полное покрытие исходного диапазона */
+    assert.equal(out[0].tStart, segs[0].tStart);
+    assert.equal(out[out.length - 1].tEnd, segs[segs.length - 1].tEnd);
+    const totalOut = out[out.length - 1].tEnd - out[0].tStart;
+    assert.ok(Math.abs(totalIn - totalOut) < 1e-9);
+  });
 });
 
 /* ──────────────────────────────────────────────────────────────
