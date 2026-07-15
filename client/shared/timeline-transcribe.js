@@ -339,6 +339,11 @@
                      (typeof window !== 'undefined' && window.NestReconstruct);
     if (!builderApi) return Promise.reject(new Error('nest-reconstruct.js не загружен'));
     var built = builderApi.buildNestReconstructFilter(segments, { sampleRate: 16000 });
+    if (progress && built.droppedNonMedia && built.droppedNonMedia.length) {
+      progress('⚠ Пропущено ' + built.droppedNonMedia.length +
+        ' Dynamic Link (After Effects) сегм. — их речь не попадёт в транскрипт. ' +
+        'Отрендерите AE-композицию в медиа, чтобы включить её.');
+    }
     var os = require('os'), path = require('path');
     var outPath = path.join(os.tmpdir(), '_llm_nestmix_' + Date.now() + '.wav');
     var args = [];
@@ -927,6 +932,11 @@
 
     if (prep.mode === 'nest_reconstruct' && prep.segments && prep.segments.length) {
       beforeAwait();
+      if (progress && prep.droppedDynamicLink && prep.droppedDynamicLink.length) {
+        progress('⚠ Пропущено ' + prep.droppedDynamicLink.length +
+          ' Dynamic Link (After Effects) клип(ов) — их речь не попадёт в транскрипт. ' +
+          'Отрендерите AE-композицию в медиа, чтобы включить её.');
+      }
       var nestWavPath = await reconstructNestAudio(prep.segments, progress);
       try {
         var chunkSecCfgN = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)

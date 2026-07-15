@@ -2243,6 +2243,23 @@ $._EXT_PRM_._fileExists = function (path) {
   return f.exists === true;
 };
 
+/* Путь ведёт на реальный медиафайл, а не на проект/шаблон (Dynamic Link
+   After Effects .aep, Premiere .prproj, MOGRT, графика)? У таких источников
+   нет аудиофайла на диске — ffmpeg их не декодирует ("Invalid data found").
+   ES3: без Array.indexOf, через словарь расширений. */
+$._EXT_PRM_._NON_MEDIA_EXT = {
+  aep: 1, aepx: 1, prproj: 1, mogrt: 1, aegraphic: 1,
+  psd: 1, psb: 1, ai: 1, prfpset: 1
+};
+$._EXT_PRM_._isReconstructableMediaExt = function (path) {
+  if (!path) return false;
+  var s = String(path);
+  var dot = s.lastIndexOf('.');
+  if (dot < 0 || dot === s.length - 1) return true;
+  var ext = s.substring(dot + 1).toLowerCase();
+  return !$._EXT_PRM_._NON_MEDIA_EXT[ext];
+};
+
 $._EXT_PRM_._encodeInToOut = function () {
   try {
     if (app.encoder && typeof app.encoder.ENCODE_IN_TO_OUT === 'number') {
@@ -2315,7 +2332,7 @@ $._EXT_PRM_._resolveNestInner = function (clip) {
  * Возвращает массив { mediaPath, streamIndex, srcStart, segDur, localOffset,
  *                     outerStart, outerEnd, trackIndex }.
  */
-$._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, windowDur) {
+$._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, windowDur, skippedOut) {
   var out = [];
   var eps = $._EXT_PRM_._EPS;
   var winStart = nestIn, winEnd = nestIn + windowDur;
@@ -2334,6 +2351,12 @@ $._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, wi
       mp = '';
       try { if (typeof pi.getMediaPath === 'function') mp = pi.getMediaPath(); } catch (eP) {}
       if (!mp || !$._EXT_PRM_._fileExists(mp)) continue;
+      /* Dynamic Link (AE .aep) / графика: файл есть, но ffmpeg его не читает.
+         Отбрасываем и, если просили, регистрируем в skippedOut для сообщения. */
+      if (!$._EXT_PRM_._isReconstructableMediaExt(mp)) {
+        if (skippedOut) skippedOut.push(String(c.name || mp).replace(/\\/g, '/'));
+        continue;
+      }
       innerStart = c.start.seconds;
       innerEnd = c.end.seconds;
       mediaIn = c.inPoint ? c.inPoint.seconds : 0;
@@ -3031,7 +3054,7 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
          Реконструируем звук каждого фрагмента из внутренней секвенции и сводим в
          один WAV: localOffset — позиция во внешнем окне относительно inSec
          (поле outerStart из _enumerateNestAudibleAudio — истинная внешняя позиция). */
-      var allNest = true, nestSegs = [], hn, hClip, hInner, hNestIn,
+      var allNest = true, nestSegs = [], nestSkipped = [], hn, hClip, hInner, hNestIn,
         ho0, ho1, hWinStart, hWinDur, hSegs, hsi;
       for (hn = 0; hn < hits.length; hn++) {
         hClip = hits[hn].clip;
@@ -3043,7 +3066,7 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
         if (ho1 <= ho0 + $._EXT_PRM_._EPS) continue;
         hWinStart = hNestIn + (ho0 - hits[hn].startSec);
         hWinDur = ho1 - ho0;
-        hSegs = $._EXT_PRM_._enumerateNestAudibleAudio(hInner, hWinStart, ho0, hWinDur);
+        hSegs = $._EXT_PRM_._enumerateNestAudibleAudio(hInner, hWinStart, ho0, hWinDur, nestSkipped);
         for (hsi = 0; hsi < hSegs.length; hsi++) {
           hSegs[hsi].localOffset = hSegs[hsi].outerStart - inSec;
           nestSegs.push(hSegs[hsi]);
@@ -3051,6 +3074,17 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
       }
       if (allNest) {
         if (!nestSegs.length) {
+          if (nestSkipped.length) {
+            return JSON.stringify({
+              ok: false,
+              error: 'Во вложенных секвенциях слышимое аудио — только Dynamic Link ' +
+                '(After Effects) клипы (' + nestSkipped.join(', ') + '). У них нет ' +
+                'аудиофайла на диске. Отрендерите AE-композицию в медиа (WAV/MOV) ' +
+                'или замените клип, затем повторите.',
+              code: 'NEST_ONLY_DYNAMICLINK',
+              droppedDynamicLink: nestSkipped
+            });
+          }
           return JSON.stringify({
             ok: false,
             error: 'Во вложенных секвенциях нет слышимых аудиоклипов с файлом на диске (всё выключено/заглушено?).',
@@ -3062,6 +3096,7 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
           mode: 'nest_reconstruct',
           innerName: 'multi',
           segments: nestSegs,
+          droppedDynamicLink: nestSkipped,
           workInSec: inSec,
           workOutSec: outSec,
           timelineOffsetSec: inSec,
@@ -3176,8 +3211,21 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
         }
         var winStartN = nestIn + (o0 - clipStartN);
         var windowDurN = o1 - o0;
-        var segs = $._EXT_PRM_._enumerateNestAudibleAudio(inner, winStartN, o0, windowDurN);
+        var nestSkippedS = [];
+        var segs = $._EXT_PRM_._enumerateNestAudibleAudio(inner, winStartN, o0, windowDurN, nestSkippedS);
         if (!segs.length) {
+          if (nestSkippedS.length) {
+            return JSON.stringify({
+              ok: false,
+              error: 'Во вложенной секвенции слышимое аудио — только Dynamic Link ' +
+                '(After Effects) клипы (' + nestSkippedS.join(', ') + '). У них нет ' +
+                'аудиофайла на диске. Отрендерите AE-композицию в медиа (WAV/MOV) ' +
+                'или замените клип, затем повторите.',
+              code: 'NEST_ONLY_DYNAMICLINK',
+              droppedDynamicLink: nestSkippedS,
+              innerName: inner.name
+            });
+          }
           return JSON.stringify({
             ok: false,
             error: 'Во вложенной секвенции нет слышимых аудиоклипов с файлом на диске (всё выключено/заглушено?).',
@@ -3190,6 +3238,7 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
           mode: 'nest_reconstruct',
           innerName: inner.name,
           segments: segs,
+          droppedDynamicLink: nestSkippedS,
           workInSec: inSec,
           workOutSec: outSec,
           timelineOffsetSec: o0,
