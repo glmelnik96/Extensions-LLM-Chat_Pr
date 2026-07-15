@@ -939,6 +939,13 @@
           ' Dynamic Link (After Effects) клип(ов) — их речь не попадёт в транскрипт. ' +
           'Отрендерите AE-композицию в медиа, чтобы включить её.');
       }
+      if (progress && prep.droppedOffline && prep.droppedOffline.length) {
+        progress('⚠ Пропущено ' + prep.droppedOffline.length +
+          ' клип(ов) offline/недоступно во вложенных секвенциях (' +
+          prep.droppedOffline.slice(0, 5).join(', ') +
+          (prep.droppedOffline.length > 5 ? '…' : '') +
+          ') — их речь не попадёт в транскрипт. Верните медиа онлайн / откройте секвенцию.');
+      }
       var nestRec = await reconstructNestAudio(prep.segments, progress);
       var nestWavPath = nestRec.path;
       try {

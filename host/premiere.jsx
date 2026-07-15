@@ -2332,7 +2332,7 @@ $._EXT_PRM_._resolveNestInner = function (clip) {
  * Возвращает массив { mediaPath, streamIndex, srcStart, segDur, localOffset,
  *                     outerStart, outerEnd, trackIndex }.
  */
-$._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, windowDur, skippedOut, depth) {
+$._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, windowDur, skippedOut, depth, droppedOut) {
   var out = [];
   var eps = $._EXT_PRM_._EPS;
   var winStart = nestIn, winEnd = nestIn + windowDur;
@@ -2362,14 +2362,23 @@ $._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, wi
       cIsSeq = false;
       try { cIsSeq = (typeof pi.isSequence === 'function') && pi.isSequence() === true; } catch (eSq) {}
       if (cIsSeq) {
-        if (curDepth >= 16) continue; /* защита от цикла (секвенция в самой себе) */
+        if (curDepth >= 16) {
+          if (droppedOut) droppedOut.push(String(c.name || '?').replace(/\\/g, '/') + ' (слишком глубокая вложенность >16)');
+          continue; /* защита от цикла (секвенция в самой себе) */
+        }
         subInner = $._EXT_PRM_._resolveNestInner(c);
-        if (!subInner) continue;
+        if (!subInner) {
+          /* isSequence()===true, но резолв по nodeId не нашёл её в проекте
+             (напр. Multi-Camera Source Sequence): аудио внутри достать нельзя —
+             сообщаем, чтобы не потерять молча. */
+          if (droppedOut) droppedOut.push(String(c.name || '?').replace(/\\/g, '/') + ' (вложенную секвенцию не удалось открыть)');
+          continue;
+        }
         subIn = c.inPoint ? c.inPoint.seconds : 0;
         subWinStart = subIn + (vs - innerStart);
         subWindowDur = ve - vs;
         subOuterStart = outerStart + (vs - winStart);
-        subSegs = $._EXT_PRM_._enumerateNestAudibleAudio(subInner, subWinStart, subOuterStart, subWindowDur, skippedOut, curDepth + 1);
+        subSegs = $._EXT_PRM_._enumerateNestAudibleAudio(subInner, subWinStart, subOuterStart, subWindowDur, skippedOut, curDepth + 1, droppedOut);
         for (ss = 0; ss < subSegs.length; ss++) {
           /* localOffset пересчитываем относительно ЭТОГО окна (в итоге, на самом
              верхнем вызове — относительно outerStart реконструкции). outerStart
@@ -2381,7 +2390,13 @@ $._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, wi
       }
       mp = '';
       try { if (typeof pi.getMediaPath === 'function') mp = pi.getMediaPath(); } catch (eP) {}
-      if (!mp || !$._EXT_PRM_._fileExists(mp)) continue;
+      /* Без пути и не секвенция — синтетика (генератор/чёрное видео), аудио нет: тихо. */
+      if (!mp) continue;
+      /* Путь есть, но файла на диске нет — offline-медиа: реально теряем звук, сообщаем. */
+      if (!$._EXT_PRM_._fileExists(mp)) {
+        if (droppedOut) droppedOut.push(String(c.name || mp).replace(/\\/g, '/') + ' (offline / файл не найден)');
+        continue;
+      }
       /* Dynamic Link (AE .aep) / графика: файл есть, но ffmpeg его не читает.
          Отбрасываем и, если просили, регистрируем в skippedOut для сообщения. */
       if (!$._EXT_PRM_._isReconstructableMediaExt(mp)) {
@@ -3080,7 +3095,7 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
          Реконструируем звук каждого фрагмента из внутренней секвенции и сводим в
          один WAV: localOffset — позиция во внешнем окне относительно inSec
          (поле outerStart из _enumerateNestAudibleAudio — истинная внешняя позиция). */
-      var allNest = true, nestSegs = [], nestSkipped = [], hn, hClip, hInner, hNestIn,
+      var allNest = true, nestSegs = [], nestSkipped = [], nestDropped = [], hn, hClip, hInner, hNestIn,
         ho0, ho1, hWinStart, hWinDur, hSegs, hsi;
       for (hn = 0; hn < hits.length; hn++) {
         hClip = hits[hn].clip;
@@ -3092,7 +3107,7 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
         if (ho1 <= ho0 + $._EXT_PRM_._EPS) continue;
         hWinStart = hNestIn + (ho0 - hits[hn].startSec);
         hWinDur = ho1 - ho0;
-        hSegs = $._EXT_PRM_._enumerateNestAudibleAudio(hInner, hWinStart, ho0, hWinDur, nestSkipped);
+        hSegs = $._EXT_PRM_._enumerateNestAudibleAudio(hInner, hWinStart, ho0, hWinDur, nestSkipped, 0, nestDropped);
         for (hsi = 0; hsi < hSegs.length; hsi++) {
           hSegs[hsi].localOffset = hSegs[hsi].outerStart - inSec;
           nestSegs.push(hSegs[hsi]);
@@ -3100,15 +3115,18 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
       }
       if (allNest) {
         if (!nestSegs.length) {
-          if (nestSkipped.length) {
+          if (nestSkipped.length || nestDropped.length) {
+            var whyM = [];
+            if (nestSkipped.length) whyM.push('Dynamic Link (After Effects): ' + nestSkipped.join(', '));
+            if (nestDropped.length) whyM.push('offline/недоступно: ' + nestDropped.join(', '));
             return JSON.stringify({
               ok: false,
-              error: 'Во вложенных секвенциях слышимое аудио — только Dynamic Link ' +
-                '(After Effects) клипы (' + nestSkipped.join(', ') + '). У них нет ' +
-                'аудиофайла на диске. Отрендерите AE-композицию в медиа (WAV/MOV) ' +
-                'или замените клип, затем повторите.',
+              error: 'Во вложенных секвенциях нет слышимого аудио, пригодного для реконструкции — ' +
+                whyM.join('; ') + '. Отрендерите AE-композиции в медиа (WAV/MOV) ' +
+                'и/или верните offline-медиа онлайн, затем повторите.',
               code: 'NEST_ONLY_DYNAMICLINK',
-              droppedDynamicLink: nestSkipped
+              droppedDynamicLink: nestSkipped,
+              droppedOffline: nestDropped
             });
           }
           return JSON.stringify({
@@ -3123,6 +3141,7 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
           innerName: 'multi',
           segments: nestSegs,
           droppedDynamicLink: nestSkipped,
+          droppedOffline: nestDropped,
           workInSec: inSec,
           workOutSec: outSec,
           timelineOffsetSec: inSec,
@@ -3238,17 +3257,21 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
         var winStartN = nestIn + (o0 - clipStartN);
         var windowDurN = o1 - o0;
         var nestSkippedS = [];
-        var segs = $._EXT_PRM_._enumerateNestAudibleAudio(inner, winStartN, o0, windowDurN, nestSkippedS);
+        var nestDroppedS = [];
+        var segs = $._EXT_PRM_._enumerateNestAudibleAudio(inner, winStartN, o0, windowDurN, nestSkippedS, 0, nestDroppedS);
         if (!segs.length) {
-          if (nestSkippedS.length) {
+          if (nestSkippedS.length || nestDroppedS.length) {
+            var whyS = [];
+            if (nestSkippedS.length) whyS.push('Dynamic Link (After Effects): ' + nestSkippedS.join(', '));
+            if (nestDroppedS.length) whyS.push('offline/недоступно: ' + nestDroppedS.join(', '));
             return JSON.stringify({
               ok: false,
-              error: 'Во вложенной секвенции слышимое аудио — только Dynamic Link ' +
-                '(After Effects) клипы (' + nestSkippedS.join(', ') + '). У них нет ' +
-                'аудиофайла на диске. Отрендерите AE-композицию в медиа (WAV/MOV) ' +
-                'или замените клип, затем повторите.',
+              error: 'Во вложенной секвенции нет слышимого аудио, пригодного для реконструкции — ' +
+                whyS.join('; ') + '. Отрендерите AE-композиции в медиа (WAV/MOV) ' +
+                'и/или верните offline-медиа онлайн, затем повторите.',
               code: 'NEST_ONLY_DYNAMICLINK',
               droppedDynamicLink: nestSkippedS,
+              droppedOffline: nestDroppedS,
               innerName: inner.name
             });
           }
@@ -3265,6 +3288,7 @@ $._EXT_PRM_.prepareTranscribeFromTimeline = function (jsonStr) {
           innerName: inner.name,
           segments: segs,
           droppedDynamicLink: nestSkippedS,
+          droppedOffline: nestDroppedS,
           workInSec: inSec,
           workOutSec: outSec,
           timelineOffsetSec: o0,
