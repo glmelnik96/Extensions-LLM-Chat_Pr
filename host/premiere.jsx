@@ -2332,11 +2332,13 @@ $._EXT_PRM_._resolveNestInner = function (clip) {
  * Возвращает массив { mediaPath, streamIndex, srcStart, segDur, localOffset,
  *                     outerStart, outerEnd, trackIndex }.
  */
-$._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, windowDur, skippedOut) {
+$._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, windowDur, skippedOut, depth) {
   var out = [];
   var eps = $._EXT_PRM_._EPS;
   var winStart = nestIn, winEnd = nestIn + windowDur;
+  var curDepth = depth || 0;
   var ti, j, tr, c, pi, muted, innerStart, innerEnd, mediaIn, mp, vs, ve;
+  var cIsSeq, subInner, subIn, subWinStart, subWindowDur, subOuterStart, subSegs, ss;
   for (ti = 0; ti < inner.audioTracks.numTracks; ti++) {
     tr = inner.audioTracks[ti];
     muted = false;
@@ -2348,6 +2350,35 @@ $._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, wi
       if (c.disabled === true) continue;
       pi = c.projectItem;
       if (!pi) continue;
+      innerStart = c.start.seconds;
+      innerEnd = c.end.seconds;
+      vs = innerStart > winStart ? innerStart : winStart;
+      ve = innerEnd < winEnd ? innerEnd : winEnd;
+      if (ve <= vs + eps) continue;
+      /* Клип сам — вложенная секвенция (nest в nest, напр. Resolve-мультикам
+         синк внутри рендер-nest): у него нет пути к файлу, поэтому спускаемся
+         рекурсивно и проецируем его слышимое аудио через видимое окно [vs,ve].
+         Без этого весь звук глубже одного уровня молча терялся. */
+      cIsSeq = false;
+      try { cIsSeq = (typeof pi.isSequence === 'function') && pi.isSequence() === true; } catch (eSq) {}
+      if (cIsSeq) {
+        if (curDepth >= 16) continue; /* защита от цикла (секвенция в самой себе) */
+        subInner = $._EXT_PRM_._resolveNestInner(c);
+        if (!subInner) continue;
+        subIn = c.inPoint ? c.inPoint.seconds : 0;
+        subWinStart = subIn + (vs - innerStart);
+        subWindowDur = ve - vs;
+        subOuterStart = outerStart + (vs - winStart);
+        subSegs = $._EXT_PRM_._enumerateNestAudibleAudio(subInner, subWinStart, subOuterStart, subWindowDur, skippedOut, curDepth + 1);
+        for (ss = 0; ss < subSegs.length; ss++) {
+          /* localOffset пересчитываем относительно ЭТОГО окна (в итоге, на самом
+             верхнем вызове — относительно outerStart реконструкции). outerStart
+             сегмента абсолютен и уже корректен. */
+          subSegs[ss].localOffset = subSegs[ss].outerStart - outerStart;
+          out.push(subSegs[ss]);
+        }
+        continue;
+      }
       mp = '';
       try { if (typeof pi.getMediaPath === 'function') mp = pi.getMediaPath(); } catch (eP) {}
       if (!mp || !$._EXT_PRM_._fileExists(mp)) continue;
@@ -2357,12 +2388,7 @@ $._EXT_PRM_._enumerateNestAudibleAudio = function (inner, nestIn, outerStart, wi
         if (skippedOut) skippedOut.push(String(c.name || mp).replace(/\\/g, '/'));
         continue;
       }
-      innerStart = c.start.seconds;
-      innerEnd = c.end.seconds;
       mediaIn = c.inPoint ? c.inPoint.seconds : 0;
-      vs = innerStart > winStart ? innerStart : winStart;
-      ve = innerEnd < winEnd ? innerEnd : winEnd;
-      if (ve <= vs + eps) continue;
       out.push({
         mediaPath: String(mp).replace(/\\/g, '/'),
         streamIndex: 0,
