@@ -329,7 +329,9 @@
 
   /**
    * Реконструировать слышимое аудио вложенной секвенции в один 16k mono WAV.
-   * segments из host-манифеста (mode nest_reconstruct). Возвращает Promise<string> путь к WAV.
+   * segments из host-манифеста (mode nest_reconstruct).
+   * Возвращает Promise<{ path, effectiveDurSec }>: путь к WAV и его фактическую
+   * длину (конец самого позднего сегмента) — нарезчику, чтобы не резать за концом.
    */
   function reconstructNestAudio(segments, progress) {
     if (typeof require === 'undefined') return Promise.reject(new Error('Node.js недоступен для ffmpeg'));
@@ -366,7 +368,7 @@
           try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (eUN2) {}
           reject(new Error('ffmpeg создал пустой nest-mix (' + outPath + ')')); return;
         }
-        resolve(outPath);
+        resolve({ path: outPath, effectiveDurSec: built.effectiveDurSec || 0 });
       });
     });
   }
@@ -937,15 +939,22 @@
           ' Dynamic Link (After Effects) клип(ов) — их речь не попадёт в транскрипт. ' +
           'Отрендерите AE-композицию в медиа, чтобы включить её.');
       }
-      var nestWavPath = await reconstructNestAudio(prep.segments, progress);
+      var nestRec = await reconstructNestAudio(prep.segments, progress);
+      var nestWavPath = nestRec.path;
       try {
         var chunkSecCfgN = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
           ? settings.transcribeExportChunkSec : 90;
         var baseOffN = (typeof prep.timelineOffsetSec === 'number') ? prep.timelineOffsetSec : 0;
         var spanN = (typeof prep.windowDurSec === 'number') ? prep.windowDurSec : 0;
+        /* Нарезаем по фактической длине реконструированного аудио, а не по всему
+           окну In–Out: после выпадения Dynamic Link-сегментов WAV может быть много
+           короче окна, и чанки за его концом выходили пустыми (хард-фейл). */
+        var effN = (typeof nestRec.effectiveDurSec === 'number' && nestRec.effectiveDurSec > 0)
+          ? nestRec.effectiveDurSec : spanN;
+        var chunkSpanN = (spanN > 0) ? Math.min(spanN, effN) : effN;
         beforeAwait();
         progress('Транскрибация nest: нарезка ffmpeg…');
-        var nChunks = await extractAudioChunksWithFfmpeg(nestWavPath, 0, spanN, chunkSecCfgN, progress, chunkFmt);
+        var nChunks = await extractAudioChunksWithFfmpeg(nestWavPath, 0, chunkSpanN, chunkSecCfgN, progress, chunkFmt);
         var combinedN = [], textAccN = '', nDone = 0;
         var nTasks = nChunks.map(function (nch, nci) {
           return function () {

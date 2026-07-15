@@ -30,6 +30,27 @@ test('empty segments throws', () => {
   assert.throws(() => buildNestReconstructFilter([], {}), /no audible/i);
 });
 
+test('effectiveDurSec = max(localOffset + segDur) over kept segments', () => {
+  const one = buildNestReconstructFilter(
+    [{ mediaPath: 'D:/a.braw', srcStart: 10, segDur: 5, localOffset: 0, streamIndex: 2 }], {});
+  assert.equal(one.effectiveDurSec, 5);
+
+  const two = buildNestReconstructFilter([
+    { mediaPath: 'D:/a.braw', srcStart: 0, segDur: 4, localOffset: 0,    streamIndex: 1 },
+    { mediaPath: 'D:/a.braw', srcStart: 8, segDur: 6, localOffset: 12.5, streamIndex: 1 }
+  ], {});
+  assert.equal(two.effectiveDurSec, 18.5);
+});
+
+test('effectiveDurSec ignores dropped Dynamic Link segments (reflects only kept media)', () => {
+  const r = buildNestReconstructFilter([
+    { mediaPath: '/vol/PRJ/Podcast_Pack.aep', srcStart: 0, segDur: 25, localOffset: 0,       streamIndex: 0 },
+    { mediaPath: '/vol/SFX/bed.wav',          srcStart: 0, segDur: 40, localOffset: 5,       streamIndex: 0 },
+    { mediaPath: '/vol/PRJ/Podcast_Pack.aep', srcStart: 0, segDur: 22, localOffset: 4738.56, streamIndex: 0 }
+  ], {});
+  assert.equal(r.effectiveDurSec, 45);
+});
+
 test('isReconstructableMediaPath: media true, project/graphic sources false', () => {
   assert.equal(isReconstructableMediaPath('D:/a.braw'), true);
   assert.equal(isReconstructableMediaPath('/x/y.wav'), true);

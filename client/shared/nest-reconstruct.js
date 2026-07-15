@@ -50,6 +50,14 @@
     var inputs = [];
     var parts = [];
     var labels = [];
+    /* Реальная длина реконструированного аудио = самый поздний конец сегмента
+       (localOffset + segDur). Нужна нарезчику, чтобы не резать пустые чанки за
+       концом WAV после выпадения Dynamic Link-сегментов. */
+    var effectiveDurSec = 0;
+    for (var e = 0; e < segments.length; e++) {
+      var end = (segments[e].localOffset || 0) + (segments[e].segDur || 0);
+      if (end > effectiveDurSec) effectiveDurSec = end;
+    }
     for (var i = 0; i < segments.length; i++) {
       var s = segments[i];
       inputs.push({ path: s.mediaPath, ss: s.srcStart, t: s.segDur, streamIndex: s.streamIndex });
@@ -66,10 +74,10 @@
     var outLabel = 'mix';
     if (segments.length === 1) {
       var only = parts[0].replace(/\[a0\]$/, '[' + outLabel + ']');
-      return { inputs: inputs, filterComplex: only, outLabel: outLabel, droppedNonMedia: droppedNonMedia };
+      return { inputs: inputs, filterComplex: only, outLabel: outLabel, droppedNonMedia: droppedNonMedia, effectiveDurSec: effectiveDurSec };
     }
     parts.push(labels.join('') + 'amix=inputs=' + segments.length + ':normalize=0[' + outLabel + ']');
-    return { inputs: inputs, filterComplex: parts.join(';'), outLabel: outLabel, droppedNonMedia: droppedNonMedia };
+    return { inputs: inputs, filterComplex: parts.join(';'), outLabel: outLabel, droppedNonMedia: droppedNonMedia, effectiveDurSec: effectiveDurSec };
   }
 
   global.NestReconstruct = {
