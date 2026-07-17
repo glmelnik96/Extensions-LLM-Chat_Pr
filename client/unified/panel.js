@@ -5030,6 +5030,128 @@ PanelBoot.run('ИИ: монтаж', function () {
       el.moreMenu.classList.remove('open');
     };
   }
+  /* ─── Читалка транскрипта ────────────────────────────────────────── */
+
+  function _trModalEls() {
+    return {
+      overlay: document.getElementById('transcript-modal'),
+      body: document.getElementById('tr-modal-body'),
+      meta: document.getElementById('tr-modal-meta'),
+      title: document.getElementById('tr-modal-title'),
+      close: document.getElementById('tr-modal-close')
+    };
+  }
+
+  function closeTranscriptViewer() {
+    var m = _trModalEls();
+    if (m.overlay) m.overlay.hidden = true;
+  }
+
+  function _renderTranscriptRows(entry, seq) {
+    var m = _trModalEls();
+    if (!m.body) return;
+    /* Достроим параграфы, если их ещё нет (как в остальных путях панели). */
+    if (entry && (!entry.paragraphs || !entry.paragraphs.length) &&
+        typeof TranscriptStructure !== 'undefined') {
+      try { TranscriptStructure.buildStructure(entry); } catch (eB) {}
+    }
+    var view = TranscriptView.buildTranscriptViewRows(entry);
+    m.title.textContent = 'Транскрипт' + (seq ? ' — ' + seq : '');
+    if (view.source === 'empty') {
+      m.meta.textContent = '';
+      m.body.innerHTML = '';
+      var em = document.createElement('div');
+      em.className = 'tr-empty';
+      em.textContent = seq
+        ? 'Для секвенции «' + seq + '» транскрипта нет. Выставьте In/Out и нажмите «Транскрибировать».'
+        : 'Нет активной секвенции или транскрипта.';
+      m.body.appendChild(em);
+      return;
+    }
+    var metaBits = [];
+    if (view.meta.paragraphCount) metaBits.push(view.meta.paragraphCount + ' абз.');
+    else if (view.meta.segmentCount) metaBits.push(view.meta.segmentCount + ' сегм.');
+    if (view.meta.durationSec) metaBits.push('~' + TranscriptView.formatTimecode(view.meta.durationSec));
+    if (view.meta.speakers && view.meta.speakers.length) metaBits.push(view.meta.speakers.length + ' спик.');
+    m.meta.textContent = metaBits.join(' · ');
+
+    m.body.innerHTML = '';
+    if (view.source === 'text') {
+      var pl = document.createElement('div');
+      pl.className = 'tr-plain';
+      pl.textContent = view.rows[0].text;
+      m.body.appendChild(pl);
+      return;
+    }
+    for (var i = 0; i < view.rows.length; i++) {
+      var r = view.rows[i];
+      var row = document.createElement('div');
+      row.className = 'tr-row';
+      var t = document.createElement('span');
+      t.className = 'tr-time';
+      t.textContent = r.time;
+      t.title = 'Перейти к ' + r.time + ' на таймлайне';
+      (function (sec) {
+        t.onclick = function () {
+          try { PremiereBridge.setPlayhead(sec, function () {}); } catch (eS) {}
+        };
+      })(r.startSec);
+      row.appendChild(t);
+      if (r.speaker) {
+        var sp = document.createElement('span');
+        sp.className = 'tr-speaker';
+        sp.textContent = r.speaker + ':';
+        row.appendChild(sp);
+      }
+      var tx = document.createElement('span');
+      tx.className = 'tr-text';
+      tx.textContent = r.text;
+      row.appendChild(tx);
+      m.body.appendChild(row);
+    }
+    m.body.scrollTop = 0;
+  }
+
+  function openTranscriptViewer() {
+    var m = _trModalEls();
+    if (!m.overlay) return;
+    if (el.moreMenu) el.moreMenu.classList.remove('open');
+    m.overlay.hidden = false;
+    m.title.textContent = 'Транскрипт';
+    m.meta.textContent = '';
+    m.body.innerHTML = '<div class="tr-empty">Загрузка…</div>';
+    PremiereBridge.getTimelineSnapshot(function (err, snap) {
+      var seq = !err && snap && snap.ok && snap.sequenceName ? snap.sequenceName : '';
+      var entry = null;
+      if (seq) {
+        var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seq);
+        entry = found && found.entry ? found.entry : null;
+      }
+      _renderTranscriptRows(entry, seq);
+    });
+  }
+
+  var btnViewTr = document.getElementById('btn-view-transcript');
+  if (btnViewTr) btnViewTr.onclick = openTranscriptViewer;
+  (function () {
+    var m = _trModalEls();
+    if (m.close) m.close.onclick = closeTranscriptViewer;
+    if (m.overlay) {
+      m.overlay.addEventListener('click', function (e) {
+        if (e.target === m.overlay) closeTranscriptViewer();
+      });
+    }
+    if (!window.__omcTrModalEscInstalled) {
+      window.__omcTrModalEscInstalled = true;
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') {
+          var ov = document.getElementById('transcript-modal');
+          if (ov && !ov.hidden) closeTranscriptViewer();
+        }
+      });
+    }
+  })();
+
   var btnExport = document.getElementById('btn-export-session');
   if (btnExport) {
     btnExport.onclick = function () {
