@@ -734,41 +734,54 @@
             <div class="proposal-area" id="dz-result"></div>
           </div>
 
-          <!-- 5c. Вертикаль 9:16 (Волна 3 п.5, 10.07.2026) — рефрейм для
-               шортсов. Исходник НЕ трогается: clone → 1080×1920 → Motion
-               Scale/Position per клип (cover-кроп). Vision исключён:
-               фокус задаётся смещениями per-камера. -->
-          <div class="tool-card" id="card-vertical">
-            <div class="tool-card-title">📱 Вертикаль 9:16</div>
+          <!-- 5c. Рилс (17.07.2026) — объединяет «Вертикаль 9:16» и «Субтитры»:
+               clone → 1080×1920 / 1080×1080 → Motion cover-кроп (позиция от
+               vision-модели по кадру из середины источника, ручные смещения
+               побеждают) → караоке-субтитры (ASS+libass → прозрачный ProRes
+               оверлей на верхней дорожке). LLM-корректура с guard, точка в
+               конце титра убирается. needs-transcript. -->
+          <div class="tool-card needs-transcript" id="card-reels">
+            <div class="tool-card-title">🎬 Рилс</div>
             <div class="tool-card-desc">
-              Копия активной секвенции в 1080×1920 для шортсов: каждый клип
-              масштабируется на весь кадр (cover), горизонтальный излишек
-              кропится. Исходная секвенция не меняется.
+              Вертикаль/квадрат из активной секвенции + анимированные
+              субтитры (SB Sans) оверлеем на верхней дорожке. Позицию
+              кадрирования подбирает vision-модель, титры проходят
+              LLM-корректуру. Исходная секвенция не меняется.
             </div>
-            <div class="param-row" title="Куда смотреть в кадре у каждой камеры: «имя клипа: сдвиг%». Сдвиг — в % ширины кадра от центра, минус = левее, плюс = правее. Пример: «Гость: -20; Ведущий: 15». Пусто = центр у всех.">
+            <div class="param-row" title="9:16 — 1080×1920 (Reels/Shorts), 1:1 — 1080×1080 (квадрат).">
+              <span class="param-label">Формат</span>
+              <select id="rl-format" style="flex:1;min-width:0;">
+                <option value="9x16" selected>9:16 (1080×1920)</option>
+                <option value="1x1">1:1 (1080×1080)</option>
+              </select>
+            </div>
+            <div class="param-row" title="Шрифт субтитров. Должен быть установлен в системе (C:\Windows\Fonts).">
+              <span class="param-label">Шрифт</span>
+              <select id="rl-font" style="flex:1;min-width:0;">
+                <option value="SB Sans Text SemiBold" selected>SB Sans Text SemiBold</option>
+                <option value="SB Sans Display SemiBold">SB Sans Display SemiBold</option>
+              </select>
+            </div>
+            <div class="param-row" title="Анимация произносимого слова: перекраска в цвет подсветки, плашка под словом или без анимации.">
+              <span class="param-label">Анимация</span>
+              <select id="rl-anim" style="flex:1;min-width:0;">
+                <option value="color" selected>цвет слова</option>
+                <option value="box">плашка под словом</option>
+                <option value="none">нет</option>
+              </select>
+            </div>
+            <div class="param-row" title="Цвет текста субтитров и цвет подсветки (перекраска слова или плашка).">
+              <span class="param-label">Цвета</span>
+              <label style="display:flex;align-items:center;gap:4px;">текст <input type="color" id="rl-text-color" value="#FFFFFF" /></label>
+              <label style="display:flex;align-items:center;gap:4px;">подсветка <input type="color" id="rl-hl-color" value="#21A038" /></label>
+            </div>
+            <div class="param-row" title="Куда смотреть в кадре у каждой камеры: «имя клипа: сдвиг%». Минус = левее, плюс = правее. Пример: «Гость: -20; Ведущий: 15». Пусто = позицию решает vision-модель (по кадру из середины источника), при её недоступности — центр. Ручное значение побеждает vision.">
               <span class="param-label">Фокус камер</span>
-              <input type="text" id="vt-offsets" placeholder="Гость: -20; Ведущий: 15 (пусто = центр)" style="flex:1;min-width:0;" />
+              <input type="text" id="rl-offsets" placeholder="Гость: -20 (пусто = vision)" style="flex:1;min-width:0;" />
             </div>
-            <button class="tool-run" data-tool="vertical">Создать вертикальную копию</button>
-            <div class="proposal-area" id="vt-result"></div>
-          </div>
-
-          <!-- 5d. Субтитры (Волна 3 п.4, 11.07.2026) — транскрипт → SRT-кьюи
-               (перенос ≤2×42, ≤5с, линейный тайминг по словам) → .srt →
-               importFiles → createCaptionTrack. needs-transcript. -->
-          <div class="tool-card needs-transcript" id="card-subtitles">
-            <div class="tool-card-title">💬 Субтитры</div>
-            <div class="tool-card-desc">
-              Caption-трек из транскрипта активной секвенции: реплики бьются
-              на титры до 2 строк × 42 символа и до 5 секунд. Если размечены
-              спикеры — смена говорящего помечается тире.
-            </div>
-            <div class="param-row" title="Ставить «— » в начале титра при смене говорящего. Требует разметки спикеров (карточка «🗣 Спикеры»).">
-              <span class="param-label">Метки спикеров</span>
-              <input type="checkbox" id="st-speakers" checked />
-            </div>
-            <button class="tool-run" data-tool="subtitles">Создать субтитры</button>
-            <div class="proposal-area" id="st-result"></div>
+            <button class="tool-run" data-tool="reels">Собрать рилс</button>
+            <button type="button" class="secondary" id="rl-edit-cues" style="font-size:11px;" title="Открыть сохранённые титры рилса: правка текста, обновление captions, перерендер караоке">Править титры</button>
+            <div class="proposal-area" id="rl-result"></div>
           </div>
 
           <!-- 6. J-cuts / L-cuts — ОТКЛЮЧЕНО (ограничение ExtendScript) -->
@@ -799,6 +812,24 @@
           <button type="button" class="tr-modal-close" id="tr-modal-close" title="Закрыть (Esc)" aria-label="Закрыть">✕</button>
         </div>
         <div class="tr-modal-body" id="tr-modal-body"></div>
+      </div>
+    </div>
+
+    <!-- Рилс v2: редактор титров. Кью — источник правды (ContextStore),
+         правка пересобирает words char-weighted; кнопки обновляют слои. -->
+    <div class="tr-modal-overlay" id="reels-edit-modal" hidden role="dialog" aria-modal="true" aria-labelledby="re-modal-title">
+      <div class="tr-modal">
+        <div class="tr-modal-head">
+          <span class="tr-modal-title" id="re-modal-title">Титры рилса</span>
+          <span class="tr-modal-meta" id="re-modal-meta"></span>
+          <button type="button" class="tr-modal-close" id="re-modal-close" title="Закрыть (Esc)" aria-label="Закрыть">✕</button>
+        </div>
+        <div class="tr-modal-body" id="re-modal-body"></div>
+        <div style="display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--border,#444);align-items:center;">
+          <button type="button" id="re-update-captions">Обновить captions</button>
+          <button type="button" id="re-rerender-karaoke">Перерендерить караоке</button>
+          <span id="re-modal-status" style="color:var(--muted);font-size:12px;flex:1;"></span>
+        </div>
       </div>
     </div>
 
@@ -842,6 +873,7 @@
           '../shared/ui-hints.js',
           '../shared/conversation-starters.js',
           '../shared/starters-ui.js',
+          '../shared/reels-pipeline.js',
           '../shared/self-update.js',
           'panel.js'
         ];

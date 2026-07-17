@@ -272,6 +272,18 @@
       this.evalJson('$._EXT_PRM_.importSrtAsCaptions("' + json + '")', cb, { mutating: true });
     },
 
+    /** Рилс: импорт оверлея + вставка на новую верхнюю видеодорожку с 0. */
+    importAndOverlayOnTop: function (payloadObj, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify(payloadObj));
+      this.evalJson('$._EXT_PRM_.importAndOverlayOnTop("' + json + '")', cb, { mutating: true });
+    },
+
+    /** Рилс v2: активировать секвенцию по имени (captions при анимации «нет»). */
+    activateSequenceByName: function (payloadObj, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify(payloadObj));
+      this.evalJson('$._EXT_PRM_.activateSequenceByName("' + json + '")', cb, { mutating: true });
+    },
+
     /** Vision: перечислить видеоклипы активной секвенции с таймингом и mediaPath (read-only). */
     getFrameSources: function (cb) {
       this.evalJson('$._EXT_PRM_.getFrameSources()', cb);

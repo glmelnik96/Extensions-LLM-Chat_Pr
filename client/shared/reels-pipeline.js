@@ -1,0 +1,492 @@
+/**
+ * ReelsPipeline — чистая логика функции «Рилс» (17.07.2026).
+ *
+ * Караоке-кьюи с пословными таймкодами, правило точек, guard LLM-корректуры,
+ * генерация ASS-субтитров (none/color/box), ffmpeg-аргументы прозрачного
+ * оверлея, план vision-запросов. Без DOM, без Node-зависимостей — тестируется
+ * в vm. Оркестрация — в panel.js (toolsRunReels).
+ */
+(function (global) {
+  'use strict';
+
+  /* ── Правило точек ─────────────────────────────────────────────────────
+   * Убирается ТОЛЬКО одиночная точка в самом конце титра.
+   * «?», «!», «…», «...» и точки в середине текста остаются. */
+  function stripCueFinalPeriod(text) {
+    var s = String(text == null ? '' : text);
+    if (/[^.]\.$/.test(s)) return s.slice(0, -1);
+    return s;
+  }
+
+  /* ── Vision: cx (0..1, центр лица) → offsetPct для planVerticalReframe ── */
+  function offsetPctFromCx(cx) {
+    var n = (typeof cx === 'number') ? cx
+      : (typeof cx === 'string' && cx !== '') ? Number(cx) : NaN;
+    if (!isFinite(n)) return null;
+    var pct = (n - 0.5) * 100;
+    return Math.max(-50, Math.min(50, Math.round(pct * 10) / 10));
+  }
+
+  /* ── Перенос слов в ≤maxLines строк по ≤maxChars (greedy).
+   * Копия приватной _wrapWords из deterministic-pipelines (модули shared
+   * независимы). null — не влезает. */
+  function _wrapWords(words, maxChars, maxLines) {
+    var lines = [''];
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      var cur = lines[lines.length - 1];
+      if (!cur.length) {
+        if (w.length > maxChars) return null;
+        lines[lines.length - 1] = w;
+      } else if (cur.length + 1 + w.length <= maxChars) {
+        lines[lines.length - 1] = cur + ' ' + w;
+      } else {
+        if (lines.length >= maxLines || w.length > maxChars) return null;
+        lines.push(w);
+      }
+    }
+    return lines.join('\n');
+  }
+
+  /* ── Выравнивание слов по речи (Cloud.ru Whisper НЕ отдаёт word-таймкоды,
+   * проверено live 17.07.2026: timestamp_granularities[]=word → 200 OK, слов
+   * нет). Детерминированная замена: интервал сегмента минус тишины ≥0.3с
+   * (ffmpeg silencedetect из audioAnalysis), слова раскладываются по
+   * озвученным подынтервалам пропорционально длине слова в символах. ── */
+
+  /* Озвученные интервалы [start,end] за вычетом тишин ≥ minSilenceSec.
+   * Формы тишин: {startSec,endSec} и {start,end} (как в deterministic-pipelines).
+   * Всё вырезано → деградация: весь [start,end]. */
+  function _speechIntervals(start, end, silences, minSilenceSec) {
+    var minSil = minSilenceSec > 0 ? minSilenceSec : 0.3;
+    var sils = [];
+    var n = silences ? silences.length : 0;
+    for (var i = 0; i < n; i++) {
+      var sl = silences[i];
+      if (!sl) continue;
+      var s = Number(sl.startSec !== undefined ? sl.startSec : sl.start);
+      var e = Number(sl.endSec !== undefined ? sl.endSec : sl.end);
+      if (!isFinite(s) || !isFinite(e) || e - s < minSil) continue;
+      var cs = Math.max(s, start), ce = Math.min(e, end);
+      if (ce > cs) sils.push({ s: cs, e: ce });
+    }
+    if (!sils.length) return [{ s: start, e: end }];
+    sils.sort(function (a, b) { return a.s - b.s; });
+    var out = [], cur = start;
+    for (var k = 0; k < sils.length; k++) {
+      if (sils[k].s > cur + 1e-9) out.push({ s: cur, e: sils[k].s });
+      cur = Math.max(cur, sils[k].e);
+    }
+    if (cur < end - 1e-9) out.push({ s: cur, e: end });
+    if (!out.length) return [{ s: start, e: end }];
+    return out;
+  }
+
+  /**
+   * Char-weighted раскладка слов по озвученным интервалам сегмента.
+   * words: массив строк; silences: см. _speechIntervals (может быть null).
+   * Возвращает [{w,s,e}], слова стыкуются встык, последнее до конца речи.
+   */
+  function alignWordsChar(words, start, end, silences) {
+    var iv = _speechIntervals(start, end, silences, 0.3);
+    var total = 0, i;
+    for (i = 0; i < iv.length; i++) total += iv[i].e - iv[i].s;
+    var chars = 0;
+    for (i = 0; i < words.length; i++) chars += Math.max(1, String(words[i]).length);
+    /* Позиция на «речевой оси» (0..total) → реальное время: кусочно-линейно,
+       тишины перепрыгиваются. */
+    function toReal(pos) {
+      var acc = 0;
+      for (var k = 0; k < iv.length; k++) {
+        var d = iv[k].e - iv[k].s;
+        if (pos <= acc + d + 1e-9) return iv[k].s + (pos - acc);
+        acc += d;
+      }
+      return iv[iv.length - 1].e;
+    }
+    var out = [], cum = 0;
+    for (i = 0; i < words.length; i++) {
+      var w = String(words[i]);
+      var dur = total * Math.max(1, w.length) / chars;
+      out.push({
+        w: w,
+        s: Math.round(toReal(cum) * 1000) / 1000,
+        e: Math.round(toReal(cum + dur) * 1000) / 1000
+      });
+      cum += dur;
+    }
+    return out;
+  }
+
+  /**
+   * Караоке-кьюи для рилса: Whisper-сегменты → короткие титры с пословными
+   * таймкодами. Тайминг слов — из seg.words (если число слов совпадает с
+   * текстом), иначе char-weighted по озвученным интервалам. Спикеры не размечаются.
+   * Возвращает [{startSec, endSec, text, words:[{w,s,e}]}].
+   */
+  function buildKaraokeCues(segments, opts) {
+    var o = opts || {};
+    var maxChars = o.maxCharsPerLine > 0 ? o.maxCharsPerLine : 20;
+    var maxLines = o.maxLines > 0 ? o.maxLines : 2;
+    var maxDur = o.maxDurSec > 0 ? o.maxDurSec : 4;
+    var cues = [];
+    if (!segments || !segments.length) return cues;
+    for (var i = 0; i < segments.length; i++) {
+      var sg = segments[i];
+      if (!sg) continue;
+      var text = String(sg.text == null ? '' : sg.text).replace(/\s+/g, ' ');
+      text = text.replace(/^\s+|\s+$/g, '');
+      if (!text) continue;
+      var start = Number(sg.startSec);
+      var end = Number(sg.endSec);
+      if (!isFinite(start) || !isFinite(end) || end <= start) continue;
+      var words = text.split(' ');
+      /* Пословные таймкоды: нативные seg.words при совпадении длины (приоритет),
+         иначе char-weighted + вычитание тишин (opts.silences). */
+      var timed = null;
+      if (sg.words && sg.words.length === words.length) {
+        timed = [];
+        for (var k = 0; k < words.length; k++) {
+          var ws = Number(sg.words[k].s), we = Number(sg.words[k].e);
+          if (!isFinite(ws) || !isFinite(we) || we < ws) { timed = null; break; }
+          timed.push({ w: words[k], s: ws, e: we });
+        }
+      }
+      if (!timed) timed = alignWordsChar(words, start, end, o.silences);
+      var idx = 0;
+      while (idx < words.length) {
+        var cueStartIdx = idx;
+        var take = [];
+        while (idx < words.length) {
+          var wrapped = _wrapWords(take.concat([words[idx]]), maxChars, maxLines);
+          var candDur = timed[idx].e - timed[cueStartIdx].s;
+          if (take.length && (wrapped === null || candDur > maxDur + 1e-9)) break;
+          take.push(words[idx]);
+          idx++;
+          if (wrapped === null) break; /* одно сверхдлинное слово — титром целиком */
+        }
+        var cueText = _wrapWords(take, maxChars, maxLines);
+        if (cueText === null) cueText = take.join(' ');
+        cues.push({
+          startSec: Math.round(timed[cueStartIdx].s * 1000) / 1000,
+          endSec: Math.round(timed[idx - 1].e * 1000) / 1000,
+          text: cueText,
+          words: timed.slice(cueStartIdx, idx)
+        });
+      }
+    }
+    return cues;
+  }
+
+  /* ── LLM-корректура: guard против искажения содержимого ──────────────── */
+
+  /** Нормализация слова для сравнения «то же ли слово»: lowercase, без пунктуации. */
+  function _normWord(w) {
+    return String(w).toLowerCase().replace(/[.,!?…:;«»"'()\u2014\u2013-]/g, '');
+  }
+
+  /** Расстояние Левенштейна (классический DP, слова короткие). */
+  function _lev(a, b) {
+    var m = a.length, n = b.length;
+    if (!m) return n;
+    if (!n) return m;
+    var prev = [], cur = [], i, j;
+    for (j = 0; j <= n; j++) prev[j] = j;
+    for (i = 1; i <= m; i++) {
+      cur[0] = i;
+      for (j = 1; j <= n; j++) {
+        var cost = a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1;
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      }
+      var t = prev; prev = cur; cur = t;
+    }
+    return prev[n];
+  }
+
+  /**
+   * Guard корректуры: правка принимается, только если число слов совпадает
+   * И каждое изменённое слово отличается от исходного на ≤2 символа
+   * (опечатка). Пунктуация/регистр игнорируются при сравнении слов, но
+   * сама правка (запятые, заглавные) применяется.
+   */
+  function proofreadGuardOk(orig, fixed) {
+    var a = String(orig == null ? '' : orig).replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '').split(' ');
+    var b = String(fixed == null ? '' : fixed).replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '').split(' ');
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      var na = _normWord(a[i]), nb = _normWord(b[i]);
+      if (na === nb) continue;
+      if (_lev(na, nb) > 2) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Применение результатов корректуры [{i, text}] к кьюям (без мутации).
+   * Guard-провал → правка отклоняется. Переносы строк пересобираются по
+   * старой разбивке (число слов в строках), тайминги words не меняются.
+   * Возвращает {cues, applied, rejected}.
+   */
+  function applyProofread(cues, results) {
+    var out = [];
+    for (var i = 0; i < cues.length; i++) out.push(cues[i]);
+    var applied = 0, rejected = 0;
+    if (!results || !results.length) return { cues: out, applied: applied, rejected: rejected };
+    for (var r = 0; r < results.length; r++) {
+      var res = results[r];
+      if (!res || typeof res.i !== 'number' || !out[res.i] || typeof res.text !== 'string') continue;
+      var cue = out[res.i];
+      var origFlat = cue.text.replace(/\n/g, ' ');
+      var fixedFlat = String(res.text).replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+      if (fixedFlat === origFlat) continue; /* без изменений */
+      if (!proofreadGuardOk(origFlat, fixedFlat)) { rejected++; continue; }
+      var newWords = fixedFlat.split(' ');
+      /* Пересборка переносов по старой построчной разбивке. */
+      var oldLines = cue.text.split('\n');
+      var lines = [], pos = 0;
+      for (var L = 0; L < oldLines.length; L++) {
+        var cnt = oldLines[L].split(' ').length;
+        lines.push(newWords.slice(pos, pos + cnt).join(' '));
+        pos += cnt;
+      }
+      var words2 = [];
+      for (var k = 0; k < cue.words.length; k++) {
+        words2.push({ w: newWords[k], s: cue.words[k].s, e: cue.words[k].e });
+      }
+      out[res.i] = {
+        startSec: cue.startSec, endSec: cue.endSec,
+        text: lines.join('\n'), words: words2
+      };
+      applied++;
+    }
+    return { cues: out, applied: applied, rejected: rejected };
+  }
+
+  /**
+   * Правка текста кью из модалки (без LLM-guard — правки монтажёра
+   * авторитетны). Границы [startSec, endSec] не двигаются; переносы
+   * пересобираются greedy; words — char-weighted с вычитанием тишин.
+   * Пустой текст → null (кью не меняется). Без мутации входа.
+   * opts: {maxCharsPerLine, maxLines, silences}
+   * Не влезает в maxChars×maxLines → best-effort: пополам по словам ('\n'),
+   * одно сверхдлинное слово — как есть (строка может превысить maxChars).
+   */
+  function rebuildCueText(cue, newText, opts) {
+    var o = opts || {};
+    var maxChars = o.maxCharsPerLine > 0 ? o.maxCharsPerLine : 20;
+    var maxLines = o.maxLines > 0 ? o.maxLines : 2;
+    var flat = String(newText == null ? '' : newText).replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+    if (!flat) return null;
+    var words = flat.split(' ');
+    var wrapped = _wrapWords(words, maxChars, maxLines);
+    if (wrapped === null) {
+      /* Не влезает в maxChars×maxLines — best-effort: одно слово → как есть,
+         несколько — делим пополам по словам (гарантируем \n в тексте). */
+      if (words.length > 1) {
+        var half = Math.ceil(words.length / 2);
+        wrapped = words.slice(0, half).join(' ') + '\n' + words.slice(half).join(' ');
+      } else {
+        wrapped = words[0];
+      }
+    }
+    return {
+      startSec: cue.startSec,
+      endSec: cue.endSec,
+      text: wrapped,
+      words: alignWordsChar(words, cue.startSec, cue.endSec, o.silences)
+    };
+  }
+
+  /* ── ASS-генерация ─────────────────────────────────────────────────────
+   * Караоке-приёмы: anim 'color' — \k-теги (Secondary→Primary по мере
+   * произнесения: Primary = подсветка, Secondary = цвет текста);
+   * anim 'box' — слой 0 статичный текст + слой 1 пословные события стилем
+   * Box (BorderStyle=3), не-текущие слова скрыты alpha-масками — libass
+   * рисует box per-run, плашка ровно под текущим словом. */
+
+  /** #RRGGBB → &H00BBGGRR (ASS = BGR). Невалидный вход → null. */
+  function assColor(hex) {
+    var m = /^#([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})$/.exec(String(hex == null ? '' : hex));
+    if (!m) return null;
+    return '&H00' + (m[3] + m[2] + m[1]).toUpperCase();
+  }
+
+  /** Секунды → ASS-время H:MM:SS.CC (сантисекунды). */
+  function assTime(sec) {
+    var cs = Math.max(0, Math.floor(Number(sec) * 100 + 1e-6));
+    var h = Math.floor(cs / 360000); cs -= h * 360000;
+    var m = Math.floor(cs / 6000); cs -= m * 6000;
+    var s = Math.floor(cs / 100); cs -= s * 100;
+    function p2(n) { return (n < 10 ? '0' : '') + n; }
+    return h + ':' + p2(m) + ':' + p2(s) + '.' + p2(cs);
+  }
+
+  /* Границы подсветки слов: лид до первого слова вливается в первое,
+   * последнее тянется до конца кью. b.length = words.length + 1. */
+  function _wordBounds(cue) {
+    var b = [cue.startSec];
+    for (var i = 1; i < cue.words.length; i++) b.push(cue.words[i].s);
+    b.push(cue.endSec);
+    return b;
+  }
+
+  /* Сборка текста кью из пословных токенов с сохранением переносов:
+   * разделители внутри строки ' ', между строками '\N'.
+   * tokenFn(wordIndex) → строка токена. */
+  function _joinTokens(cue, tokenFn) {
+    var lines = cue.text.split('\n');
+    var out = '', wi = 0;
+    for (var L = 0; L < lines.length; L++) {
+      var cnt = lines[L].split(' ').length;
+      for (var k = 0; k < cnt; k++) {
+        out += (k > 0 ? ' ' : (L > 0 ? '\\N' : '')) + tokenFn(wi);
+        wi++;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Кьюи → полный текст .ass.
+   * opts: {w, h, fontName, textColor:'#RRGGBB', hlColor:'#RRGGBB',
+   *        anim:'none'|'color'|'box'}
+   */
+  function buildAss(cues, opts) {
+    var w = opts.w, h = opts.h;
+    var anim = opts.anim || 'none';
+    var textC = assColor(opts.textColor) || '&H00FFFFFF';
+    var hlC = assColor(opts.hlColor) || '&H0038A021';
+    var black = '&H00000000';
+    var fontSize = Math.round(h * 0.045);
+    var marginV = Math.round(h * 0.12);
+    var boxPad = Math.max(6, Math.round(fontSize * 0.18));
+    /* color: караоке заливает Secondary→Primary → Primary = подсветка */
+    var primary = anim === 'color' ? hlC : textC;
+    var lines = [
+      '[Script Info]',
+      'ScriptType: v4.00+',
+      'PlayResX: ' + w,
+      'PlayResY: ' + h,
+      'WrapStyle: 2',
+      'ScaledBorderAndShadow: yes',
+      '',
+      '[V4+ Styles]',
+      'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+      'Style: Base,' + opts.fontName + ',' + fontSize + ',' + primary + ',' + textC + ',' + black + ',' + black + ',0,0,0,0,100,100,0,0,1,3,0,2,60,60,' + marginV + ',1'
+    ];
+    if (anim === 'box') {
+      /* BorderStyle=3: box рисуется OutlineColour (у некоторых сборок BackColour) → оба = hl */
+      lines.push('Style: Box,' + opts.fontName + ',' + fontSize + ',' + textC + ',' + textC + ',' + hlC + ',' + hlC + ',0,0,0,0,100,100,0,0,3,' + boxPad + ',0,2,60,60,' + marginV + ',1');
+    }
+    lines.push('', '[Events]',
+      'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text');
+
+    var ON = '{\\1a&H00&\\3a&H00&\\4a&H00&}';
+    var OFF = '{\\1a&HFF&\\3a&HFF&\\4a&HFF&}';
+    for (var i = 0; i < cues.length; i++) {
+      var cue = cues[i];
+      var t0 = assTime(cue.startSec), t1 = assTime(cue.endSec);
+      var plain = cue.text.replace(/\n/g, '\\N');
+      if (anim === 'color' && cue.words && cue.words.length) {
+        var b = _wordBounds(cue);
+        var karaoke = _joinTokens(cue, function (wi) {
+          var cs = Math.max(1, Math.round((b[wi + 1] - b[wi]) * 100));
+          return '{\\k' + cs + '}' + cue.words[wi].w;
+        });
+        lines.push('Dialogue: 0,' + t0 + ',' + t1 + ',Base,,0,0,0,,' + karaoke);
+      } else if (anim === 'box' && cue.words && cue.words.length) {
+        lines.push('Dialogue: 0,' + t0 + ',' + t1 + ',Base,,0,0,0,,' + plain);
+        var bb = _wordBounds(cue);
+        for (var k = 0; k < cue.words.length; k++) {
+          var evText = (function (cur) {
+            return _joinTokens(cue, function (wi) {
+              return (wi === cur ? ON : OFF) + cue.words[wi].w;
+            });
+          })(k);
+          lines.push('Dialogue: 1,' + assTime(bb[k]) + ',' + assTime(bb[k + 1]) + ',Box,,0,0,0,,' + evText);
+        }
+      } else {
+        lines.push('Dialogue: 0,' + t0 + ',' + t1 + ',Base,,0,0,0,,' + plain);
+      }
+    }
+    return lines.join('\n') + '\n';
+  }
+
+  /* ── ffmpeg: прозрачный оверлей субтитров ──────────────────────────────
+   * lavfi-источник прозрачного холста + фильтр ass + ProRes 4444 с альфой
+   * (yuva444p10le) — Premiere читает альфу нативно. */
+  function buildOverlayFfmpegArgs(o) {
+    var assEsc = String(o.assPath).replace(/\\/g, '/').replace(/:/g, '\\:');
+    return ['-hide_banner', '-f', 'lavfi',
+      '-i', 'color=black@0.0:s=' + o.w + 'x' + o.h + ':r=' + o.fps + ',format=rgba',
+      /* alpha=1 ОБЯЗАТЕЛЕН: без него vf_ass рисует текст только в цветовые
+       * плоскости, альфа остаётся 0 → в Premiere оверлей полностью прозрачен
+       * (подтверждено live 17.07: текст был виден в RGB, alpha плоская). */
+      '-vf', "ass='" + assEsc + "':alpha=1",
+      '-c:v', 'prores_ks', '-profile:v', '4444', '-pix_fmt', 'yuva444p10le',
+      '-t', String(o.durationSec), '-y', String(o.outPath)];
+  }
+
+  /* ── План vision-запросов: уникальные файловые mediaPath ───────────────
+   * nested-секвенции (mediaPath 'nest:…') vision не покрывает — центр. */
+  function visionPlan(clips) {
+    var paths = [], skipped = [], seen = {};
+    if (!clips || !clips.length) return { paths: paths, skipped: skipped };
+    for (var i = 0; i < clips.length; i++) {
+      var c = clips[i];
+      if (!c || !c.mediaPath) continue;
+      var p = String(c.mediaPath);
+      if (p.indexOf('nest:') === 0) {
+        skipped.push({ name: c.name || '?', reason: 'nested-секвенция — vision недоступен, центр' });
+        continue;
+      }
+      if (seen[p]) continue;
+      seen[p] = true;
+      paths.push(p);
+    }
+    return { paths: paths, skipped: skipped };
+  }
+
+  /* ── SRT для caption-дорожки Premiere (importSrtAsCaptions) ──────────── */
+
+  /** Секунды → SRT-время HH:MM:SS,mmm. */
+  function srtTime(sec) {
+    var ms = Math.round(Number(sec) * 1000); if (!isFinite(ms) || ms < 0) ms = 0;
+    var h = Math.floor(ms / 3600000); ms -= h * 3600000;
+    var m = Math.floor(ms / 60000); ms -= m * 60000;
+    var s = Math.floor(ms / 1000); ms -= s * 1000;
+    function p2(n) { return (n < 10 ? '0' : '') + n; }
+    function p3(n) { return (n < 100 ? (n < 10 ? '00' : '0') : '') + n; }
+    return p2(h) + ':' + p2(m) + ':' + p2(s) + ',' + p3(ms);
+  }
+
+  /** Кьюи → текст .srt (переносы строк кью сохраняются как многострочный блок). */
+  function buildSrt(cues) {
+    if (!cues || !cues.length) return '';
+    var out = [];
+    for (var i = 0; i < cues.length; i++) {
+      out.push(String(i + 1));
+      out.push(srtTime(cues[i].startSec) + ' --> ' + srtTime(cues[i].endSec));
+      out.push(cues[i].text);
+      out.push('');
+    }
+    return out.join('\n');
+  }
+
+  global.ReelsPipeline = {
+    stripCueFinalPeriod: stripCueFinalPeriod,
+    offsetPctFromCx: offsetPctFromCx,
+    alignWordsChar: alignWordsChar,
+    buildKaraokeCues: buildKaraokeCues,
+    proofreadGuardOk: proofreadGuardOk,
+    applyProofread: applyProofread,
+    rebuildCueText: rebuildCueText,
+    assColor: assColor,
+    assTime: assTime,
+    buildAss: buildAss,
+    buildOverlayFfmpegArgs: buildOverlayFfmpegArgs,
+    visionPlan: visionPlan,
+    srtTime: srtTime,
+    buildSrt: buildSrt
+  };
+})(window);

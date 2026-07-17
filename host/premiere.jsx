@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.11.0';
+$._EXT_PRM_.version = '2.13.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -2978,6 +2978,230 @@ $._EXT_PRM_.importSrtAsCaptions = function (jsonStr) {
 };
 
 /**
+ * Рилс (17.07.2026): импорт файла-оверлея (прозрачный ProRes с субтитрами)
+ * и вставка на НОВУЮ верхнюю видеодорожку с нуля секвенции.
+ * Вход: {filePath, expectedSequenceName}. Целевая секвенция ищется по имени
+ * (applyVerticalReframe НЕ активирует клон) и активируется.
+ * overwriteClip, не insertClip — стандарт проекта (без ripple/дубликатов).
+ */
+$._EXT_PRM_.importAndOverlayOnTop = function (jsonStr) {
+  try {
+    if (!app.project) return JSON.stringify({ ok: false, error: 'Нет открытого проекта' });
+    var p;
+    try {
+      p = JSON.parse(jsonStr);
+    } catch (eJ) {
+      return JSON.stringify({ ok: false, error: 'Невалидный JSON: ' + String(eJ) });
+    }
+    var filePath = String((p && p.filePath) || '').replace(/\\/g, '/');
+    if (!filePath) return JSON.stringify({ ok: false, error: 'filePath обязателен' });
+    if (!$._EXT_PRM_._fileExists(filePath)) {
+      return JSON.stringify({ ok: false, error: 'Файл оверлея не найден: ' + filePath });
+    }
+    var wantName = String((p && p.expectedSequenceName) || '');
+    if (!wantName) return JSON.stringify({ ok: false, error: 'expectedSequenceName обязателен' });
+    /* Целевая секвенция по имени (+ fallback на активную). */
+    var seq = null;
+    var seqs = app.project.sequences;
+    var i;
+    for (i = 0; i < seqs.numSequences; i++) {
+      if (String(seqs[i].name) === wantName) { seq = seqs[i]; break; }
+    }
+    if (!seq && app.project.activeSequence &&
+        String(app.project.activeSequence.name) === wantName) {
+      seq = app.project.activeSequence;
+    }
+    if (!seq) {
+      return JSON.stringify({ ok: false, error: 'Секвенция «' + wantName + '» не найдена в проекте' });
+    }
+    /* Активируем (QE addTracks работает только с активной). */
+    try {
+      if (!app.project.activeSequence ||
+          String(app.project.activeSequence.sequenceID) !== String(seq.sequenceID)) {
+        app.project.activeSequence = seq;
+      }
+    } catch (eAct) {}
+    /* Импорт файла в bin AI Renders — снапшот nodeId до/после (честная верификация). */
+    var rootItem = app.project.rootItem;
+    var binName = 'AI Renders';
+    var targetBin = null;
+    try {
+      for (i = 0; i < rootItem.children.numItems; i++) {
+        var ch = rootItem.children[i];
+        if (ch && ch.name === binName && ch.type === 2 /* BIN */) { targetBin = ch; break; }
+      }
+    } catch (eFind) {}
+    if (!targetBin) {
+      try { targetBin = rootItem.createBin(binName); } catch (eBin) { targetBin = rootItem; }
+    }
+    var before = {};
+    var nid;
+    function snapIds(container, map) {
+      try {
+        for (var k = 0; k < container.children.numItems; k++) {
+          var id = '';
+          try { id = String(container.children[k].nodeId); } catch (eId) {}
+          if (id) map[id] = 1;
+        }
+      } catch (eSnap) {}
+    }
+    snapIds(targetBin, before);
+    snapIds(rootItem, before);
+    var undoOpened = false;
+    try { app.beginUndoGroup('ИИ: рилс-оверлей'); undoOpened = true; } catch (eBU) {}
+    try {
+      try {
+        app.project.importFiles([filePath], false, targetBin, false);
+      } catch (eImp1) {
+        try { app.project.importFiles([filePath]); } catch (eImp2) {
+          return JSON.stringify({ ok: false, error: 'importFiles упал: ' + String(eImp1 && eImp1.message ? eImp1.message : eImp1) });
+        }
+      }
+      /* Новый item — diff по nodeId в bin и в корне. */
+      var item = null;
+      function findNew(container) {
+        try {
+          for (var k = container.children.numItems - 1; k >= 0; k--) {
+            var id = '';
+            try { id = String(container.children[k].nodeId); } catch (eId2) {}
+            if (id && !before[id] && container.children[k].type !== 2) return container.children[k];
+          }
+        } catch (eFN) {}
+        return null;
+      }
+      item = findNew(targetBin);
+      if (!item) item = findNew(rootItem);
+      if (!item) {
+        return JSON.stringify({ ok: false, error: 'Импорт оверлея не добавил элемент в проект: ' + filePath });
+      }
+      /* Верхняя видеодорожка: если занята — добавить новую через QE. */
+      var numV = seq.videoTracks.numTracks;
+      var top = seq.videoTracks[numV - 1];
+      var topBusy = false;
+      try { topBusy = top.clips.numItems > 0; } catch (eTB) { topBusy = true; }
+      /* Рилс v2: replaceTopOverlay — заменить старый оверлей на той же
+         дорожке (перерендер из модалки), дорожки не добавлять.
+         Last line of defense (стандарт проекта): НЕ трогаем V1 и НЕ удаляем
+         клипы, не похожие на оверлей (.mov) — отклоняем, не клампим. */
+      var replaceTop = !!(p && p.replaceTopOverlay);
+      if (replaceTop && topBusy) {
+        if (numV < 2) {
+          return JSON.stringify({ ok: false, error: 'replaceTopOverlay: верхняя дорожка = V1 с исходным видео — замена отклонена' });
+        }
+        var rc;
+        for (rc = 0; rc < top.clips.numItems; rc++) {
+          var rcName = '';
+          try { rcName = String(top.clips[rc].name); } catch (eRcN) {}
+          if (!/\.mov$/i.test(rcName)) {
+            return JSON.stringify({ ok: false, error: 'replaceTopOverlay: на V' + numV + ' найден клип «' + rcName + '» (не .mov-оверлей) — замена отклонена' });
+          }
+        }
+        try {
+          for (rc = top.clips.numItems - 1; rc >= 0; rc--) {
+            top.clips[rc].remove(false, false);
+          }
+        } catch (eRm) {
+          return JSON.stringify({ ok: false, error: 'Не удалось удалить старый оверлей: ' + String(eRm && eRm.message ? eRm.message : eRm) });
+        }
+        topBusy = false;
+        try { topBusy = top.clips.numItems > 0; } catch (eTB2) { topBusy = true; }
+        if (topBusy) {
+          return JSON.stringify({ ok: false, error: 'Старый оверлей не удалился с V' + numV });
+        }
+      }
+      if (topBusy) {
+        var added = false;
+        try {
+          if (typeof app.enableQE === 'function') app.enableQE();
+          if (typeof qe !== 'undefined' && qe.project && typeof qe.project.getActiveSequence === 'function') {
+            var qeSeq = qe.project.getActiveSequence();
+            if (qeSeq && typeof qeSeq.addTracks === 'function') {
+              /* addTracks(numVideo, afterVideoIndex, numAudio) — новая видеодорожка сверху */
+              qeSeq.addTracks(1, numV, 0);
+              added = true;
+            }
+          }
+        } catch (eQE) {}
+        var numV2 = seq.videoTracks.numTracks;
+        if (!added || numV2 <= numV) {
+          return JSON.stringify({
+            ok: false,
+            error: 'Не удалось добавить видеодорожку (QE недоступен). Добавьте пустую дорожку сверху вручную и повторите.'
+          });
+        }
+        top = seq.videoTracks[numV2 - 1];
+      }
+      var topIndex = seq.videoTracks.numTracks - 1;
+      /* Вставка с 0 без ripple. */
+      var beforeClips = 0;
+      try { beforeClips = top.clips.numItems; } catch (eBCl) {}
+      try {
+        top.overwriteClip(item, 0);
+      } catch (eOw) {
+        return JSON.stringify({ ok: false, error: 'overwriteClip: ' + String(eOw && eOw.message ? eOw.message : eOw) });
+      }
+      /* Верификация: на дорожке появился клип со start≈0. */
+      var afterClips = 0;
+      try { afterClips = top.clips.numItems; } catch (eACl) {}
+      if (afterClips <= beforeClips) {
+        return JSON.stringify({ ok: false, error: 'overwriteClip не сообщил об ошибке, но клип на дорожке V' + (topIndex + 1) + ' не появился' });
+      }
+      var placed = null;
+      try { placed = top.clips[afterClips - 1]; } catch (ePl) {}
+      var startSec = -1;
+      try { startSec = placed ? placed.start.seconds : -1; } catch (eSt) {}
+      if (!(startSec >= 0 && startSec < 0.5)) {
+        return JSON.stringify({
+          ok: false,
+          error: 'Оверлей вставлен, но start=' + startSec + 'с (ожидался 0) на V' + (topIndex + 1) + ' — проверьте таймлайн'
+        });
+      }
+      return JSON.stringify({
+        ok: true,
+        sequenceName: String(seq.name),
+        trackIndex: topIndex,
+        clipName: String(placed && placed.name ? placed.name : item.name),
+        hostVersion: $._EXT_PRM_.version
+      });
+    } finally {
+      if (undoOpened) try { app.endUndoGroup(); } catch (eEU) {}
+    }
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
+ * Рилс v2 (18.07.2026): активировать секвенцию по имени.
+ * Нужен для импорта captions в рилс-секвенцию при анимации «нет»
+ * (importSrtAsCaptions работает по активной; importAndOverlayOnTop,
+ * который раньше активировал её попутно, в этом режиме не вызывается).
+ */
+$._EXT_PRM_.activateSequenceByName = function (jsonStr) {
+  try {
+    if (!app.project) return JSON.stringify({ ok: false, error: 'Нет открытого проекта' });
+    var p;
+    try {
+      p = JSON.parse(jsonStr);
+    } catch (eJ) {
+      return JSON.stringify({ ok: false, error: 'Невалидный JSON: ' + String(eJ) });
+    }
+    var wantName = String((p && p.name) || '');
+    if (!wantName) return JSON.stringify({ ok: false, error: 'name обязателен' });
+    var seqs = app.project.sequences;
+    for (var i = 0; i < seqs.numSequences; i++) {
+      if (String(seqs[i].name) === wantName) {
+        app.project.activeSequence = seqs[i];
+        return JSON.stringify({ ok: true, sequenceName: wantName, hostVersion: $._EXT_PRM_.version });
+      }
+    }
+    return JSON.stringify({ ok: false, error: 'Секвенция «' + wantName + '» не найдена' });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
  * Экспорт In–Out чанками (меньше 413 на Whisper). Восстанавливает In/Out.
  */
 $._EXT_PRM_._exportInOutAsChunks = function (seq, preset, root, chunkSec, chunkExt) {
@@ -3934,7 +4158,9 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     'getVerticalReframeSources',
     'applyVerticalReframe',
     'importSrtAsCaptions',
-    'getFrameSources'
+    'getFrameSources',
+    'importAndOverlayOnTop',
+    'activateSequenceByName'
   ];
   for (var i = 0; i < EXPORTED.length; i++) {
     var name = EXPORTED[i];

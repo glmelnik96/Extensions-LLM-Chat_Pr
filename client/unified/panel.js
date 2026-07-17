@@ -7558,22 +7558,180 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
     }
 
-    /* ── «📱 Вертикаль 9:16»: рефрейм для шортсов (Волна 3 п.5, 10.07.2026).
-       Исходная секвенция read-only: host clone() → setSettings 1080×1920 →
-       Motion Scale/Position по чистому плану planVerticalReframe (cover-кроп,
-       фокус — смещениями per-камера, vision исключён). Размеры исходников —
-       ffprobe локально; для nest-клипов host отдаёт размеры inner-секвенции. */
-    async function toolsRunVertical() {
-      if (!beginOperation('tools:vertical')) {
+    /* ── «🎬 Рилс» (17.07.2026): объединяет «Вертикаль 9:16» и «Субтитры».
+       Рефрейм: host clone() → setSettings 9:16/1:1 → Motion по плану
+       planVerticalReframe; позицию кадрирования решает vision-модель по кадру
+       из середины каждого уникального источника (ручные смещения побеждают,
+       nest — центр). Субтитры: караоке-кьюи с пословным таймингом →
+       LLM-корректура с guard (только орфография/пунктуация, слова неизменны) →
+       правило точек → ASS (SB Sans, анимация нет/цвет/плашка) → ffmpeg+libass
+       → прозрачный ProRes 4444 → importAndOverlayOnTop на новую верхнюю
+       дорожку новой секвенции. Исходная секвенция не меняется. */
+
+    /* Шрифт для libass берётся из системных; ищем файл SB Sans в шрифтовых
+       папках (имена файлов без пробелов → нормализация). */
+    function reelsFontInstalled(fontName) {
+      try {
+        var fs = require('fs');
+        var os = require('os');
+        var dirs = [
+          'C:\\Windows\\Fonts',
+          os.homedir() + '\\AppData\\Local\\Microsoft\\Windows\\Fonts',
+          '/Library/Fonts', '/System/Library/Fonts',
+          os.homedir() + '/Library/Fonts'
+        ];
+        var key = /display/i.test(fontName) ? 'sbsansdisplay' : 'sbsanstext';
+        for (var d = 0; d < dirs.length; d++) {
+          var files;
+          try { files = fs.readdirSync(dirs[d]); } catch (eDir) { continue; }
+          for (var f = 0; f < files.length; f++) {
+            var nf = String(files[f]).toLowerCase().replace(/[\s_-]/g, '');
+            if (nf.indexOf(key) !== -1 && nf.indexOf('semibold') !== -1) return true;
+          }
+        }
+      } catch (e) {}
+      return false;
+    }
+
+    /* ffmpeg промисом (паттерн audio-render.js), таймаут 10 мин. */
+    function reelsRunFfmpeg(bin, args) {
+      return new Promise(function (resolve, reject) {
+        var execFile = require('child_process').execFile;
+        execFile(bin, args, { timeout: 600000, maxBuffer: 8 * 1024 * 1024 }, function (err, stdout, stderr) {
+          if (err) {
+            reject(new Error('ffmpeg упал: ' + String(err.message || err) + '\n' + String(stderr || '').slice(0, 600)));
+            return;
+          }
+          resolve(String(stderr || ''));
+        });
+      });
+    }
+
+    /* LLM-корректура кьюев батчами: только орфография/пунктуация, guard
+       applyProofread отклоняет всё, что меняет слова. Фейл батча — исключение
+       наверх (вызывающий продолжает с исходными кьюями). */
+    var REELS_PROOFREAD_BATCH = 40;
+
+    /* Рилс v2: кью персистятся через transcript-cache механизм ContextStore
+       с отдельным PID — ключ = имя рилс-секвенции. Ноль изменений в сторе. */
+    var REELS_PID = '_llm_reels_cache';
+    function reelsActivateSequence(name) {
+      return new Promise(function (resolve, reject) {
+        PremiereBridge.activateSequenceByName({ name: name }, function (err, data) {
+          if (err) reject(err);
+          else if (!data || !data.ok) reject(new Error((data && data.error) || 'activateSequenceByName: нет ответа'));
+          else resolve(data);
+        });
+      });
+    }
+
+    async function reelsProofread(cues, settings, onProgress) {
+      if (!settings.apiKey || !settings.chatModel) throw new Error('нет chat-модели или API-ключа');
+      var out = cues;
+      var applied = 0, rejected = 0;
+      for (var off = 0; off < cues.length; off += REELS_PROOFREAD_BATCH) {
+        if (onProgress) onProgress(off, cues.length);
+        var batch = [];
+        var hi = Math.min(off + REELS_PROOFREAD_BATCH, cues.length);
+        for (var i = off; i < hi; i++) {
+          batch.push({ i: i, text: out[i].text.replace(/\n/g, ' ') });
+        }
+        var resp = await CloudRuClient.chatCompletions({
+          baseUrl: settings.baseUrl,
+          apiKey: settings.apiKey,
+          model: settings.chatModel,
+          temperature: 0,
+          enableThinking: false,
+          responseFormat: 'json_object',
+          chatParams: { max_tokens: 4096 },
+          messages: [
+            {
+              role: 'system',
+              content: 'Ты корректор русских субтитров. Исправляй ТОЛЬКО орфографию и пунктуацию. ' +
+                'ЗАПРЕЩЕНО добавлять, удалять или заменять слова, менять их порядок или смысл. ' +
+                'Верни строго JSON {"cues":[{"i":<номер>,"text":"<исправленный текст>"}]} — ' +
+                'ТОЛЬКО изменённые титры (если правок нет — {"cues":[]}).'
+            },
+            { role: 'user', content: JSON.stringify({ cues: batch }) }
+          ]
+        });
+        var content = (resp && resp.choices && resp.choices[0] && resp.choices[0].message)
+          ? String(resp.choices[0].message.content || '') : '';
+        var parsed = null;
+        try { parsed = JSON.parse(content); } catch (ePj) { throw new Error('модель вернула не-JSON'); }
+        var results = (parsed && parsed.cues && parsed.cues.length) ? parsed.cues : [];
+        if (results.length) {
+          var r = ReelsPipeline.applyProofread(out, results);
+          out = r.cues;
+          applied += r.applied;
+          rejected += r.rejected;
+        }
+      }
+      return { cues: out, applied: applied, rejected: rejected };
+    }
+
+    async function toolsRunReels() {
+      if (!beginOperation('tools:reels')) {
         toolsShowErr('Идёт обработка в чате — дождитесь завершения (кнопка «Стоп» на вкладке «Чат»).');
         return;
       }
       toolsDisableRun(true);
-      toolsStatusUi.show('Читаю видеоклипы секвенции…', true);
-      var resEl = document.getElementById('vt-result');
+      toolsStatusUi.show('Рилс: проверяю условия…', true);
+      var resEl = document.getElementById('rl-result');
       if (resEl) { resEl.textContent = ''; }
       var keepStatus = false;
       try {
+        var fs = require('fs');
+        var path = require('path');
+        var os = require('os');
+        var notes = [];
+
+        /* 0. Preflight: ffmpeg, шрифт (только при анимации), транскрипт, настройки. */
+        var anim = (document.getElementById('rl-anim') || {}).value || 'color';
+        var ffBin = AudioPreprocess.findFfmpegPath();
+        if (!ffBin) {
+          toolsShowErr('Нужен ffmpeg (кадры для vision' + (anim !== 'none' ? ' и рендер субтитров' : '') + '). Установите ffmpeg и повторите.');
+          return;
+        }
+        var fontName = (document.getElementById('rl-font') || {}).value || 'SB Sans Text SemiBold';
+        if (anim !== 'none' && !reelsFontInstalled(fontName)) {
+          toolsShowErr('Шрифт «' + fontName + '» не найден среди системных. Установите .otf (правый клик → «Установить для всех пользователей») и повторите.');
+          return;
+        }
+        var snap = await execGetSnapshot(true);
+        if (!snap || !snap.ok) {
+          toolsShowErr(snap && snap.error ? snap.error : 'Не удалось получить снимок таймлайна.');
+          return;
+        }
+        var seqName = String(snap.sequenceName || '');
+        var found = seqName ? ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName) : { entry: null };
+        var entry = found && found.entry;
+        if (!entry || !entry.segments || !entry.segments.length) {
+          toolsShowErr('Нет транскрипта для «' + seqName + '» — сначала транскрибируйте In–Out (вкладка «Чат»).');
+          return;
+        }
+        var settings = ContextStore.getResolvedSettings();
+        var fmt = (document.getElementById('rl-format') || {}).value || '9x16';
+        var targetW = 1080;
+        var targetH = fmt === '1x1' ? 1080 : 1920;
+        var textColor = (document.getElementById('rl-text-color') || {}).value || '#FFFFFF';
+        var hlColor = (document.getElementById('rl-hl-color') || {}).value || '#21A038';
+
+        /* Сборка ffmpeg должна содержать фильтр ass (libass) — только при анимации. */
+        if (anim !== 'none') {
+          var filtersOut = await new Promise(function (resolve) {
+            require('child_process').execFile(ffBin, ['-hide_banner', '-filters'],
+              { timeout: 30000, maxBuffer: 4 * 1024 * 1024 },
+              function (err, stdout) { resolve(String(stdout || '')); });
+          });
+          if (filtersOut.indexOf(' ass ') === -1) {
+            toolsShowErr('Сборка ffmpeg без libass (нет фильтра ass) — субтитры не отрендерить. Установите полную сборку (например, gyan.dev full).');
+            return;
+          }
+        }
+
+        /* 1. Источники рефрейма + размеры (nest — от host, файлы — ffprobe). */
+        toolsStatusUi.show('Рилс: читаю видеоклипы секвенции…', true);
         var src = await new Promise(function (resolve, reject) {
           PremiereBridge.getVerticalReframeSources(function (err, data) {
             if (err) reject(err); else resolve(data);
@@ -7583,8 +7741,10 @@ PanelBoot.run('ИИ: монтаж', function () {
           toolsShowErr((src && src.error) || 'Не удалось перечислить видеоклипы.');
           return;
         }
-        var seqName = String(src.sequenceName || '');
-        /* Размеры: nest — от host (inner-секвенция), файлы — ffprobe один раз. */
+        if (String(src.sequenceName || '') !== seqName) {
+          toolsShowErr('Активная секвенция сменилась («' + src.sequenceName + '» вместо «' + seqName + '») — повторите.');
+          return;
+        }
         var dims = {};
         var nd = src.nestDims || {};
         for (var nk in nd) {
@@ -7598,7 +7758,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         var paths = Object.keys(pathSet);
         var doneCount = 0;
         var showProbeStatus = function () {
-          toolsStatusUi.show('Определяю размеры исходников: ' + doneCount + ' из ' + paths.length + '…', true);
+          toolsStatusUi.show('Рилс: размеры исходников ' + doneCount + ' из ' + paths.length + '…', true);
         };
         if (paths.length) showProbeStatus();
         await Promise.all(paths.map(function (p) {
@@ -7608,48 +7768,267 @@ PanelBoot.run('ИИ: монтаж', function () {
             if (d) dims[p] = d; /* null → планировщик пропустит клип с причиной */
           });
         }));
-        var offsetsEl = document.getElementById('vt-offsets');
-        var offsets = DeterministicPipelines.parseVerticalOffsets(offsetsEl ? offsetsEl.value : '');
-        var plan = DeterministicPipelines.planVerticalReframe(src.clips, dims, { offsets: offsets });
+
+        /* 2. Смещения: ручные > vision > центр. Vision — кадр из середины
+           каждого уникального источника, {"cx":0..1} → offsetPct. */
+        var offsetsEl = document.getElementById('rl-offsets');
+        var manual = DeterministicPipelines.parseVerticalOffsets(offsetsEl ? offsetsEl.value : '') || [];
+        var vp = ReelsPipeline.visionPlan(src.clips);
+        for (var vs = 0; vs < vp.skipped.length; vs++) {
+          notes.push(vp.skipped[vs].name + ': ' + vp.skipped[vs].reason);
+        }
+        var visionOffsets = [];
+        var visionModel = settings.visionModel || 'MiniMaxAI/MiniMax-M3';
+        for (var vi = 0; vi < vp.paths.length; vi++) {
+          var vPath = vp.paths[vi];
+          var vBase = vPath.substring(Math.max(vPath.lastIndexOf('/'), vPath.lastIndexOf('\\')) + 1);
+          /* Имена клипов этого источника; покрытые ручным смещением — пропуск. */
+          var clipNames = [];
+          for (var cn = 0; cn < src.clips.length; cn++) {
+            if (src.clips[cn].mediaPath === vPath && clipNames.indexOf(src.clips[cn].name) === -1) {
+              clipNames.push(src.clips[cn].name);
+            }
+          }
+          var uncovered = clipNames.filter(function (nm2) {
+            var low = String(nm2).toLowerCase();
+            return !manual.some(function (o) { return low.indexOf(o.match) !== -1; });
+          });
+          if (!uncovered.length) {
+            notes.push(vBase + ': ручное смещение (vision пропущен)');
+            continue;
+          }
+          if (!settings.apiKey) {
+            notes.push(vBase + ': нет API-ключа — vision пропущен, центр');
+            continue;
+          }
+          toolsStatusUi.show('Рилс: vision-кадрирование ' + (vi + 1) + ' из ' + vp.paths.length + ' (' + vBase + ')…', true);
+          try {
+            var vDur = await AudioPreprocess.probeDurationSec(vPath);
+            var vSec = (vDur && vDur > 0) ? vDur / 2 : 1;
+            var vFrame = await AudioPreprocess.extractFrameJpeg(vPath, vSec, { maxWidth: 768 });
+            var vResp = await CloudRuClient.chatCompletions({
+              baseUrl: settings.baseUrl,
+              apiKey: settings.apiKey,
+              model: visionModel,
+              temperature: 0,
+              enableThinking: false,
+              /* БЕЗ responseFormat: json_object — MiniMax-M3 на Cloud.ru с ним
+               * возвращает ПУСТОЙ content (finish=stop), A/B-проверено live
+               * 17.07.2026. Без него модель отвечает честным JSON. */
+              chatParams: { max_tokens: 256 },
+              messages: [{
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Найди главного человека (лицо) в кадре. Ответ строго JSON: {"cx": <число 0..1 — горизонтальный центр лица, 0 = левый край кадра, 1 = правый>}. Если людей нет: {"cx": 0.5}.'
+                  },
+                  { type: 'image_url', image_url: { url: vFrame } }
+                ]
+              }]
+            });
+            var vContent = (vResp && vResp.choices && vResp.choices[0] && vResp.choices[0].message)
+              ? String(vResp.choices[0].message.content || '') : '';
+            /* Модель может обернуть JSON в текст/маркдаун — берём первый {...} */
+            var vJsonM = vContent.match(/\{[\s\S]*?\}/);
+            if (!vJsonM) throw new Error('нет JSON в ответе vision: ' + vContent.slice(0, 120));
+            var vCx = JSON.parse(vJsonM[0]).cx;
+            var vPct = ReelsPipeline.offsetPctFromCx(vCx);
+            if (vPct === null) throw new Error('невалидный cx: ' + vCx);
+            for (var un = 0; un < uncovered.length; un++) {
+              visionOffsets.push({ match: String(uncovered[un]).toLowerCase(), offsetPct: vPct });
+            }
+            notes.push(vBase + ': vision ' + (vPct > 0 ? '+' : '') + vPct + '%');
+          } catch (eV) {
+            notes.push(vBase + ': vision не сработал (' + String((eV && eV.message) || eV) + ') — центр');
+          }
+        }
+        /* manual раньше в массиве → substring-матч планировщика найдёт его первым */
+        var offsets = manual.concat(visionOffsets);
+
+        /* 3. Рефрейм: clone → setSettings → Motion. */
+        var plan = DeterministicPipelines.planVerticalReframe(src.clips, dims, {
+          targetW: targetW,
+          targetH: targetH,
+          offsets: offsets.length ? offsets : null
+        });
         if (!plan.items.length) {
           toolsShowErr('Не удалось спланировать ни один клип' +
             (plan.skipped.length ? ' (' + plan.skipped[0].name + ': ' + plan.skipped[0].reason + ')' : '') + '.');
           return;
         }
-        toolsStatusUi.show('Создаю вертикальную копию (' + plan.items.length + ' клипов)…', true);
-        var resp = await new Promise(function (resolve, reject) {
+        var newName = seqName + ' — Рилс ' + (fmt === '1x1' ? '1x1' : '9x16');
+        toolsStatusUi.show('Рилс: создаю секвенцию ' + targetW + '×' + targetH + ' (' + plan.items.length + ' клипов)…', true);
+        var applied = await new Promise(function (resolve, reject) {
           PremiereBridge.applyVerticalReframe({
             expectedSequenceName: seqName,
-            newName: seqName + ' — 9x16',
-            targetW: 1080,
-            targetH: 1920,
+            newName: newName,
+            targetW: targetW,
+            targetH: targetH,
             items: plan.items
           }, function (err, data) {
             if (err) reject(err); else resolve(data);
           });
         });
-        if (!resp || !resp.ok) {
-          toolsShowErr((resp && resp.error) || 'Не удалось создать вертикальную секвенцию.');
+        if (!applied || !applied.ok) {
+          toolsShowErr((applied && applied.error) || 'Не удалось создать секвенцию рилса.');
           return;
         }
+
+        /* 4. Караоке-кьюи. */
+        var cues = ReelsPipeline.buildKaraokeCues(entry.segments, {
+          silences: (entry.audioAnalysis && entry.audioAnalysis.silences && entry.audioAnalysis.silences.length)
+            ? entry.audioAnalysis.silences : null
+        });
+        if (!cues.length) {
+          toolsShowErr('Секвенция «' + applied.sequenceName + '» создана, но из транскрипта не получилось ни одного титра (пустые сегменты?).');
+          return;
+        }
+
+        /* 5. LLM-корректура (фейл — не фатален) + правило точек. */
+        var proofApplied = 0, proofRejected = 0, proofOk = false;
+        try {
+          var pr = await reelsProofread(cues, settings, function (done, total) {
+            toolsStatusUi.show('Рилс: корректура субтитров ' + done + ' из ' + total + '…', true);
+          });
+          cues = pr.cues;
+          proofApplied = pr.applied;
+          proofRejected = pr.rejected;
+          proofOk = true;
+        } catch (ePr) {
+          notes.push('Корректура LLM не сработала (' + String((ePr && ePr.message) || ePr) + ') — титры без правок');
+        }
+        cues = cues.map(function (c) {
+          var t2 = ReelsPipeline.stripCueFinalPeriod(c.text);
+          if (t2 === c.text) return c;
+          var w2 = c.words.slice();
+          if (w2.length) {
+            var lw = w2[w2.length - 1];
+            w2[w2.length - 1] = { w: ReelsPipeline.stripCueFinalPeriod(lw.w), s: lw.s, e: lw.e };
+          }
+          return { startSec: c.startSec, endSec: c.endSec, text: t2, words: w2 };
+        });
+
+        /* 6. Файлы: SRT всегда; ASS+оверлей — только при анимации. */
+        var fps = Number(snap.fps) > 0 ? Number(snap.fps) : 25;
+        var durationSec = Math.ceil((cues[cues.length - 1].endSec + 0.5) * 100) / 100;
+        var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'reels');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        var safeName = seqName.replace(/[\\\/:*?"<>|]/g, '_');
+        var srtPath = path.join(dir, safeName + '_' + ts + '.srt');
+        fs.writeFileSync(srtPath, ReelsPipeline.buildSrt(cues), 'utf8');
+        var assPath = null, outPath = null, ins = null, actErr = '';
+        if (anim !== 'none') {
+          var ass = ReelsPipeline.buildAss(cues, {
+            w: targetW, h: targetH,
+            fontName: fontName,
+            textColor: textColor,
+            hlColor: hlColor,
+            anim: anim
+          });
+          assPath = path.join(dir, safeName + '_' + ts + '.ass');
+          outPath = path.join(dir, safeName + '_' + ts + '.mov');
+          fs.writeFileSync(assPath, ass, 'utf8'); /* UTF-8 БЕЗ BOM — libass */
+          toolsStatusUi.show('Рилс: рендерю субтитры (' + cues.length + ' титров, ~' + Math.round(durationSec) + 'с)…', true);
+          await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
+            assPath: assPath, w: targetW, h: targetH, fps: fps,
+            durationSec: durationSec, outPath: outPath
+          }));
+          if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 4096) {
+            toolsShowErr('Секвенция «' + applied.sequenceName + '» создана, но ffmpeg отрендерил пустой оверлей: ' + outPath);
+            return;
+          }
+          /* 7a. Оверлей на новую верхнюю дорожку (активирует рилс-секвенцию). */
+          toolsStatusUi.show('Рилс: вставляю оверлей в «' + applied.sequenceName + '»…', true);
+          ins = await new Promise(function (resolve, reject) {
+            PremiereBridge.importAndOverlayOnTop({
+              filePath: outPath.replace(/\\/g, '/'),
+              expectedSequenceName: applied.sequenceName
+            }, function (err, data) {
+              if (err) reject(err); else resolve(data);
+            });
+          });
+          if (!ins || !ins.ok) {
+            toolsShowErr('Секвенция «' + applied.sequenceName + '» создана, но оверлей не вставлен: ' +
+              ((ins && ins.error) || 'нет ответа хоста') + '\nФайл оверлея: ' + outPath);
+            return;
+          }
+        } else {
+          /* Анимация «нет»: рендера не будет — активируем рилс-секвенцию
+             для captions явно (обычно её активирует importAndOverlayOnTop). */
+          try {
+            await reelsActivateSequence(applied.sequenceName);
+          } catch (eAct) {
+            actErr = String((eAct && eAct.message) || eAct);
+            notes.push('Секвенция «' + applied.sequenceName + '» создана, но не активировалась (' + actErr + ') — captions не импортированы, SRT: ' + srtPath);
+          }
+        }
+
+        /* 7b. Caption-дорожка — всегда (нативно редактируемый слой). */
+        var capOk = false, capErr = '';
+        if (!actErr) {
+          toolsStatusUi.show('Рилс: импортирую captions в «' + applied.sequenceName + '»…', true);
+          try {
+            var cap = await new Promise(function (resolve, reject) {
+              PremiereBridge.importSrtAsCaptions({
+                srtPath: srtPath.replace(/\\/g, '/'),
+                expectedSequenceName: applied.sequenceName
+              }, function (err, data) {
+                if (err) reject(err); else resolve(data);
+              });
+            });
+            capOk = !!(cap && cap.ok);
+            if (!capOk) capErr = (cap && cap.error) || 'нет ответа хоста';
+          } catch (eCap) { capErr = String((eCap && eCap.message) || eCap); }
+          if (!capOk) notes.push('Caption-дорожка не создана (' + capErr + ') — титры только в ' + (anim !== 'none' ? 'оверлее' : 'SRT: ' + srtPath));
+        }
+
+        /* 7c. Персист кью — источник правды для модалки «Править титры». */
+        try {
+          ContextStore.setTranscriptEntry(REELS_PID, applied.sequenceName, {
+            cues: cues,
+            settings: { format: fmt, anim: anim, fontName: fontName, textColor: textColor, hlColor: hlColor, fps: fps, w: targetW, h: targetH },
+            paths: { srt: srtPath, ass: assPath, mov: outPath },
+            silences: (entry.audioAnalysis && entry.audioAnalysis.silences) || null,
+            sourceSequenceName: seqName,
+            reelsSequenceName: applied.sequenceName,
+            createdAt: Date.now()
+          });
+        } catch (eSt) { notes.push('Кью не сохранены для редактора (' + String((eSt && eSt.message) || eSt) + ')'); }
+
+        /* 8. Отчёт. */
+        var animLabel = anim === 'box' ? 'плашка под словом' : (anim === 'none' ? 'без анимации' : 'цвет слова');
         var lines = [
-          'Создана секвенция «' + resp.sequenceName + '» (1080×1920).',
-          'Отрефреймлено ' + resp.applied + ' из ' + plan.total + ' клипов.'
+          'Создана секвенция «' + applied.sequenceName + '» (' + targetW + '×' + targetH + ').',
+          'Отрефреймлено ' + applied.applied + ' из ' + plan.total + ' клипов.',
+          anim !== 'none'
+            ? ('Субтитры: ' + cues.length + ' титров, ' + animLabel + ', шрифт ' + fontName + ' — оверлей на V' + (ins.trackIndex + 1) + (capOk ? ' + caption-дорожка' : '') + '.')
+            : (capOk
+              ? ('Субтитры: ' + cues.length + ' титров — caption-дорожка (редактируемая, без анимации).')
+              : ('Субтитры: ' + cues.length + ' титров — caption-дорожка НЕ создана, титры в SRT: ' + srtPath)),
+          proofOk
+            ? ('Корректура LLM: ' + proofApplied + ' правок' + (proofRejected ? ' (' + proofRejected + ' отклонено guard-ом)' : '') + '.')
+            : 'Корректура LLM: пропущена.'
         ];
+        if (anim !== 'none' && capOk) {
+          lines.push('Внимание: включённый CC в мониторе задвоит текст — выключите CC или удалите caption-дорожку.');
+        }
         for (var sk = 0; sk < plan.skipped.length && sk < 5; sk++) {
           lines.push('Пропущен ' + plan.skipped[sk].name + ': ' + plan.skipped[sk].reason);
         }
-        var fl = resp.failed || [];
+        var fl = applied.failed || [];
         for (var fi = 0; fi < fl.length; fi++) lines.push('Не применён ' + fl[fi]);
         var nm = src.noMedia || [];
         if (nm.length) lines.push('Без медиа (не тронуты): ' + nm.slice(0, 5).join(', ') + (nm.length > 5 ? '…' : ''));
+        for (var nt = 0; nt < notes.length; nt++) lines.push(notes[nt]);
         if (resEl) {
           resEl.style.whiteSpace = 'pre-line';
           resEl.textContent = lines.join('\n');
         }
-        toolsSetCardStatus('card-vertical', seqName,
-          'Создана «' + resp.sequenceName + '»: ' + resp.applied + ' из ' + plan.total + ' клипов', 'ok');
-        toolsStatusUi.show('Вертикаль готова ✓', false);
+        toolsSetCardStatus('card-reels', seqName,
+          'Создана «' + applied.sequenceName + '»: ' + applied.applied + ' клипов, ' + cues.length + ' титров', 'ok');
+        toolsStatusUi.show('Рилс готов ✓', false);
         keepStatus = true;
         setTimeout(function () { toolsStatusUi.hide(); }, 4000);
       } catch (e) {
@@ -7661,97 +8040,205 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
     }
 
-    /* ── «💬 Субтитры»: caption-трек из транскрипта (Волна 3 п.4, 11.07.2026).
-       Кьюи считает чистый segmentsToSrtCues (≤2×42, ≤5с, линейный тайминг по
-       словам — Whisper не отдаёт пословные метки), SRT пишется из Node-контекста
-       панели (MSIX: файлы, записанные извне, host может не видеть), host
-       импортирует и вызывает createCaptionTrack. Read-back caption-треков
-       у PP 26.2.2 нет — подтверждение визуальное. */
-    async function toolsRunSubtitles() {
-      if (!beginOperation('tools:subtitles')) {
-        toolsShowErr('Идёт обработка в чате — дождитесь завершения (кнопка «Стоп» на вкладке «Чат»).');
-        return;
+    /* ═══ Рилс v2: модалка «Править титры» ═══
+       Кью из ContextStore (REELS_PID, ключ = имя рилс-секвенции) — источник
+       правды. Правка текста: rebuildCueText (без LLM-guard — монтажёр
+       авторитетен), границы кью не двигаются, сохранение сразу.
+       «Обновить captions»: новый .srt → новая caption-дорожка (старую
+       удалить вручную — API удаления в ExtendScript нет).
+       «Перерендерить караоке»: ASS → ffmpeg → replaceTopOverlay (замена
+       на той же дорожке, число дорожек не растёт). */
+    var _reelsEditEntry = null;
+
+    function reelsFindSavedEntry(seqName) {
+      /* Активная секвенция — сама рилс-секвенция или её исходник. */
+      var cands = [seqName, seqName + ' — Рилс 9x16', seqName + ' — Рилс 1x1'];
+      for (var i = 0; i < cands.length; i++) {
+        var e = ContextStore.getTranscriptEntry(REELS_PID, cands[i]);
+        if (e && e.cues && e.cues.length) return e;
       }
-      toolsDisableRun(true);
-      toolsStatusUi.show('Готовлю субтитры…', true);
-      var resEl = document.getElementById('st-result');
-      if (resEl) { resEl.textContent = ''; }
-      var keepStatus = false;
+      return null;
+    }
+
+    function reelsEditStatus(msg) {
+      var el = document.getElementById('re-modal-status');
+      if (el) el.textContent = msg || '';
+    }
+
+    function reelsSaveEditEntry(e) {
+      var entry = e || _reelsEditEntry;
+      if (!entry) return false;
+      return ContextStore.setTranscriptEntry(REELS_PID, entry.reelsSequenceName, entry);
+    }
+
+    function reelsRenderEditBody() {
+      var body = document.getElementById('re-modal-body');
+      if (!body || !_reelsEditEntry) return;
+      body.textContent = '';
+      var cues = _reelsEditEntry.cues;
+      for (var i = 0; i < cues.length; i++) {
+        (function (idx) {
+          var row = document.createElement('div');
+          row.style.cssText = 'display:flex;gap:8px;margin-bottom:6px;align-items:flex-start;';
+          var tc = document.createElement('span');
+          tc.style.cssText = 'color:var(--muted);font-size:11px;white-space:nowrap;padding-top:4px;min-width:88px;';
+          tc.textContent = cues[idx].startSec.toFixed(1) + '–' + cues[idx].endSec.toFixed(1) + 'с';
+          var ta = document.createElement('textarea');
+          ta.style.cssText = 'flex:1;min-height:34px;resize:vertical;font-size:12px;';
+          ta.value = cues[idx].text;
+          ta.addEventListener('change', function () {
+            var upd = ReelsPipeline.rebuildCueText(cues[idx], ta.value, {
+              silences: _reelsEditEntry.silences || null
+            });
+            if (!upd) { ta.value = cues[idx].text; reelsEditStatus('Пустой титр — правка отменена'); return; }
+            cues[idx] = upd;
+            ta.value = upd.text;
+            var saved = reelsSaveEditEntry();
+            if (saved === false) {
+              reelsEditStatus('Не удалось сохранить титры — правка не persisted (проверьте место на диске).');
+            } else {
+              reelsEditStatus('Сохранено. Обновите captions/караоке, чтобы применить в Premiere.');
+            }
+          });
+          row.appendChild(tc);
+          row.appendChild(ta);
+          body.appendChild(row);
+        })(i);
+      }
+    }
+
+    function reelsOpenEditModal() {
+      toolsShowErr('');
+      PremiereBridge.getSequenceRegionInfo(function (err, info) {
+        if (err || !info || !info.ok) {
+          toolsShowErr('Не удалось определить активную секвенцию: ' + String((err && err.message) || err || 'нет ответа от моста'));
+          return;
+        }
+        var seqName = String(info.sequenceName || '');
+        var entry = seqName ? reelsFindSavedEntry(seqName) : null;
+        if (!entry) {
+          toolsShowErr('Нет сохранённых титров рилса для «' + (seqName || '?') + '». Сначала соберите рилс.');
+          return;
+        }
+        _reelsEditEntry = entry;
+        var ov = document.getElementById('reels-edit-modal');
+        var meta = document.getElementById('re-modal-meta');
+        var rerenderBtn = document.getElementById('re-rerender-karaoke');
+        if (meta) meta.textContent = entry.reelsSequenceName + ' · ' + entry.cues.length + ' титров · ' + (entry.settings.anim === 'none' ? 'без анимации' : entry.settings.anim === 'box' ? 'плашка' : 'цвет слова');
+        if (rerenderBtn) rerenderBtn.hidden = entry.settings.anim === 'none';
+        reelsEditStatus('');
+        reelsRenderEditBody();
+        if (ov) ov.hidden = false;
+      });
+    }
+
+    async function reelsUpdateCaptions() {
+      if (!_reelsEditEntry) return;
+      if (!beginOperation('tools:reels-captions')) { reelsEditStatus('Идёт другая операция — подождите.'); return; }
+      var entry = _reelsEditEntry; /* snapshot — защита от race при долгом рендере */
       try {
-        var snap = await execGetSnapshot(true);
-        if (!snap || !snap.ok) {
-          toolsShowErr(snap && snap.error ? snap.error : 'Не удалось получить снимок таймлайна.');
-          return;
-        }
-        var seqKey = snap.sequenceName || '';
-        var found = seqKey ? ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqKey) : { entry: null };
-        var entry = found && found.entry;
-        if (!entry || !entry.segments || !entry.segments.length) {
-          toolsShowErr('Нет транскрипта для «' + seqKey + '» — сначала транскрибируйте In–Out (вкладка «Чат»).');
-          return;
-        }
-        var spEl = document.getElementById('st-speakers');
-        var wantSpeakers = !spEl || spEl.checked;
-        var hasSpeakers = false;
-        for (var si = 0; si < entry.segments.length; si++) {
-          if (entry.segments[si] && entry.segments[si].speaker) { hasSpeakers = true; break; }
-        }
-        var cues = DeterministicPipelines.segmentsToSrtCues(entry.segments, {
-          withSpeakers: wantSpeakers && hasSpeakers
-        });
-        if (!cues.length) {
-          toolsShowErr('Из транскрипта не получилось ни одного титра (пустые сегменты?).');
-          return;
-        }
-        var srt = DeterministicPipelines.cuesToSrt(cues);
+        reelsEditStatus('Обновляю captions…');
         var fs = require('fs');
         var path = require('path');
         var os = require('os');
-        var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'subtitles');
+        var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'reels');
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        /* Имя = секвенция + время: item остаётся в проекте (caption-трек
-           ссылается на него), повторный запуск не должен конфликтовать. */
         var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        var srtPath = path.join(dir, seqKey.replace(/[\\\/:*?"<>|]/g, '_') + '_' + ts + '.srt');
-        fs.writeFileSync(srtPath, '\uFEFF' + srt, 'utf8');
-        toolsStatusUi.show('Создаю caption-трек (' + cues.length + ' титров)…', true);
-        var resp = await new Promise(function (resolve, reject) {
+        var safeName = entry.reelsSequenceName.replace(/[\\\/:*?"<>|]/g, '_');
+        var srtPath = path.join(dir, safeName + '_' + ts + '.srt');
+        fs.writeFileSync(srtPath, ReelsPipeline.buildSrt(entry.cues), 'utf8');
+        await reelsActivateSequence(entry.reelsSequenceName);
+        var cap = await new Promise(function (resolve, reject) {
           PremiereBridge.importSrtAsCaptions({
             srtPath: srtPath.replace(/\\/g, '/'),
-            expectedSequenceName: seqKey
-          }, function (err, data) {
-            if (err) reject(err); else resolve(data);
-          });
+            expectedSequenceName: entry.reelsSequenceName
+          }, function (err, data) { if (err) reject(err); else resolve(data); });
         });
-        if (!resp || !resp.ok) {
-          toolsShowErr((resp && resp.error) || 'Не удалось создать caption-трек.');
-          return;
-        }
-        var durMin = cues[cues.length - 1].endSec / 60;
-        var lines = [
-          'Создан caption-трек: ' + cues.length + ' титров (~' + durMin.toFixed(1) + ' мин).',
-          (wantSpeakers && hasSpeakers)
-            ? 'Смена говорящего помечена «— ».'
-            : (wantSpeakers ? 'Спикеры не размечены — без меток (карточка «🗣 Спикеры»).' : 'Метки спикеров выключены.'),
-          'Файл «' + resp.imported + '» добавлен в проект — не удаляйте, трек ссылается на него.'
-        ];
-        if (resEl) {
-          resEl.style.whiteSpace = 'pre-line';
-          resEl.textContent = lines.join('\n');
-        }
-        toolsSetCardStatus('card-subtitles', seqKey,
-          'Caption-трек: ' + cues.length + ' титров (~' + durMin.toFixed(1) + ' мин)', 'ok');
-        toolsStatusUi.show('Субтитры готовы ✓', false);
-        keepStatus = true;
-        setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+        if (!cap || !cap.ok) throw new Error((cap && cap.error) || 'importSrtAsCaptions: нет ответа');
+        entry.paths.srt = srtPath;
+        reelsSaveEditEntry(entry);
+        reelsEditStatus('Captions обновлены (новая дорожка). Старую caption-дорожку удалите вручную — API удаления нет.');
       } catch (e) {
-        toolsShowErr(String(e.message || e));
+        reelsEditStatus('Ошибка captions: ' + String((e && e.message) || e));
       } finally {
         endOperation();
-        toolsDisableRun(false);
-        if (!keepStatus) toolsStatusUi.hide();
       }
     }
+
+    async function reelsRerenderKaraoke() {
+      if (!_reelsEditEntry) return;
+      if (_reelsEditEntry.settings.anim === 'none') return;
+      if (!beginOperation('tools:reels-rerender')) { reelsEditStatus('Идёт другая операция — подождите.'); return; }
+      var entry = _reelsEditEntry; /* snapshot — защита от race при долгом ffmpeg-рендере */
+      try {
+        var st = entry.settings;
+        var ffBin = AudioPreprocess.findFfmpegPath();
+        if (!ffBin) throw new Error('ffmpeg не найден');
+        var fs = require('fs');
+        var path = require('path');
+        var os = require('os');
+        var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'reels');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        var safeName = entry.reelsSequenceName.replace(/[\\\/:*?"<>|]/g, '_');
+        var cues = entry.cues;
+        var ass = ReelsPipeline.buildAss(cues, {
+          w: st.w, h: st.h, fontName: st.fontName,
+          textColor: st.textColor, hlColor: st.hlColor, anim: st.anim
+        });
+        var assPath = path.join(dir, safeName + '_' + ts + '.ass');
+        var outPath = path.join(dir, safeName + '_' + ts + '.mov');
+        fs.writeFileSync(assPath, ass, 'utf8');
+        var durationSec = Math.ceil((cues[cues.length - 1].endSec + 0.5) * 100) / 100;
+        reelsEditStatus('Рендерю караоке (~' + Math.round(durationSec) + 'с видео)…');
+        await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
+          assPath: assPath, w: st.w, h: st.h, fps: st.fps,
+          durationSec: durationSec, outPath: outPath
+        }));
+        if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 4096) {
+          throw new Error('ffmpeg отрендерил пустой файл: ' + outPath);
+        }
+        reelsEditStatus('Заменяю оверлей на таймлайне…');
+        var ins = await new Promise(function (resolve, reject) {
+          PremiereBridge.importAndOverlayOnTop({
+            filePath: outPath.replace(/\\/g, '/'),
+            expectedSequenceName: entry.reelsSequenceName,
+            replaceTopOverlay: true
+          }, function (err, data) { if (err) reject(err); else resolve(data); });
+        });
+        if (!ins || !ins.ok) throw new Error((ins && ins.error) || 'importAndOverlayOnTop: нет ответа');
+        entry.paths.ass = assPath;
+        entry.paths.mov = outPath;
+        reelsSaveEditEntry(entry);
+        reelsEditStatus('Караоке перерендерено — оверлей заменён на V' + (ins.trackIndex + 1) + '.');
+      } catch (e) {
+        reelsEditStatus('Ошибка перерендера: ' + String((e && e.message) || e));
+      } finally {
+        endOperation();
+      }
+    }
+
+    (function wireReelsEditModal() {
+      var openBtn = document.getElementById('rl-edit-cues');
+      var closeBtn = document.getElementById('re-modal-close');
+      var ov = document.getElementById('reels-edit-modal');
+      var capBtn = document.getElementById('re-update-captions');
+      var rrBtn = document.getElementById('re-rerender-karaoke');
+      if (openBtn) openBtn.addEventListener('click', reelsOpenEditModal);
+      if (closeBtn) closeBtn.addEventListener('click', function () { if (ov) ov.hidden = true; });
+      if (ov) ov.addEventListener('click', function (ev) { if (ev.target === ov) ov.hidden = true; });
+      if (capBtn) capBtn.addEventListener('click', reelsUpdateCaptions);
+      if (rrBtn) rrBtn.addEventListener('click', reelsRerenderKaraoke);
+      if (!window.__omcReelsEditEscInstalled) {
+        window.__omcReelsEditEscInstalled = true;
+        document.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape') {
+            var reelsOv = document.getElementById('reels-edit-modal');
+            if (reelsOv && !reelsOv.hidden) reelsOv.hidden = true;
+          }
+        });
+      }
+    })();
 
     /* ── Run tool ─────────────────────────────────────────── */
     async function toolsRunTool(toolName) {
@@ -7762,13 +8249,9 @@ PanelBoot.run('ИИ: монтаж', function () {
          с записью меток прямо в кэш транскрипта. */
       if (toolName === 'speakers') { await toolsRunDiarize(); return; }
 
-      /* «📱 Вертикаль 9:16» — тоже не proposal: исходник не трогается,
-         результат — новая секвенция (откат = удалить её). */
-      if (toolName === 'vertical') { await toolsRunVertical(); return; }
-
-      /* «💬 Субтитры» — не proposal: добавляет caption-трек поверх, ничего
-         не режет (откат = удалить трек / Ctrl+Z). */
-      if (toolName === 'subtitles') { await toolsRunSubtitles(); return; }
+      /* «🎬 Рилс» — тоже не proposal: исходник не трогается, результат —
+         новая секвенция с оверлеем субтитров (откат = удалить её). */
+      if (toolName === 'reels') { await toolsRunReels(); return; }
 
       var pipelineFn, params = {}, proposalId;
 
