@@ -79,6 +79,11 @@
       .more-menu .more-popover button:hover { background: rgba(255,255,255,0.07); }
       .more-menu .more-popover button.danger:hover { background: rgba(196,43,43,0.18); color: #ff8888; }
       .more-menu .more-popover hr { border: none; border-top: 1px solid var(--border); margin: 4px 2px; }
+      .more-menu .more-popover .version-row {
+        padding: 4px 10px; font-size: 11px; color: var(--muted, #888);
+        font-variant-numeric: tabular-nums; user-select: text; cursor: default;
+      }
+      .more-menu .more-popover #btn-self-update.update-available { color: #7dc87d; }
 
       /* ── Usage/контекст-поповер (Волна 2 п.2) ───────────────────── */
       .usage-menu .usage-badge { cursor: pointer; }
@@ -463,6 +468,9 @@
               <button type="button" id="btn-export-report">AI-отчёт о сессии</button>
               <hr />
               <button type="button" id="btn-clear-all" class="danger">Сбросить всё</button>
+              <hr />
+              <div class="version-row" id="version-row" title="Версия host-скрипта · git-коммит">v?</div>
+              <button type="button" id="btn-self-update" hidden>Обновить с GitHub</button>
             </div>
           </div>
         </div>
@@ -834,6 +842,7 @@
           '../shared/ui-hints.js',
           '../shared/conversation-starters.js',
           '../shared/starters-ui.js',
+          '../shared/self-update.js',
           'panel.js'
         ];
         scripts.forEach(function (src) {

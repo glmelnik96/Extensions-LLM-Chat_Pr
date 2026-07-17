@@ -5152,6 +5152,68 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
   })();
 
+  /* ── Версия плагина + самообновление из git (17.07.2026) ─────────────
+     Расширение установлено как git-клон (или симлинк на него), поэтому
+     `git pull` в корне расширения = обновление. Host перечитывается
+     $.evalFile'ом при location.reload() панели — рестарт Premiere не нужен.
+     Грациозная деградация: нет git / не клон → только показ версии. */
+  (function () {
+    var verRow = document.getElementById('version-row');
+    var btnUpd = document.getElementById('btn-self-update');
+    if (!verRow || !btnUpd || typeof SelfUpdate === 'undefined') return;
+
+    var repoRoot = extensionRootForHost();
+    var gitStatus = null;
+
+    function renderVersion(hostVer) {
+      var parts = ['v' + (hostVer || '?')];
+      if (gitStatus && gitStatus.supported) {
+        parts.push(gitStatus.commit + (gitStatus.dirty ? '*' : ''));
+        if (gitStatus.branch && gitStatus.branch !== 'main') parts.push(gitStatus.branch);
+      }
+      verRow.textContent = parts.join(' · ');
+    }
+
+    var hostVersion = null;
+    try {
+      cs.evalScript('$._EXT_PRM_ && $._EXT_PRM_.version || "?"', function (v) {
+        hostVersion = v;
+        renderVersion(hostVersion);
+      });
+    } catch (eV) {}
+
+    SelfUpdate.getStatus(repoRoot).then(function (st) {
+      gitStatus = st;
+      renderVersion(hostVersion);
+      if (!st.supported) return; /* не git-клон / нет git — кнопку не показываем */
+      return SelfUpdate.checkForUpdate(repoRoot).then(function (chk) {
+        if (chk.available) {
+          btnUpd.hidden = false;
+          btnUpd.classList.add('update-available');
+          btnUpd.textContent = 'Обновить с GitHub (+' + chk.behind + ')';
+        } else if (chk.diverged) {
+          btnUpd.hidden = false;
+          btnUpd.disabled = true;
+          btnUpd.textContent = 'Локальные коммиты расходятся с origin';
+        }
+      });
+    }).catch(function () { /* тихо: версия останется без git-части */ });
+
+    btnUpd.onclick = function () {
+      if (btnUpd.disabled) return;
+      btnUpd.disabled = true;
+      btnUpd.textContent = 'Обновляю…';
+      SelfUpdate.applyUpdate(repoRoot).then(function (r) {
+        btnUpd.textContent = 'Обновлено → ' + r.commit + ', перезагрузка…';
+        setTimeout(function () { location.reload(); }, 800);
+      }).catch(function (e) {
+        btnUpd.disabled = false;
+        btnUpd.textContent = 'Обновить с GitHub';
+        showErr('Обновление не удалось: ' + ((e && e.message) || e));
+      });
+    };
+  })();
+
   var btnExport = document.getElementById('btn-export-session');
   if (btnExport) {
     btnExport.onclick = function () {
