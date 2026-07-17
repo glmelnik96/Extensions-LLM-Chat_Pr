@@ -498,6 +498,18 @@
    * @param {object} [opts] { maxClips=250 }
    * @returns {string|null}
    */
+  var AUTO_SNAPSHOT_PREFIX = '[auto-snapshot] ';
+
+  /**
+   * isAutoSnapshotText(s) — распознаватель авто-снимка, парный к
+   * buildAutoSnapshotText (аудит 17.07.2026). panel.js фильтрует такие
+   * user-сообщения при персисте истории: снимок валиден один ход,
+   * накопленные старые снимки противоречат свежему и раздувают контекст.
+   */
+  function isAutoSnapshotText(s) {
+    return typeof s === 'string' && s.indexOf(AUTO_SNAPSHOT_PREFIX) === 0;
+  }
+
   function buildAutoSnapshotText(snap, opts) {
     if (!snap || !snap.ok || !Array.isArray(snap.clips)) return null;
     opts = opts || {};
@@ -515,7 +527,7 @@
     for (i = 0; i < all.length; i++) {
       if (all[i].endSec > effectiveEndSec) effectiveEndSec = all[i].endSec;
     }
-    var head = '[auto-snapshot] seq=' + snap.sequenceName +
+    var head = AUTO_SNAPSHOT_PREFIX + 'seq=' + snap.sequenceName +
       ' dur=' + effectiveEndSec.toFixed(1) + 's fps=' + snap.fps;
 
     if (all.length > maxClips) {
@@ -692,6 +704,7 @@
     buildTimelineDiff: buildTimelineDiff,
     compactSnapshotForLlm: compactSnapshotForLlm,
     buildAutoSnapshotText: buildAutoSnapshotText,
+    isAutoSnapshotText: isAutoSnapshotText,
     calcExpectedDeltaSec: calcExpectedDeltaSec,
     analyzeInputGeometry: analyzeInputGeometry
   };

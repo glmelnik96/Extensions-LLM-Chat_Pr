@@ -89,16 +89,8 @@
    * - single quotes instead of double
    * Пробуем починить перед отказом.
    */
-  function repairJson(raw) {
-    if (!raw || typeof raw !== 'string') return '{}';
-    var s = raw.trim();
-    /* 1. Trailing commas before } or ] */
-    s = s.replace(/,\s*([}\]])/g, '$1');
-    /* 2. Single quotes → double quotes (naive, handles simple cases) */
-    s = s.replace(/'/g, '"');
-    /* 3. Unquoted keys: {action: → {"action": */
-    s = s.replace(/([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:/g, '$1"$2":');
-    /* 4. Truncated: try to close open braces/brackets */
+  /* Закрыть оборванные строки/скобки (обрыв на max_tokens). */
+  function _closeOpen(s) {
     var opens = 0, openB = 0;
     for (var i = 0; i < s.length; i++) {
       if (s[i] === '{') opens++;
@@ -112,6 +104,24 @@
     while (openB > 0) { s += ']'; openB--; }
     while (opens > 0) { s += '}'; opens--; }
     return s;
+  }
+
+  function repairJson(raw) {
+    if (!raw || typeof raw !== 'string') return '{}';
+    var s = raw.trim();
+    /* 1. Trailing commas before } or ] */
+    s = s.replace(/,\s*([}\]])/g, '$1');
+    /* 2. Unquoted keys: {action: → {"action": */
+    s = s.replace(/([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:/g, '$1"$2":');
+    /* 3. Сначала БЕЗ конверсии кавычек: глобальный replace(/'/g,'"')
+       портил апострофы внутри валидных двойных кавычек ("it's" → "it"s").
+       Если после безопасных починок JSON парсится — возвращаем как есть. */
+    var safe = _closeOpen(s);
+    try { JSON.parse(safe); return safe; } catch (eSafe) {}
+    /* 4. Last resort: одинарные кавычки → двойные (naive, для {'a':'b'}) */
+    var sq = s.replace(/'/g, '"');
+    sq = sq.replace(/([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:/g, '$1"$2":');
+    return _closeOpen(sq);
   }
 
   function safeParseArgs(raw) {
@@ -425,8 +435,18 @@
       }
 
       /* ── Cycle detection ─────────────────────────────────────── */
+      /* Аудит 17.07.2026: в историю хэшей идёт ОДИН хэш на уникальный вызов
+         в батче. Раньше 3 идентичных tool_calls в одной пачке (легитимный
+         паттерн параллельных вызовов) мгновенно триггерили detectCycle и
+         убивали ход. Дубли внутри батча дедупим ниже, а зацикливание ловим
+         только на повторах МЕЖДУ шагами. */
+      var seenInBatch = {};
       for (var ci = 0; ci < toolCalls.length; ci++) {
-        callHashes.push(hashToolCall(toolCalls[ci]));
+        var ciHash = hashToolCall(toolCalls[ci]);
+        if (!seenInBatch[ciHash]) {
+          seenInBatch[ciHash] = true;
+          callHashes.push(ciHash);
+        }
       }
       if (detectCycle(callHashes)) {
         var cycleToolName = toolCalls[0].function.name;
@@ -456,6 +476,12 @@
       var toolTasks = [];
       var toolTaskHashes = [];
       var toolTaskBlocked = [];
+      /* Дедуп внутри батча: dupOf[i] = индекс первого идентичного вызова
+         (или -1). Дубль не исполняется (критично для мутирующих: apply_*
+         дважды = двойной рез), его tool-ответ копирует результат первого —
+         у каждого tool_call_id остаётся свой tool-message (контракт FM). */
+      var batchFirstIdx = {};
+      var dupOf = [];
       var hasMutating = false;
       for (var i = 0; i < toolCalls.length; i++) {
         throwIfAborted(signal, abortCheck);
@@ -465,6 +491,17 @@
         var args = safeParseArgs(fn.arguments);
         var tcHash = hashToolCall(tc);
         if (mutatingTools[name]) hasMutating = true;
+
+        if (batchFirstIdx[tcHash] !== undefined) {
+          /* Дубль: не исполняем, retry guard не трогаем (blocked=true) */
+          toolTasks.push(null);
+          toolTaskHashes.push(tcHash);
+          toolTaskBlocked.push(true);
+          dupOf.push(batchFirstIdx[tcHash]);
+          continue;
+        }
+        batchFirstIdx[tcHash] = i;
+        dupOf.push(-1);
 
         /* If JSON repair injected _parseError, report it as tool result */
         if (args._parseError) {
@@ -517,11 +554,32 @@
         toolResults = [];
         for (var si = 0; si < toolTasks.length; si++) {
           throwIfAborted(signal, abortCheck);
+          if (dupOf[si] >= 0) {
+            toolResults.push({
+              role: 'tool',
+              tool_call_id: toolCalls[si].id,
+              content: toolResults[dupOf[si]].content
+            });
+            continue;
+          }
           toolResults.push(await toolTasks[si]());
         }
       } else {
         /* Только чтение/propose — параллельно, как раньше. */
-        toolResults = await Promise.all(toolTasks.map(function (t) { return t(); }));
+        toolResults = new Array(toolTasks.length);
+        await Promise.all(toolTasks.map(function (t, ti2) {
+          if (!t) return null; /* дубль — заполним после */
+          return t().then(function (r) { toolResults[ti2] = r; });
+        }));
+        for (var di = 0; di < toolResults.length; di++) {
+          if (dupOf[di] >= 0) {
+            toolResults[di] = {
+              role: 'tool',
+              tool_call_id: toolCalls[di].id,
+              content: toolResults[dupOf[di]].content
+            };
+          }
+        }
       }
 
       /* Anti-spam guard: обновляем счётчики ПОСЛЕ await всех результатов пачки.
@@ -553,7 +611,16 @@
     var resultStr = '';
     try {
       var out = await exec(args);
-      resultStr = typeof out === 'string' ? out : JSON.stringify(out != null ? out : {});
+      if (out == null) {
+        /* Аудит 17.07.2026: "{}" неинформативен — модель не понимает,
+           успех это или нет, и может повторить вызов. Говорим честно. */
+        resultStr = JSON.stringify({
+          ok: true,
+          note: 'Инструмент выполнен, но вернул пустой результат (нет данных).'
+        });
+      } else {
+        resultStr = typeof out === 'string' ? out : JSON.stringify(out);
+      }
     } catch (err) {
       resultStr = JSON.stringify({ error: String(err.message || err) });
     }

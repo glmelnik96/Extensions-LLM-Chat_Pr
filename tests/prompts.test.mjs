@@ -110,6 +110,27 @@ describe('TIER1_TRANSCRIPT — секция «ТИПИЧНЫЕ ОШИБКИ»', 
   });
 });
 
+/* ═══ classifyIntent — «сожми/сократи» = transcript (аудит 17.07.2026) ═══ */
+describe('classifyIntent — сжатие/сокращение хронометража → transcript', () => {
+  const phrases = [
+    'сожми ролик до 5 минут',
+    'сократи видео вдвое',
+    'сократить до 3 минут',
+    'сожми до минуты'
+  ];
+  for (const q of phrases) {
+    it(JSON.stringify(q) + ' → целевой [transcript], не fallback на все tier', () => {
+      const r = AP.classifyIntent(q);
+      assert.ok(r.includes('transcript'), 'ожидался transcript: ' + JSON.stringify(r));
+      assert.ok(r.length < 4, 'нецелевой fallback на все 4 tier: ' + JSON.stringify(r));
+    });
+  }
+
+  it('«уложи в хронометраж» по-прежнему transcript (регресс)', () => {
+    assert.ok(AP.classifyIntent('уложи ролик в 5 минут хронометража').includes('transcript'));
+  });
+});
+
 /* ═══ buildPrompt подключает TIER1_TRANSCRIPT для запросов про транскрипт ═══ */
 describe('buildPrompt — интеграция', () => {
   it('запрос про вырезание пауз включает негативные few-shots', () => {

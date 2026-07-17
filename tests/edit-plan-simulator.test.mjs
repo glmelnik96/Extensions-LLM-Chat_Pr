@@ -504,3 +504,32 @@ describe('EditPlanSimulator.buildAutoSnapshotText', () => {
     assert.match(EP.buildAutoSnapshotText(snap), /dur=3\.0s/);
   });
 });
+
+/* ══════════════════════════════════════════════════════════════
+ * isAutoSnapshotText (аудит 17.07.2026): распознаватель авто-снимка,
+ * парный к buildAutoSnapshotText. Нужен panel.js, чтобы НЕ персистить
+ * снимок в историю чата: раньше каждый ход добавлял user-сообщение
+ * со снимком навсегда → N противоречащих снимков в контексте модели,
+ * раздувание истории и «пузыри пользователя» в UI.
+ * ══════════════════════════════════════════════════════════════ */
+describe('EditPlanSimulator.isAutoSnapshotText', () => {
+  test('выход buildAutoSnapshotText распознаётся (обычный и плотный)', () => {
+    const clips = [];
+    for (let i = 0; i < 3; i++) {
+      clips.push({ nodeId: 'v' + i, name: 'c.mp4', trackType: 'video', trackIndex: 0, startSec: i, endSec: i + 1 });
+    }
+    const snap = { ok: true, sequenceName: 'S', sequenceEndSec: 3, fps: 25, clips };
+    assert.equal(EP.isAutoSnapshotText(EP.buildAutoSnapshotText(snap)), true);
+    const dense = EP.buildAutoSnapshotText(snap, { maxClips: 2 });
+    assert.equal(EP.isAutoSnapshotText(dense), true);
+  });
+
+  test('обычные сообщения пользователя НЕ распознаются', () => {
+    assert.equal(EP.isAutoSnapshotText('вырежь паузы'), false);
+    assert.equal(EP.isAutoSnapshotText('расскажи про [auto-snapshot]'), false);
+    assert.equal(EP.isAutoSnapshotText(''), false);
+    assert.equal(EP.isAutoSnapshotText(null), false);
+    assert.equal(EP.isAutoSnapshotText(undefined), false);
+    assert.equal(EP.isAutoSnapshotText(42), false);
+  });
+});

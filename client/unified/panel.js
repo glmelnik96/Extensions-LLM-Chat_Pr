@@ -5692,7 +5692,14 @@ PanelBoot.run('ИИ: монтаж', function () {
       ContextStore.setMessages(
         panelId,
         result.messages.filter(function (m) {
-          return m.role !== 'system';
+          if (m.role === 'system') return false;
+          /* Аудит 17.07.2026: auto-snapshot валиден ОДИН ход. Раньше он
+             персистился как user-сообщение → история копила N устаревших
+             снимков (противоречат свежему, раздувают контекст, рисуются
+             пузырями пользователя). Фильтр заодно вычищает legacy-снимки
+             из историй, сохранённых до фикса. */
+          if (m.role === 'user' && EditPlanSimulator.isAutoSnapshotText(m.content)) return false;
+          return true;
         })
       );
       renderMessages(ContextStore.getMessages(panelId));

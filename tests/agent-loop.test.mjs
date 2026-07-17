@@ -586,3 +586,96 @@ describe('runAgentLoop retry guard (mock CloudRuClient)', () => {
     assert.ok(blocked.length >= 1, 'после 3 новых фейлов → блок');
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * Аудит харнеса 17.07.2026 — repairJson не должен портить валидные
+ * данные; дедуп одинаковых вызовов в одном батче; честный результат
+ * при undefined из executor'а.
+ * ═══════════════════════════════════════════════════════════════ */
+describe('agent-loop.repairJson не портит апострофы (аудит 17.07)', () => {
+  test('апостроф внутри двойных кавычек сохраняется при починке trailing comma', () => {
+    const out = JSON.parse(AL.repairJson('{"text": "it\'s fine",}'));
+    assert.equal(out.text, "it's fine");
+  });
+
+  test('кириллический текст с апострофом + обрыв строки', () => {
+    const out = JSON.parse(AL.repairJson('{"name": "д\'Артаньян", "note": "обры'));
+    assert.equal(out.name, "д'Артаньян");
+  });
+
+  test('одинарно-кавыченный JSON по-прежнему чинится (fallback)', () => {
+    assert.deepEqual(JSON.parse(AL.repairJson("{'action':'remove'}")), { action: 'remove' });
+  });
+});
+
+describe('runAgentLoop дедуп одинаковых tool_calls в одном батче (аудит 17.07)', () => {
+  test('3 идентичных вызова в ОДНОМ батче: executor один раз, ход НЕ убит, 3 tool-ответа', async () => {
+    const { client } = makeMock([
+      { choices: [{ message: { tool_calls: [
+        { id: 'c1', function: { name: 'look', arguments: '{"q":1}' } },
+        { id: 'c2', function: { name: 'look', arguments: '{"q":1}' } },
+        { id: 'c3', function: { name: 'look', arguments: '{"q":1}' } }
+      ] } }] },
+      { choices: [{ message: { content: 'готово' } }] }
+    ]);
+    const { runAgentLoop } = loadAgentLoop(client);
+    let execCount = 0;
+    const res = await runAgentLoop(baseOpts({
+      toolExecutors: { look: async () => { execCount++; return { seen: true }; } }
+    }));
+    assert.equal(res.cycleDetected, undefined, 'дубли в одном батче — не зацикливание');
+    assert.equal(execCount, 1, 'executor должен выполниться один раз');
+    const toolMsgs = res.messages.filter((m) => m.role === 'tool');
+    assert.equal(toolMsgs.length, 3, 'каждый tool_call_id получает свой tool-ответ');
+    assertLoose.deepEqual(toolMsgs.map((m) => m.tool_call_id).sort(), ['c1', 'c2', 'c3']);
+    for (const m of toolMsgs) assert.deepEqual(JSON.parse(m.content), { seen: true });
+    assert.equal(res.finalText, 'готово');
+  });
+
+  test('дубль мутирующего инструмента в батче не исполняется дважды', async () => {
+    const { client } = makeMock([
+      { choices: [{ message: { tool_calls: [
+        { id: 'm1', function: { name: 'apply_x', arguments: '{"cut":1}' } },
+        { id: 'm2', function: { name: 'apply_x', arguments: '{"cut":1}' } }
+      ] } }] },
+      { choices: [{ message: { content: 'ok' } }] }
+    ]);
+    const { runAgentLoop } = loadAgentLoop(client);
+    let applied = 0;
+    await runAgentLoop(baseOpts({
+      toolExecutors: { apply_x: async () => { applied++; return { ok: true }; } },
+      mutatingTools: ['apply_x']
+    }));
+    assert.equal(applied, 1, 'мутирующая операция не должна примениться дважды');
+  });
+
+  test('зацикливание МЕЖДУ шагами по-прежнему ловится (3 шага × 1 вызов)', async () => {
+    const sameCall = { choices: [{ message: { tool_calls: [{ id: 'c', function: { name: 'spin', arguments: '{}' } }] } }] };
+    const { client, calls } = makeMock(() => sameCall);
+    const { runAgentLoop } = loadAgentLoop(client);
+    const res = await runAgentLoop(baseOpts({
+      toolExecutors: { spin: async () => ({ again: true }) },
+      maxSteps: 20
+    }));
+    assert.equal(res.cycleDetected, true);
+    assert.equal(calls().length, 3);
+  });
+});
+
+describe('agent-loop._execTool: undefined из executor → информативный результат (аудит 17.07)', () => {
+  test('executor вернул undefined → не "{}", а честная пометка о пустом результате', async () => {
+    const { client } = makeMock([
+      { choices: [{ message: { tool_calls: [{ id: 'c1', function: { name: 'void_tool', arguments: '{}' } }] } }] },
+      { choices: [{ message: { content: 'ок' } }] }
+    ]);
+    const { runAgentLoop } = loadAgentLoop(client);
+    const res = await runAgentLoop(baseOpts({
+      toolExecutors: { void_tool: async () => undefined }
+    }));
+    const toolMsg = res.messages.find((m) => m.role === 'tool');
+    assert.notEqual(toolMsg.content, '{}', 'пустой "{}" неинформативен для модели');
+    const parsed = JSON.parse(toolMsg.content);
+    assert.equal(parsed.ok, true);
+    assert.ok(/пуст/i.test(parsed.note || ''), 'должна быть пометка о пустом результате');
+  });
+});

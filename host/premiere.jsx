@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.10.1';
+$._EXT_PRM_.version = '2.11.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -810,9 +810,13 @@ $._EXT_PRM_._findClipsByDisplayName = function (seq, clipName) {
  * Порядок справа налево. Нужен для move_clip: иначе сдвиг только пересекающих [0,L] заводит длинный клип на соседний.
  * @returns {Array} лог { nodeId, newStartSec, newEndSec }
  */
+/* Аудит 17.07.2026: возвращает { shifted: [...], attempted: N } вместо голого
+   массива — вызывающий обязан отличать «нечего сдвигать» (attempted=0, легитимно)
+   от «кандидаты были, но ни один не сдвинулся» (attempted>0, shifted=0 → тихий
+   провал, о котором раньше сообщалось ok:true). */
 $._EXT_PRM_._rippleShiftAllClipsFrom = function (seq, fromSec, deltaSec, excludeNodeIdSet) {
   var eps = $._EXT_PRM_._EPS;
-  if (!seq || typeof fromSec !== 'number' || typeof deltaSec !== 'number' || deltaSec === 0) return [];
+  if (!seq || typeof fromSec !== 'number' || typeof deltaSec !== 'number' || deltaSec === 0) return { shifted: [], attempted: 0 };
   var ex = excludeNodeIdSet || {};
   var items = [];
   var vi,
@@ -873,7 +877,7 @@ $._EXT_PRM_._rippleShiftAllClipsFrom = function (seq, fromSec, deltaSec, exclude
       log.push({ nodeId: String(c.nodeId), newStartSec: ns, newEndSec: ne });
     } catch (eMv) {}
   }
-  return log;
+  return { shifted: log, attempted: scored.length };
 };
 
 $._EXT_PRM_._setTimelineIn = function (found, newStartSec) {
@@ -1290,8 +1294,17 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
             exRip[String(op.excludeNodeIds[xr])] = true;
           }
         }
-        var ripLog = $._EXT_PRM_._rippleShiftAllClipsFrom(seq, op.fromSec, op.deltaSec, exRip);
-        results.push({ op: a, ok: true, shifted: ripLog, count: ripLog.length });
+        var ripRes = $._EXT_PRM_._rippleShiftAllClipsFrom(seq, op.fromSec, op.deltaSec, exRip);
+        /* Аудит 17.07.2026: честный отчёт вместо безусловного ok:true. */
+        if (ripRes.attempted > 0 && ripRes.shifted.length === 0) {
+          results.push({ op: a, ok: false, error: 'Кандидатов на сдвиг: ' + ripRes.attempted + ', но ни один клип не сдвинулся (start.seconds недоступен?)', count: 0 });
+          continue;
+        }
+        if (ripRes.shifted.length < ripRes.attempted) {
+          results.push({ op: a, ok: false, error: 'Сдвинуто ' + ripRes.shifted.length + ' из ' + ripRes.attempted + ' клипов — таймлайн может быть в неконсистентном состоянии, проверь get_timeline_snapshot', shifted: ripRes.shifted, count: ripRes.shifted.length });
+          continue;
+        }
+        results.push({ op: a, ok: true, shifted: ripRes.shifted, count: ripRes.shifted.length });
         continue;
       }
 
@@ -1393,7 +1406,17 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
             aff++;
           } catch (eBn) {}
         }
-        results.push({ op: a, ok: true, clipName: nm, enabled: en, affectedClips: aff });
+        /* Аудит 17.07.2026: раньше ok:true всегда — модель считала клипы
+           переключёнными, даже когда ничего не нашлось/не переключилось. */
+        if (byName.length === 0) {
+          results.push({ op: a, ok: false, clipName: nm, error: 'Клип «' + nm + '» не найден на секвенции (имя — как в снимке таймлайна)' });
+          continue;
+        }
+        if (aff === 0) {
+          results.push({ op: a, ok: false, clipName: nm, error: 'Найдено сегментов: ' + byName.length + ', но ни один не переключился (.disabled недоступен в этой сборке PP)', affectedClips: 0 });
+          continue;
+        }
+        results.push({ op: a, ok: true, clipName: nm, enabled: en, affectedClips: aff, foundClips: byName.length });
         continue;
       }
 
@@ -1434,7 +1457,20 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         var shiftLog = null;
         if (useRippleInsert) {
           /* Сдвигаем ВСЕ клипы КРОМЕ переносимой связки: освобождаем место в [newStartSec, newStartSec+dur] */
-          shiftLog = $._EXT_PRM_._rippleShiftAllClipsFrom(seq, op.newStartSec, dur, linkedNodeIds);
+          var shiftRes = $._EXT_PRM_._rippleShiftAllClipsFrom(seq, op.newStartSec, dur, linkedNodeIds);
+          shiftLog = shiftRes.shifted;
+          /* Аудит 17.07.2026: если место НЕ освобождено полностью — перенос
+             отменяется (иначе связка ляжет поверх несдвинутых клипов). */
+          if (shiftRes.attempted > shiftRes.shifted.length) {
+            results.push({
+              op: a,
+              ok: false,
+              error: 'Не удалось освободить место: сдвинуто ' + shiftRes.shifted.length + ' из ' + shiftRes.attempted +
+                ' мешающих клипов — перенос отменён. Проверь состояние через get_timeline_snapshot.',
+              shiftedBeforeAttempt: shiftLog
+            });
+            continue;
+          }
           /* Перечитываем клип (после сдвига индексы могли измениться, но сам клип НЕ двигался) */
           found = $._EXT_PRM_._findClipByNodeId(seq, nodeRef);
           if (!found) {
@@ -2969,8 +3005,9 @@ $._EXT_PRM_._exportInOutAsChunks = function (seq, preset, root, chunkSec, chunkE
     while (t < savedOut - eps && idx < maxChunks) {
       var segEnd = Math.min(t + chunkSec, savedOut);
       try {
-        seq.setInPoint(String(t));
-        seq.setOutPoint(String(segEnd));
+        /* ЧИСЛО: setInPoint(String) молча игнорируется в PP 26.x (аудит 17.07.2026) */
+        seq.setInPoint(t);
+        seq.setOutPoint(segEnd);
       } catch (eSO) {
         return { ok: false, error: String(eSO && eSO.message ? eSO.message : eSO), code: 'SET_IN_OUT_FAIL', partial: chunks };
       }
@@ -3002,8 +3039,9 @@ $._EXT_PRM_._exportInOutAsChunks = function (seq, preset, root, chunkSec, chunkE
     }
   } finally {
     try {
-      seq.setInPoint(String(savedIn));
-      seq.setOutPoint(String(savedOut));
+      /* ЧИСЛО: setInPoint(String) молча игнорируется в PP 26.x (аудит 17.07.2026) */
+      seq.setInPoint(savedIn);
+      seq.setOutPoint(savedOut);
     } catch (eF) {}
   }
   return { ok: true, chunks: chunks };
@@ -3457,9 +3495,15 @@ $._EXT_PRM_.importMediaFile = function (jsonArg) {
         targetBin = rootItem.createBin(binName);
       } catch (eBin) { targetBin = rootItem; }
     }
-    /* Определяем количество элементов до импорта, чтобы найти новый */
+    /* Определяем количество элементов до импорта, чтобы найти новый.
+       Аудит 17.07.2026: importFiles может вернуть false БЕЗ исключения —
+       раньше beforeCount считался и не использовался, ok:true уходил
+       даже когда элемент в проекте не появился. Проверяем и bin, и root
+       (fallback-путь importFiles([p]) кладёт в root). */
     var beforeCount = 0;
+    var beforeRootCount = 0;
     try { beforeCount = targetBin.children.numItems; } catch (eBC) {}
+    try { beforeRootCount = rootItem.children.numItems; } catch (eBRC) {}
     var imported = false;
     try {
       app.project.importFiles([p], false, targetBin, false);
@@ -3468,6 +3512,16 @@ $._EXT_PRM_.importMediaFile = function (jsonArg) {
       try { app.project.importFiles([p]); imported = true; } catch (eImp2) {
         return JSON.stringify({ ok: false, error: 'importFiles упал: ' + String(eImp1.message || eImp1) });
       }
+    }
+    var afterCount = beforeCount;
+    var afterRootCount = beforeRootCount;
+    try { afterCount = targetBin.children.numItems; } catch (eAC) {}
+    try { afterRootCount = rootItem.children.numItems; } catch (eARC) {}
+    if (afterCount <= beforeCount && afterRootCount <= beforeRootCount) {
+      return JSON.stringify({
+        ok: false,
+        error: 'importFiles не сообщил об ошибке, но новый элемент не появился ни в bin «' + binName + '», ни в корне проекта. Файл: ' + p
+      });
     }
     /* Имя нового элемента — basename файла. Не используем regex с '/' в char class —
        ExtendScript некорректно завершает regex literal на '/' даже внутри [...]. */

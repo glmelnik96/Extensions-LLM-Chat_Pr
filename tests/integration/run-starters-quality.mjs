@@ -84,7 +84,15 @@ const settings = {
 
 /* ─── Load cache ───────────────────────────────────────────────────────── */
 const CACHE = JSON.parse(readFileSync(resolve(os.homedir(), '.extensions_llm_chat_pr/_llm_transcript_cache.json'), 'utf8'));
-const cacheKey = Object.keys(CACHE)[0];
+/* 17.07.2026: берём первый entry С СЕГМЕНТАМИ — в кэше бывают analysisOnly-записи
+   без segments/paragraphs (падало на entry.segments[...-1].endSec). */
+const cacheKey = Object.keys(CACHE).find(
+  (k) => Array.isArray(CACHE[k].segments) && CACHE[k].segments.length > 0
+);
+if (!cacheKey) {
+  console.error('В кэше нет entry с сегментами — транскрибируйте секвенцию.');
+  process.exit(1);
+}
 const entry = CACHE[cacheKey];
 const totalDur = Math.max(
   entry.segments[entry.segments.length - 1].endSec,
