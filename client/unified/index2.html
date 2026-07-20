@@ -770,10 +770,16 @@
                 <option value="none">нет</option>
               </select>
             </div>
-            <div class="param-row" title="Цвет текста субтитров и цвет подсветки (перекраска слова или плашка).">
+            <div class="param-row" title="Цвет текста субтитров и цвет подсветки (перекраска слова или плашка). HEX в формате #RRGGBB — CEP не открывает системную палитру, поэтому вводится вручную.">
               <span class="param-label">Цвета</span>
-              <label style="display:flex;align-items:center;gap:4px;">текст <input type="color" id="rl-text-color" value="#FFFFFF" /></label>
-              <label style="display:flex;align-items:center;gap:4px;">подсветка <input type="color" id="rl-hl-color" value="#21A038" /></label>
+              <label style="display:flex;align-items:center;gap:4px;">текст
+                <input type="text" id="rl-text-color" value="#FFFFFF" maxlength="7" spellcheck="false" style="width:72px;min-width:0;" />
+                <span id="rl-text-color-sw" style="width:16px;height:16px;border:1px solid var(--border,#444);border-radius:3px;background:#FFFFFF;display:inline-block;flex:none;"></span>
+              </label>
+              <label style="display:flex;align-items:center;gap:4px;">подсветка
+                <input type="text" id="rl-hl-color" value="#21A038" maxlength="7" spellcheck="false" style="width:72px;min-width:0;" />
+                <span id="rl-hl-color-sw" style="width:16px;height:16px;border:1px solid var(--border,#444);border-radius:3px;background:#21A038;display:inline-block;flex:none;"></span>
+              </label>
             </div>
             <div class="param-row" title="Куда смотреть в кадре у каждой камеры: «имя клипа: сдвиг%». Минус = левее, плюс = правее. Пример: «Гость: -20; Ведущий: 15». Пусто = позицию решает vision-модель (по кадру из середины источника), при её недоступности — центр. Ручное значение побеждает vision.">
               <span class="param-label">Фокус камер</span>

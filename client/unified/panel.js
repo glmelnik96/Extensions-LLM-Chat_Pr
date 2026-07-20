@@ -7615,6 +7615,15 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* Рилс v2: кью персистятся через transcript-cache механизм ContextStore
        с отдельным PID — ключ = имя рилс-секвенции. Ноль изменений в сторе. */
     var REELS_PID = '_llm_reels_cache';
+    /* HEX-нормализация цветов рилса: поле теперь текстовое (CEP не открывает
+       системную палитру у <input type="color">). Допускаем «21a038» без «#»,
+       любой регистр; мусор → fallback (assColor в pipeline тоже отобьёт). */
+    function reelsNormalizeHex(v, fallback) {
+      var s = String(v == null ? '' : v).trim();
+      if (s && s.charAt(0) !== '#') s = '#' + s;
+      s = s.toUpperCase();
+      return /^#[0-9A-F]{6}$/.test(s) ? s : fallback;
+    }
     function reelsActivateSequence(name) {
       return new Promise(function (resolve, reject) {
         PremiereBridge.activateSequenceByName({ name: name }, function (err, data) {
@@ -7693,6 +7702,21 @@ PanelBoot.run('ИИ: монтаж', function () {
           toolsShowErr('Нужен ffmpeg (кадры для vision' + (anim !== 'none' ? ' и рендер субтитров' : '') + '). Установите ffmpeg и повторите.');
           return;
         }
+        /* Караоке-оверлей требует фильтр ass (libass). Нет его — не рушим
+           сборку: деградируем до captions-only (v2: caption-слой всегда),
+           .mov-оверлей пропускаем с пометкой. Проверяем ДО шрифта, чтобы
+           при деградации не требовать установленный шрифт. */
+        if (anim !== 'none') {
+          var filtersOut = await new Promise(function (resolve) {
+            require('child_process').execFile(ffBin, ['-hide_banner', '-filters'],
+              { timeout: 30000, maxBuffer: 4 * 1024 * 1024 },
+              function (err, stdout) { resolve(String(stdout || '')); });
+          });
+          if (filtersOut.indexOf(' ass ') === -1) {
+            notes.push('Сборка ffmpeg без libass (нет фильтра ass) — караоке-оверлей пропущен, титры только в редактируемой caption-дорожке. Для анимации поставьте полную сборку ffmpeg (например, gyan.dev full).');
+            anim = 'none';
+          }
+        }
         var fontName = (document.getElementById('rl-font') || {}).value || 'SB Sans Text SemiBold';
         if (anim !== 'none' && !reelsFontInstalled(fontName)) {
           toolsShowErr('Шрифт «' + fontName + '» не найден среди системных. Установите .otf (правый клик → «Установить для всех пользователей») и повторите.');
@@ -7714,21 +7738,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         var fmt = (document.getElementById('rl-format') || {}).value || '9x16';
         var targetW = 1080;
         var targetH = fmt === '1x1' ? 1080 : 1920;
-        var textColor = (document.getElementById('rl-text-color') || {}).value || '#FFFFFF';
-        var hlColor = (document.getElementById('rl-hl-color') || {}).value || '#21A038';
-
-        /* Сборка ffmpeg должна содержать фильтр ass (libass) — только при анимации. */
-        if (anim !== 'none') {
-          var filtersOut = await new Promise(function (resolve) {
-            require('child_process').execFile(ffBin, ['-hide_banner', '-filters'],
-              { timeout: 30000, maxBuffer: 4 * 1024 * 1024 },
-              function (err, stdout) { resolve(String(stdout || '')); });
-          });
-          if (filtersOut.indexOf(' ass ') === -1) {
-            toolsShowErr('Сборка ffmpeg без libass (нет фильтра ass) — субтитры не отрендерить. Установите полную сборку (например, gyan.dev full).');
-            return;
-          }
-        }
+        var textColor = reelsNormalizeHex((document.getElementById('rl-text-color') || {}).value, '#FFFFFF');
+        var hlColor = reelsNormalizeHex((document.getElementById('rl-hl-color') || {}).value, '#21A038');
 
         /* 1. Источники рефрейма + размеры (nest — от host, файлы — ffprobe). */
         toolsStatusUi.show('Рилс: читаю видеоклипы секвенции…', true);
@@ -8238,6 +8249,30 @@ PanelBoot.run('ИИ: монтаж', function () {
           }
         });
       }
+    })();
+
+    /* Превью HEX-цветов рилса: поле текстовое (CEP не открывает системную
+       палитру), поэтому свотч рисуем сами. Невалидный HEX → бледный свотч. */
+    (function wireReelsColorSwatches() {
+      function bind(inputId, swId) {
+        var inp = document.getElementById(inputId);
+        var sw = document.getElementById(swId);
+        if (!inp || !sw) return;
+        function sync() {
+          var v = reelsNormalizeHex(inp.value, '');
+          if (v) { sw.style.background = v; sw.style.opacity = '1'; }
+          else { sw.style.opacity = '0.35'; }
+        }
+        inp.addEventListener('input', sync);
+        inp.addEventListener('change', function () {
+          var v = reelsNormalizeHex(inp.value, '');
+          if (v) inp.value = v;
+          sync();
+        });
+        sync();
+      }
+      bind('rl-text-color', 'rl-text-color-sw');
+      bind('rl-hl-color', 'rl-hl-color-sw');
     })();
 
     /* ── Run tool ─────────────────────────────────────────── */
