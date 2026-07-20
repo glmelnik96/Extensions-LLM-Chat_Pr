@@ -2131,6 +2131,69 @@
     return batches;
   }
 
+  /**
+   * Точные резы (спека 2026-07-20): уточнение границ вырезаемых интервалов.
+   * Каждая граница: (1) снап в центр ближайшей физической тишины
+   * (ffmpeg silencedetect, длительность ≥ minSilenceSec, центр в окне
+   * ±windowSec); (2) fallback — padding: граница сдвигается внутрь
+   * вырезаемого интервала на padSec (запас звука остаётся снаружи:
+   * лучше лишний хвост звука, чем обрезанное слово). Интервалы короче
+   * minIntervalSec после уточнения отбрасываются. Вход не мутируется;
+   * NaN/инверсия → отброс. Формы тишин: {startSec,endSec} и {start,end}.
+   * → { intervals: [...], stats: { snapped, padded — счёт ГРАНИЦ (0–2 на интервал), dropped — счёт ИНТЕРВАЛОВ } }
+   */
+  function refineCutBoundaries(intervals, silences, opts) {
+    var o = opts || {};
+    var windowSec = o.windowSec > 0 ? o.windowSec : 0.7;
+    var minSilenceSec = o.minSilenceSec > 0 ? o.minSilenceSec : 0.2;
+    var padSec = o.padSec >= 0 ? o.padSec : 0.15;
+    var minIntervalSec = o.minIntervalSec > 0 ? o.minIntervalSec : 0.3;
+    var res = { intervals: [], stats: { snapped: 0, padded: 0, dropped: 0 } };
+    if (!intervals || !intervals.length) return res;
+
+    /* Центры валидных тишин (обе формы полей) */
+    var centers = [];
+    var list = silences || [];
+    for (var si = 0; si < list.length; si++) {
+      var s = list[si] || {};
+      var ss = (typeof s.startSec === 'number') ? s.startSec : s.start;
+      var se = (typeof s.endSec === 'number') ? s.endSec : s.end;
+      if (typeof ss !== 'number' || typeof se !== 'number' ||
+          !isFinite(ss) || !isFinite(se) || se - ss < minSilenceSec) continue;
+      centers.push((ss + se) / 2);
+    }
+
+    function refineBoundary(t, isStart) {
+      var best = null, bestDist = Infinity;
+      for (var ci = 0; ci < centers.length; ci++) {
+        var d = Math.abs(centers[ci] - t);
+        if (d <= windowSec && d < bestDist) { best = centers[ci]; bestDist = d; }
+      }
+      if (best !== null) return { t: best, how: 'snapped' };
+      return { t: isStart ? t + padSec : t - padSec, how: 'padded' };
+    }
+
+    for (var i = 0; i < intervals.length; i++) {
+      var iv = intervals[i];
+      var t0 = iv ? Number(iv.startSec) : NaN;
+      var t1 = iv ? Number(iv.endSec) : NaN;
+      if (!isFinite(t0) || !isFinite(t1) || t1 <= t0) { res.stats.dropped++; continue; }
+      var r0 = refineBoundary(t0, true);
+      var r1 = refineBoundary(t1, false);
+      var n0 = Math.max(0, r0.t);
+      var n1 = r1.t;
+      if (n1 - n0 < minIntervalSec) { res.stats.dropped++; continue; }
+      res.stats[r0.how]++;
+      res.stats[r1.how]++;
+      var copy = {};
+      for (var k in iv) { if (Object.prototype.hasOwnProperty.call(iv, k)) copy[k] = iv[k]; }
+      copy.startSec = n0;
+      copy.endSec = n1;
+      res.intervals.push(copy);
+    }
+    return res;
+  }
+
   global.DeterministicPipelines = {
     cutFillers: cutFillers,
     cutSilences: cutSilences,
@@ -2156,6 +2219,7 @@
     parsePipelineCommand: parsePipelineCommand,
     snapIntervalsToFrame: snapIntervalsToFrame,
     splitCutIntervalsIntoBatches: splitCutIntervalsIntoBatches,
+    refineCutBoundaries: refineCutBoundaries,
     _mergeIntervals: _mergeIntervals,
     _detectSharedAudio: _detectSharedAudio,
     _detectFlatAudio: _detectFlatAudio,

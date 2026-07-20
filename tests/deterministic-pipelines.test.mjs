@@ -2508,3 +2508,110 @@ describe('DeterministicPipelines.planFrameSources', () => {
     assert.equal(out.items[0].sourceSec, 1);
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * refineCutBoundaries — точные резы: тишино-снап границ (2026-07-20)
+ * ═══════════════════════════════════════════════════════════════ */
+describe('DeterministicPipelines.refineCutBoundaries', () => {
+  it('граница рядом с тишиной → центр тишины (форма startSec/endSec)', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10.0, endSec: 20.0 }],
+      [{ startSec: 9.5, endSec: 9.9 }, { startSec: 20.1, endSec: 20.5 }],
+      {});
+    assert.equal(r.intervals.length, 1);
+    assert.ok(Math.abs(r.intervals[0].startSec - 9.7) < 1e-9);
+    assert.ok(Math.abs(r.intervals[0].endSec - 20.3) < 1e-9);
+    assert.equal(r.stats.snapped, 2);
+    assert.equal(r.stats.padded, 0);
+  });
+
+  it('форма полей start/end работает так же', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10.0, endSec: 20.0 }],
+      [{ start: 9.5, end: 9.9 }],
+      {});
+    assert.ok(Math.abs(r.intervals[0].startSec - 9.7) < 1e-9);
+    /* правая граница без тишины → сдвиг внутрь вырезаемого интервала (padding) */
+    assert.ok(Math.abs(r.intervals[0].endSec - 19.85) < 1e-9);
+    assert.equal(r.stats.snapped, 1);
+    assert.equal(r.stats.padded, 1);
+  });
+
+  it('тишины нет → padding наружу с обеих сторон (интервал сжимается)', () => {
+    const r = DP.refineCutBoundaries([{ startSec: 10, endSec: 20 }], [], {});
+    assert.ok(Math.abs(r.intervals[0].startSec - 10.15) < 1e-9);
+    assert.ok(Math.abs(r.intervals[0].endSec - 19.85) < 1e-9);
+    assert.equal(r.stats.padded, 2);
+  });
+
+  it('silences = null → чистый padding, ничего не падает', () => {
+    const r = DP.refineCutBoundaries([{ startSec: 5, endSec: 6 }], null, {});
+    assert.equal(r.intervals.length, 1);
+    assert.equal(r.stats.padded, 2);
+  });
+
+  it('интервал после уточнения короче 0.3с → dropped', () => {
+    /* 10.0–10.5, padding 0.15 с двух сторон → 0.2с < 0.3с */
+    const r = DP.refineCutBoundaries([{ startSec: 10.0, endSec: 10.5 }], [], {});
+    assert.equal(r.intervals.length, 0);
+    assert.equal(r.stats.dropped, 1);
+    assert.equal(r.stats.padded, 0);
+    assert.equal(r.stats.snapped, 0);
+  });
+
+  it('тишина за пределами окна ±0.7с игнорируется, работает padding', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10, endSec: 20 }],
+      [{ startSec: 8.0, endSec: 8.4 }], /* центр 8.2 — дальше 0.7 от 10 */
+      {});
+    assert.ok(Math.abs(r.intervals[0].startSec - 10.15) < 1e-9);
+    assert.equal(r.stats.snapped, 0);
+    assert.equal(r.stats.padded, 2);
+  });
+
+  it('тишина короче minSilenceSec (0.2с) игнорируется', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10, endSec: 20 }],
+      [{ startSec: 9.9, endSec: 10.0 }], /* 0.1с */
+      {});
+    assert.equal(r.stats.snapped, 0);
+    assert.equal(r.stats.padded, 2);
+  });
+
+  it('из двух тишин в окне выбирается ближайшая', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10, endSec: 20 }],
+      [{ startSec: 9.3, endSec: 9.7 }, { startSec: 9.8, endSec: 10.2 }],
+      {});
+    /* центры 9.5 и 10.0 — ближе 10.0 */
+    assert.ok(Math.abs(r.intervals[0].startSec - 10.0) < 1e-9);
+  });
+
+  it('вход не мутируется, дополнительные поля интервала сохраняются', () => {
+    const input = [{ startSec: 10, endSec: 20, reason: 'смысловой блок' }];
+    const r = DP.refineCutBoundaries(input, [], {});
+    assert.equal(input[0].startSec, 10);
+    assert.equal(input[0].endSec, 20);
+    assert.equal(r.intervals[0].reason, 'смысловой блок');
+  });
+
+  it('NaN и инверсия границ → интервал отброшен', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: NaN, endSec: 5 }, { startSec: 9, endSec: 3 }, null],
+      [], {});
+    assert.equal(r.intervals.length, 0);
+    assert.equal(r.stats.dropped, 3);
+  });
+
+  it('интеграция: снап создал пересечение → mergeRemoveIntervals-совместимые интервалы', () => {
+    /* два интервала, обе внутренние границы снапаются к одной тишине (центр 15.0) */
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10, endSec: 14.8 }, { startSec: 15.2, endSec: 20 }],
+      [{ startSec: 14.7, endSec: 15.3 }],
+      {});
+    assert.equal(r.intervals.length, 2);
+    assert.ok(Math.abs(r.intervals[0].endSec - 15.0) < 1e-9);
+    assert.ok(Math.abs(r.intervals[1].startSec - 15.0) < 1e-9);
+    /* смежные границы совпали — merge на панели схлопнет (EPS 0.05) */
+  });
+});

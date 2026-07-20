@@ -2128,6 +2128,17 @@ PanelBoot.run('ИИ: монтаж', function () {
       'фрагментов keep: ' + (v.keepCount || 0) + ' · вырезов remove: ' + (v.removeCount || 0);
     card.appendChild(stats);
 
+    /* Точные резы (2026-07-20): статистика уточнения границ по тишине */
+    var bs = _pendingProposal.boundaryStats;
+    if (bs && (bs.snapped || bs.padded || bs.dropped)) {
+      var bsEl = document.createElement('div');
+      bsEl.style.cssText = 'font-size:11px;color:var(--muted);margin:-4px 0 8px;';
+      bsEl.textContent = 'Границы: ' + (bs.snapped || 0) + ' по тишине, ' +
+        (bs.padded || 0) + ' с отступом' +
+        (bs.dropped ? ' · интервалов отброшено (<0.3с): ' + bs.dropped : '');
+      card.appendChild(bsEl);
+    }
+
     /* 18.06.2026: предупреждение о неполном покрытии транскрипта при сборке «на N мин». */
     if (_pendingProposal.warnings && _pendingProposal.warnings.length) {
       for (var pwi = 0; pwi < _pendingProposal.warnings.length; pwi++) {
@@ -3131,8 +3142,32 @@ PanelBoot.run('ИИ: монтаж', function () {
     var paddingSec = typeof args.paddingSec === 'number' ? Math.max(0, args.paddingSec) : 0.3;
     var paddedIntervals = _padRemoveIntervals(workingArgs.removeIntervals || [], paddingSec);
 
-    /* Snap к границам сегментов для предотвращения обрезки слов + merge перекрытий */
-    var snappedIntervals = mergeRemoveIntervals(snapIntervalsToSegmentBoundaries(paddedIntervals));
+    /* Точные резы (спека 2026-07-20): после снапа к границам сегментов
+       граница переносится в центр ближайшей физической тишины (ffmpeg
+       silencedetect из audioAnalysis), fallback — граница сдвигается внутрь вырезаемого интервала (запас звука остаётся снаружи).
+       Таймкоды Whisper-сегментов неточны (до ~0.3с) — рез в тишине
+       гарантирует целые слова. Затем merge схлопывает пересечения. */
+    var _cutSilences = [];
+    var _snapSeqKey = _cleanSeqKey((lastSnap && lastSnap.sequenceName) || '');
+    /* Тот же приоритет ключей, что у snapIntervalsToSegmentBoundaries:
+       тишины обязаны быть из ТОЙ ЖЕ записи, что и сегменты снапа.
+       Ключ от LLM может быть кривым → retry по ключу lastSnap. */
+    var _silKeys = [];
+    if (_arSeqKey) _silKeys.push(_arSeqKey);
+    if (_snapSeqKey && _snapSeqKey !== _arSeqKey) _silKeys.push(_snapSeqKey);
+    for (var _ski = 0; _ski < _silKeys.length; _ski++) {
+      var _silFound = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, _silKeys[_ski]);
+      if (_silFound && _silFound.entry) {
+        if (_silFound.entry.audioAnalysis &&
+            Array.isArray(_silFound.entry.audioAnalysis.silences)) {
+          _cutSilences = _silFound.entry.audioAnalysis.silences;
+        }
+        break; /* запись найдена — не пробуем следующий ключ */
+      }
+    }
+    var _refined = DeterministicPipelines.refineCutBoundaries(
+      snapIntervalsToSegmentBoundaries(paddedIntervals), _cutSilences, {});
+    var snappedIntervals = mergeRemoveIntervals(_refined.intervals);
     var verification = computeVerification(snappedIntervals);
 
     /* 19.06.2026: ре-валидация хронометража ПОСЛЕ снапа к границам абзацев.
@@ -3161,6 +3196,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       removeSummary: args.removeSummary || [],
       summary: args.summary || '',
       verification: verification,
+      boundaryStats: _refined.stats,
       snapshot: lastSnap,
       createdAt: Date.now(),
       invertedFromKeep: hasKeep,
