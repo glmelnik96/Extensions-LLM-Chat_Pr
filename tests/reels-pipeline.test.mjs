@@ -204,23 +204,127 @@ describe('buildOverlayFfmpegArgs', () => {
   });
 });
 
-/* ═══ План vision-запросов ═══ */
-describe('visionPlan', () => {
-  it('уникальные mediaPath, nest: пропускается с причиной', () => {
-    const clips = [
-      { name: 'A', mediaPath: '/a.mp4' },
-      { name: 'B', mediaPath: '/a.mp4' },
-      { name: 'N', mediaPath: 'nest:xyz' },
-      { name: 'C', mediaPath: '/c.mp4' }
-    ];
-    const r = RP.visionPlan(clips);
-    assertLoose.deepEqual(r.paths, ['/a.mp4', '/c.mp4']);
-    assert.equal(r.skipped.length, 1);
-    assert.equal(r.skipped[0].name, 'N');
+/* ═══ Vision по клипам таймлайна (спека 2026-07-20) ═══ */
+describe('planClipFrames', () => {
+  const clip = (over) => Object.assign({
+    trackIndex: 0, clipIndex: 0, name: 'c', mediaPath: '/v/a.mp4',
+    startSec: 0, endSec: 10, inPointSec: 0
+  }, over);
+
+  it('середина клипа с учётом inPoint: frameSec = inPoint + (end-start)/2', () => {
+    const r = RP.planClipFrames([clip({ inPointSec: 100, startSec: 20, endSec: 30 })], {});
+    assert.equal(r.frames.length, 1);
+    assert.equal(r.frames[0].frameSec, 105);
+    assert.equal(r.frames[0].fileMidFallback, false);
+    assertLoose.deepEqual(r.frames[0].clipRefs, [{ trackIndex: 0, clipIndex: 0 }]);
   });
-  it('пустые/битые клипы не ломают план', () => {
-    const r = RP.visionPlan([null, { name: 'X' }, { name: 'Y', mediaPath: '' }]);
-    assertLoose.deepEqual(r.paths, []);
+
+  it('дедуп: кадры одного файла ближе 2с → одна группа, два clipRefs', () => {
+    const r = RP.planClipFrames([
+      clip({ clipIndex: 0, inPointSec: 10, startSec: 0, endSec: 4 }),   /* mid 12 */
+      clip({ clipIndex: 1, inPointSec: 11, startSec: 4, endSec: 8 })    /* mid 13 */
+    ], { dedupeSec: 2 });
+    assert.equal(r.frames.length, 1);
+    assert.equal(r.frames[0].clipRefs.length, 2);
+  });
+
+  it('кадры одного файла дальше 2с → две группы', () => {
+    const r = RP.planClipFrames([
+      clip({ clipIndex: 0, inPointSec: 0, startSec: 0, endSec: 4 }),    /* mid 2 */
+      clip({ clipIndex: 1, inPointSec: 50, startSec: 4, endSec: 8 })    /* mid 52 */
+    ], { dedupeSec: 2 });
+    assert.equal(r.frames.length, 2);
+  });
+
+  it('разные mediaPath не дедупятся даже при близких frameSec', () => {
+    const r = RP.planClipFrames([
+      clip({ mediaPath: '/v/a.mp4' }),
+      clip({ mediaPath: '/v/b.mp4', clipIndex: 1 })
+    ], {});
+    assert.equal(r.frames.length, 2);
+  });
+
+  it('nest: и пустой mediaPath → skipped с причиной', () => {
+    const r = RP.planClipFrames([
+      clip({ mediaPath: 'nest:abc', name: 'вложенная' }),
+      clip({ mediaPath: '', name: 'пустой' })
+    ], {});
+    assert.equal(r.frames.length, 0);
+    assert.equal(r.skipped.length, 2);
+    assert.ok(r.skipped[0].reason.length > 0);
+  });
+
+  it('inPointSec = null → fileMidFallback, frameSec = null', () => {
+    const r = RP.planClipFrames([clip({ inPointSec: null })], {});
+    assert.equal(r.frames[0].fileMidFallback, true);
+    assert.equal(r.frames[0].frameSec, null);
+  });
+
+  it('пустой вход → пустой результат', () => {
+    assertLoose.deepEqual(RP.planClipFrames([], {}), { frames: [], skipped: [] });
+  });
+});
+
+describe('buildVisionBatches', () => {
+  const mk = (n) => Array.from({ length: n }, (_, i) => ({ mediaPath: '/v/' + i }));
+  it('1 кадр → 1 батч', () =>
+    assertLoose.deepEqual(RP.buildVisionBatches(mk(1), {}), [[0]]));
+  it('9 кадров → батчи [8, 1]', () => {
+    const b = RP.buildVisionBatches(mk(9), { batchSize: 8 });
+    assert.equal(b.length, 2);
+    assert.equal(b[0].length, 8);
+    assertLoose.deepEqual(b[1], [8]);
+  });
+  it('0 кадров → []', () =>
+    assertLoose.deepEqual(RP.buildVisionBatches([], {}), []));
+});
+
+describe('parseVisionBatchAnswer', () => {
+  it('честный JSON-массив', () => {
+    const r = RP.parseVisionBatchAnswer('[{"i":1,"cx":0.3},{"i":2,"cx":0.7}]', 2);
+    assertLoose.deepEqual(r, [0.3, 0.7]);
+  });
+  it('JSON в markdown-обёртке', () => {
+    const r = RP.parseVisionBatchAnswer('Вот ответ:\n```json\n[{"i":1,"cx":0.4}]\n```', 1);
+    assertLoose.deepEqual(r, [0.4]);
+  });
+  it('пропущенные индексы → null', () => {
+    const r = RP.parseVisionBatchAnswer('[{"i":2,"cx":0.6}]', 3);
+    assertLoose.deepEqual(r, [null, 0.6, null]);
+  });
+  it('мусор → все null', () =>
+    assertLoose.deepEqual(RP.parseVisionBatchAnswer('не могу распознать', 2), [null, null]));
+  it('cx вне [0,1] или не число → null', () => {
+    const r = RP.parseVisionBatchAnswer('[{"i":1,"cx":1.5},{"i":2,"cx":"левее"}]', 2);
+    assertLoose.deepEqual(r, [null, null]);
+  });
+  it('индекс вне диапазона игнорируется', () =>
+    assertLoose.deepEqual(RP.parseVisionBatchAnswer('[{"i":9,"cx":0.5}]', 1), [null]));
+});
+
+describe('assignClipOffsets', () => {
+  it('cx → offsetPct ((cx-0.5)*100), распределение по всем clipRefs группы', () => {
+    const frames = [{
+      mediaPath: '/v/a.mp4', frameSec: 5, fileMidFallback: false,
+      clipRefs: [{ trackIndex: 0, clipIndex: 0 }, { trackIndex: 0, clipIndex: 2 }]
+    }];
+    const r = RP.assignClipOffsets(frames, [0.7]);
+    assertLoose.deepEqual(r, [
+      { trackIndex: 0, clipIndex: 0, offsetPct: 20 },
+      { trackIndex: 0, clipIndex: 2, offsetPct: 20 }
+    ]);
+  });
+  it('null cx → клипы группы не получают оффсет', () => {
+    const frames = [
+      { mediaPath: '/a', frameSec: 1, fileMidFallback: false, clipRefs: [{ trackIndex: 0, clipIndex: 0 }] },
+      { mediaPath: '/b', frameSec: 1, fileMidFallback: false, clipRefs: [{ trackIndex: 1, clipIndex: 0 }] }
+    ];
+    const r = RP.assignClipOffsets(frames, [null, 0.5]);
+    assertLoose.deepEqual(r, [{ trackIndex: 1, clipIndex: 0, offsetPct: 0 }]);
+  });
+  it('пустые входы → []', () => {
+    assertLoose.deepEqual(RP.assignClipOffsets([], []), []);
+    assertLoose.deepEqual(RP.assignClipOffsets(null, null), []);
   });
 });
 

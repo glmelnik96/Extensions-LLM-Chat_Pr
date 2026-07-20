@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.13.0';
+$._EXT_PRM_.version = '2.14.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -2574,7 +2574,10 @@ $._EXT_PRM_.getVerticalReframeSources = function () {
           clips.push({
             trackIndex: ti, clipIndex: ci,
             name: String(c.name || ''),
-            mediaPath: String(mp).replace(/\\/g, '/')
+            mediaPath: String(mp).replace(/\\/g, '/'),
+            startSec: c.start.seconds,
+            endSec: c.end.seconds,
+            inPointSec: c.inPoint ? c.inPoint.seconds : null
           });
           continue;
         }
@@ -2591,7 +2594,10 @@ $._EXT_PRM_.getVerticalReframeSources = function () {
           clips.push({
             trackIndex: ti, clipIndex: ci,
             name: String(c.name || ''),
-            mediaPath: key
+            mediaPath: key,
+            startSec: c.start.seconds,
+            endSec: c.end.seconds,
+            inPointSec: c.inPoint ? c.inPoint.seconds : null
           });
           continue;
         }

@@ -1557,7 +1557,9 @@
    *
    * clips: [{trackIndex, clipIndex, name, mediaPath}] (host-перечисление);
    * dimsByPath: {[mediaPath]: {width, height}} (ffprobe на панели);
-   * opts: {targetW=1080, targetH=1920, offsets: parseVerticalOffsets()|null}.
+   * opts: {targetW=1080, targetH=1920, offsets: parseVerticalOffsets()|null,
+   *        clipOffsets: [{trackIndex, clipIndex, offsetPct}]|null — адресные vision-оффсеты;
+   *        приоритет: offsets (имя) → clipOffsets → центр 0.5}.
    * Возвращает {items:[{trackIndex, clipIndex, scalePct, posX, posY}],
    * skipped:[{name, reason}], total}. Position — нормированные координаты
    * НОВОГО кадра ([0.5, 0.5] = центр, ось X растёт вправо).
@@ -1567,6 +1569,7 @@
     var targetW = o.targetW > 0 ? o.targetW : 1080;
     var targetH = o.targetH > 0 ? o.targetH : 1920;
     var offsets = o.offsets || null;
+    var clipOffsets = o.clipOffsets || null;
     var res = { items: [], skipped: [], total: 0 };
     if (!clips || !clips.length || !dimsByPath) return res;
     res.total = clips.length;
@@ -1582,11 +1585,23 @@
       var displayedW = dims.width * scale;
       /* фокус f ∈ [0..1] по ширине исходника; клампим окно кропа в кадр */
       var f = 0.5;
+      var matchedByName = false;
       if (offsets) {
         var nameLc = String(c.name || '').toLowerCase();
         for (var j = 0; j < offsets.length; j++) {
           if (nameLc.indexOf(offsets[j].match) !== -1) {
             f = 0.5 + offsets[j].offsetPct / 100;
+            matchedByName = true;
+            break;
+          }
+        }
+      }
+      /* Адресный vision-оффсет (2026-07-20): manual (имя) побеждает */
+      if (!matchedByName && clipOffsets) {
+        for (var q = 0; q < clipOffsets.length; q++) {
+          if (clipOffsets[q].trackIndex === c.trackIndex &&
+              clipOffsets[q].clipIndex === c.clipIndex) {
+            f = 0.5 + clipOffsets[q].offsetPct / 100;
             break;
           }
         }

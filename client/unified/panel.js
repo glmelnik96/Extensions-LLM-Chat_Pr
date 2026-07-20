@@ -7816,88 +7816,101 @@ PanelBoot.run('ИИ: монтаж', function () {
           });
         }));
 
-        /* 2. Смещения: ручные > vision > центр. Vision — кадр из середины
-           каждого уникального источника, {"cx":0..1} → offsetPct. */
+        /* 2. Смещения: ручные > vision (per-clip) > центр. Спека 2026-07-20:
+           кадр из середины КАЖДОГО клипа таймлайна (source-время с учётом
+           inPoint), близкие кадры одного файла дедупятся, до 4 кадров в один
+           vision-запрос, оффсеты адресные (trackIndex/clipIndex). */
         var offsetsEl = document.getElementById('rl-offsets');
         var manual = DeterministicPipelines.parseVerticalOffsets(offsetsEl ? offsetsEl.value : '') || [];
-        var vp = ReelsPipeline.visionPlan(src.clips);
-        for (var vs = 0; vs < vp.skipped.length; vs++) {
-          notes.push(vp.skipped[vs].name + ': ' + vp.skipped[vs].reason);
+        /* Клипы, покрытые ручным «Фокусом камер», в vision не идут */
+        var manualCovered = 0;
+        var visionClips = src.clips.filter(function (c) {
+          var low = String(c.name || '').toLowerCase();
+          var hit = manual.some(function (o) { return low.indexOf(o.match) !== -1; });
+          if (hit) manualCovered++;
+          return !hit;
+        });
+        var cp = ReelsPipeline.planClipFrames(visionClips, { dedupeSec: 2 });
+        for (var vs = 0; vs < cp.skipped.length; vs++) {
+          notes.push(cp.skipped[vs].name + ': ' + cp.skipped[vs].reason);
         }
-        var visionOffsets = [];
+        if (manualCovered) notes.push('ручное смещение: ' + manualCovered + ' клипов (vision пропущен)');
+        var clipOffsets = [];
         var visionModel = settings.visionModel || 'MiniMaxAI/MiniMax-M3';
-        for (var vi = 0; vi < vp.paths.length; vi++) {
-          var vPath = vp.paths[vi];
-          var vBase = vPath.substring(Math.max(vPath.lastIndexOf('/'), vPath.lastIndexOf('\\')) + 1);
-          /* Имена клипов этого источника; покрытые ручным смещением — пропуск. */
-          var clipNames = [];
-          for (var cn = 0; cn < src.clips.length; cn++) {
-            if (src.clips[cn].mediaPath === vPath && clipNames.indexOf(src.clips[cn].name) === -1) {
-              clipNames.push(src.clips[cn].name);
+        if (cp.frames.length && !settings.apiKey) {
+          notes.push('нет API-ключа — vision пропущен, центр');
+        } else if (cp.frames.length) {
+          /* Кадры групп; fileMidFallback → середина файла (host не дал inPoint) */
+          var frameUrls = [];
+          for (var fi = 0; fi < cp.frames.length; fi++) {
+            var fr = cp.frames[fi];
+            var frBase = fr.mediaPath.substring(Math.max(fr.mediaPath.lastIndexOf('/'), fr.mediaPath.lastIndexOf('\\')) + 1);
+            toolsStatusUi.show('Рилс: кадры для vision ' + (fi + 1) + ' из ' + cp.frames.length + '…', true);
+            try {
+              var fSec = fr.frameSec;
+              if (fr.fileMidFallback || typeof fSec !== 'number') {
+                var vDur = await AudioPreprocess.probeDurationSec(fr.mediaPath);
+                fSec = (vDur && vDur > 0) ? vDur / 2 : 1;
+              }
+              frameUrls.push(await AudioPreprocess.extractFrameJpeg(fr.mediaPath, fSec, { maxWidth: 768 }));
+            } catch (eF) {
+              frameUrls.push(null);
+              notes.push(frBase + ': кадр не извлечён (' + String((eF && eF.message) || eF) + ') — центр');
             }
           }
-          var uncovered = clipNames.filter(function (nm2) {
-            var low = String(nm2).toLowerCase();
-            return !manual.some(function (o) { return low.indexOf(o.match) !== -1; });
-          });
-          if (!uncovered.length) {
-            notes.push(vBase + ': ручное смещение (vision пропущен)');
-            continue;
-          }
-          if (!settings.apiKey) {
-            notes.push(vBase + ': нет API-ключа — vision пропущен, центр');
-            continue;
-          }
-          toolsStatusUi.show('Рилс: vision-кадрирование ' + (vi + 1) + ' из ' + vp.paths.length + ' (' + vBase + ')…', true);
-          try {
-            var vDur = await AudioPreprocess.probeDurationSec(vPath);
-            var vSec = (vDur && vDur > 0) ? vDur / 2 : 1;
-            var vFrame = await AudioPreprocess.extractFrameJpeg(vPath, vSec, { maxWidth: 768 });
-            var vResp = await CloudRuClient.chatCompletions({
-              baseUrl: settings.baseUrl,
-              apiKey: settings.apiKey,
-              model: visionModel,
-              temperature: 0,
-              enableThinking: false,
-              /* БЕЗ responseFormat: json_object — MiniMax-M3 на Cloud.ru с ним
-               * возвращает ПУСТОЙ content (finish=stop), A/B-проверено live
-               * 17.07.2026. Без него модель отвечает честным JSON. */
-              chatParams: { max_tokens: 256 },
-              messages: [{
-                role: 'user',
-                content: [
-                  {
-                    type: 'text',
-                    text: 'Найди главного человека (лицо) в кадре. Ответ строго JSON: {"cx": <число 0..1 — горизонтальный центр лица, 0 = левый край кадра, 1 = правый>}. Если людей нет: {"cx": 0.5}.'
-                  },
-                  { type: 'image_url', image_url: { url: vFrame } }
-                ]
-              }]
-            });
-            var vContent = (vResp && vResp.choices && vResp.choices[0] && vResp.choices[0].message)
-              ? String(vResp.choices[0].message.content || '') : '';
-            /* Модель может обернуть JSON в текст/маркдаун — берём первый {...} */
-            var vJsonM = vContent.match(/\{[\s\S]*?\}/);
-            if (!vJsonM) throw new Error('нет JSON в ответе vision: ' + vContent.slice(0, 120));
-            var vCx = JSON.parse(vJsonM[0]).cx;
-            var vPct = ReelsPipeline.offsetPctFromCx(vCx);
-            if (vPct === null) throw new Error('невалидный cx: ' + vCx);
-            for (var un = 0; un < uncovered.length; un++) {
-              visionOffsets.push({ match: String(uncovered[un]).toLowerCase(), offsetPct: vPct });
+          /* Батчи ≤4 кадров — Cloud.ru принимает max 5 изображений на запрос (live 20.07.2026), 4 — с запасом по thinking-бюджету */
+          var cxAll = [];
+          for (var ca = 0; ca < cp.frames.length; ca++) cxAll.push(null);
+          var batches = ReelsPipeline.buildVisionBatches(cp.frames, { batchSize: 4 });
+          var reqCount = 0;
+          for (var bi = 0; bi < batches.length; bi++) {
+            var idxs = batches[bi].filter(function (ix) { return frameUrls[ix] !== null; });
+            if (!idxs.length) continue;
+            toolsStatusUi.show('Рилс: vision-кадрирование, запрос ' + (bi + 1) + ' из ' + batches.length + '…', true);
+            var vContent = [{
+              type: 'text',
+              text: 'Ниже ' + idxs.length + ' кадров видео. Для КАЖДОГО кадра найди главного человека (лицо); если людей нет — главный объект. Ответ строго JSON-массивом без пояснений: [{"i": <номер кадра>, "cx": <число 0..1 — горизонтальный центр, 0 = левый край кадра, 1 = правый>}]. Если объекта нет: cx 0.5.'
+            }];
+            for (var ni = 0; ni < idxs.length; ni++) {
+              vContent.push({ type: 'text', text: 'Кадр ' + (ni + 1) + ':' });
+              vContent.push({ type: 'image_url', image_url: { url: frameUrls[idxs[ni]] } });
             }
-            notes.push(vBase + ': vision ' + (vPct > 0 ? '+' : '') + vPct + '%');
-          } catch (eV) {
-            notes.push(vBase + ': vision не сработал (' + String((eV && eV.message) || eV) + ') — центр');
+            try {
+              reqCount++;
+              var vResp = await CloudRuClient.chatCompletions({
+                baseUrl: settings.baseUrl,
+                apiKey: settings.apiKey,
+                model: visionModel,
+                temperature: 0,
+                enableThinking: false,
+                /* БЕЗ responseFormat: json_object — MiniMax-M3 на Cloud.ru с ним
+                 * возвращает ПУСТОЙ content (finish=stop), A/B-проверено live
+                 * 17.07.2026. Без него модель отвечает честным JSON. */
+                chatParams: { max_tokens: 2048 }, /* 512 не хватает: MiniMax-M3 жжёт бюджет на скрытое рассуждение до ответа — на 4 кадрах finish=length с пустым content (live 20.07.2026) */
+                messages: [{ role: 'user', content: vContent }]
+              });
+              var vText = (vResp && vResp.choices && vResp.choices[0] && vResp.choices[0].message)
+                ? String(vResp.choices[0].message.content || '') : '';
+              var cxBatch = ReelsPipeline.parseVisionBatchAnswer(vText, idxs.length);
+              for (var pb = 0; pb < idxs.length; pb++) cxAll[idxs[pb]] = cxBatch[pb];
+            } catch (eB) {
+              notes.push('vision-запрос ' + (bi + 1) + ' не сработал (' + String((eB && eB.message) || eB) + ') — центр для его кадров');
+            }
           }
+          clipOffsets = ReelsPipeline.assignClipOffsets(cp.frames, cxAll);
+          var visionClipCount = 0;
+          for (var vc = 0; vc < cp.frames.length; vc++) {
+            if (cxAll[vc] !== null) visionClipCount += cp.frames[vc].clipRefs.length;
+          }
+          notes.push('vision: ' + visionClipCount + ' клипов, ' + cp.frames.length + ' кадров, ' + reqCount + ' запросов');
         }
-        /* manual раньше в массиве → substring-матч планировщика найдёт его первым */
-        var offsets = manual.concat(visionOffsets);
 
         /* 3. Рефрейм: clone → setSettings → Motion. */
         var plan = DeterministicPipelines.planVerticalReframe(src.clips, dims, {
           targetW: targetW,
           targetH: targetH,
-          offsets: offsets.length ? offsets : null
+          offsets: manual.length ? manual : null,
+          clipOffsets: clipOffsets.length ? clipOffsets : null
         });
         if (!plan.items.length) {
           toolsShowErr('Не удалось спланировать ни один клип' +

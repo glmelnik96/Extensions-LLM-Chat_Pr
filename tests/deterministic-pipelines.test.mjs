@@ -2360,6 +2360,44 @@ describe('DeterministicPipelines.planVerticalReframe', () => {
   });
 });
 
+describe('planVerticalReframe — адресные vision-оффсеты (2026-07-20)', () => {
+  const dims = { '/v/a.mp4': { width: 1920, height: 1080 } };
+  const clips = [
+    { trackIndex: 0, clipIndex: 0, name: 'Cam A', mediaPath: '/v/a.mp4' },
+    { trackIndex: 0, clipIndex: 1, name: 'Cam B', mediaPath: '/v/a.mp4' }
+  ];
+
+  it('адресный оффсет применяется к своему клипу, остальные — центр', () => {
+    const r = DP.planVerticalReframe(clips, dims, {
+      clipOffsets: [{ trackIndex: 0, clipIndex: 1, offsetPct: 20 }]
+    });
+    assert.equal(r.items.length, 2);
+    assert.equal(r.items[0].posX, 0.5); /* центр */
+    assert.ok(r.items[1].posX < 0.5);   /* фокус правее → кадр влево */
+  });
+
+  it('manual по имени побеждает адресный', () => {
+    const rManual = DP.planVerticalReframe(clips, dims, {
+      offsets: [{ match: 'cam b', offsetPct: -10 }],
+      clipOffsets: [{ trackIndex: 0, clipIndex: 1, offsetPct: 30 }]
+    });
+    const rOnly = DP.planVerticalReframe(clips, dims, {
+      offsets: [{ match: 'cam b', offsetPct: -10 }]
+    });
+    assert.equal(rManual.items[1].posX, rOnly.items[1].posX);
+  });
+
+  it('кламп в границы кадра работает и для адресных (регресс)', () => {
+    const rBig = DP.planVerticalReframe(clips, dims, {
+      clipOffsets: [{ trackIndex: 0, clipIndex: 0, offsetPct: 500 }]
+    });
+    const rEdge = DP.planVerticalReframe(clips, dims, {
+      clipOffsets: [{ trackIndex: 0, clipIndex: 0, offsetPct: 50 }]
+    });
+    assert.equal(rBig.items[0].posX, rEdge.items[0].posX); /* оба уперлись в край */
+  });
+});
+
 /* ═══ segmentsToSrtCues / cuesToSrt: смарт-субтитры из Whisper-сегментов.
  * Титры: ≤2 строки по ≤42 символа, ≤5с; длинные сегменты режутся по словам
  * с линейным таймингом. cuesToSrt — стандартный SRT (HH:MM:SS,mmm). ═══ */

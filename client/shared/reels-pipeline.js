@@ -427,24 +427,118 @@
       '-t', String(o.durationSec), '-y', String(o.outPath)];
   }
 
-  /* ── План vision-запросов: уникальные файловые mediaPath ───────────────
-   * nested-секвенции (mediaPath 'nest:…') vision не покрывает — центр. */
-  function visionPlan(clips) {
-    var paths = [], skipped = [], seen = {};
-    if (!clips || !clips.length) return { paths: paths, skipped: skipped };
+  /* ── Vision по клипам таймлайна (спека 2026-07-20) ──────────────────────
+   * Кадр из середины КАЖДОГО клипа таймлайна (source-время с учётом
+   * inPoint), близкие кадры одного файла дедупятся, батчи ≤8 кадров
+   * на запрос, оффсеты адресные (trackIndex/clipIndex). ── */
+
+  /* planClipFrames: клипы host getVerticalReframeSources (с геометрией) →
+   * группы кадров. 'nest:'/пустой mediaPath → skipped (vision недоступен,
+   * центр). inPointSec == null (host не смог) → fileMidFallback: панель
+   * возьмёт середину файла (текущее поведение как деградация). */
+  function planClipFrames(clips, opts) {
+    var o = opts || {};
+    var dedupeSec = o.dedupeSec > 0 ? o.dedupeSec : 2;
+    var frames = [], skipped = [];
+    if (!clips || !clips.length) return { frames: frames, skipped: skipped };
     for (var i = 0; i < clips.length; i++) {
       var c = clips[i];
-      if (!c || !c.mediaPath) continue;
+      if (!c || !c.mediaPath) {
+        skipped.push({ name: (c && c.name) || '?', reason: 'нет mediaPath — vision недоступен, центр' });
+        continue;
+      }
       var p = String(c.mediaPath);
       if (p.indexOf('nest:') === 0) {
         skipped.push({ name: c.name || '?', reason: 'nested-секвенция — vision недоступен, центр' });
         continue;
       }
-      if (seen[p]) continue;
-      seen[p] = true;
-      paths.push(p);
+      var ref = { trackIndex: c.trackIndex, clipIndex: c.clipIndex };
+      var mid = null, fallback = false;
+      if (typeof c.inPointSec === 'number' && isFinite(c.inPointSec) &&
+          typeof c.startSec === 'number' && isFinite(c.startSec) &&
+          typeof c.endSec === 'number' && isFinite(c.endSec) &&
+          c.endSec > c.startSec) {
+        mid = c.inPointSec + (c.endSec - c.startSec) / 2;
+      } else {
+        fallback = true;
+      }
+      var joined = false;
+      for (var g = 0; g < frames.length; g++) {
+        var fr = frames[g];
+        if (fr.mediaPath !== p) continue;
+        if (fallback && fr.fileMidFallback) { fr.clipRefs.push(ref); joined = true; break; }
+        if (!fallback && !fr.fileMidFallback && Math.abs(fr.frameSec - mid) < dedupeSec) {
+          fr.clipRefs.push(ref); joined = true; break;
+        }
+      }
+      if (!joined) {
+        frames.push({
+          mediaPath: p,
+          frameSec: fallback ? null : Math.max(0, Math.round(mid * 100) / 100),
+          fileMidFallback: fallback,
+          clipRefs: [ref]
+        });
+      }
     }
-    return { paths: paths, skipped: skipped };
+    return { frames: frames, skipped: skipped };
+  }
+
+  /* buildVisionBatches: индексы frames батчами ≤batchSize (по 8 —
+   * VISION_MAX_FRAMES, паттерн describe_frames). */
+  function buildVisionBatches(frames, opts) {
+    var size = (opts && opts.batchSize > 0) ? opts.batchSize : 8;
+    var out = [];
+    if (!frames || !frames.length) return out;
+    var cur = [];
+    for (var i = 0; i < frames.length; i++) {
+      cur.push(i);
+      if (cur.length >= size) { out.push(cur); cur = []; }
+    }
+    if (cur.length) out.push(cur);
+    return out;
+  }
+
+  /* parseVisionBatchAnswer: ответ vision-модели → массив cx длиной count
+   * (null = центр). Ждём JSON-массив [{"i":<1-based номер кадра>,"cx":0..1}],
+   * допускаем markdown/текст вокруг. Невалидный cx, кривой JSON, индекс
+   * вне диапазона → null. */
+  function parseVisionBatchAnswer(text, count) {
+    var out = [];
+    for (var i = 0; i < count; i++) out.push(null);
+    var s = String(text == null ? '' : text);
+    var m = s.match(/\[[\s\S]*\]/);
+    if (!m) return out;
+    var arr;
+    try { arr = JSON.parse(m[0]); } catch (e) { return out; }
+    if (!arr || !arr.length) return out;
+    for (var j = 0; j < arr.length; j++) {
+      var it = arr[j];
+      if (!it) continue;
+      var idx = Number(it.i) - 1;
+      if (!isFinite(idx) || idx !== Math.floor(idx) || idx < 0 || idx >= count) continue;
+      var cx = (typeof it.cx === 'number') ? it.cx : NaN;
+      if (!isFinite(cx) || cx < 0 || cx > 1) continue;
+      out[idx] = cx;
+    }
+    return out;
+  }
+
+  /* assignClipOffsets: cx группы → offsetPct на каждый её clipRef.
+   * null cx → клипы группы не получают оффсет (останутся центром). */
+  function assignClipOffsets(frames, cxList) {
+    var out = [];
+    if (!frames || !frames.length) return out;
+    for (var i = 0; i < frames.length; i++) {
+      var cx = (cxList && i < cxList.length) ? cxList[i] : null;
+      if (cx === null || cx === undefined) continue;
+      var pct = offsetPctFromCx(cx);
+      if (pct === null) continue;
+      var refs = frames[i].clipRefs || [];
+      for (var r = 0; r < refs.length; r++) {
+        out.push({ trackIndex: refs[r].trackIndex, clipIndex: refs[r].clipIndex, offsetPct: pct });
+      }
+    }
+    return out;
   }
 
   /* ── SRT для caption-дорожки Premiere (importSrtAsCaptions) ──────────── */
@@ -485,7 +579,10 @@
     assTime: assTime,
     buildAss: buildAss,
     buildOverlayFfmpegArgs: buildOverlayFfmpegArgs,
-    visionPlan: visionPlan,
+    planClipFrames: planClipFrames,
+    buildVisionBatches: buildVisionBatches,
+    parseVisionBatchAnswer: parseVisionBatchAnswer,
+    assignClipOffsets: assignClipOffsets,
     srtTime: srtTime,
     buildSrt: buildSrt
   };
