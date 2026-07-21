@@ -6197,6 +6197,120 @@ PanelBoot.run('ИИ: монтаж', function () {
     audioOnlyBtns[aoi].onclick = onAudioOnlyAnalyze;
   }
 
+  /* ─── Кастомный тултип (macOS CEP WebKit не показывает нативный title) ── */
+
+  (function initCustomTooltips() {
+    /* Создаём единственный div-тултип и кладём его в body. */
+    var tip = document.createElement('div');
+    tip.className = 'cc-tooltip';
+    document.body.appendChild(tip);
+
+    var _tipTimer = null;  /* таймер задержки показа */
+    var _tipTarget = null; /* элемент, над которым висит курсор */
+
+    /* Показать тултип у текущих координат курсора. */
+    function showTip(text, x, y) {
+      tip.textContent = text;
+      tip.classList.remove('visible');
+      /* Сначала поставить в угол, чтобы offsetWidth был актуальным. */
+      tip.style.left = '0px';
+      tip.style.top = '0px';
+      tip.style.display = 'block';
+
+      var W = window.innerWidth;
+      var H = window.innerHeight;
+      var tw = tip.offsetWidth;
+      var th = tip.offsetHeight;
+      var ox = 14; /* смещение от курсора */
+      var oy = 14;
+
+      var left = x + ox;
+      var top  = y + oy;
+
+      /* Не вылезать за правый/нижний край — уходим влево/вверх. */
+      if (left + tw > W - 4) left = x - tw - ox;
+      if (top  + th > H - 4) top  = y - th - oy;
+      /* Не уходить за левый/верхний край. */
+      if (left < 4) left = 4;
+      if (top  < 4) top  = 4;
+
+      tip.style.left = left + 'px';
+      tip.style.top  = top  + 'px';
+      tip.classList.add('visible');
+    }
+
+    function hideTip() {
+      clearTimeout(_tipTimer);
+      _tipTimer = null;
+      _tipTarget = null;
+      tip.classList.remove('visible');
+      tip.style.display = 'none';
+    }
+
+    /* Обновляем позицию при движении мыши, пока тултип виден. */
+    document.addEventListener('mousemove', function (e) {
+      if (tip.classList.contains('visible') && _tipTarget) {
+        var W = window.innerWidth;
+        var H = window.innerHeight;
+        var tw = tip.offsetWidth;
+        var th = tip.offsetHeight;
+        var ox = 14;
+        var oy = 14;
+        var left = e.clientX + ox;
+        var top  = e.clientY + oy;
+        if (left + tw > W - 4) left = e.clientX - tw - ox;
+        if (top  + th > H - 4) top  = e.clientY - th - oy;
+        if (left < 4) left = 4;
+        if (top  < 4) top  = 4;
+        tip.style.left = left + 'px';
+        tip.style.top  = top  + 'px';
+      }
+    });
+
+    document.addEventListener('mouseover', function (e) {
+      /* Ищем ближайший предок (или сам элемент) с title или data-cc-tip. */
+      var target = e.target && typeof e.target.closest === 'function'
+        ? e.target.closest('[title],[data-cc-tip]')
+        : null;
+      if (!target) { hideTip(); return; }
+
+      /* Если у элемента есть свежий title — переносим в data-cc-tip навсегда,
+         удаляем title, чтобы на Windows не появлялся ещё и нативный тултип.
+         При следующих наведениях читаем data-cc-tip (title уже нет).
+         Если внешний код снова выставил title — подхватываем его здесь и
+         снова переносим: условие «есть title» обрабатывается в приоритете. */
+      var rawTitle = target.getAttribute('title');
+      if (rawTitle !== null) {
+        /* title присутствует (возможно пустой — пропускаем пустые). */
+        if (rawTitle) {
+          target.dataset.ccTip = rawTitle;
+        }
+        target.removeAttribute('title'); /* убираем во всех случаях, даже если пустой */
+      }
+
+      var text = target.dataset.ccTip || '';
+      if (!text) { hideTip(); return; }
+
+      if (_tipTarget === target) return; /* уже готовимся показать для этого элемента */
+      hideTip();
+      _tipTarget = target;
+
+      var cx = e.clientX;
+      var cy = e.clientY;
+      _tipTimer = setTimeout(function () {
+        if (_tipTarget === target) showTip(text, cx, cy);
+      }, 400);
+    });
+
+    document.addEventListener('mouseout', function (e) {
+      /* Проверяем, что курсор ушёл с _tipTarget (а не просто перешёл на дочерний). */
+      if (!_tipTarget) return;
+      var related = e.relatedTarget;
+      if (related && _tipTarget.contains(related)) return;
+      hideTip();
+    });
+  })();
+
   /* ─── Инициализация единой панели ─────────────────────────────────── */
 
   function initUnifiedPanel() {
