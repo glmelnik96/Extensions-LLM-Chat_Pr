@@ -3092,6 +3092,34 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* US-004: если keepIntervals — инвертируем в removeIntervals. */
     var workingArgs = args;
     if (hasKeep) {
+      /* Sentence-end подрезка keep (2026-07-21, фикс «фраза обрывается» / часть C):
+         LLM иногда ставит границу keep ВНУТРИ предложения (сегмент без терминальной
+         пунктуации → мысль обрывается на слух). Подрезаем keep к границам
+         предложений по тексту Whisper-сегментов ДО проверки хронометража и инверсии
+         (подрезка только сжимает/дозавершает — сумма keep не растёт сверх сегмента). */
+      var _keepSeqKey = _cleanSeqKey(args.sequenceKey || '');
+      if (_keepSeqKey) {
+        var _keepFound = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, _keepSeqKey);
+        if (_keepFound && _keepFound.entry && Array.isArray(_keepFound.entry.segments) &&
+            _keepFound.entry.segments.length) {
+          /* Клэмп-по-области (2026-07-21, фикс «хвост в ролике»): LLM стабильно
+             тянет endSec последнего keep до конца ВСЕЙ секвенции — за транскрипт.
+             Обрезаем keep к [inSec, outSec] реальной речи ДО C, иначе хвост не
+             режется (C его не видит, инверсия не рождает remove после последнего keep). */
+          var _clampKeeps = args.keepIntervals;
+          var _clampRes = DeterministicPipelines.clampKeepsToTranscribedRegion(
+            _clampKeeps, _keepFound.entry.segments,
+            { region: _keepFound.entry.analyzedRegion });
+          if (_clampRes && Array.isArray(_clampRes.intervals) && _clampRes.intervals.length) {
+            _clampKeeps = _clampRes.intervals;
+          }
+          var _trimRes = DeterministicPipelines.trimKeepsToSentenceBoundaries(
+            _clampKeeps, _keepFound.entry.segments, {});
+          if (_trimRes && Array.isArray(_trimRes.intervals) && _trimRes.intervals.length) {
+            args = Object.assign({}, args, { keepIntervals: _trimRes.intervals });
+          }
+        }
+      }
       /* HIGH (6 мая 2026): проверка хронометража ДО инверсии. LLM на сборочном
          монтаже часто игнорирует «уложи в N секунд» — сейчас проверим сумму keep
          и вернём fix-it message чтобы LLM пересобрал план. Допустим overshoot 20%
@@ -3104,9 +3132,15 @@ PanelBoot.run('ИИ: монтаж', function () {
           return Promise.resolve({ validationError: dRes.error });
         }
       }
-      /* Сборка «на N минут» (targetDurationSec) → инвертируем в границах ВСЕЙ
-         секвенции, иначе нетранскрибированный хвост остаётся (live-баг: 3 мин → 47 мин). */
-      var assembleFull = typeof args.targetDurationSec === 'number' && args.targetDurationSec > 0;
+      /* Keep-режим = «финал = склейка ТОЛЬКО этих фрагментов», поэтому ВСЕГДА
+         инвертируем в границах ВСЕЙ секвенции — вырезаем всё вне keep, включая
+         нетранскрибированный хвост. Раньше гейт стоял на targetDurationSec (фикс
+         live-бага «3 мин → 47 мин»), но LLM его часто НЕ передаёт (live-баг
+         2026-07-21: 3 чистых keep без targetDurationSec → инверсия ограничена
+         транскриптом → 92-минутный хвост остаётся в ролике). Keep-интервалы
+         передаются ТОЛЬКО в сборочном монтаже по смыслу, поэтому full-инверсия
+         здесь всегда корректна. */
+      var assembleFull = true;
       var invRes = _invertKeepToRemove(args.keepIntervals, args.sequenceKey, assembleFull);
       if (invRes.error) {
         return Promise.resolve({ validationError: invRes.error });
@@ -3146,8 +3180,13 @@ PanelBoot.run('ИИ: монтаж', function () {
        граница переносится в центр ближайшей физической тишины (ffmpeg
        silencedetect из audioAnalysis), fallback — граница сдвигается внутрь вырезаемого интервала (запас звука остаётся снаружи).
        Таймкоды Whisper-сегментов неточны (до ~0.3с) — рез в тишине
-       гарантирует целые слова. Затем merge схлопывает пересечения. */
+       гарантирует целые слова. Затем merge схлопывает пересечения.
+       Анти-клип (2026-07-21): _padRemoveIntervals выше уже сдвинул границы внутрь
+       на ~0.3с (запас речи). refineCutBoundaries ограничивает снап НАРУЖУ
+       (maxOutwardSnapSec 0.3), чтобы снап не перепрыгнул через сохраняемое слово
+       к дальней паузе и не съел его — корень «монтаж по смыслу режет фразы». */
     var _cutSilences = [];
+    var _cutSegments = [];
     var _snapSeqKey = _cleanSeqKey((lastSnap && lastSnap.sequenceName) || '');
     /* Тот же приоритет ключей, что у snapIntervalsToSegmentBoundaries:
        тишины обязаны быть из ТОЙ ЖЕ записи, что и сегменты снапа.
@@ -3162,11 +3201,26 @@ PanelBoot.run('ИИ: монтаж', function () {
             Array.isArray(_silFound.entry.audioAnalysis.silences)) {
           _cutSilences = _silFound.entry.audioAnalysis.silences;
         }
+        /* Segment-aware снап (фикс «фраза обрывается»): refineCutBoundaries
+           снапает только к межсегментным зазорам, не к паузам внутри фразы. */
+        if (Array.isArray(_silFound.entry.segments)) {
+          _cutSegments = _silFound.entry.segments;
+        }
         break; /* запись найдена — не пробуем следующий ключ */
       }
     }
+    /* Фолбэк тишины из зазоров (2026-07-21, фикс «слышимые обрывы/склейки»): у
+       nest_reconstruct-записей audioAnalysis отсутствует (физический silencedetect
+       не сохранён) → _cutSilences пуст → refineCutBoundaries снапать не к чему,
+       резы садятся на неточные Whisper-границы (±0.3с) и клипают слова/дают резкие
+       склейки. Выводим тишину из МЕЖсегментных зазоров (естественные паузы речи,
+       ≥0.2с) и снапаем резы к их центрам — на стыке остаётся полупауза с каждой
+       стороны, речь не режется. */
+    if ((!_cutSilences || !_cutSilences.length) && _cutSegments && _cutSegments.length) {
+      _cutSilences = DeterministicPipelines._silencesFromSegmentGaps(_cutSegments, 0.2);
+    }
     var _refined = DeterministicPipelines.refineCutBoundaries(
-      snapIntervalsToSegmentBoundaries(paddedIntervals), _cutSilences, {});
+      snapIntervalsToSegmentBoundaries(paddedIntervals), _cutSilences, { segments: _cutSegments });
     var snappedIntervals = mergeRemoveIntervals(_refined.intervals);
     var verification = computeVerification(snappedIntervals);
 

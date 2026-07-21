@@ -2652,4 +2652,322 @@ describe('DeterministicPipelines.refineCutBoundaries', () => {
     assert.ok(Math.abs(r.intervals[1].startSec - 15.0) < 1e-9);
     /* смежные границы совпали — merge на панели схлопнет (EPS 0.05) */
   });
+
+  /* ── Анти-клип фраз (2026-07-21): снап НЕ должен расширять вырез наружу
+       в сохраняемую речь дальше maxOutwardSnapSec. Причина клипа в монтаже
+       по смыслу — снап перепрыгивал через сохраняемое слово к дальней паузе. */
+  it('снап наружу дальше 0.3с (в речь) отклоняется → padding', () => {
+    /* t1=20, тишина center 20.5 (20.35–20.65): d=0.5≤окно0.7, но наружу 0.5>0.3 */
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10, endSec: 20 }],
+      [{ startSec: 20.35, endSec: 20.65 }],
+      {});
+    assert.ok(Math.abs(r.intervals[0].endSec - 19.85) < 1e-9); /* padding, не 20.5 */
+    assert.equal(r.stats.snapped, 0);
+    assert.equal(r.stats.padded, 2);
+  });
+
+  it('снап наружу ровно на 0.3с (граница допуска) принимается', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10, endSec: 20 }],
+      [{ startSec: 20.15, endSec: 20.45 }], /* center 20.3, наружу 0.3 */
+      {});
+    assert.ok(Math.abs(r.intervals[0].endSec - 20.3) < 1e-9);
+    assert.equal(r.stats.snapped, 1);
+  });
+
+  it('снап ВНУТРЬ выреза не ограничен (сжатие всегда безопасно)', () => {
+    /* t0=10, тишина center 10.6 внутри выреза: наружу=-0.6, разрешено */
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10, endSec: 20 }],
+      [{ startSec: 10.4, endSec: 10.8 }], /* center 10.6, длит. 0.4 > minSilence */
+      {});
+    assert.ok(Math.abs(r.intervals[0].startSec - 10.6) < 1e-9);
+    assert.equal(r.stats.snapped, 1);
+  });
+
+  it('maxOutwardSnapSec настраивается через opts', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10, endSec: 20 }],
+      [{ startSec: 20.35, endSec: 20.65 }], /* наружу 0.5 */
+      { maxOutwardSnapSec: 0.6 });
+    assert.ok(Math.abs(r.intervals[0].endSec - 20.5) < 1e-9); /* теперь снап проходит */
+    assert.equal(r.stats.snapped, 1);
+  });
+
+  /* ── Segment-aware снап (2026-07-21, фикс «фраза обрывается»): при переданных
+       o.segments снап разрешён только к межсегментным зазорам; пауза-запятая
+       ВНУТРИ сегмента игнорируется, а без зазор-тишины граница держится на месте
+       (без padding в речь соседа). Числа — реальный кейс live-бага (seg38/seg39). */
+  const _liveSegs = [{ startSec: 136.3, endSec: 137.44 }, { startSec: 137.82, endSec: 142.14 }];
+
+  it('segment-aware: пауза ВНУТРИ сегмента игнорируется → граница держится (kept)', () => {
+    /* тишина center 137.97 лежит внутри seg39 (137.82–142.14) — внутрифразовая */
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 137.82, endSec: 300 }],
+      [{ startSec: 137.85, endSec: 138.09 }],
+      { segments: _liveSegs });
+    assert.ok(Math.abs(r.intervals[0].startSec - 137.82) < 1e-9); /* НЕ 137.97 — без орфана */
+    assert.equal(r.stats.snapped, 0);
+    assert.equal(r.stats.padded, 0);
+    assert.equal(r.stats.kept, 2); /* обе границы held на месте */
+  });
+
+  it('segment-aware: тишина в МЕЖсегментном зазоре используется', () => {
+    /* center 137.625 в зазоре seg38→seg39 (137.44–137.82) */
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 137.82, endSec: 300 }],
+      [{ startSec: 137.5, endSec: 137.75 }],
+      { segments: _liveSegs });
+    assert.ok(Math.abs(r.intervals[0].startSec - 137.625) < 1e-9);
+    assert.equal(r.stats.snapped, 1);
+  });
+
+  it('БЕЗ segments — старое поведение: та же внутрифразовая тишина снапается (регрессия, которую чиним)', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 137.82, endSec: 300 }],
+      [{ startSec: 137.85, endSec: 138.09 }],
+      {}); /* без segments → snap к 137.97, как раньше (орфан) */
+    assert.ok(Math.abs(r.intervals[0].startSec - 137.97) < 1e-9);
+    assert.equal(r.stats.snapped, 1);
+  });
+
+  it('segment-aware: зазор-тишина за окном ±0.7с → граница kept (не padded внутрь сегмента)', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 137.82, endSec: 300 }],
+      [{ startSec: 130.0, endSec: 130.4 }], /* далеко от 137.82 */
+      { segments: _liveSegs });
+    assert.ok(Math.abs(r.intervals[0].startSec - 137.82) < 1e-9);
+    assert.equal(r.stats.kept, 2);
+    assert.equal(r.stats.padded, 0);
+  });
+});
+
+describe('DeterministicPipelines.trimKeepsToSentenceBoundaries (часть C: границы к предложениям)', () => {
+  /* Реальный кейс live-бага keep3-end (окно транскрипта обрезано на 10-й минуте):
+     последний сегмент «...ты находишь» без точки, впереди завершения НЕТ →
+     подрезаем НАЗАД к концу последнего завершённого предложения. */
+  it('конец в незавершённом хвосте, впереди завершения нет → назад к концу предложения', () => {
+    const _trunc = [
+      { startSec: 595.0, endSec: 598.2, text: 'Это работает именно так.' },   // sentEnd
+      { startSec: 598.2, endSec: 600.4, text: 'И вот что важно понять.' },     // sentEnd
+      { startSec: 600.4, endSec: 601.3, text: 'то, что ты находишь' }         // НЕ sentEnd (последний)
+    ];
+    const r = DP.trimKeepsToSentenceBoundaries(
+      [{ startSec: 595.0, endSec: 601.3 }], _trunc, {});
+    assert.ok(Math.abs(r.intervals[0].endSec - 600.4) < 1e-9); /* конец seg1 */
+    assert.equal(r.stats.trimmedEnd, 1);
+  });
+
+  it('конец посреди предложения, впереди есть завершение → дотянуть ВПЕРЁД (дозавершить)', () => {
+    const _m = [
+      { startSec: 10, endSec: 12, text: 'Раз.' },          // sentEnd
+      { startSec: 12, endSec: 13, text: 'два' },           // НЕ sentEnd
+      { startSec: 13, endSec: 14.5, text: 'три конец.' }   // sentEnd
+    ];
+    const r = DP.trimKeepsToSentenceBoundaries(
+      [{ startSec: 10, endSec: 12.5 }], _m, {}); /* 12.5 внутри «два» */
+    assert.ok(Math.abs(r.intervals[0].endSec - 14.5) < 1e-9); /* вперёд к концу «три конец.» */
+    assert.equal(r.stats.trimmedEnd, 1);
+  });
+
+  it('начало посреди предложения, начало в бюджете → назад к началу мысли', () => {
+    const _m = [
+      { startSec: 10, endSec: 12, text: 'Первое.' },       // sentEnd, sentStart
+      { startSec: 12, endSec: 14, text: 'начало мысли' },  // НЕ sentEnd, sentStart
+      { startSec: 14, endSec: 16, text: 'и конец.' }       // sentEnd, НЕ sentStart
+    ];
+    const r = DP.trimKeepsToSentenceBoundaries(
+      [{ startSec: 14.5, endSec: 16 }], _m, {}); /* 14.5 внутри seg2 «и конец.» */
+    assert.ok(Math.abs(r.intervals[0].startSec - 12) < 1e-9); /* назад к началу предл. (seg1) */
+    assert.equal(r.stats.trimmedStart, 1);
+  });
+
+  it('начало глубоко в длинном предложении (начало вне бюджета) → вперёд к следующему', () => {
+    const _m = [
+      { startSec: 10, endSec: 12, text: 'Первое.' },                   // sentEnd, sentStart
+      { startSec: 12, endSec: 20, text: 'очень длинная часть без конца' }, // НЕ sentEnd, sentStart
+      { startSec: 20, endSec: 22, text: 'наконец конец.' },            // sentEnd, НЕ sentStart
+      { startSec: 22, endSec: 24, text: 'Новая.' }                     // sentEnd, sentStart
+    ];
+    const r = DP.trimKeepsToSentenceBoundaries(
+      [{ startSec: 18, endSec: 24 }], _m, {}); /* начало 12 в 6с назад > maxExtendSec 3 */
+    assert.ok(Math.abs(r.intervals[0].startSec - 22) < 1e-9); /* вперёд к «Новая.» */
+    assert.equal(r.stats.trimmedStart, 1);
+  });
+
+  it('обе границы уже на предложениях → без изменений (kept)', () => {
+    const _m = [
+      { startSec: 595.0, endSec: 598.2, text: 'Это работает так.' },
+      { startSec: 598.2, endSec: 600.4, text: 'И вот что важно.' },
+      { startSec: 600.4, endSec: 602.6, text: 'Ещё мысль.' }
+    ];
+    const r = DP.trimKeepsToSentenceBoundaries(
+      [{ startSec: 598.2, endSec: 600.4 }], _m, {});
+    assert.ok(Math.abs(r.intervals[0].startSec - 598.2) < 1e-9);
+    assert.ok(Math.abs(r.intervals[0].endSec - 600.4) < 1e-9);
+    assert.equal(r.stats.kept, 1);
+    assert.equal(r.stats.trimmedStart, 0);
+    assert.equal(r.stats.trimmedEnd, 0);
+  });
+
+  it('сдвиг дальше бюджетов (extend/trim) → граница держится', () => {
+    const _trunc = [
+      { startSec: 595.0, endSec: 600.4, text: 'Одно длинное предложение.' }, // sentEnd
+      { startSec: 600.4, endSec: 605.0, text: 'хвост без конца' }            // НЕ sentEnd (последний)
+    ];
+    const r = DP.trimKeepsToSentenceBoundaries(
+      [{ startSec: 595.0, endSec: 604.0 }], _trunc, { maxExtendSec: 0.5, maxTrimSec: 0.5 });
+    assert.ok(Math.abs(r.intervals[0].endSec - 604.0) < 1e-9); /* 604→600.4 = 3.6с > 0.5 → held */
+  });
+
+  it('нет сегментов → интервалы без изменений', () => {
+    const r = DP.trimKeepsToSentenceBoundaries(
+      [{ startSec: 10, endSec: 20 }], [], {});
+    assert.ok(Math.abs(r.intervals[0].startSec - 10) < 1e-9);
+    assert.ok(Math.abs(r.intervals[0].endSec - 20) < 1e-9);
+    assert.equal(r.stats.kept, 1);
+  });
+
+  it('вход не мутируется, доп. поля интервала сохраняются', () => {
+    const _trunc = [
+      { startSec: 595.0, endSec: 600.4, text: 'Завершено.' },
+      { startSec: 600.4, endSec: 601.3, text: 'хвост' }
+    ];
+    const inp = [{ startSec: 595.0, endSec: 601.3, label: 'x' }];
+    const r = DP.trimKeepsToSentenceBoundaries(inp, _trunc, {});
+    assert.equal(inp[0].endSec, 601.3); /* оригинал цел */
+    assert.equal(r.intervals[0].label, 'x');
+    assert.ok(Math.abs(r.intervals[0].endSec - 600.4) < 1e-9);
+  });
+
+  it('формы полей {start,end,text} поддержаны', () => {
+    const segsAlt = [
+      { start: 595.0, end: 598.2, text: 'Первое предложение.' },
+      { start: 598.2, end: 600.4, text: 'без пунктуации в конце' } // последний, НЕ sentEnd
+    ];
+    const r = DP.trimKeepsToSentenceBoundaries(
+      [{ startSec: 595.0, endSec: 599.5 }], segsAlt, {}); /* назад к 598.2 (впереди завершения нет) */
+    assert.ok(Math.abs(r.intervals[0].endSec - 598.2) < 1e-9);
+    assert.equal(r.stats.trimmedEnd, 1);
+  });
+});
+
+describe('DeterministicPipelines.clampKeepsToTranscribedRegion (фикс «хвост в ролике»)', () => {
+  /* Сегменты речи 0–596.3, analyzedRegion.outSec = 595. */
+  const _segs = [
+    { startSec: 0, endSec: 16.7, text: 'начало.' },
+    { startSec: 555.4, endSec: 560.0, text: 'середина мысли' },
+    { startSec: 589.7, endSec: 591.36, text: 'Это крутой навык.' },
+    { startSec: 595.0, endSec: 596.3, text: 'ты находишь' }
+  ];
+
+  /* Реальный live-баг: LLM тянет endSec последнего keep до конца ВСЕЙ секвенции. */
+  it('endSec до конца секвенции → обрезан к outSec области', () => {
+    const r = DP.clampKeepsToTranscribedRegion(
+      [{ startSec: 555.4, endSec: 6138.8 }], _segs, { region: { inSec: 0, outSec: 595 } });
+    assert.equal(r.intervals.length, 1);
+    assert.ok(Math.abs(r.intervals[0].endSec - 595) < 1e-9);
+    assert.ok(Math.abs(r.intervals[0].startSec - 555.4) < 1e-9);
+    assert.equal(r.stats.clampedEnd, 1);
+    assert.equal(r.stats.clampedStart, 0);
+  });
+
+  it('keep целиком в хвосте (после речи) → отброшен', () => {
+    const r = DP.clampKeepsToTranscribedRegion(
+      [{ startSec: 700, endSec: 6138.8 }], _segs, { region: { inSec: 0, outSec: 595 } });
+    assert.equal(r.intervals.length, 0);
+    assert.equal(r.stats.dropped, 1);
+  });
+
+  it('keep внутри области → без изменений', () => {
+    const r = DP.clampKeepsToTranscribedRegion(
+      [{ startSec: 100, endSec: 200 }], _segs, { region: { inSec: 0, outSec: 595 } });
+    assert.ok(Math.abs(r.intervals[0].startSec - 100) < 1e-9);
+    assert.ok(Math.abs(r.intervals[0].endSec - 200) < 1e-9);
+    assert.equal(r.stats.clampedStart, 0);
+    assert.equal(r.stats.clampedEnd, 0);
+  });
+
+  it('start раньше начала речи → поднят к lo', () => {
+    const r = DP.clampKeepsToTranscribedRegion(
+      [{ startSec: -50, endSec: 100 }], _segs, { region: { inSec: 10, outSec: 595 } });
+    assert.ok(Math.abs(r.intervals[0].startSec - 10) < 1e-9); /* max(0, inSec 10) */
+    assert.equal(r.stats.clampedStart, 1);
+  });
+
+  it('только сегменты (region нет) → ceiling = конец последнего сегмента', () => {
+    const r = DP.clampKeepsToTranscribedRegion(
+      [{ startSec: 555.4, endSec: 6138.8 }], _segs, {});
+    assert.ok(Math.abs(r.intervals[0].endSec - 596.3) < 1e-9);
+    assert.equal(r.stats.clampedEnd, 1);
+  });
+
+  it('только region (сегментов нет) → клэмп по области', () => {
+    const r = DP.clampKeepsToTranscribedRegion(
+      [{ startSec: 100, endSec: 6138.8 }], [], { region: { inSec: 0, outSec: 595 } });
+    assert.ok(Math.abs(r.intervals[0].endSec - 595) < 1e-9);
+    assert.equal(r.stats.clampedEnd, 1);
+  });
+
+  it('ни сегментов, ни region → без изменений', () => {
+    const r = DP.clampKeepsToTranscribedRegion(
+      [{ startSec: 100, endSec: 6138.8 }], [], {});
+    assert.ok(Math.abs(r.intervals[0].endSec - 6138.8) < 1e-9);
+    assert.equal(r.stats.clampedEnd, 0);
+    assert.equal(r.stats.dropped, 0);
+  });
+
+  it('вход не мутируется, доп. поля сохраняются, формы {start,end}', () => {
+    const inp = [{ start: 555.4, end: 6138.8, label: 'tail' }];
+    const r = DP.clampKeepsToTranscribedRegion(
+      inp, _segs, { region: { inSec: 0, outSec: 595 } });
+    assert.equal(inp[0].end, 6138.8); /* оригинал цел */
+    assert.equal(r.intervals[0].label, 'tail');
+    assert.ok(Math.abs(r.intervals[0].endSec - 595) < 1e-9);
+  });
+
+  it('пустой вход → пустой результат', () => {
+    const r = DP.clampKeepsToTranscribedRegion([], _segs, { region: { inSec: 0, outSec: 595 } });
+    assert.equal(r.intervals.length, 0);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * Фолбэк тишины из зазоров → снап резов (фикс «слышимые обрывы», 2026-07-21)
+ * nest_reconstruct-транскрипты не несут audioAnalysis: физической тишины нет.
+ * Тишину выводим из МЕЖсегментных зазоров и снапаем к её центрам, чтобы рез
+ * садился в паузу речи, а не на неточную Whisper-границу (клип слова).
+ * ═══════════════════════════════════════════════════════════════ */
+describe('Зазоро-тишина → refineCutBoundaries снапает рез в паузу речи', () => {
+  it('центр зазора между сегментами становится границей выреза', () => {
+    /* сегменты: 8.0–9.6 речь, зазор 0.6с, 10.2–12.0 речь. Центр зазора = 9.9 */
+    const segs = [
+      { startSec: 8.0, endSec: 9.6, text: 'первый.' },
+      { startSec: 10.2, endSec: 12.0, text: 'второй.' }
+    ];
+    const sil = DP._silencesFromSegmentGaps(segs, 0.2);
+    assert.equal(sil.length, 1);
+    assert.ok(Math.abs(sil[0].startSec - 9.6) < 1e-9);
+    assert.ok(Math.abs(sil[0].endSec - 10.2) < 1e-9);
+    /* рез с границей у 10.1 (внутри 0.7-окна от центра 9.9) снапается на 9.9 */
+    const r = DP.refineCutBoundaries([{ startSec: 10.1, endSec: 12.0 }], sil, { segments: segs });
+    assert.ok(Math.abs(r.intervals[0].startSec - 9.9) < 1e-9);
+    assert.equal(r.stats.snapped, 1);
+  });
+
+  it('центр зазора внутри сегмента не создаётся — снапать не к чему', () => {
+    /* смежные сегменты без зазора → тишины нет → чистый padding */
+    const segs = [
+      { startSec: 0, endSec: 10, text: 'а.' },
+      { startSec: 10, endSec: 20, text: 'б.' }
+    ];
+    const sil = DP._silencesFromSegmentGaps(segs, 0.2);
+    assert.equal(sil.length, 0);
+    const r = DP.refineCutBoundaries([{ startSec: 5, endSec: 15 }], sil, { segments: segs });
+    assert.equal(r.stats.snapped, 0);
+    /* segment-aware без зазор-тишины держит границы на месте (не падит в речь) */
+    assert.equal(r.stats.kept, 2);
+    assert.equal(r.stats.padded, 0);
+  });
 });

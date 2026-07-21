@@ -2155,7 +2155,9 @@
    * лучше лишний хвост звука, чем обрезанное слово). Интервалы короче
    * minIntervalSec после уточнения отбрасываются. Вход не мутируется;
    * NaN/инверсия → отброс. Формы тишин: {startSec,endSec} и {start,end}.
-   * → { intervals: [...], stats: { snapped, padded — счёт ГРАНИЦ (0–2 на интервал), dropped — счёт ИНТЕРВАЛОВ } }
+   * opts.segments (опц.): при передаче снап разрешён только к МЕЖсегментным
+   * зазорам, а без валидной тишины граница держится на месте (без padding).
+   * → { intervals: [...], stats: { snapped, padded, kept — счёт ГРАНИЦ (0–2 на интервал), dropped — счёт ИНТЕРВАЛОВ } }
    */
   function refineCutBoundaries(intervals, silences, opts) {
     var o = opts || {};
@@ -2163,10 +2165,45 @@
     var minSilenceSec = o.minSilenceSec > 0 ? o.minSilenceSec : 0.2;
     var padSec = o.padSec >= 0 ? o.padSec : 0.15;
     var minIntervalSec = o.minIntervalSec > 0 ? o.minIntervalSec : 0.3;
-    var res = { intervals: [], stats: { snapped: 0, padded: 0, dropped: 0 } };
+    /* Анти-клип фраз (2026-07-21): снап границы НАРУЖУ (расширение выреза в
+       сохраняемую речь) ограничен maxOutwardSnapSec. В монтаже по смыслу вырезы
+       уже сдвинуты внутрь на _padRemoveIntervals (~0.3с запаса речи), но снап мог
+       перепрыгнуть через сохраняемое слово к дальней паузе и съесть его.
+       Снап ВНУТРЬ выреза (сжатие, keeps more speech) всегда безопасен — не лимитим. */
+    var maxOutwardSnapSec = o.maxOutwardSnapSec >= 0 ? o.maxOutwardSnapSec : 0.3;
+    /* Segment-aware снап (2026-07-21, фикс «фраза обрывается»): когда переданы
+       o.segments (Whisper-utterances с таймингом), разрешаем снап ТОЛЬКО к тишинам
+       в МЕЖсегментных зазорах. Пауза ВНУТРИ сегмента — это запятая/заминка внутри
+       предложения; снап туда перепрыгивал чистую границу предложения и хватал
+       обрывок соседнего (вырезаемого) сегмента → на слух «...вот так вот. И момент[рез]».
+       Плюс: если валидной зазор-тишины нет, границу НЕ падим внутрь (padding увёл бы
+       её в речь соседнего сегмента) — оставляем на месте (она уже на границе сегмента
+       после snapIntervalsToSegmentBoundaries = естественная пауза). */
+    var segEps = o.segmentEps >= 0 ? o.segmentEps : 0.12;
+    var segSpans = [];
+    var segList = o.segments || null;
+    if (segList && segList.length) {
+      for (var gi = 0; gi < segList.length; gi++) {
+        var g = segList[gi] || {};
+        var gs = (typeof g.startSec === 'number') ? g.startSec : g.start;
+        var ge = (typeof g.endSec === 'number') ? g.endSec : g.end;
+        if (typeof gs === 'number' && typeof ge === 'number' && isFinite(gs) && isFinite(ge) && ge > gs) {
+          segSpans.push([gs, ge]);
+        }
+      }
+    }
+    var segmentAware = segSpans.length > 0;
+    function insideSegment(c) {
+      for (var pi = 0; pi < segSpans.length; pi++) {
+        if (c > segSpans[pi][0] + segEps && c < segSpans[pi][1] - segEps) return true;
+      }
+      return false;
+    }
+    var res = { intervals: [], stats: { snapped: 0, padded: 0, dropped: 0, kept: 0 } };
     if (!intervals || !intervals.length) return res;
 
-    /* Центры валидных тишин (обе формы полей) */
+    /* Центры валидных тишин (обе формы полей). При segment-aware отсеиваем
+       центры, лежащие ВНУТРИ речи сегмента (внутрифразовые паузы). */
     var centers = [];
     var list = silences || [];
     for (var si = 0; si < list.length; si++) {
@@ -2175,16 +2212,27 @@
       var se = (typeof s.endSec === 'number') ? s.endSec : s.end;
       if (typeof ss !== 'number' || typeof se !== 'number' ||
           !isFinite(ss) || !isFinite(se) || se - ss < minSilenceSec) continue;
-      centers.push((ss + se) / 2);
+      var cen = (ss + se) / 2;
+      if (segmentAware && insideSegment(cen)) continue;
+      centers.push(cen);
     }
 
     function refineBoundary(t, isStart) {
       var best = null, bestDist = Infinity;
       for (var ci = 0; ci < centers.length; ci++) {
-        var d = Math.abs(centers[ci] - t);
-        if (d <= windowSec && d < bestDist) { best = centers[ci]; bestDist = d; }
+        var c = centers[ci];
+        var d = Math.abs(c - t);
+        if (d > windowSec) continue;
+        /* Наружу = расширение выреза: старт двигается влево (c<t),
+           конец — вправо (c>t). Внутрь (сжатие) — отрицательное «наружу». */
+        var outward = isStart ? (t - c) : (c - t);
+        if (outward > maxOutwardSnapSec + 1e-6) continue;
+        if (d < bestDist) { best = c; bestDist = d; }
       }
       if (best !== null) return { t: best, how: 'snapped' };
+      /* segment-aware: нет зазор-тишины → держим границу на месте (уже в паузе),
+         НЕ падим внутрь соседнего сегмента. */
+      if (segmentAware) return { t: t, how: 'kept' };
       return { t: isStart ? t + padSec : t - padSec, how: 'padded' };
     }
 
@@ -2207,6 +2255,173 @@
       res.intervals.push(copy);
     }
     return res;
+  }
+
+  /* Текст сегмента завершает предложение? Снимаем закрывающие кавычки/скобки,
+     затем проверяем терминальную пунктуацию . ! ? … (в т.ч. «?!», «...»). */
+  function _endsSentence(text) {
+    var t = String(text == null ? '' : text).replace(/[\)\]"»'\u2019\u201d\s]+$/g, '');
+    return /[.!?\u2026]$/.test(t);
+  }
+
+  /**
+   * Sentence-end подрезка keep-интервалов (спека 2026-07-21, фикс «фраза
+   * обрывается» / часть C). LLM в монтаже по смыслу иногда ставит границу keep
+   * ВНУТРИ предложения (сегмент без терминальной пунктуации на конце → на слух
+   * мысль не завершена, «...ты находишь[рез]»). Двигаем границы keep к границам
+   * ПРЕДЛОЖЕНИЙ по тексту Whisper-сегментов, предпочитая ДОЗАВЕРШИТЬ мысль:
+   *   • конец keep: сперва вперёд к концу ближайшего сегмента с терминальной
+   *     пунктуацией (дозавершаем текущее предложение, сдвиг ≤ maxExtendSec);
+   *     если впереди в бюджете такого нет (напр. окно транскрипта обрезано на
+   *     10-й минуте посреди фразы) — назад к концу последнего завершённого
+   *     предложения (сдвиг ≤ maxTrimSec);
+   *   • начало keep: симметрично — сперва назад к началу текущего предложения
+   *     (≤ maxExtendSec), иначе вперёд к началу следующего (≤ maxTrimSec).
+   * Схлопывание (start≥end) → интервал без изменений. Нет сегментов → без
+   * изменений. Вход не мутируется. Формы сегментов: {startSec,endSec,text} и
+   * {start,end,text}. maxExtendSec — насколько разрешено РАСШИРИТЬ (дозавершить),
+   * maxTrimSec — насколько СЖАТЬ (когда завершения впереди/сзади нет).
+   * → { intervals: [...], stats: { trimmedStart, trimmedEnd, kept } }
+   */
+  function trimKeepsToSentenceBoundaries(keeps, segments, opts) {
+    var o = opts || {};
+    var maxExtendSec = o.maxExtendSec >= 0 ? o.maxExtendSec : 3.0;
+    var maxTrimSec = o.maxTrimSec >= 0 ? o.maxTrimSec : 6.0;
+    var eps = o.eps >= 0 ? o.eps : 0.05;
+    var out = { intervals: [], stats: { trimmedStart: 0, trimmedEnd: 0, kept: 0 } };
+    if (!keeps || !keeps.length) return out;
+
+    var segs = [];
+    var sl = segments || [];
+    for (var i = 0; i < sl.length; i++) {
+      var g = sl[i] || {};
+      var gs = (typeof g.startSec === 'number') ? g.startSec : g.start;
+      var ge = (typeof g.endSec === 'number') ? g.endSec : g.end;
+      if (typeof gs === 'number' && typeof ge === 'number' && isFinite(gs) && isFinite(ge) && ge > gs) {
+        segs.push({ s: gs, e: ge, sentEnd: _endsSentence(g.text) });
+      }
+    }
+    segs.sort(function (a, b) { return a.s - b.s; });
+    for (var p = 0; p < segs.length; p++) {
+      segs[p].sentStart = (p === 0) || segs[p - 1].sentEnd;
+    }
+    var haveSegs = segs.length > 0;
+
+    for (var j = 0; j < keeps.length; j++) {
+      var iv = keeps[j] || {};
+      var ks = (typeof iv.startSec === 'number') ? iv.startSec : Number(iv.start);
+      var ke = (typeof iv.endSec === 'number') ? iv.endSec : Number(iv.end);
+      var copy = {};
+      for (var k in iv) { if (Object.prototype.hasOwnProperty.call(iv, k)) copy[k] = iv[k]; }
+      if (!haveSegs || !isFinite(ks) || !isFinite(ke) || ke <= ks) {
+        out.intervals.push(copy); out.stats.kept++; continue;
+      }
+      var newKs = ks, newKe = ke, startMoved = false, endMoved = false;
+
+      /* END: конец ближайшего завершённого предложения ВПЕРЁД (дозавершить),
+         затем НАЗАД (окно обрезано посреди фразы). */
+      var fwdEnd = null, bwdEnd = null;
+      for (var a = 0; a < segs.length; a++) {
+        if (!segs[a].sentEnd) continue;
+        if (segs[a].e >= ke - eps) { if (fwdEnd === null) fwdEnd = segs[a].e; }
+        if (segs[a].e <= ke + eps) { bwdEnd = segs[a].e; }
+      }
+      if (fwdEnd !== null && (fwdEnd - ke) <= maxExtendSec && Math.abs(fwdEnd - ke) > eps) {
+        newKe = fwdEnd; endMoved = true;
+      } else if (fwdEnd !== null && Math.abs(fwdEnd - ke) <= eps) {
+        /* уже на конце предложения — не двигаем */
+      } else if (bwdEnd !== null && (ke - bwdEnd) <= maxTrimSec && Math.abs(ke - bwdEnd) > eps) {
+        newKe = bwdEnd; endMoved = true;
+      }
+
+      /* START: начало текущего предложения НАЗАД (дозавершить контекст),
+         затем начало следующего ВПЕРЁД (окно обрезано в начале фразы). */
+      var bwdStart = null, fwdStart = null;
+      for (var b2 = segs.length - 1; b2 >= 0; b2--) {
+        if (!segs[b2].sentStart) continue;
+        if (segs[b2].s <= ks + eps) { if (bwdStart === null) bwdStart = segs[b2].s; }
+        if (segs[b2].s >= ks - eps) { fwdStart = segs[b2].s; }
+      }
+      if (bwdStart !== null && (ks - bwdStart) <= maxExtendSec && Math.abs(ks - bwdStart) > eps) {
+        newKs = bwdStart; startMoved = true;
+      } else if (bwdStart !== null && Math.abs(ks - bwdStart) <= eps) {
+        /* уже на начале предложения */
+      } else if (fwdStart !== null && (fwdStart - ks) <= maxTrimSec && Math.abs(fwdStart - ks) > eps) {
+        newKs = fwdStart; startMoved = true;
+      }
+
+      if (newKe - newKs < eps) { /* подрезка схлопнула — откат */
+        out.intervals.push(copy); out.stats.kept++; continue;
+      }
+      copy.startSec = newKs; copy.endSec = newKe;
+      out.intervals.push(copy);
+      if (startMoved) out.stats.trimmedStart++;
+      if (endMoved) out.stats.trimmedEnd++;
+      if (!startMoved && !endMoved) out.stats.kept++;
+    }
+    return out;
+  }
+
+  /**
+   * Клэмп keep-интервалов к транскрибированной области (спека 2026-07-21, фикс
+   * «хвост в ролике»). LLM в сборочном монтаже стабильно ставит endSec последнего
+   * keep = длине ВСЕЙ секвенции (напр. 6138.8с при транскрипте до 596с), т.е. за
+   * концом проанализированной речи. Такой хвост не режет ни C (нет сегмента на
+   * этой отметке → без изменений), ни инверсия keep→remove (после последнего keep
+   * нет дырки → нет remove) — в ролик попадает нетранскрибированный хвост.
+   * Ограничиваем границы keep областью реальной речи [lo, hi]:
+   *   lo = max(начало первого сегмента, analyzedRegion.inSec)
+   *   hi = min(конец последнего сегмента, analyzedRegion.outSec)
+   * (пересечение сегментов и области транскрибации). Keep целиком вне [lo,hi]
+   * (start≥hi) отбрасывается; частично торчащий — обрезается к границе, после чего
+   * C (trimKeepsToSentenceBoundaries) сажает обрезанный конец на конец предложения.
+   * Нет ни сегментов, ни region → без изменений. Вход не мутируется. Формы
+   * сегментов/интервалов: {startSec,endSec} и {start,end}. opts.region = {inSec,outSec}.
+   * → { intervals: [...], stats: { clampedStart, clampedEnd, dropped } }
+   */
+  function clampKeepsToTranscribedRegion(keeps, segments, opts) {
+    var o = opts || {};
+    var out = { intervals: [], stats: { clampedStart: 0, clampedEnd: 0, dropped: 0 } };
+    if (!keeps || !keeps.length) return out;
+
+    var lo = null, hi = null;
+    var sl = segments || [];
+    for (var i = 0; i < sl.length; i++) {
+      var g = sl[i] || {};
+      var gs = (typeof g.startSec === 'number') ? g.startSec : g.start;
+      var ge = (typeof g.endSec === 'number') ? g.endSec : g.end;
+      if (typeof gs === 'number' && isFinite(gs)) lo = (lo === null) ? gs : Math.min(lo, gs);
+      if (typeof ge === 'number' && isFinite(ge)) hi = (hi === null) ? ge : Math.max(hi, ge);
+    }
+    var region = o.region;
+    if (region) {
+      if (typeof region.inSec === 'number' && isFinite(region.inSec)) {
+        lo = (lo === null) ? region.inSec : Math.max(lo, region.inSec);
+      }
+      if (typeof region.outSec === 'number' && isFinite(region.outSec)) {
+        hi = (hi === null) ? region.outSec : Math.min(hi, region.outSec);
+      }
+    }
+
+    var canClamp = (lo !== null && hi !== null && hi > lo);
+    for (var j = 0; j < keeps.length; j++) {
+      var iv = keeps[j] || {};
+      var ks = (typeof iv.startSec === 'number') ? iv.startSec : Number(iv.start);
+      var ke = (typeof iv.endSec === 'number') ? iv.endSec : Number(iv.end);
+      var copy = {};
+      for (var k in iv) { if (Object.prototype.hasOwnProperty.call(iv, k)) copy[k] = iv[k]; }
+      if (!canClamp || !isFinite(ks) || !isFinite(ke) || ke <= ks) {
+        out.intervals.push(copy); continue;
+      }
+      var ns = ks < lo ? lo : (ks > hi ? hi : ks);
+      var ne = ke < lo ? lo : (ke > hi ? hi : ke);
+      if (ne - ns <= 0) { out.stats.dropped++; continue; } /* целиком вне речи */
+      if (ns !== ks) out.stats.clampedStart++;
+      if (ne !== ke) out.stats.clampedEnd++;
+      copy.startSec = ns; copy.endSec = ne;
+      out.intervals.push(copy);
+    }
+    return out;
   }
 
   global.DeterministicPipelines = {
@@ -2235,6 +2450,8 @@
     snapIntervalsToFrame: snapIntervalsToFrame,
     splitCutIntervalsIntoBatches: splitCutIntervalsIntoBatches,
     refineCutBoundaries: refineCutBoundaries,
+    trimKeepsToSentenceBoundaries: trimKeepsToSentenceBoundaries,
+    clampKeepsToTranscribedRegion: clampKeepsToTranscribedRegion,
     _mergeIntervals: _mergeIntervals,
     _detectSharedAudio: _detectSharedAudio,
     _detectFlatAudio: _detectFlatAudio,
