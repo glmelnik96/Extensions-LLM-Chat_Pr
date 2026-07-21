@@ -210,12 +210,26 @@
       .catch(function (e) { return { supported: false, commits: [], reason: String((e && e.message) || e) }; });
   }
 
+  /**
+   * Коммиты после sinceHash до HEAD (что нового с прошлого просмотра окна
+   * «Что нового»). Пустой sinceHash → {commits:[]} (первый запуск — вызывающий
+   * решает, показать ли базовый список). Невалидный hash → supported:false.
+   */
+  function getCommitsSince(repoRoot, sinceHash, runOpt) {
+    var run = runOpt || makeRunner(repoRoot);
+    if (!sinceHash) return Promise.resolve({ supported: true, commits: [] });
+    return run(['log', '--pretty=format:%h%x1f%s%x1f%cs', sinceHash + '..HEAD'])
+      .then(function (out) { return { supported: true, commits: _parseCommitLog(out) }; })
+      .catch(function (e) { return { supported: false, commits: [], reason: String((e && e.message) || e) }; });
+  }
+
   global.SelfUpdate = {
     getStatus: getStatus,
     checkForUpdate: checkForUpdate,
     applyUpdate: applyUpdate,
     getRecentCommits: getRecentCommits,
     getIncomingCommits: getIncomingCommits,
+    getCommitsSince: getCommitsSince,
     findGitPath: findGitPath,
     _normalizeRoot: _normalizeRoot,
     _parseLeftRightCount: _parseLeftRightCount,

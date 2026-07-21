@@ -5293,20 +5293,12 @@ PanelBoot.run('ИИ: монтаж', function () {
       if (btnUpd.disabled) return;
       btnUpd.disabled = true;
       btnUpd.textContent = 'Обновляю…';
-      /* До pull фиксируем, какие коммиты прилетят — чтобы после reload
-         показать окно «Что нового» (что именно скачал пользователь). */
-      SelfUpdate.getIncomingCommits(repoRoot).then(function (inc) {
-        return SelfUpdate.applyUpdate(repoRoot).then(function (r) {
-          try {
-            localStorage.setItem('extllmpr_pending_whatsnew', JSON.stringify({
-              commit: r.commit,
-              commits: (inc && inc.commits) || [],
-              at: Date.now()
-            }));
-          } catch (eLS) {}
-          btnUpd.textContent = 'Обновлено → ' + r.commit + ', перезагрузка…';
-          setTimeout(function () { location.reload(); }, 800);
-        });
+      /* Не сохраняем список коммитов вручную: окно «Что нового» само сравнит
+         HEAD с маркером extllmpr_whatsnew_seen после reload и покажет ровно то,
+         что подтянулось (работает и при обновлении через терминал). */
+      SelfUpdate.applyUpdate(repoRoot).then(function (r) {
+        btnUpd.textContent = 'Обновлено → ' + r.commit + ', перезагрузка…';
+        setTimeout(function () { location.reload(); }, 800);
       }).catch(function (e) {
         btnUpd.disabled = false;
         btnUpd.textContent = 'Обновить с GitHub';
@@ -5317,9 +5309,11 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   /* ── «Что нового»: реальные коммиты git как список изменений ─────────
      Источник правды — git log, не отдельный changelog-файл (не разъедется
-     с кодом). После self-update авто-показ подтянутых коммитов (сохранены
-     в localStorage перед reload); кнопка «Что нового» — ручной просмотр
-     последних. Грациозно: не git-клон → «список недоступен». */
+     с кодом). Маркер extllmpr_whatsnew_seen хранит последний HEAD, который
+     пользователь уже видел. После обновления (кнопкой ИЛИ git pull в
+     терминале) HEAD уходит вперёд → авто-показ ровно новых коммитов
+     (seen..HEAD). Кнопка «Что нового» — те же новые, а если новых нет —
+     короткий список последних. Грациозно: не git-клон → «список недоступен». */
   (function () {
     var btn = document.getElementById('btn-whatsnew');
     var modal = document.getElementById('whatsnew-modal');
@@ -5401,25 +5395,51 @@ PanelBoot.run('ИИ: монтаж', function () {
     modal.addEventListener('click', function (e) { if (e.target === modal) close(); });
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !modal.hidden) close(); });
 
+    var SEEN_KEY = 'extllmpr_whatsnew_seen';
+    function getSeen() { try { return localStorage.getItem(SEEN_KEY) || ''; } catch (e) { return ''; } }
+    function markSeen(head) { try { if (head) localStorage.setItem(SEEN_KEY, head); } catch (e) {} }
+
+    /* Ручной просмотр: сперва новое с прошлого раза (seen..HEAD); если нового
+       нет — короткий список последних правок, а не вся история. */
     if (btn) {
       btn.onclick = function () {
         open([], 'Загружаю список изменений…', '');
-        SelfUpdate.getRecentCommits(repoRoot, 30).then(function (r) {
-          open(r.commits, r.commits.length ? 'Свежие изменения плагина:' : '', '');
+        SelfUpdate.getStatus(repoRoot).then(function (st) {
+          var head = st && st.supported ? st.commit : '';
+          var seen = getSeen();
+          return SelfUpdate.getCommitsSince(repoRoot, (seen && seen !== head) ? seen : '').then(function (since) {
+            if (since.commits && since.commits.length) {
+              open(since.commits, 'Новое с прошлого просмотра:', head ? ('→ ' + head) : '');
+              markSeen(head);
+              return;
+            }
+            return SelfUpdate.getRecentCommits(repoRoot, 8).then(function (r) {
+              open(r.commits, r.commits.length ? 'Новых изменений нет. Последние правки:' : '', head ? ('→ ' + head) : '');
+              markSeen(head);
+            });
+          });
         });
       };
     }
 
-    /* Авто-показ после self-update. */
+    /* Авто-показ после обновления: сравниваем текущий HEAD с маркером. Если
+       ушёл вперёд (обновились кнопкой или git pull) — показываем ровно новые
+       коммиты. Первый запуск (маркера нет) — молча запоминаем HEAD, историю
+       не вываливаем. */
     try {
-      var raw = localStorage.getItem('extllmpr_pending_whatsnew');
-      if (raw) {
-        localStorage.removeItem('extllmpr_pending_whatsnew');
-        var pend = JSON.parse(raw);
-        if (pend && pend.commits && pend.commits.length) {
-          open(pend.commits, 'Плагин обновлён — вот что изменилось:', pend.commit ? ('→ ' + pend.commit) : '');
-        }
-      }
+      SelfUpdate.getStatus(repoRoot).then(function (st) {
+        if (!st || !st.supported || !st.commit) return;
+        var head = st.commit;
+        var seen = getSeen();
+        if (!seen) { markSeen(head); return; }
+        if (seen === head) return;
+        SelfUpdate.getCommitsSince(repoRoot, seen).then(function (since) {
+          if (since.commits && since.commits.length) {
+            open(since.commits, 'Плагин обновлён — вот что изменилось:', '→ ' + head);
+          }
+          markSeen(head);
+        });
+      });
     } catch (eWN) {}
   })();
 

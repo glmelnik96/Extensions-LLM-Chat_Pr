@@ -116,6 +116,39 @@ describe('SelfUpdate.getRecentCommits / getIncomingCommits', () => {
   });
 });
 
+/* ═══ getCommitsSince (окно «Что нового» — только новое с прошлого раза) ═══ */
+describe('SelfUpdate.getCommitsSince', () => {
+  it('sinceHash задан → log sinceHash..HEAD, парсит коммиты', async () => {
+    const calls = [];
+    const run = fakeRun({
+      'log --pretty=format:%h%x1f%s%x1f%cs abc123..HEAD':
+        'n1\u001ffeat(x): новое\u001f2026-07-21\nn2\u001ffix(y): фикс\u001f2026-07-21'
+    }, calls);
+    const r = await SU.getCommitsSince('/repo', 'abc123', run);
+    assert.equal(r.supported, true);
+    assert.equal(r.commits.length, 2);
+    assert.equal(r.commits[0].subject, 'feat(x): новое');
+    assert.ok(calls[0].indexOf('abc123..HEAD') >= 0);
+  });
+  it('пустой sinceHash → {commits:[]} без вызова git (первый запуск)', async () => {
+    const calls = [];
+    const run = fakeRun({}, calls);
+    const r = await SU.getCommitsSince('/repo', '', run);
+    assert.equal(r.supported, true);
+    assertLoose.deepEqual(r.commits, []);
+    assert.equal(calls.length, 0);
+  });
+  it('невалидный hash / git упал → supported:false, commits:[]', async () => {
+    const run = fakeRun({
+      'log --pretty=format:%h%x1f%s%x1f%cs deadbeef..HEAD':
+        new Error("fatal: bad revision 'deadbeef..HEAD'")
+    });
+    const r = await SU.getCommitsSince('/repo', 'deadbeef', run);
+    assert.equal(r.supported, false);
+    assertLoose.deepEqual(r.commits, []);
+  });
+});
+
 /* ═══ getStatus ═══ */
 describe('SelfUpdate.getStatus', () => {
   it('возвращает commit, branch, dirty', async () => {
