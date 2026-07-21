@@ -98,6 +98,24 @@
     return String(out || '').replace(/\s+/g, '') !== '';
   }
 
+  /**
+   * Парсер `git log --pretty=format:%h%x1f%s%x1f%cs`: одна строка = один
+   * коммит, поля разделены байтом 0x1f (unit separator — не встречается в
+   * теме коммита). → [{ hash, subject, date }]. Используется для окна
+   * «Что нового» (список подтянутых/недавних фиксов).
+   */
+  function _parseCommitLog(out) {
+    var lines = String(out || '').split('\n');
+    var res = [];
+    for (var i = 0; i < lines.length; i++) {
+      if (!lines[i]) continue;
+      var p = lines[i].split('\u001f');
+      if (!p[0]) continue;
+      res.push({ hash: p[0].trim(), subject: (p[1] || '').trim(), date: (p[2] || '').trim() });
+    }
+    return res;
+  }
+
   /* ── API ───────────────────────────────────────────────────────── */
 
   function getStatus(repoRoot, runOpt) {
@@ -168,13 +186,40 @@
     });
   }
 
+  /**
+   * Недавние коммиты (для окна «Что нового», ручной просмотр).
+   * Грациозно: не git / нет коммитов → {supported:false, commits:[]}.
+   */
+  function getRecentCommits(repoRoot, n, runOpt) {
+    var run = runOpt || makeRunner(repoRoot);
+    var count = n > 0 ? n : 25;
+    return run(['log', '-n', String(count), '--pretty=format:%h%x1f%s%x1f%cs'])
+      .then(function (out) { return { supported: true, commits: _parseCommitLog(out) }; })
+      .catch(function (e) { return { supported: false, commits: [], reason: String((e && e.message) || e) }; });
+  }
+
+  /**
+   * Коммиты, которые прилетят при обновлении (есть в origin/main, нет в HEAD).
+   * Вызывать ПОСЛЕ checkForUpdate (он делает fetch) — иначе список может быть
+   * пустым/устаревшим. Это ответ на «что скачивает пользователь».
+   */
+  function getIncomingCommits(repoRoot, runOpt) {
+    var run = runOpt || makeRunner(repoRoot);
+    return run(['log', '--pretty=format:%h%x1f%s%x1f%cs', 'HEAD..origin/main'])
+      .then(function (out) { return { supported: true, commits: _parseCommitLog(out) }; })
+      .catch(function (e) { return { supported: false, commits: [], reason: String((e && e.message) || e) }; });
+  }
+
   global.SelfUpdate = {
     getStatus: getStatus,
     checkForUpdate: checkForUpdate,
     applyUpdate: applyUpdate,
+    getRecentCommits: getRecentCommits,
+    getIncomingCommits: getIncomingCommits,
     findGitPath: findGitPath,
     _normalizeRoot: _normalizeRoot,
     _parseLeftRightCount: _parseLeftRightCount,
-    _isDirtyOutput: _isDirtyOutput
+    _isDirtyOutput: _isDirtyOutput,
+    _parseCommitLog: _parseCommitLog
   };
 })(window);

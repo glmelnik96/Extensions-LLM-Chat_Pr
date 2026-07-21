@@ -3138,15 +3138,19 @@ $._EXT_PRM_.importAndOverlayOnTop = function (jsonStr) {
         top = seq.videoTracks[numV2 - 1];
       }
       var topIndex = seq.videoTracks.numTracks - 1;
-      /* Вставка с 0 без ripple. */
+      /* Вставка на startSec (по умолчанию 0) без ripple. «Только субтитры»
+         сдвигает оверлей на начало речи (тайминги ASS сдвинуты на ту же
+         величину), чтобы не рендерить пустой хвост от 0 до региона In–Out. */
+      var startAtSec = 0;
+      try { var _sa = Number(p && p.startSec); if (_sa > 0) startAtSec = _sa; } catch (eSa) {}
       var beforeClips = 0;
       try { beforeClips = top.clips.numItems; } catch (eBCl) {}
       try {
-        top.overwriteClip(item, 0);
+        top.overwriteClip(item, startAtSec);
       } catch (eOw) {
         return JSON.stringify({ ok: false, error: 'overwriteClip: ' + String(eOw && eOw.message ? eOw.message : eOw) });
       }
-      /* Верификация: на дорожке появился клип со start≈0. */
+      /* Верификация: на дорожке появился клип со start≈startAtSec. */
       var afterClips = 0;
       try { afterClips = top.clips.numItems; } catch (eACl) {}
       if (afterClips <= beforeClips) {
@@ -3156,16 +3160,17 @@ $._EXT_PRM_.importAndOverlayOnTop = function (jsonStr) {
       try { placed = top.clips[afterClips - 1]; } catch (ePl) {}
       var startSec = -1;
       try { startSec = placed ? placed.start.seconds : -1; } catch (eSt) {}
-      if (!(startSec >= 0 && startSec < 0.5)) {
+      if (!(startSec >= 0 && Math.abs(startSec - startAtSec) < 0.5)) {
         return JSON.stringify({
           ok: false,
-          error: 'Оверлей вставлен, но start=' + startSec + 'с (ожидался 0) на V' + (topIndex + 1) + ' — проверьте таймлайн'
+          error: 'Оверлей вставлен, но start=' + startSec + 'с (ожидался ' + startAtSec + ') на V' + (topIndex + 1) + ' — проверьте таймлайн'
         });
       }
       return JSON.stringify({
         ok: true,
         sequenceName: String(seq.name),
         trackIndex: topIndex,
+        startSec: startSec,
         clipName: String(placed && placed.name ? placed.name : item.name),
         hostVersion: $._EXT_PRM_.version
       });

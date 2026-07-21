@@ -72,6 +72,48 @@ describe('SelfUpdate — парсеры вывода git', () => {
     assert.equal(SU._isDirtyOutput(' M client/unified/panel.js\n'), true);
     assert.equal(SU._isDirtyOutput('?? new-file.js\n'), true);
   });
+  it('_parseCommitLog: hash\\x1fsubject\\x1fdate по строкам → массив объектов', () => {
+    const out = '3e00fb5\u001ffix(ui): кастомные тултипы\u001f2026-07-21\n' +
+                '754bfb6\u001ffeat(reels): умные переносы\u001f2026-07-20';
+    assertLoose.deepEqual(SU._parseCommitLog(out), [
+      { hash: '3e00fb5', subject: 'fix(ui): кастомные тултипы', date: '2026-07-21' },
+      { hash: '754bfb6', subject: 'feat(reels): умные переносы', date: '2026-07-20' }
+    ]);
+  });
+  it('_parseCommitLog: пустой вывод и пустые строки → []/пропуск', () => {
+    assertLoose.deepEqual(SU._parseCommitLog(''), []);
+    assertLoose.deepEqual(SU._parseCommitLog('\n\n'), []);
+  });
+});
+
+/* ═══ getRecentCommits / getIncomingCommits ═══ */
+describe('SelfUpdate.getRecentCommits / getIncomingCommits', () => {
+  it('getRecentCommits: парсит git log, ограничивает n', async () => {
+    const calls = [];
+    const run = fakeRun({
+      'log -n 30 --pretty=format:%h%x1f%s%x1f%cs': 'abc1234\u001ffeat(x): новое\u001f2026-07-21'
+    }, calls);
+    const r = await SU.getRecentCommits('/repo', 30, run);
+    assert.equal(r.supported, true);
+    assert.equal(r.commits.length, 1);
+    assert.equal(r.commits[0].subject, 'feat(x): новое');
+    assert.ok(calls[0].startsWith('log -n 30'));
+  });
+  it('getRecentCommits: git упал → supported:false, commits:[]', async () => {
+    const run = fakeRun({});
+    const r = await SU.getRecentCommits('/repo', 5, run);
+    assert.equal(r.supported, false);
+    assertLoose.deepEqual(r.commits, []);
+  });
+  it('getIncomingCommits: log HEAD..origin/main → подтягиваемые коммиты', async () => {
+    const run = fakeRun({
+      'log --pretty=format:%h%x1f%s%x1f%cs HEAD..origin/main':
+        'd1\u001ffix(a): b\u001f2026-07-21\ne2\u001ffeat(c): d\u001f2026-07-21'
+    });
+    const r = await SU.getIncomingCommits('/repo', run);
+    assert.equal(r.commits.length, 2);
+    assert.equal(r.commits[1].subject, 'feat(c): d');
+  });
 });
 
 /* ═══ getStatus ═══ */

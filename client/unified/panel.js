@@ -5293,15 +5293,134 @@ PanelBoot.run('ИИ: монтаж', function () {
       if (btnUpd.disabled) return;
       btnUpd.disabled = true;
       btnUpd.textContent = 'Обновляю…';
-      SelfUpdate.applyUpdate(repoRoot).then(function (r) {
-        btnUpd.textContent = 'Обновлено → ' + r.commit + ', перезагрузка…';
-        setTimeout(function () { location.reload(); }, 800);
+      /* До pull фиксируем, какие коммиты прилетят — чтобы после reload
+         показать окно «Что нового» (что именно скачал пользователь). */
+      SelfUpdate.getIncomingCommits(repoRoot).then(function (inc) {
+        return SelfUpdate.applyUpdate(repoRoot).then(function (r) {
+          try {
+            localStorage.setItem('extllmpr_pending_whatsnew', JSON.stringify({
+              commit: r.commit,
+              commits: (inc && inc.commits) || [],
+              at: Date.now()
+            }));
+          } catch (eLS) {}
+          btnUpd.textContent = 'Обновлено → ' + r.commit + ', перезагрузка…';
+          setTimeout(function () { location.reload(); }, 800);
+        });
       }).catch(function (e) {
         btnUpd.disabled = false;
         btnUpd.textContent = 'Обновить с GitHub';
         showErr('Обновление не удалось: ' + ((e && e.message) || e));
       });
     };
+  })();
+
+  /* ── «Что нового»: реальные коммиты git как список изменений ─────────
+     Источник правды — git log, не отдельный changelog-файл (не разъедется
+     с кодом). После self-update авто-показ подтянутых коммитов (сохранены
+     в localStorage перед reload); кнопка «Что нового» — ручной просмотр
+     последних. Грациозно: не git-клон → «список недоступен». */
+  (function () {
+    var btn = document.getElementById('btn-whatsnew');
+    var modal = document.getElementById('whatsnew-modal');
+    var body = document.getElementById('wn-modal-body');
+    var meta = document.getElementById('wn-modal-meta');
+    var closeBtn = document.getElementById('wn-modal-close');
+    if (!modal || !body || typeof SelfUpdate === 'undefined') return;
+    var repoRoot = extensionRootForHost();
+
+    var TYPE_MAP = {
+      feat: { label: 'Новое', icon: '✨', order: 0 },
+      fix: { label: 'Исправления', icon: '🔧', order: 1 },
+      perf: { label: 'Ускорение', icon: '⚡', order: 2 },
+      refactor: { label: 'Под капотом', icon: '♻', order: 3 }
+    };
+    var OTHER = { label: 'Прочее', icon: '•', order: 9 };
+
+    function parseSubject(s) {
+      var m = /^(\w+)(?:\(([^)]*)\))?!?:\s*(.+)$/.exec(String(s || ''));
+      if (!m) return { cat: OTHER, scope: '', text: String(s || '') };
+      return { cat: TYPE_MAP[m[1].toLowerCase()] || OTHER, scope: m[2] || '', text: m[3] };
+    }
+
+    function render(commits, headline) {
+      body.textContent = '';
+      if (headline) {
+        var h = document.createElement('div');
+        h.style.cssText = 'margin:0 0 10px;color:var(--muted);font-size:12px;';
+        h.textContent = headline;
+        body.appendChild(h);
+      }
+      if (!commits || !commits.length) {
+        var empty = document.createElement('div');
+        empty.style.color = 'var(--muted)';
+        empty.textContent = 'Список изменений недоступен (плагин установлен не из git или git не найден).';
+        body.appendChild(empty);
+        return;
+      }
+      var groups = {}, order = [];
+      for (var i = 0; i < commits.length; i++) {
+        var p = parseSubject(commits[i].subject);
+        if (!groups[p.cat.label]) { groups[p.cat.label] = { cat: p.cat, items: [] }; order.push(p.cat.label); }
+        groups[p.cat.label].items.push({ scope: p.scope, text: p.text });
+      }
+      order.sort(function (a, b) { return groups[a].cat.order - groups[b].cat.order; });
+      for (var g = 0; g < order.length; g++) {
+        var grp = groups[order[g]];
+        var title = document.createElement('div');
+        title.style.cssText = 'font-weight:600;margin:12px 0 5px;color:var(--text);';
+        title.textContent = grp.cat.icon + ' ' + grp.cat.label;
+        body.appendChild(title);
+        for (var j = 0; j < grp.items.length; j++) {
+          var it = grp.items[j];
+          var row = document.createElement('div');
+          row.style.cssText = 'display:flex;gap:6px;padding:3px 0;align-items:baseline;';
+          if (it.scope) {
+            var tag = document.createElement('span');
+            tag.style.cssText = 'flex:none;font-size:10px;color:var(--accent-text);background:rgba(255,255,255,0.05);border-radius:3px;padding:1px 5px;';
+            tag.textContent = it.scope;
+            row.appendChild(tag);
+          }
+          var txt = document.createElement('span');
+          txt.style.cssText = 'flex:1;color:var(--text);';
+          txt.textContent = it.text;
+          row.appendChild(txt);
+          body.appendChild(row);
+        }
+      }
+    }
+
+    function open(commits, headline, metaText) {
+      render(commits, headline);
+      if (meta) meta.textContent = metaText || '';
+      modal.hidden = false;
+    }
+    function close() { modal.hidden = true; }
+
+    if (closeBtn) closeBtn.onclick = close;
+    modal.addEventListener('click', function (e) { if (e.target === modal) close(); });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !modal.hidden) close(); });
+
+    if (btn) {
+      btn.onclick = function () {
+        open([], 'Загружаю список изменений…', '');
+        SelfUpdate.getRecentCommits(repoRoot, 30).then(function (r) {
+          open(r.commits, r.commits.length ? 'Свежие изменения плагина:' : '', '');
+        });
+      };
+    }
+
+    /* Авто-показ после self-update. */
+    try {
+      var raw = localStorage.getItem('extllmpr_pending_whatsnew');
+      if (raw) {
+        localStorage.removeItem('extllmpr_pending_whatsnew');
+        var pend = JSON.parse(raw);
+        if (pend && pend.commits && pend.commits.length) {
+          open(pend.commits, 'Плагин обновлён — вот что изменилось:', pend.commit ? ('→ ' + pend.commit) : '');
+        }
+      }
+    } catch (eWN) {}
   })();
 
   var btnExport = document.getElementById('btn-export-session');
@@ -6868,8 +6987,9 @@ PanelBoot.run('ИИ: монтаж', function () {
        нужно» + кнопка действия. Блокируем «Найти и вырезать», пока гейт активен
        (раньше кнопка кликалась и выдавала сырую ошибку → «кнопки бесполезны»). */
     function _setCardGate(card, gated, kind, stale) {
-      var runBtn = card.querySelector('.tool-run');
-      if (runBtn) runBtn.disabled = gated;
+      var runBtns = card.querySelectorAll('.tool-run');
+      for (var gi = 0; gi < runBtns.length; gi++) runBtns[gi].disabled = gated;
+      var runBtn = runBtns[0]; /* якорь для вставки плашки-гейта */
       var gate = card.querySelector('.tool-gate');
       if (!gated) { if (gate) gate.hidden = true; return; }
       if (!gate) {
@@ -7798,15 +7918,53 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
 
     /* ffmpeg промисом (паттерн audio-render.js), таймаут 10 мин. */
-    function reelsRunFfmpeg(bin, args) {
+    /* Рендер оверлея через spawn (а не execFile), чтобы читать прогресс
+       из stderr в реальном времени. ffmpeg печатает «time=HH:MM:SS.ms» —
+       делим на общую длительность → проценты + ETA. opts.onProgress(pct, etaSec)
+       и opts.durationSec опциональны: без них поведение как раньше (просто
+       ждём завершения). Резолвит накопленный stderr, реджектит по коду/ошибке. */
+    function reelsRunFfmpeg(bin, args, opts) {
+      opts = opts || {};
       return new Promise(function (resolve, reject) {
-        var execFile = require('child_process').execFile;
-        execFile(bin, args, { timeout: 600000, maxBuffer: 8 * 1024 * 1024 }, function (err, stdout, stderr) {
-          if (err) {
-            reject(new Error('ffmpeg упал: ' + String(err.message || err) + '\n' + String(stderr || '').slice(0, 600)));
-            return;
+        var spawn = require('child_process').spawn;
+        var child;
+        try { child = spawn(bin, args, { windowsHide: true }); }
+        catch (eSp) { reject(new Error('ffmpeg не запустился: ' + String((eSp && eSp.message) || eSp))); return; }
+        var errBuf = '';
+        var MAX = 8 * 1024 * 1024;
+        var totalDur = Number(opts.durationSec) > 0 ? Number(opts.durationSec) : 0;
+        var lastPct = -1;
+        var startedAt = Date.now();
+        var timer = setTimeout(function () {
+          try { child.kill(); } catch (eK) {}
+          reject(new Error('ffmpeg таймаут (10 мин) — рендер не уложился'));
+        }, 600000);
+        child.stderr.on('data', function (d) {
+          var s = String(d);
+          if (errBuf.length < MAX) errBuf += s;
+          if (opts.onProgress && totalDur > 0) {
+            var re = /time=(\d+):(\d+):(\d+(?:\.\d+)?)/g, mm, cur = null;
+            while ((mm = re.exec(s))) cur = mm;
+            if (cur) {
+              var t = (+cur[1]) * 3600 + (+cur[2]) * 60 + (+cur[3]);
+              var pct = Math.max(0, Math.min(100, Math.round((t / totalDur) * 100)));
+              if (pct !== lastPct) {
+                lastPct = pct;
+                var elapsed = (Date.now() - startedAt) / 1000;
+                var eta = t > 0.1 ? Math.max(0, elapsed * (totalDur - t) / t) : 0;
+                try { opts.onProgress(pct, eta); } catch (eP) {}
+              }
+            }
           }
-          resolve(String(stderr || ''));
+        });
+        child.on('error', function (e) {
+          clearTimeout(timer);
+          reject(new Error('ffmpeg не запустился: ' + String((e && e.message) || e)));
+        });
+        child.on('close', function (code) {
+          clearTimeout(timer);
+          if (code === 0) resolve(errBuf);
+          else reject(new Error('ffmpeg упал (код ' + code + ')\n' + errBuf.slice(0, 600)));
         });
       });
     }
@@ -8178,11 +8336,19 @@ PanelBoot.run('ИИ: монтаж', function () {
           assPath = path.join(dir, safeName + '_' + ts + '.ass');
           outPath = path.join(dir, safeName + '_' + ts + '.mov');
           fs.writeFileSync(assPath, ass, 'utf8'); /* UTF-8 БЕЗ BOM — libass */
-          toolsStatusUi.show('Рилс: рендерю субтитры (' + cues.length + ' титров, ~' + Math.round(durationSec) + 'с)…', true);
+          toolsStatusUi.show('Рилс: рендерю субтитры (' + cues.length + ' титров)…', true);
           await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
             assPath: assPath, w: targetW, h: targetH, fps: fps,
             durationSec: durationSec, outPath: outPath
-          }));
+          }), {
+            durationSec: durationSec,
+            onProgress: function (pct, etaSec) {
+              var eta = etaSec > 0 ? (etaSec >= 60
+                ? ('~' + Math.round(etaSec / 60) + ' мин осталось')
+                : ('~' + Math.round(etaSec) + 'с осталось')) : '';
+              toolsStatusUi.show('Рилс: рендерю субтитры ' + pct + '%' + (eta ? ' (' + eta + ')' : '') + '…', true);
+            }
+          });
           if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 4096) {
             toolsShowErr('Секвенция «' + applied.sequenceName + '» создана, но ffmpeg отрендерил пустой оверлей: ' + outPath);
             return;
@@ -8277,6 +8443,300 @@ PanelBoot.run('ИИ: монтаж', function () {
         toolsSetCardStatus('card-reels', seqName,
           'Создана «' + applied.sequenceName + '»: ' + applied.applied + ' клипов, ' + cues.length + ' титров', 'ok');
         toolsStatusUi.show('Рилс готов ✓', false);
+        keepStatus = true;
+        setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+      } catch (e) {
+        toolsShowErr(String(e.message || e));
+      } finally {
+        endOperation();
+        toolsDisableRun(false);
+        if (!keepStatus) toolsStatusUi.hide();
+      }
+    }
+
+    /* «Только субтитры»: титры на АКТИВНУЮ секвенцию, без вертикали/рефрейма.
+       Два режима:
+         'animated' — караоке-оверлей ProRes (ffmpeg) + caption-дорожка;
+         'static'   — только нативная caption-дорожка (без рендера, мгновенно).
+       Переиспользует preflight/корректуру рилса, но пропускает шаги 1–3
+       (источники/vision/applyVerticalReframe). Оверлей — в нативном
+       разрешении секвенции; тайминги ASS сдвинуты на начало речи, оверлей
+       кладётся с тем же сдвигом (не рендерим пустой хвост от 0 до региона).
+       Кью персистятся в REELS_PID под именем активной секвенции — редактор
+       «Править титры» работает как и для рилса. Исходник не режется. */
+    /* Порог тяжести оверлея: спан речи (с) × мегапиксели кадра. Выше —
+       рендер ffmpeg рискует выйти за 10-мин таймаут и раздуть файл; отказ
+       с подсказкой (сузить In–Out или «статичные»). ≈ 13 мин @1080×1920 или
+       ≈ 3.2 мин @4K. */
+    var SUBTITLES_COST_LIMIT_MPS = 1600;
+    /* Потолок числа титров для LLM-корректуры. Корректура идёт батчами по
+       REELS_PROOFREAD_BATCH (40) последовательными запросами; ~400 титров —
+       ~10 батчей, дальше ожидание раздувается. Выше — пропуск (см. ниже). */
+    var SUBTITLES_PROOFREAD_MAX_CUES = 400;
+    async function toolsRunSubtitles(mode) {
+      var isStatic = mode === 'static';
+      if (!beginOperation('tools:subtitles')) {
+        toolsShowErr('Идёт обработка в чате — дождитесь завершения (кнопка «Стоп» на вкладке «Чат»).');
+        return;
+      }
+      toolsDisableRun(true);
+      toolsStatusUi.show('Субтитры: проверяю условия…', true);
+      var resEl = document.getElementById('rl-result');
+      if (resEl) { resEl.textContent = ''; }
+      var keepStatus = false;
+      try {
+        var fs = require('fs');
+        var path = require('path');
+        var os = require('os');
+        var notes = [];
+
+        /* 0. Preflight: ffmpeg/libass/шрифт (только для анимированных),
+           транскрипт, настройки. Статичные — только caption-дорожка. */
+        var anim = isStatic ? 'none' : ((document.getElementById('rl-anim') || {}).value || 'color');
+        if (!isStatic && anim === 'none') anim = 'color'; /* анимированная кнопка ⇒ всегда оверлей */
+        var ffBin = null;
+        if (!isStatic) {
+          ffBin = AudioPreprocess.findFfmpegPath();
+          if (!ffBin) {
+            toolsShowErr('Нужен ffmpeg для рендера анимированных субтитров. Установите ffmpeg (или используйте «Субтитры: статичные» — caption-дорожка без рендера).');
+            return;
+          }
+          var filtersOut = await new Promise(function (resolve) {
+            require('child_process').execFile(ffBin, ['-hide_banner', '-filters'],
+              { timeout: 30000, maxBuffer: 4 * 1024 * 1024 },
+              function (err, stdout) { resolve(String(stdout || '')); });
+          });
+          if (filtersOut.indexOf(' ass ') === -1) {
+            notes.push('Сборка ffmpeg без libass (нет фильтра ass) — караоке-оверлей пропущен, титры только в редактируемой caption-дорожке. Для анимации поставьте полную сборку ffmpeg (например, gyan.dev full).');
+            anim = 'none';
+          }
+        }
+        var fontName = (document.getElementById('rl-font') || {}).value || 'SB Sans Text SemiBold';
+        if (anim !== 'none' && !reelsFontInstalled(fontName)) {
+          toolsShowErr('Шрифт «' + fontName + '» не найден среди системных. Установите .otf (правый клик → «Установить для всех пользователей») и повторите.');
+          return;
+        }
+        var snap = await execGetSnapshot(true);
+        if (!snap || !snap.ok) {
+          toolsShowErr(snap && snap.error ? snap.error : 'Не удалось получить снимок таймлайна.');
+          return;
+        }
+        var seqName = String(snap.sequenceName || '');
+        var found = seqName ? ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName) : { entry: null };
+        var entry = found && found.entry;
+        if (!entry || !entry.segments || !entry.segments.length) {
+          toolsShowErr('Нет транскрипта для «' + seqName + '» — сначала транскрибируйте In–Out (вкладка «Чат»).');
+          return;
+        }
+        var settings = ContextStore.getResolvedSettings();
+        /* Размер оверлея = нативное разрешение активной секвенции (не 1080×1920). */
+        var targetW = Number(snap.frameSizeH) > 0 ? Math.round(Number(snap.frameSizeH)) : 1920;
+        var targetH = Number(snap.frameSizeV) > 0 ? Math.round(Number(snap.frameSizeV)) : 1080;
+        var textColor = reelsNormalizeHex((document.getElementById('rl-text-color') || {}).value, '#FFFFFF');
+        var hlColor = reelsNormalizeHex((document.getElementById('rl-hl-color') || {}).value, '#21A038');
+
+        /* 1. Караоке-кьюи. */
+        var cues = ReelsPipeline.buildKaraokeCues(entry.segments, {
+          silences: (entry.audioAnalysis && entry.audioAnalysis.silences && entry.audioAnalysis.silences.length)
+            ? entry.audioAnalysis.silences : null
+        });
+        if (!cues.length) {
+          toolsShowErr('Из транскрипта «' + seqName + '» не получилось ни одного титра (пустые сегменты?).');
+          return;
+        }
+
+        /* 1b. Тайминг-сдвиг + гард тяжести (только для анимированного оверлея).
+           overlayOffset — начало речи (небольшой пре-ролл), спан = речь без
+           пустого хвоста. Гард: спан×мегапиксели > лимита ⇒ отказ. */
+        var overlayOffset = 0;
+        if (anim !== 'none') {
+          var firstStart = cues[0].startSec;
+          var lastEnd = cues[cues.length - 1].endSec;
+          overlayOffset = firstStart > 1 ? Math.max(0, firstStart - 0.1) : 0;
+          var spanSec = lastEnd - overlayOffset;
+          var costMps = spanSec * ((targetW * targetH) / 1e6);
+          if (costMps > SUBTITLES_COST_LIMIT_MPS) {
+            var mins = Math.round(spanSec / 6) / 10;
+            toolsShowErr('Оверлей субтитров получился бы слишком тяжёлым: ~' + mins + ' мин × ' +
+              targetW + '×' + targetH + ' (рендер рискует не уложиться в лимит времени и раздуть файл). ' +
+              'Сузьте область In–Out и перетранскрибируйте, либо используйте «Субтитры: статичные» ' +
+              '(caption-дорожка без рендера — работает для любой длины).');
+            return;
+          }
+        }
+
+        /* 2. LLM-корректура (фейл — не фатален) + правило точек.
+           Гард длины: корректура — это цепочка LLM-запросов (батч по
+           REELS_PROOFREAD_BATCH), время ∝ числу титров. На длинной области
+           (напр. 30+ мин → 1200+ титров) это десятки минут блокирующего
+           ожидания и лишний расход API. Выше порога — пропускаем корректуру
+           (титры остаются редактируемыми в caption-дорожке), чтобы «статичные»
+           честно работали для любой длины. */
+        var proofApplied = 0, proofRejected = 0, proofOk = false;
+        if (cues.length > SUBTITLES_PROOFREAD_MAX_CUES) {
+          notes.push('Корректура LLM пропущена: ' + cues.length + ' титров (> ' +
+            SUBTITLES_PROOFREAD_MAX_CUES + ') — заняла бы десятки минут. Титры без ' +
+            'авто-правок, но их можно поправить в caption-дорожке или сузив In–Out.');
+        } else {
+          try {
+            var pr = await reelsProofread(cues, settings, function (done, total) {
+              toolsStatusUi.show('Субтитры: корректура ' + done + ' из ' + total + '…', true);
+            });
+            cues = pr.cues;
+            proofApplied = pr.applied;
+            proofRejected = pr.rejected;
+            proofOk = true;
+          } catch (ePr) {
+            notes.push('Корректура LLM не сработала (' + String((ePr && ePr.message) || ePr) + ') — титры без правок');
+          }
+        }
+        cues = cues.map(function (c) {
+          var t2 = ReelsPipeline.stripCueFinalPeriod(c.text);
+          if (t2 === c.text) return c;
+          var w2 = c.words.slice();
+          if (w2.length) {
+            var lw = w2[w2.length - 1];
+            w2[w2.length - 1] = { w: ReelsPipeline.stripCueFinalPeriod(lw.w), s: lw.s, e: lw.e };
+          }
+          return { startSec: c.startSec, endSec: c.endSec, text: t2, words: w2 };
+        });
+
+        /* 3. Файлы: SRT всегда (абсолютные времена — caption-дорожка на реальном
+           таймкоде); ASS+оверлей — только при анимации (тайминги сдвинуты на
+           overlayOffset, оверлей кладётся на тот же сдвиг). */
+        var fps = Number(snap.fps) > 0 ? Number(snap.fps) : 25;
+        var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'reels');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        var safeName = seqName.replace(/[\\\/:*?"<>|]/g, '_');
+        var srtPath = path.join(dir, safeName + '_sub_' + ts + '.srt');
+        fs.writeFileSync(srtPath, ReelsPipeline.buildSrt(cues), 'utf8');
+        var assPath = null, outPath = null, ins = null;
+        if (anim !== 'none') {
+          /* Сдвиг таймингов на overlayOffset (ASS рендерится от 0). */
+          var shifted = overlayOffset > 0 ? cues.map(function (c) {
+            return {
+              startSec: c.startSec - overlayOffset,
+              endSec: c.endSec - overlayOffset,
+              text: c.text,
+              words: (c.words || []).map(function (w) { return { w: w.w, s: w.s - overlayOffset, e: w.e - overlayOffset }; })
+            };
+          }) : cues;
+          var durationSec = Math.ceil((shifted[shifted.length - 1].endSec + 0.5) * 100) / 100;
+          var ass = ReelsPipeline.buildAss(shifted, {
+            w: targetW, h: targetH,
+            fontName: fontName,
+            textColor: textColor,
+            hlColor: hlColor,
+            anim: anim
+          });
+          assPath = path.join(dir, safeName + '_sub_' + ts + '.ass');
+          outPath = path.join(dir, safeName + '_sub_' + ts + '.mov');
+          fs.writeFileSync(assPath, ass, 'utf8'); /* UTF-8 БЕЗ BOM — libass */
+          toolsStatusUi.show('Субтитры: рендерю оверлей (' + cues.length + ' титров)…', true);
+          await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
+            assPath: assPath, w: targetW, h: targetH, fps: fps,
+            durationSec: durationSec, outPath: outPath
+          }), {
+            durationSec: durationSec,
+            onProgress: function (pct, etaSec) {
+              var eta = etaSec > 0 ? (etaSec >= 60
+                ? ('~' + Math.round(etaSec / 60) + ' мин осталось')
+                : ('~' + Math.round(etaSec) + 'с осталось')) : '';
+              toolsStatusUi.show('Субтитры: рендерю оверлей ' + pct + '%' + (eta ? ' (' + eta + ')' : '') + '…', true);
+            }
+          });
+          if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 4096) {
+            toolsShowErr('ffmpeg отрендерил пустой оверлей: ' + outPath);
+            return;
+          }
+          /* Оверлей на новую верхнюю дорожку активной секвенции, старт = overlayOffset. */
+          toolsStatusUi.show('Субтитры: вставляю оверлей в «' + seqName + '»…', true);
+          ins = await new Promise(function (resolve, reject) {
+            PremiereBridge.importAndOverlayOnTop({
+              filePath: outPath.replace(/\\/g, '/'),
+              expectedSequenceName: seqName,
+              startSec: overlayOffset
+            }, function (err, data) {
+              if (err) reject(err); else resolve(data);
+            });
+          });
+          if (!ins || !ins.ok) {
+            toolsShowErr('Оверлей не вставлен: ' +
+              ((ins && ins.error) || 'нет ответа хоста') + '\nФайл оверлея: ' + outPath);
+            return;
+          }
+          if (overlayOffset > 0) {
+            notes.push('Оверлей начинается с ' + Math.round(overlayOffset) + 'с (пустой хвост до речи не рендерился).');
+          }
+        }
+
+        /* 4. Caption-дорожка — ТОЛЬКО для статичных (anim==='none'). Для
+           анимированных весь текст в караоке-оверлее; вторая caption-дорожка
+           задвоила бы субтитры (жалоба «при анимированных создаются и
+           статичные»). SRT всё равно сохранён — редактор «Править титры»
+           может добавить captions вручную. */
+        var capOk = false, capErr = '';
+        if (anim === 'none') {
+          toolsStatusUi.show('Субтитры: импортирую captions в «' + seqName + '»…', true);
+          try {
+            var cap = await new Promise(function (resolve, reject) {
+              PremiereBridge.importSrtAsCaptions({
+                srtPath: srtPath.replace(/\\/g, '/'),
+                expectedSequenceName: seqName
+              }, function (err, data) {
+                if (err) reject(err); else resolve(data);
+              });
+            });
+            capOk = !!(cap && cap.ok);
+            if (!capOk) capErr = (cap && cap.error) || 'нет ответа хоста';
+          } catch (eCap) { capErr = String((eCap && eCap.message) || eCap); }
+          if (!capOk) notes.push('Caption-дорожка не создана (' + capErr + ') — титры в SRT: ' + srtPath);
+        }
+
+        /* 5. Персист кью — источник правды для модалки «Править титры».
+           ВАЖНО: reels-кэш и transcript-кэш — один стор с ключом = имя
+           секвенции (panelId в get/setTranscriptCache игнорируется). У рилса
+           ключ рилс-секвенции отличается от исходника, а здесь ключ = сама
+           активная секвенция, у которой ЕСТЬ транскрипт. Полный setTranscriptEntry
+           затёр бы segments/audioAnalysis (сломал бы гейт и текстовые
+           инструменты). Поэтому МЕРЖИМ поля рилса в существующую запись. */
+        try {
+          var mergedEntry = {};
+          for (var mk in entry) { if (Object.prototype.hasOwnProperty.call(entry, mk)) mergedEntry[mk] = entry[mk]; }
+          mergedEntry.cues = cues;
+          mergedEntry.settings = { format: 'subtitles', anim: anim, fontName: fontName, textColor: textColor, hlColor: hlColor, fps: fps, w: targetW, h: targetH };
+          mergedEntry.paths = { srt: srtPath, ass: assPath, mov: outPath };
+          mergedEntry.sourceSequenceName = seqName;
+          mergedEntry.reelsSequenceName = seqName;
+          mergedEntry.createdAt = Date.now();
+          ContextStore.setTranscriptEntry(REELS_PID, seqName, mergedEntry);
+        } catch (eSt) { notes.push('Кью не сохранены для редактора (' + String((eSt && eSt.message) || eSt) + ')'); }
+
+        /* 6. Отчёт. */
+        var animLabel = anim === 'box' ? 'плашка под словом' : (anim === 'none' ? 'без анимации' : 'цвет слова');
+        var lines = [
+          'Субтитры добавлены на «' + seqName + '» (' + targetW + '×' + targetH + ').',
+          anim !== 'none'
+            ? ('Титры: ' + cues.length + ', ' + animLabel + ', шрифт ' + fontName + ' — оверлей на V' + (ins.trackIndex + 1) + (capOk ? ' + caption-дорожка' : '') + '.')
+            : (capOk
+              ? ('Титры: ' + cues.length + ' — caption-дорожка (редактируемая, без анимации).')
+              : ('Титры: ' + cues.length + ' — caption-дорожка НЕ создана, титры в SRT: ' + srtPath)),
+          proofOk
+            ? ('Корректура LLM: ' + proofApplied + ' правок' + (proofRejected ? ' (' + proofRejected + ' отклонено guard-ом)' : '') + '.')
+            : 'Корректура LLM: пропущена.'
+        ];
+        if (anim !== 'none' && capOk) {
+          lines.push('Внимание: включённый CC в мониторе задвоит текст — выключите CC или удалите caption-дорожку.');
+        }
+        for (var nt = 0; nt < notes.length; nt++) lines.push(notes[nt]);
+        if (resEl) {
+          resEl.style.whiteSpace = 'pre-line';
+          resEl.textContent = lines.join('\n');
+        }
+        toolsSetCardStatus('card-reels', seqName,
+          'Субтитры на «' + seqName + '»: ' + cues.length + ' титров', 'ok');
+        toolsStatusUi.show('Субтитры готовы ✓', false);
         keepStatus = true;
         setTimeout(function () { toolsStatusUi.hide(); }, 4000);
       } catch (e) {
@@ -8488,29 +8948,9 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
     })();
 
-    /* Превью HEX-цветов рилса: поле текстовое (CEP не открывает системную
-       палитру), поэтому свотч рисуем сами. Невалидный HEX → бледный свотч. */
-    (function wireReelsColorSwatches() {
-      function bind(inputId, swId) {
-        var inp = document.getElementById(inputId);
-        var sw = document.getElementById(swId);
-        if (!inp || !sw) return;
-        function sync() {
-          var v = reelsNormalizeHex(inp.value, '');
-          if (v) { sw.style.background = v; sw.style.opacity = '1'; }
-          else { sw.style.opacity = '0.35'; }
-        }
-        inp.addEventListener('input', sync);
-        inp.addEventListener('change', function () {
-          var v = reelsNormalizeHex(inp.value, '');
-          if (v) inp.value = v;
-          sync();
-        });
-        sync();
-      }
-      bind('rl-text-color', 'rl-text-color-sw');
-      bind('rl-hl-color', 'rl-hl-color-sw');
-    })();
+    /* Цвета рилса — нативные <input type="color"> (CEP 12/CEF открывает
+       палитру по клику). value всегда валидный #rrggbb, свой предпросмотр —
+       ручной свотч и нормализация HEX больше не нужны. */
 
     /* ── Run tool ─────────────────────────────────────────── */
     async function toolsRunTool(toolName) {
@@ -8524,6 +8964,12 @@ PanelBoot.run('ИИ: монтаж', function () {
       /* «🎬 Рилс» — тоже не proposal: исходник не трогается, результат —
          новая секвенция с оверлеем субтитров (откат = удалить её). */
       if (toolName === 'reels') { await toolsRunReels(); return; }
+
+      /* «Только субтитры» — титры на АКТИВНУЮ секвенцию без вертикали/рефрейма.
+         Две кнопки: анимированные (караоке-оверлей ProRes) и статичные (только
+         caption-дорожка, без рендера). Не proposal: откат = удалить дорожку. */
+      if (toolName === 'subtitles-anim') { await toolsRunSubtitles('animated'); return; }
+      if (toolName === 'subtitles-static') { await toolsRunSubtitles('static'); return; }
 
       var pipelineFn, params = {}, proposalId;
 

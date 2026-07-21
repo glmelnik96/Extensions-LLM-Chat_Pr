@@ -498,6 +498,7 @@
               <hr />
               <div class="version-row" id="version-row" title="Версия host-скрипта · git-коммит">v?</div>
               <button type="button" id="btn-self-update" hidden>Обновить с GitHub</button>
+              <button type="button" id="btn-whatsnew" title="Что изменилось в свежих версиях плагина">Что нового</button>
             </div>
           </div>
         </div>
@@ -797,15 +798,13 @@
                 <option value="none">нет</option>
               </select>
             </div>
-            <div class="param-row" title="Цвет текста субтитров и цвет подсветки (перекраска слова или плашка). HEX в формате #RRGGBB — CEP не открывает системную палитру, поэтому вводится вручную.">
+            <div class="param-row" title="Цвет текста субтитров и цвет подсветки (перекраска слова или плашка). Клик по образцу открывает палитру.">
               <span class="param-label">Цвета</span>
-              <label style="display:flex;align-items:center;gap:4px;">текст
-                <input type="text" id="rl-text-color" value="#FFFFFF" maxlength="7" spellcheck="false" style="width:72px;min-width:0;" />
-                <span id="rl-text-color-sw" style="width:16px;height:16px;border:1px solid var(--border,#444);border-radius:3px;background:#FFFFFF;display:inline-block;flex:none;"></span>
+              <label style="display:flex;align-items:center;gap:5px;">текст
+                <input type="color" id="rl-text-color" value="#FFFFFF" title="Цвет текста субтитров" style="width:30px;height:22px;padding:1px;border:1px solid var(--border,#444);border-radius:3px;background:none;cursor:pointer;flex:none;" />
               </label>
-              <label style="display:flex;align-items:center;gap:4px;">подсветка
-                <input type="text" id="rl-hl-color" value="#21A038" maxlength="7" spellcheck="false" style="width:72px;min-width:0;" />
-                <span id="rl-hl-color-sw" style="width:16px;height:16px;border:1px solid var(--border,#444);border-radius:3px;background:#21A038;display:inline-block;flex:none;"></span>
+              <label style="display:flex;align-items:center;gap:5px;">подсветка
+                <input type="color" id="rl-hl-color" value="#21A038" title="Цвет подсветки произносимого слова (перекраска/плашка)" style="width:30px;height:22px;padding:1px;border:1px solid var(--border,#444);border-radius:3px;background:none;cursor:pointer;flex:none;" />
               </label>
             </div>
             <div class="param-row" title="Куда смотреть в кадре у каждой камеры: «имя клипа: сдвиг%». Минус = левее, плюс = правее. Пример: «Гость: -20; Ведущий: 15». Пусто = позицию решает vision-модель (по кадру из середины источника), при её недоступности — центр. Ручное значение побеждает vision.">
@@ -813,6 +812,10 @@
               <input type="text" id="rl-offsets" placeholder="Гость: -20 (пусто = vision)" style="flex:1;min-width:0;" />
             </div>
             <button class="tool-run" data-tool="reels">Собрать рилс</button>
+            <div style="display:flex;gap:6px;">
+              <button type="button" class="tool-run" data-tool="subtitles-anim" style="flex:1;min-width:0;background:var(--panel-2,#2a2a2a);" title="Анимированные субтитры (караоке-оверлей ProRes) на активную секвенцию — без вертикали/рефрейма. Анимация/шрифт/цвета берутся выше; размер оверлея = разрешение активной секвенции. Оверлей рендерится ffmpeg — для длинных/4K секвенций возможен отказ (сузьте In–Out или используйте «Статичные»).">Субтитры: анимированные</button>
+              <button type="button" class="tool-run" data-tool="subtitles-static" style="flex:1;min-width:0;background:var(--panel-2,#2a2a2a);" title="Статичные субтитры на активную секвенцию: только нативная caption-дорожка (редактируемая), без рендера оверлея. Работает мгновенно для любой длины/разрешения.">Субтитры: статичные</button>
+            </div>
             <button type="button" class="secondary" id="rl-edit-cues" style="font-size:11px;" title="Открыть сохранённые титры рилса: правка текста, обновление captions, перерендер караоке">Править титры</button>
             <div class="proposal-area" id="rl-result"></div>
           </div>
@@ -863,6 +866,18 @@
           <button type="button" id="re-rerender-karaoke">Перерендерить караоке</button>
           <span id="re-modal-status" style="color:var(--muted);font-size:12px;flex:1;"></span>
         </div>
+      </div>
+    </div>
+
+    <!-- ══ Modal: «Что нового» (список обновлений плагина) ═══════════ -->
+    <div class="tr-modal-overlay" id="whatsnew-modal" hidden role="dialog" aria-modal="true" aria-labelledby="wn-modal-title">
+      <div class="tr-modal">
+        <div class="tr-modal-head">
+          <span class="tr-modal-title" id="wn-modal-title">Что нового</span>
+          <span class="tr-modal-meta" id="wn-modal-meta"></span>
+          <button type="button" class="tr-modal-close" id="wn-modal-close" title="Закрыть (Esc)" aria-label="Закрыть">✕</button>
+        </div>
+        <div class="tr-modal-body" id="wn-modal-body"></div>
       </div>
     </div>
 
