@@ -47,6 +47,28 @@
     return status >= 500 || status === 429;
   }
 
+  /* Фолбэк на запасную модель (21.07.2026). Триггерим ТОЛЬКО когда сама модель
+     недоступна, а не когда запрос кривой:
+       • наш таймаут (fetchWithRetry:184 «Таймаут запроса») — модель молча висит
+         (реальный кейс 21.07: GLM-5.1 не отдавала ни 500, ни ответ, сокет висел
+         до 300с × 5 ретраев);
+       • 5xx после исчерпания ретраев (message «HTTP 5xx»);
+       • 404 — модель снята/недоступна на аккаунте (см. fm-defaults: preview-модели
+         отдают 404);
+       • сетевой обрыв (fetch failed / ECONNRESET).
+     НЕ фолбэчим: AbortError (пользователь нажал Стоп), 413 (payload — на любой
+     модели то же, помечаем err.noFallback), 400/иные 4xx (кривой запрос),
+     «Ответ не JSON» на 200 (тело битое, но модель отвечает). */
+  function isModelUnavailable(err) {
+    if (!err || err.noFallback) return false;
+    if (err.name === 'AbortError') return false;
+    if (typeof err.httpStatus === 'number') {
+      return err.httpStatus >= 500 || err.httpStatus === 404;
+    }
+    var m = String((err && err.message) || '');
+    return /Таймаут запроса|fetch failed|network|ECONNRESET|ETIMEDOUT|ENOTFOUND|HTTP\s*5\d\d/i.test(m);
+  }
+
   /* Волна 1.1 (10.07.2026): 429 приходит с заголовком Retry-After (секунды или
      HTTP-date), но backoff был чисто экспоненциальным (1/2/4с) — при лимите
      60с мы долбили API раньше времени и снова ловили 429 до исчерпания retry.
@@ -118,6 +140,12 @@
   async function fetchWithRetry(url, fetchOpts, abortCheck, opts) {
     opts = opts || {};
     var timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : FETCH_TIMEOUT_MS;
+    /* Фолбэк моделей (21.07.2026): вызывающий может урезать число попыток
+       на ПЕРВИЧНОЙ модели, чтобы после N таймаутов/5xx быстрее переключиться
+       на запасную, а не долбить мёртвую модель все 5×300с (см. chatCompletions). */
+    var maxRetries = (typeof opts.maxRetries === 'number' && opts.maxRetries > 0)
+      ? Math.floor(opts.maxRetries)
+      : MAX_RETRIES;
     var lastErr = null;
     /* HIGH #3 (6 мая 2026): pre-aborted external signal проверяем явно.
        addEventListener('abort') не сработает если signal уже aborted. */
@@ -126,7 +154,7 @@
       preAbortErr.name = 'AbortError';
       throw preAbortErr;
     }
-    for (var attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    for (var attempt = 0; attempt < maxRetries; attempt++) {
       throwIfAbortCheck(abortCheck);
       var retryAfterMs = 0; /* Волна 1.1: из заголовка Retry-After при 429/5xx */
 
@@ -165,7 +193,7 @@
       try {
         var res = await fetch(url, mergedOpts);
         _cleanupAttempt();
-        if (!isRetryable(res.status) || attempt === MAX_RETRIES - 1) {
+        if (!isRetryable(res.status) || attempt === maxRetries - 1) {
           return res;
         }
         /* Retryable error — wait and try again */
@@ -182,9 +210,9 @@
           if (typeof abortCheck === 'function' && abortCheck()) throw fetchErr;
           /* Иначе это наш таймаут — делаем retryable ошибкой. */
           lastErr = new Error('Таймаут запроса (' + (timeoutMs / 1000).toFixed(0) + 'с)');
-          if (attempt === MAX_RETRIES - 1) throw lastErr;
+          if (attempt === maxRetries - 1) throw lastErr;
         } else {
-          if (attempt === MAX_RETRIES - 1) throw fetchErr;
+          if (attempt === maxRetries - 1) throw fetchErr;
           lastErr = fetchErr;
         }
       }
@@ -388,42 +416,96 @@
         body.stream_options = { include_usage: true };
       }
 
-      var bodyStr = JSON.stringify(body);
-      var fetchOpts = {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer ' + apiKey,
-          'Content-Type': 'application/json'
-        },
-        body: bodyStr
-      };
-      if (opts.signal) fetchOpts.signal = opts.signal;
-      throwIfAbortCheck(opts.abortCheck);
+      /* Одна попытка на конкретной модели: fetch+retry, парс, классификация.
+         Бросает классифицированную ошибку (httpStatus / noFallback), чтобы
+         внешний цикл решил, стоит ли фолбэчить на запасную модель. */
+      async function attemptModel(modelName, maxRetries) {
+        body.model = modelName;
+        var fetchOpts = {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer ' + apiKey,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(body)
+        };
+        if (opts.signal) fetchOpts.signal = opts.signal;
+        throwIfAbortCheck(opts.abortCheck);
 
-      var res = await fetchWithRetry(url, fetchOpts, opts.abortCheck);
-      throwIfAbortCheck(opts.abortCheck);
+        var res = await fetchWithRetry(url, fetchOpts, opts.abortCheck, { maxRetries: maxRetries });
+        throwIfAbortCheck(opts.abortCheck);
 
-      /* Streaming response */
-      if (useStreaming && res.ok && res.body) {
-        var streamed = await parseSSEStream(res, opts.onChunk, opts.abortCheck);
-        if (global.UsageMeter && streamed && streamed.usage) {
-          UsageMeter.recordChat(streamed.model || model, streamed.usage);
+        /* Streaming response */
+        if (useStreaming && res.ok && res.body) {
+          var streamed = await parseSSEStream(res, opts.onChunk, opts.abortCheck);
+          if (global.UsageMeter && streamed && streamed.usage) {
+            UsageMeter.recordChat(streamed.model || modelName, streamed.usage);
+          }
+          return streamed;
         }
-        return streamed;
+
+        var text = await res.text();
+        if (isPayloadTooLarge(res.status, text)) {
+          var e413 = new Error('413 Payload Too Large — запрос к чату слишком большой (сократите историю сообщений).');
+          e413.noFallback = true; /* payload одинаков на любой модели — не фолбэчим */
+          throw e413;
+        }
+        /* Классифицируем ПО СТАТУСУ до JSON-парса: недоступная модель часто
+           отдаёт 404/502 с ПУСТЫМ или HTML-телом (живой тест 21.07: 404 «»).
+           Если парсить сначала — падаем в «Ответ не JSON» без httpStatus и
+           фолбэк не срабатывает. Тело парсим лениво только ради текста ошибки. */
+        if (!res.ok) {
+          var errMsg = '';
+          try {
+            var errData = JSON.parse(text);
+            errMsg = (errData && errData.error && errData.error.message) ? errData.error.message : '';
+          } catch (_parseErr) {}
+          if (!errMsg) errMsg = String(text || '').slice(0, 300) || ('HTTP ' + res.status);
+          var eHttp = new Error(errMsg);
+          eHttp.httpStatus = res.status; /* 404/5xx → модель недоступна, isModelUnavailable решит */
+          throw eHttp;
+        }
+        var data = parseJsonResponse(text, 'Ответ не JSON');
+        if (global.UsageMeter && data && data.usage) {
+          UsageMeter.recordChat(data.model || modelName, data.usage);
+        }
+        return data;
       }
 
-      var text = await res.text();
-      if (isPayloadTooLarge(res.status, text)) {
-        throw new Error('413 Payload Too Large — запрос к чату слишком большой (сократите историю сообщений).');
+      /* Список моделей: основная + запасные (дедуп, без пустых). */
+      var modelList = [model];
+      var fbs = opts.fallbackModels || [];
+      for (var fi = 0; fi < fbs.length; fi++) {
+        if (fbs[fi] && modelList.indexOf(fbs[fi]) < 0) modelList.push(fbs[fi]);
       }
-      var data = parseJsonResponse(text, 'Ответ не JSON');
-      if (!res.ok) {
-        throw new Error(data.error && data.error.message ? data.error.message : text.slice(0, 300));
+      /* На НЕпоследней модели урезаем ретраи (по умолчанию 1), чтобы не ждать
+         5×timeout на мёртвой модели перед переключением. Последняя модель
+         получает полный бюджет MAX_RETRIES. */
+      var retriesBeforeFallback = (typeof opts.retriesBeforeFallback === 'number' && opts.retriesBeforeFallback > 0)
+        ? Math.floor(opts.retriesBeforeFallback)
+        : 1;
+
+      var lastErr = null;
+      for (var mi = 0; mi < modelList.length; mi++) {
+        var isLast = mi === modelList.length - 1;
+        try {
+          return await attemptModel(modelList[mi], isLast ? undefined : retriesBeforeFallback);
+        } catch (err) {
+          lastErr = err;
+          if (err && err.name === 'AbortError') throw err;
+          if (isLast || !isModelUnavailable(err)) throw err;
+          if (typeof opts.onModelFallback === 'function') {
+            try {
+              opts.onModelFallback({
+                from: modelList[mi],
+                to: modelList[mi + 1],
+                reason: String((err && err.message) || err)
+              });
+            } catch (_cbErr) {}
+          }
+        }
       }
-      if (global.UsageMeter && data && data.usage) {
-        UsageMeter.recordChat(data.model || model, data.usage);
-      }
-      return data;
+      throw lastErr;
     },
 
     /**
@@ -483,8 +565,10 @@
     parseJsonResponse: parseJsonResponse,
     isPayloadTooLarge: isPayloadTooLarge,
     isRetryable: isRetryable,
+    isModelUnavailable: isModelUnavailable,
     parseRetryAfterMs: parseRetryAfterMs,
     fetchWithRetry: fetchWithRetry,
-    parseSSEStream: parseSSEStream
+    parseSSEStream: parseSSEStream,
+    chatCompletions: global.CloudRuClient.chatCompletions
   };
 })(window);

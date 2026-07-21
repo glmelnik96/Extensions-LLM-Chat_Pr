@@ -336,13 +336,17 @@
         : 60;
     var step = 0;
     var lastAssistantText = '';
-    var model = settings.activeAgentModel || settings.chatModel;
+    /* currentModel «залипает» на рабочей модели: если основная (GLM-5.1) ушла в
+       офлайн и cloudru-client сфолбэчил на GLM-4.7, следующие шаги стартуют уже
+       с 4.7, а не долбят мёртвую основную по 300с на каждом шаге (21.07.2026). */
+    var currentModel = settings.activeAgentModel || settings.chatModel;
+    var modelFallbacksMap = (settings.modelFallbacks && typeof settings.modelFallbacks === 'object')
+      ? settings.modelFallbacks : {};
     /* ETA-ключ учитывает thinking: GLM-5.1 с thinking ждёт первый токен ~45с,
        без — <1с. Это разные «модели» с точки зрения ожидания пользователя. */
     var chatThinking = (settings.thinkingPolicy && typeof settings.thinkingPolicy.chat === 'boolean')
       ? settings.thinkingPolicy.chat
       : settings.enableThinking;
-    var etaKey = model + (chatThinking ? '#think' : '');
 
     /* Cycle detection: хэши последних tool_calls */
     var callHashes = [];
@@ -353,6 +357,12 @@
       throwIfAborted(signal, abortCheck);
       step++;
       messages = trimHistory(messages, maxHistory);
+      /* Модель этого шага + её запасные (залипаем на рабочей — см. currentModel). */
+      var reqModel = currentModel;
+      var reqFallbacks = (modelFallbacksMap[reqModel] && modelFallbacksMap[reqModel].length)
+        ? modelFallbacksMap[reqModel].slice()
+        : [];
+      var etaKey = reqModel + (chatThinking ? '#think' : '');
       var etaMs = expectedLatencyMs(etaKey);
       var reqStart = Date.now();
       var firstVisibleTs = 0;
@@ -360,7 +370,7 @@
         phase: 'llm',
         step: step,
         maxSteps: maxSteps,
-        model: model,
+        model: reqModel,
         etaMs: etaMs,
         message:
           'Очередь агента: шаг ' +
@@ -368,13 +378,26 @@
           ' из ' +
           maxSteps +
           ' (лимит на сообщение). Запрос к FM: ' +
-          model +
+          reqModel +
           (etaMs ? ' (обычно ~' + Math.max(1, Math.round(etaMs / 1000)) + 'с)' : '')
       });
       var data = await CloudRuClient.chatCompletions({
         baseUrl: settings.baseUrl,
         apiKey: settings.apiKey,
-        model: model,
+        model: reqModel,
+        /* Фолбэк на запасную при недоступности основной (21.07.2026). */
+        fallbackModels: reqFallbacks,
+        onModelFallback: function (info) {
+          /* Залипаем на рабочей модели для следующих шагов. */
+          currentModel = info.to;
+          onStatus({
+            phase: 'model-fallback',
+            step: step,
+            maxSteps: maxSteps,
+            model: info.to,
+            message: 'Модель ' + info.from + ' недоступна — переключаюсь на ' + info.to
+          });
+        },
         messages: messages,
         tools: tools,
         chatParams: settings.chatParams || {},

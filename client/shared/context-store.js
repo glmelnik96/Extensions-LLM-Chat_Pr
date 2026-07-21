@@ -299,7 +299,10 @@
         transcribeParams: shallowCopy(d.transcribeParams || {}),
         fastModel: String(d.fastModel || '').trim(),
         /* Волна 3 п.1 (11 июля 2026): vision-модель для describe_frames. */
-        visionModel: String(d.visionModel || '').trim()
+        visionModel: String(d.visionModel || '').trim(),
+        /* Фолбэк-модели по недоступности (21.07.2026). Карта primary→[запасные];
+           cloudru-client переключается при 5xx/404/таймауте. См. fm-defaults. */
+        modelFallbacks: (d.modelFallbacks && typeof d.modelFallbacks === 'object') ? d.modelFallbacks : {}
       };
     },
 

@@ -255,4 +255,194 @@ describe('cloudru-client.fetchWithRetry + Retry-After', () => {
     const maxDelay = Math.max(...delays, 0);
     assert.ok(maxDelay >= 700 && maxDelay <= 1300, 'ожидали ~1000мс, получили ' + maxDelay);
   });
+
+  test('opts.maxRetries урезает число попыток (1 → одна попытка, без ретрая 500)', async () => {
+    let calls = 0;
+    const fetchImpl = async () => { calls++; return { status: 500, ok: false, headers: { get: () => null } }; };
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    const res = await CR2.fetchWithRetry('http://x', {}, null, { maxRetries: 1 });
+    assert.equal(res.status, 500);
+    assert.equal(calls, 1, 'при maxRetries=1 — ровно одна попытка');
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * isModelUnavailable — триггер фолбэка на запасную модель (21.07.2026)
+ * ═══════════════════════════════════════════════════════════════ */
+describe('cloudru-client.isModelUnavailable', () => {
+  const U = CR.isModelUnavailable;
+  test('наш таймаут (молчаливый висяк) → фолбэк', () => {
+    assert.equal(U(new Error('Таймаут запроса (300с)')), true);
+  });
+  test('сетевой обрыв → фолбэк', () => {
+    assert.equal(U(new Error('fetch failed')), true);
+    assert.equal(U(new Error('ECONNRESET while reading')), true);
+  });
+  test('исчерпанный 5xx (message HTTP 5xx) → фолбэк', () => {
+    assert.equal(U(new Error('HTTP 500')), true);
+    assert.equal(U(new Error('HTTP 503')), true);
+  });
+  test('httpStatus 5xx/404 → фолбэк', () => {
+    assert.equal(U(Object.assign(new Error('x'), { httpStatus: 500 })), true);
+    assert.equal(U(Object.assign(new Error('x'), { httpStatus: 503 })), true);
+    assert.equal(U(Object.assign(new Error('model not found'), { httpStatus: 404 })), true);
+  });
+  test('400/429 (кривой запрос / rate-limit) → НЕ фолбэк', () => {
+    assert.equal(U(Object.assign(new Error('bad request'), { httpStatus: 400 })), false);
+    assert.equal(U(Object.assign(new Error('rate'), { httpStatus: 429 })), false);
+  });
+  test('413 (noFallback) и AbortError → НЕ фолбэк', () => {
+    assert.equal(U(Object.assign(new Error('413'), { noFallback: true })), false);
+    assert.equal(U(Object.assign(new Error('stop'), { name: 'AbortError' })), false);
+  });
+  test('битый JSON на 200 (модель отвечает) → НЕ фолбэк', () => {
+    assert.equal(U(new Error('Ответ не JSON: garbage')), false);
+  });
+  test('пусто/undefined → НЕ фолбэк', () => {
+    assert.equal(U(null), false);
+    assert.equal(U(undefined), false);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * chatCompletions — фолбэк на запасную модель при недоступности
+ * ═══════════════════════════════════════════════════════════════ */
+describe('cloudru-client.chatCompletions fallback', () => {
+  /* Мок fetch: поведение по модели (читаем model из тела запроса). */
+  function chatFetch(behaviorByModel) {
+    const calls = [];
+    const fetchImpl = async (url, opts) => {
+      const model = JSON.parse(opts.body).model;
+      calls.push(model);
+      const b = behaviorByModel[model];
+      if (!b) throw new Error('нет поведения для модели ' + model);
+      if (b.throw) {
+        const e = new Error(b.throw);
+        if (b.name) e.name = b.name;
+        throw e;
+      }
+      return {
+        status: b.status,
+        ok: b.status >= 200 && b.status < 300,
+        headers: { get: () => null },
+        text: async () => (typeof b.body === 'string' ? b.body : JSON.stringify(b.body))
+      };
+    };
+    return { fetchImpl, calls };
+  }
+  const ok = (model) => ({ status: 200, body: { model: model, choices: [{ message: { content: 'ok-' + model } }] } });
+  const base = { baseUrl: 'http://x', apiKey: 'k', messages: [{ role: 'user', content: 'hi' }], chatParams: { max_tokens: 10 } };
+
+  test('молчаливый висяк основной (fetch failed) → фолбэк на запасную', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { throw: 'fetch failed' }, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    const fb = [];
+    const data = await CR2.chatCompletions({
+      ...base, model: 'A', fallbackModels: ['B'], onModelFallback: (i) => fb.push(i)
+    });
+    assert.equal(data.choices[0].message.content, 'ok-B');
+    assert.deepEqual(calls, ['A', 'B'], 'A один раз (maxRetries=1), затем B');
+    assert.equal(fb.length, 1);
+    assert.equal(fb[0].from, 'A');
+    assert.equal(fb[0].to, 'B');
+  });
+
+  test('500 на основной → фолбэк', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { status: 500, body: { error: { message: 'boom' } } }, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    const data = await CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'] });
+    assert.equal(data.choices[0].message.content, 'ok-B');
+    assert.deepEqual(calls, ['A', 'B']);
+  });
+
+  test('404 (модель снята) → фолбэк', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { status: 404, body: { error: { message: 'model not found' } } }, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    const data = await CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'] });
+    assert.equal(data.choices[0].message.content, 'ok-B');
+    assert.deepEqual(calls, ['A', 'B']);
+  });
+
+  test('404 с ПУСТЫМ телом → фолбэк (живой баг 21.07: снятая модель отдаёт 404 «»)', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { status: 404, body: '' }, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    const data = await CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'] });
+    assert.equal(data.choices[0].message.content, 'ok-B');
+    assert.deepEqual(calls, ['A', 'B'], 'пустое тело не должно ломать классификацию');
+  });
+
+  test('502 с HTML-телом (не JSON) → фолбэк', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { status: 502, body: '<html><body>Bad Gateway</body></html>' }, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    const data = await CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'] });
+    assert.equal(data.choices[0].message.content, 'ok-B');
+    assert.deepEqual(calls, ['A', 'B']);
+  });
+
+  test('413 → НЕ фолбэк (payload одинаков на любой модели)', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { status: 413, body: 'Payload Too Large' }, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    await assert.rejects(
+      () => CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'] }),
+      /413/
+    );
+    assert.deepEqual(calls, ['A'], 'B не должна вызываться');
+  });
+
+  test('400 (кривой запрос) → НЕ фолбэк', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { status: 400, body: { error: { message: 'bad request' } } }, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    await assert.rejects(
+      () => CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'] }),
+      /bad request/
+    );
+    assert.deepEqual(calls, ['A']);
+  });
+
+  test('AbortError (Стоп) → НЕ фолбэк, пробрасывается', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { throw: 'stop', name: 'AbortError' }, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    let ac = 0;
+    /* Проверки abortCheck до фетча: attemptModel-старт + начало цикла fetchWithRetry —
+       обе false, чтобы дойти до fetch; 3-я (в catch на AbortError) — true. */
+    const abortCheck = () => (ac++ >= 2);
+    const fb = [];
+    await assert.rejects(
+      () => CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'], abortCheck, onModelFallback: (i) => fb.push(i) }),
+      (err) => err.name === 'AbortError'
+    );
+    assert.deepEqual(calls, ['A'], 'B не пробуем при отмене пользователем');
+    assert.equal(fb.length, 0);
+  });
+
+  test('дедуп: primary повторно в fallbackModels не вызывается дважды подряд', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { throw: 'fetch failed' }, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    const data = await CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['A', 'B'] });
+    assert.equal(data.choices[0].message.content, 'ok-B');
+    assert.deepEqual(calls, ['A', 'B'], 'дубль A убран');
+  });
+
+  test('без fallbackModels — обычное поведение (успех на основной)', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: ok('A') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    const data = await CR2.chatCompletions({ ...base, model: 'A' });
+    assert.equal(data.choices[0].message.content, 'ok-A');
+    assert.deepEqual(calls, ['A']);
+  });
+
+  test('все модели недоступны → бросает последнюю ошибку', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: { throw: 'fetch failed' }, B: { throw: 'fetch failed' } });
+    /* Последняя модель B получает полный MAX_RETRIES=5 с backoff — глушим таймеры. */
+    const fakeSetTimeout = (fn) => setTimeout(() => fn(), 0);
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl, setTimeout: fakeSetTimeout });
+    const fb = [];
+    await assert.rejects(
+      () => CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'], onModelFallback: (i) => fb.push(i) }),
+      /fetch failed/
+    );
+    assert.equal(fb.length, 1, 'один переход A→B');
+    assert.equal(calls[0], 'A');
+    assert.ok(calls.filter((m) => m === 'B').length >= 2, 'B ретраилась как последняя модель');
+  });
 });
