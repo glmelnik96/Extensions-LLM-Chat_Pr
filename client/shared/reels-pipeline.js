@@ -165,8 +165,7 @@
           idx++;
           if (wrapped === null) break; /* одно сверхдлинное слово — титром целиком */
         }
-        var cueText = _wrapWords(take, maxChars, maxLines);
-        if (cueText === null) cueText = take.join(' ');
+        var cueText = wrapCueLines(take, maxChars, maxLines, { hintBreakAfter: null });
         cues.push({
           startSec: Math.round(timed[cueStartIdx].s * 1000) / 1000,
           endSec: Math.round(timed[idx - 1].e * 1000) / 1000,
@@ -223,11 +222,15 @@
 
   /**
    * Применение результатов корректуры [{i, text}] к кьюям (без мутации).
-   * Guard-провал → правка отклоняется. Переносы строк пересобираются по
-   * старой разбивке (число слов в строках), тайминги words не меняются.
+   * Guard-провал → правка отклоняется. Переносы строк пересобираются через
+   * wrapCueLines, тайминги words не меняются.
+   * opts: {maxCharsPerLine, maxLines} — дефолты 20/2 (как в buildKaraokeCues).
    * Возвращает {cues, applied, rejected}.
    */
-  function applyProofread(cues, results) {
+  function applyProofread(cues, results, opts) {
+    var o = opts || {};
+    var maxChars = o.maxCharsPerLine > 0 ? o.maxCharsPerLine : 20;
+    var maxLines = o.maxLines > 0 ? o.maxLines : 2;
     var out = [];
     for (var i = 0; i < cues.length; i++) out.push(cues[i]);
     var applied = 0, rejected = 0;
@@ -241,21 +244,16 @@
       if (fixedFlat === origFlat) continue; /* без изменений */
       if (!proofreadGuardOk(origFlat, fixedFlat)) { rejected++; continue; }
       var newWords = fixedFlat.split(' ');
-      /* Пересборка переносов по старой построчной разбивке. */
-      var oldLines = cue.text.split('\n');
-      var lines = [], pos = 0;
-      for (var L = 0; L < oldLines.length; L++) {
-        var cnt = oldLines[L].split(' ').length;
-        lines.push(newWords.slice(pos, pos + cnt).join(' '));
-        pos += cnt;
-      }
+      /* Пересборка переносов через wrapCueLines. hintBreakAfter из results[r] если есть, иначе null. */
+      var hint = (res && typeof res.hintBreakAfter === 'number') ? res.hintBreakAfter : null;
+      var newText = wrapCueLines(newWords, maxChars, maxLines, { hintBreakAfter: hint });
       var words2 = [];
       for (var k = 0; k < cue.words.length; k++) {
         words2.push({ w: newWords[k], s: cue.words[k].s, e: cue.words[k].e });
       }
       out[res.i] = {
         startSec: cue.startSec, endSec: cue.endSec,
-        text: lines.join('\n'), words: words2
+        text: newText, words: words2
       };
       applied++;
     }
@@ -278,17 +276,7 @@
     var flat = String(newText == null ? '' : newText).replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
     if (!flat) return null;
     var words = flat.split(' ');
-    var wrapped = _wrapWords(words, maxChars, maxLines);
-    if (wrapped === null) {
-      /* Не влезает в maxChars×maxLines — best-effort: одно слово → как есть,
-         несколько — делим пополам по словам (гарантируем \n в тексте). */
-      if (words.length > 1) {
-        var half = Math.ceil(words.length / 2);
-        wrapped = words.slice(0, half).join(' ') + '\n' + words.slice(half).join(' ');
-      } else {
-        wrapped = words[0];
-      }
-    }
+    var wrapped = wrapCueLines(words, maxChars, maxLines, { hintBreakAfter: null });
     return {
       startSec: cue.startSec,
       endSec: cue.endSec,
@@ -541,6 +529,208 @@
     return out;
   }
 
+  /* ── Умный перенос субтитров: висячий предлог + балансировка + LLM-hint ─
+   *
+   * wrapCueLines(words, maxChars, maxLines, opts) → строка с '\n' между строками.
+   *
+   * Перебирает все валидные разбивки words на ≤maxLines строк (каждая ≤maxChars
+   * символов), выбирает с минимальным штрафом:
+   *   HANGING +100: последнее слово строки (не последней) — glue-слово
+   *   BALANCE +(max_len - min_len): балансировка длин строк
+   *   HINT   -30: разрыв совпадает с opts.hintBreakAfter (LLM-подсказка)
+   * Fallback при отсутствии валидных: _wrapWords, затем best-effort пополам.
+   */
+
+  /* Словарь glue-слов (предлоги, союзы, частицы). */
+  var _GLUE = (function () {
+    var g = {};
+    var words = [
+      'в','во','на','над','под','по','за','к','ко','с','со','о','об','от','до',
+      'из','у','для','без','при','про','через','между','перед',
+      'и','а','но','да','или','либо','что','чтобы','как','когда','если','чем','то',
+      'не','ни','же','бы','ли','уж'
+    ];
+    for (var _i = 0; _i < words.length; _i++) g[words[_i]] = 1;
+    return g;
+  }());
+
+  /** Является ли слово glue (сравнение без пунктуации, lowercase). */
+  function isGlueWord(w) {
+    var bare = String(w).toLowerCase().replace(/[.,!?…:;«»"'()\u2014\u2013-]/g, '');
+    return _GLUE[bare] === 1;
+  }
+
+  /**
+   * Длина строки-группы: слова[from..to] join пробелами.
+   * from и to включительно.
+   */
+  function _groupLen(words, from, to) {
+    var n = 0;
+    for (var i = from; i <= to; i++) {
+      if (i > from) n += 1; /* пробел */
+      n += words[i].length;
+    }
+    return n;
+  }
+
+  /**
+   * Рекурсивный перебор всех валидных разбивок words[start..end] на linesLeft
+   * непустых строк с каждой ≤maxChars. Каждая найденная разбивка — массив
+   * индексов концов строк (inclusive): [k0, k1, ...] длиной linesLeft.
+   * Результаты добавляются в out.
+   */
+  function _enumBreaks(words, start, end, linesLeft, breaksSoFar, out) {
+    if (linesLeft === 1) {
+      /* Последняя строка: words[start..end] должна влезть в maxChars. */
+      /* Проверка уже выполнена снаружи (мы добавляем end, только если влезает). */
+      var copy = [];
+      for (var ci = 0; ci < breaksSoFar.length; ci++) copy.push(breaksSoFar[ci]);
+      copy.push(end);
+      out.push(copy);
+      return;
+    }
+    /* Пробуем разместить первую из оставшихся строк на [start..k], k < end */
+    for (var k = start; k < end; k++) {
+      /* Строка [start..k] должна влезать в maxChars. */
+      var len = _groupLen(words, start, k);
+      if (len > out._maxChars) continue;
+      /* Следующая строка начинается с k+1. Проверим, влезет ли последняя часть [k+1..end] в maxChars при linesLeft-1 = 1 (это пессимистичная проверка нижней рекурсии — нет, рекурсия сама проверит). */
+      breaksSoFar.push(k);
+      /* Проверяем, что оставшимся словам [k+1..end] хватит хотя бы linesLeft-1 строк (не менее одного слова на строку). */
+      var remaining = end - k; /* слов от k+1 до end */
+      if (remaining >= linesLeft - 1) {
+        _enumBreaks(words, k + 1, end, linesLeft - 1, breaksSoFar, out);
+      }
+      breaksSoFar.pop();
+    }
+  }
+
+  /**
+   * Штраф за разбивку. breaks — массив конечных индексов строк (inclusive).
+   * words — исходный массив.
+   */
+  function _scoreSplit(words, breaks, hintBreakAfter) {
+    var penalty = 0;
+    /* HANGING: за каждую строку кроме последней, если её последнее слово — glue */
+    for (var i = 0; i < breaks.length - 1; i++) {
+      var lastW = words[breaks[i]];
+      if (isGlueWord(lastW)) penalty += 100;
+    }
+    /* BALANCE: (max_len - min_len) строк */
+    var minLen = -1, maxLen = -1;
+    var lineStart = 0;
+    for (var j = 0; j < breaks.length; j++) {
+      var ln = _groupLen(words, lineStart, breaks[j]);
+      if (minLen < 0 || ln < minLen) minLen = ln;
+      if (maxLen < 0 || ln > maxLen) maxLen = ln;
+      lineStart = breaks[j] + 1;
+    }
+    penalty += (maxLen - minLen);
+    /* HINT: если подсказка совпадает с одной из точек разрыва → бонус -30 */
+    if (typeof hintBreakAfter === 'number' && hintBreakAfter >= 0) {
+      for (var h = 0; h < breaks.length - 1; h++) {
+        if (breaks[h] === hintBreakAfter) { penalty -= 30; break; }
+      }
+    }
+    return penalty;
+  }
+
+  /**
+   * Умный перенос субтитров.
+   * @param {string[]} words  — слова
+   * @param {number}   maxChars  — макс символов в строке (дефолт 20)
+   * @param {number}   maxLines  — макс строк (дефолт 2)
+   * @param {Object}   opts      — {hintBreakAfter: number|null}
+   * @returns {string}  строки, разделённые '\n'
+   */
+  function wrapCueLines(words, maxChars, maxLines, opts) {
+    var mxC = (maxChars > 0) ? maxChars : 20;
+    var mxL = (maxLines > 0) ? maxLines : 2;
+    var o = opts || {};
+    var hint = (typeof o.hintBreakAfter === 'number') ? o.hintBreakAfter : null;
+
+    if (!words || !words.length) return '';
+
+    /* Если одно слово — возвращаем как есть, без переносов */
+    if (words.length === 1) return words[0];
+
+    /* Перебор всех валидных разбивок. */
+    var candidates = [];
+    candidates._maxChars = mxC; /* передаём максимум в рекурсию через свойство */
+
+    /* Проверяем, не превышает ли последняя строка (весь хвост) maxChars.
+     * _enumBreaks сам проверяет промежуточные строки, но последнюю — нет.
+     * Поэтому оборачиваем: добавляем результаты только если последняя строка влезает. */
+    var rawOut = [];
+    rawOut._maxChars = mxC;
+
+    /* Вызываем для разного числа строк от 1 до mxL */
+    for (var nl = 1; nl <= mxL; nl++) {
+      if (nl > words.length) break; /* нельзя больше строк, чем слов */
+      _enumBreaks(words, 0, words.length - 1, nl, [], rawOut);
+    }
+
+    /* Фильтруем: все строки должны влезать в maxChars. */
+    for (var ri = 0; ri < rawOut.length; ri++) {
+      var breaks = rawOut[ri];
+      var valid = true;
+      var ls = 0;
+      for (var bi = 0; bi < breaks.length; bi++) {
+        var gl = _groupLen(words, ls, breaks[bi]);
+        if (gl > mxC) { valid = false; break; }
+        ls = breaks[bi] + 1;
+      }
+      if (valid) candidates.push(breaks);
+    }
+
+    /* Если нет ни одной валидной разбивки — fallback */
+    if (!candidates.length) {
+      var fw = _wrapWords(words, mxC, mxL);
+      if (fw !== null) return fw;
+      if (words.length === 1) return words[0];
+      var half = Math.ceil(words.length / 2);
+      return words.slice(0, half).join(' ') + '\n' + words.slice(half).join(' ');
+    }
+
+    /* Выбираем кандидата с минимальным штрафом */
+    var bestBreaks = null;
+    var bestScore = 0;
+    for (var ci = 0; ci < candidates.length; ci++) {
+      var sc = _scoreSplit(words, candidates[ci], hint);
+      /* При равенстве — предпочесть меньше строк, затем ближе к центру */
+      var better = false;
+      if (bestBreaks === null) {
+        better = true;
+      } else if (sc < bestScore) {
+        better = true;
+      } else if (sc === bestScore) {
+        /* меньше строк лучше */
+        if (candidates[ci].length < bestBreaks.length) {
+          better = true;
+        } else if (candidates[ci].length === bestBreaks.length) {
+          /* ближе к центру: смотрим первую точку разрыва (для 2 строк — единственная) */
+          var center = (words.length - 1) / 2;
+          var distNew = Math.abs(candidates[ci][0] - center);
+          var distBest = Math.abs(bestBreaks[0] - center);
+          if (distNew < distBest) better = true;
+        }
+      }
+      if (better) {
+        bestBreaks = candidates[ci];
+        bestScore = sc;
+      }
+    }
+
+    /* Собираем строки по bestBreaks */
+    var lines = [];
+    var lstart = 0;
+    for (var li = 0; li < bestBreaks.length; li++) {
+      lines.push(words.slice(lstart, bestBreaks[li] + 1).join(' '));
+      lstart = bestBreaks[li] + 1;
+    }
+    return lines.join('\n');
+  }
+
   /* ── SRT для caption-дорожки Premiere (importSrtAsCaptions) ──────────── */
 
   /** Секунды → SRT-время HH:MM:SS,mmm. */
@@ -584,6 +774,8 @@
     parseVisionBatchAnswer: parseVisionBatchAnswer,
     assignClipOffsets: assignClipOffsets,
     srtTime: srtTime,
-    buildSrt: buildSrt
+    buildSrt: buildSrt,
+    isGlueWord: isGlueWord,
+    wrapCueLines: wrapCueLines
   };
 })(window);

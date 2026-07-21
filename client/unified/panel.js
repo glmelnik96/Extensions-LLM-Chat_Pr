@@ -7694,7 +7694,13 @@ PanelBoot.run('ИИ: монтаж', function () {
               role: 'system',
               content: 'Ты корректор русских субтитров. Исправляй ТОЛЬКО орфографию и пунктуацию. ' +
                 'ЗАПРЕЩЕНО добавлять, удалять или заменять слова, менять их порядок или смысл. ' +
-                'Верни строго JSON {"cues":[{"i":<номер>,"text":"<исправленный текст>"}]} — ' +
+                'Помимо исправленного text, для каждого титра из 4 и более слов ты МОЖЕШЬ (не обязан) ' +
+                'указать наилучшую точку переноса на 2 строки — поле "br": номер слова (1-based по словам ' +
+                'исправленного text), ПОСЛЕ которого следует разрыв строки. Выбирай естественную границу фразы: ' +
+                'не разрывай предлог и следующее за ним существительное, не оставляй предлог или союз в конце ' +
+                'первой строки. Если титр короткий или укладывается в одну строку — поле br опускай. ' +
+                'Слова НЕ менять — это по-прежнему строго запрещено; br — только подсказка разбивки. ' +
+                'Верни строго JSON {"cues":[{"i":<номер>,"text":"<исправленный текст>","br":<число — опустить если не нужен>}]} — ' +
                 'ТОЛЬКО изменённые титры (если правок нет — {"cues":[]}).'
             },
             { role: 'user', content: JSON.stringify({ cues: batch }) }
@@ -7705,8 +7711,22 @@ PanelBoot.run('ИИ: монтаж', function () {
         var parsed = null;
         try { parsed = JSON.parse(content); } catch (ePj) { throw new Error('модель вернула не-JSON'); }
         var results = (parsed && parsed.cues && parsed.cues.length) ? parsed.cues : [];
+        /* Перевод br (1-based, из ответа LLM) → hintBreakAfter (0-based, для applyProofread).
+           br=N означает «перенос после N-го слова» → hintBreakAfter = N-1.
+           Валидируем: br должен быть целым числом в диапазоне [1, wordCount-1];
+           wordCount берём из r.text исправленного титра. Некорректный br — игнорируем. */
+        for (var bi = 0; bi < results.length; bi++) {
+          var br = results[bi] && results[bi].br;
+          if (typeof br === 'number' && br === Math.floor(br) && br >= 1) {
+            var brText = typeof results[bi].text === 'string' ? results[bi].text : '';
+            var wordCount = brText.trim().split(/\s+/).length;
+            if (br < wordCount) {
+              results[bi].hintBreakAfter = br - 1;
+            }
+          }
+        }
         if (results.length) {
-          var r = ReelsPipeline.applyProofread(out, results);
+          var r = ReelsPipeline.applyProofread(out, results, {});
           out = r.cues;
           applied += r.applied;
           rejected += r.rejected;

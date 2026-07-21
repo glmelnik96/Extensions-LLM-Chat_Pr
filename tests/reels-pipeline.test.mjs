@@ -119,7 +119,8 @@ describe('proofread', () => {
     const r = RP.applyProofread(cues, [{ i: 0, text: 'привет мир' }]);
     assert.equal(r.applied, 1);
     assert.equal(r.rejected, 0);
-    assert.equal(r.cues[0].text, 'привет\nмир');
+    /* wrapCueLines предпочитает одну строку, когда оба слова влезают (10 симв ≤ 20) */
+    assert.equal(r.cues[0].text, 'привет мир');
     assert.equal(r.cues[0].words[0].w, 'привет');
     assert.equal(r.cues[0].words[0].s, 0);
     assert.equal(r.cues[0].words[1].e, 2);
@@ -131,6 +132,138 @@ describe('proofread', () => {
     assert.equal(r.applied, 0);
     assert.equal(r.rejected, 1);
     assert.equal(r.cues[0].text, 'привет мир');
+  });
+  it('applyProofread: висячий предлог убирается wrapCueLines (не остаётся в конце первой строки)', () => {
+    /* Старая пересборка по старым строкам могла оставить «в» на первой строке.
+       wrapCueLines штрафует за висячий предлог и переносит его на вторую строку.
+       Слова: «пашол в магазин» → правка → «пошёл в магазин».
+       Оригинал был разбит как «пашол в\nмагазин» — предлог висел.
+       wrapCueLines для ['пошёл','в','магазин'] при maxChars=20 вернёт одну строку
+       (14 симв влезает), т.е. предлог НЕ окажется последним словом первой строки. */
+    const cues = [{
+      startSec: 0, endSec: 3,
+      /* Исходный текст: «пашол в» на первой строке (висячий предлог, опечатка) */
+      text: 'пашол в\nмагазин',
+      words: [
+        { w: 'пашол', s: 0, e: 1 },
+        { w: 'в', s: 1, e: 1.5 },
+        { w: 'магазин', s: 1.5, e: 3 }
+      ]
+    }];
+    const r = RP.applyProofread(cues, [{ i: 0, text: 'пошёл в магазин' }]);
+    assert.equal(r.applied, 1, 'правка принята');
+    /* wrapCueLines должна убрать «в» с конца первой строки (либо одна строка, либо «в» на второй) */
+    const lines = r.cues[0].text.split('\n');
+    if (lines.length > 1) {
+      const firstLineLastWord = lines[0].split(' ').slice(-1)[0];
+      assert.notEqual(firstLineLastWord, 'в', 'предлог не висит в конце первой строки: ' + r.cues[0].text);
+    }
+    /* Лимит символов соблюдён на каждой строке */
+    for (var li = 0; li < lines.length; li++) {
+      assert.ok(lines[li].length <= 20, 'строка ≤20 симв: ' + lines[li]);
+    }
+  });
+  it('applyProofread: число и порядок cue.words сохранены, тайминги не меняются', () => {
+    const cues = [{
+      startSec: 5, endSec: 9,
+      text: 'выхожу на работу',
+      words: [
+        { w: 'выхожу', s: 5, e: 6 },
+        { w: 'на', s: 6, e: 7 },
+        { w: 'работу', s: 7, e: 9 }
+      ]
+    }];
+    /* Правка: «выхажу» → «выхожу» (Левенштейн 1) */
+    const r = RP.applyProofread(cues, [{ i: 0, text: 'выхожу на работу' }]);
+    /* «без изменений» — fixedFlat === origFlat, правка пропускается */
+    assert.equal(r.applied, 0);
+    assert.equal(r.cues[0].words.length, 3);
+    assert.equal(r.cues[0].words[0].s, 5);
+    assert.equal(r.cues[0].words[2].e, 9);
+
+    /* Реальная правка опечатки */
+    const cues2 = [{
+      startSec: 5, endSec: 9,
+      text: 'выхажу на работу',
+      words: [
+        { w: 'выхажу', s: 5, e: 6 },
+        { w: 'на', s: 6, e: 7 },
+        { w: 'работу', s: 7, e: 9 }
+      ]
+    }];
+    const r2 = RP.applyProofread(cues2, [{ i: 0, text: 'выхожу на работу' }]);
+    assert.equal(r2.applied, 1);
+    /* порядок и тайминги words сохранены */
+    assert.equal(r2.cues[0].words.length, 3);
+    assert.equal(r2.cues[0].words[0].s, 5);
+    assert.equal(r2.cues[0].words[1].s, 6);
+    assert.equal(r2.cues[0].words[2].e, 9);
+    /* text разбит по wrapCueLines (лимит 20, все 3 слова влезают = одна строка) */
+    assert.equal(r2.cues[0].text, 'выхожу на работу');
+  });
+
+  it('applyProofread: hintBreakAfter валидный — разрыв по подсказке', () => {
+    /* 6 слов, maxChars=20 (дефолт). Без подсказки wrapCueLines режет по балансу.
+       С hintBreakAfter=2 (после 3-го слова, 0-based=2) ожидаем разрыв там,
+       если обе строки укладываются в 20 символов.
+       Слова: 'иду', 'домой', 'потому', 'что', 'устал', 'сегодня'
+       Подсказка: hintBreakAfter=2 → строки 'иду домой потому'(16) + 'что устал сегодня'(17) */
+    const cues = [{
+      startSec: 0, endSec: 4,
+      text: 'иду домой патаму что устал сегодня',
+      words: [
+        { w: 'иду', s: 0, e: 0.5 },
+        { w: 'домой', s: 0.5, e: 1 },
+        { w: 'патаму', s: 1, e: 1.5 },
+        { w: 'что', s: 1.5, e: 2 },
+        { w: 'устал', s: 2, e: 3 },
+        { w: 'сегодня', s: 3, e: 4 }
+      ]
+    }];
+    const results = [{ i: 0, text: 'иду домой потому что устал сегодня', hintBreakAfter: 2 }];
+    const r = RP.applyProofread(cues, results, { maxCharsPerLine: 20, maxLines: 2 });
+    assert.equal(r.applied, 1, 'правка применена');
+    /* Подсказка hintBreakAfter=2 → разрыв после 'потому'; обе строки ≤20 симв */
+    assert.equal(r.cues[0].text, 'иду домой потому\nчто устал сегодня');
+    const lines = r.cues[0].text.split('\n');
+    for (const line of lines) {
+      assert.ok(line.length <= 20, 'строка ≤20 симв: «' + line + '»');
+    }
+  });
+
+  it('applyProofread: hintBreakAfter невалидный — корректная разбивка без падения', () => {
+    /* hintBreakAfter=99 (за пределами слов) — должен игнорироваться, разбивка детерминированная */
+    const cues = [{
+      startSec: 0, endSec: 3,
+      text: 'превет красивый мир',
+      words: [
+        { w: 'превет', s: 0, e: 1 },
+        { w: 'красивый', s: 1, e: 2 },
+        { w: 'мир', s: 2, e: 3 }
+      ]
+    }];
+    const results = [{ i: 0, text: 'привет красивый мир', hintBreakAfter: 99 }];
+    const r = RP.applyProofread(cues, results, { maxCharsPerLine: 20, maxLines: 2 });
+    assert.equal(r.applied, 1, 'правка применена несмотря на невалидный hint');
+    assert.ok(typeof r.cues[0].text === 'string' && r.cues[0].text.length > 0, 'text непустой');
+    /* Все строки ≤20 симв */
+    const lines = r.cues[0].text.split('\n');
+    for (const line of lines) {
+      assert.ok(line.length <= 20, 'строка ≤20 симв: «' + line + '»');
+    }
+  });
+
+  it('applyProofread: без hintBreakAfter — поведение как раньше (обратная совместимость)', () => {
+    /* results без поля hintBreakAfter — должно работать идентично старому поведению */
+    const cues = [{
+      startSec: 0, endSec: 2,
+      text: 'превет мир',
+      words: [{ w: 'превет', s: 0, e: 1 }, { w: 'мир', s: 1, e: 2 }]
+    }];
+    const results = [{ i: 0, text: 'привет мир' }]; /* нет поля br и нет hintBreakAfter */
+    const r = RP.applyProofread(cues, results, {});
+    assert.equal(r.applied, 1);
+    assert.equal(r.cues[0].text, 'привет мир'); /* одна строка — оба слова влезают */
   });
 });
 
@@ -493,5 +626,173 @@ describe('offsetPctFromCx', () => {
     assert.equal(RP.offsetPctFromCx('x'), null);
     assert.equal(RP.offsetPctFromCx(undefined), null);
     assert.equal(RP.offsetPctFromCx(NaN), null);
+  });
+});
+
+/* ═══ isGlueWord ═══ */
+describe('ReelsPipeline.isGlueWord', () => {
+  it('предлоги распознаются как glue', () => {
+    assert.equal(RP.isGlueWord('в'), true);
+    assert.equal(RP.isGlueWord('на'), true);
+    assert.equal(RP.isGlueWord('для'), true);
+    assert.equal(RP.isGlueWord('через'), true);
+    assert.equal(RP.isGlueWord('перед'), true);
+  });
+  it('союзы распознаются как glue', () => {
+    assert.equal(RP.isGlueWord('и'), true);
+    assert.equal(RP.isGlueWord('но'), true);
+    assert.equal(RP.isGlueWord('чтобы'), true);
+    assert.equal(RP.isGlueWord('когда'), true);
+  });
+  it('частицы распознаются как glue', () => {
+    assert.equal(RP.isGlueWord('не'), true);
+    assert.equal(RP.isGlueWord('ни'), true);
+    assert.equal(RP.isGlueWord('бы'), true);
+    assert.equal(RP.isGlueWord('уж'), true);
+  });
+  it('обычные слова не являются glue', () => {
+    assert.equal(RP.isGlueWord('магазин'), false);
+    assert.equal(RP.isGlueWord('пошёл'), false);
+    assert.equal(RP.isGlueWord('привет'), false);
+  });
+  it('регистр и пунктуация игнорируются при glue-проверке', () => {
+    assert.equal(RP.isGlueWord('В'), true);
+    assert.equal(RP.isGlueWord('И,'), true);
+    assert.equal(RP.isGlueWord('НЕ'), true);
+  });
+});
+
+/* ═══ wrapCueLines ═══ */
+describe('ReelsPipeline.wrapCueLines', () => {
+  /*
+   * Тест 1: висячий предлог
+   * words: ['он', 'пошёл', 'в', 'магазин'], maxChars=12
+   * Жадный результат: 'он пошёл в' (10) + 'магазин' (7) — 'в' висит в конце строки 1
+   * Умный результат:  'он пошёл' (8) + 'в магазин' (9) — предлог уходит вниз
+   */
+  it('висячий предлог уезжает в начало следующей строки', () => {
+    const words = ['он', 'пошёл', 'в', 'магазин'];
+    const result = RP.wrapCueLines(words, 12, 2, {});
+    assert.equal(result, 'он пошёл\nв магазин',
+      'предлог «в» должен быть в начале второй строки, а не в конце первой');
+  });
+
+  /*
+   * Тест 2: балансировка строк
+   * words: ['один', 'два', 'три', 'четыре'], maxChars=18
+   * Вся строка 'один два три четыре' = 19 симв > 18 → в одну строку не влезает.
+   * Варианты 2-строчной разбивки (без glue-проблем):
+   *   [0]: 'один'(4)    + 'два три четыре'(14) → balance 10
+   *   [1]: 'один два'(8)+ 'три четыре'(10)     → balance 2  ← победитель
+   *   [2]: 'один два три'(12)+'четыре'(6)       → balance 6
+   */
+  it('балансировка: выбирается разбивка с наименьшим разбросом длин строк', () => {
+    const words = ['один', 'два', 'три', 'четыре'];
+    const result = RP.wrapCueLines(words, 18, 2, {});
+    assert.equal(result, 'один два\nтри четыре');
+  });
+
+  /*
+   * Тест 3: лимит символов соблюдён
+   * Для любого валидного входа ни одна строка (кроме fallback сверхдлинного слова)
+   * не должна превышать maxChars.
+   */
+  it('лимит символов соблюдён для всех строк', () => {
+    const words = ['мы', 'идём', 'в', 'старый', 'парк'];
+    const maxChars = 12;
+    const result = RP.wrapCueLines(words, maxChars, 2, {});
+    const lines = result.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      assert.ok(lines[i].length <= maxChars,
+        'строка «' + lines[i] + '» длиннее ' + maxChars);
+    }
+  });
+
+  /*
+   * Тест 4: hintBreakAfter honored
+   * words: ['раз', 'два', 'три'], maxChars=20, hint=1
+   * Оба варианта ('раз' + 'два три', 'раз два' + 'три') одинаково сбалансированы
+   * по balance (|7-3|=4 vs |7-3|=4), но hint=1 даёт -30 для split-after-1 → winner.
+   */
+  it('hintBreakAfter honored при прочих равных', () => {
+    const words = ['раз', 'два', 'три'];
+    const result = RP.wrapCueLines(words, 20, 2, { hintBreakAfter: 1 });
+    assert.equal(result, 'раз два\nтри');
+  });
+
+  /*
+   * Тест 5: hintBreakAfter игнорируется когда невалиден
+   * words: ['один', 'два', 'три'], maxChars=8
+   * Все возможные разбивки: split-0 'один'(4)+'два три'(7) и split-1 'один два'(8)+'три'(3)
+   * hint=2 указывает на break после индекса 2 (= последнее слово), что невалидно.
+   * Функция должна всё равно вернуть валидную разбивку.
+   * balance: split-0 = 7-4 = 3; split-1 = 8-3 = 5 → split-0 ('один\nдва три') побеждает.
+   */
+  it('hintBreakAfter игнорируется когда указывает на невалидный разрыв', () => {
+    const words = ['один', 'два', 'три'];
+    const result = RP.wrapCueLines(words, 8, 2, { hintBreakAfter: 2 });
+    // Функция должна вернуть валидный результат, не падать
+    assert.ok(typeof result === 'string' && result.length > 0, 'результат — непустая строка');
+    // Все строки результата должны не превышать maxChars=8
+    const lines = result.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      assert.ok(lines[i].length <= 8,
+        'строка «' + lines[i] + '» длиннее 8 (невалидный hint не должен ломать разбивку)');
+    }
+    // Balance: split-0 (balance=3) лучше split-1 (balance=5), hint=2 не применяется
+    assert.equal(result, 'один\nдва три');
+  });
+
+  /*
+   * Тест 6: fallback — одно сверхдлинное слово
+   * words: ['Константинополь'], maxChars=10
+   * Слово (15 символов) > maxChars=10. Нет валидной разбивки.
+   * Функция должна вернуть слово как есть, не падать.
+   */
+  it('fallback: одно сверхдлинное слово возвращается как есть, не падает', () => {
+    const word = 'Константинополь'; // 15 символов
+    const result = RP.wrapCueLines([word], 10, 2, {});
+    assert.equal(result, word);
+    assert.ok(result.indexOf('\n') === -1, 'нет переноса строки');
+  });
+
+  /*
+   * Тест 7: одна строка помещается целиком — без переносов
+   * words: ['раз', 'два'], maxChars=20
+   * Оба слова вместе = 7 символов < 20 → 1-строчный вариант предпочтительнее.
+   */
+  it('одна строка помещается целиком — без переносов', () => {
+    const result = RP.wrapCueLines(['раз', 'два'], 20, 2, {});
+    assert.equal(result, 'раз два');
+    assert.ok(result.indexOf('\n') === -1, 'нет переноса строки');
+  });
+
+  /* Тест 8: предлог «для» висит в конце строки → уходит вниз */
+  it('предлог «для» не остаётся в конце строки 1', () => {
+    /* 'иду для' = 7 символов, 'встречи' = 7 → жадный оставил бы 'для' в конце
+     * Умный: 'иду' (3) + 'для встречи' (11) → нет висячего, balance = 8 */
+    const words = ['иду', 'для', 'встречи'];
+    const result = RP.wrapCueLines(words, 12, 2, {});
+    const lines = result.split('\n');
+    if (lines.length > 1) {
+      assert.ok(
+        !RP.isGlueWord(lines[0].split(' ').pop()),
+        'последнее слово первой строки не должно быть glue: «' + lines[0] + '»'
+      );
+    }
+  });
+
+  /* Тест 9: дефолтные значения — maxChars=0 и maxLines=0 используют значения по умолчанию */
+  it('maxChars=0 и maxLines=0 → используются дефолты 20 и 2', () => {
+    const words = ['слово', 'раз', 'два'];
+    const result = RP.wrapCueLines(words, 0, 0, {});
+    // С дефолтным maxChars=20 все 3 слова влезают в одну строку
+    assert.equal(result, 'слово раз два');
+  });
+
+  /* Тест 10: пустой массив слов → пустая строка */
+  it('пустой массив слов → пустая строка', () => {
+    const result = RP.wrapCueLines([], 20, 2, {});
+    assert.equal(result, '');
   });
 });
