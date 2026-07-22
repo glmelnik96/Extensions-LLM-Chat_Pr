@@ -749,6 +749,10 @@ PanelBoot.run('ИИ: монтаж', function () {
               type: 'number',
               description: 'Дыхание в секундах вокруг каждого removeInterval (по умолчанию 0.3). Каждый интервал ужимается на padding с обеих сторон, чтобы оставить запас перед/после фразы — речь не будет звучать обрезанной. 0 = резать впритык. Применяется ДО привязки к границам сегментов. Хорошие значения: 0.2 для агрессивного монтажа, 0.3 default, 0.5 для медитативной речи.'
             },
+            leadInSec: {
+              type: 'number',
+              description: 'Лид-ин зазор тишины в НАЧАЛЕ каждого сохраняемого фрагмента (по умолчанию 0.12). Применяется ПОСЛЕ привязки к границам и не съедается снапом: конец выреза сдвигается чуть раньше, поэтому следующий фрагмент открывается с коротким «вдохом», а не кадр-в-кадр с репликой. Окончания фраз не трогает. 0 = без лид-ина.'
+            },
             keepSummary: {
               type: 'array',
               items: {
@@ -1470,6 +1474,66 @@ PanelBoot.run('ИИ: монтаж', function () {
       out.push({ startSec: s, endSec: e, reason: iv.reason });
     }
     return out;
+  }
+
+  /**
+   * Лид-ин зазор в начале сохраняемого фрагмента (2026-07-22).
+   * Проблема: конец фразы звучит хорошо (Whisper пишет хвост сегмента с запасом),
+   * но НАЧАЛО следующего фрагмента открывается «кадр-в-кадр» с репликой — старты
+   * сегментов Whisper тайтовые (ровно/чуть позже онсета речи), на слух клип реплики.
+   * Симметричный _padRemoveIntervals давал зазор и на старте, но
+   * snapIntervalsToSegmentBoundaries снапал padded endSec обратно к границе абзаца
+   * (= онсету следующего фрагмента), стирая лид-ин (подтверждено live-прогоном).
+   * Решение: ФИНАЛЬНЫЙ сдвиг ПОСЛЕ snap+refine+merge — тянем КОНЕЦ выреза чуть раньше
+   * (endSec -= shift), чтобы keep-фрагмент открывался коротким «вдохом» тишины ПЕРЕД
+   * словом (возвращаем недобор Whisper-онсета). Окончания фраз (startSec выреза) НЕ
+   * трогаем.
+   * SILENCE-AWARE (иначе бага, пойманная live): сдвигаем ТОЛЬКО сквозь тишину,
+   * непосредственно предшествующую концу выреза (пауза перед словом на вырезаемой
+   * стороне). Если перед endSec речь (endSec = хвост вырезанного слова) — сдвиг 0,
+   * иначе в ролик просочился бы обрывок вырезанной реплики. Без данных о тишине
+   * (silences пуст) — тоже 0 (безопасно). Сдвиг только внутрь выреза → перекрытий
+   * не создаёт (merge уже сделан); клампим по MIN_DURATION.
+   */
+  function _applyLeadInGap(intervals, leadInSec, silences) {
+    if (!Array.isArray(intervals) || !intervals.length) return intervals;
+    if (!leadInSec || leadInSec <= 0) return intervals;
+    var MIN_DURATION = 0.15;
+    var EDGE_EPS = 0.08; /* endSec может стоять чуть внутри/снаружи края тишины */
+    var sils = [];
+    if (Array.isArray(silences)) {
+      for (var k = 0; k < silences.length; k++) {
+        var sv = silences[k] || {};
+        var ss = (typeof sv.startSec === 'number') ? sv.startSec : sv.start;
+        var se = (typeof sv.endSec === 'number') ? sv.endSec : sv.end;
+        if (typeof ss === 'number' && typeof se === 'number' &&
+            isFinite(ss) && isFinite(se) && se > ss) sils.push([ss, se]);
+      }
+    }
+    /* Сколько тишины лежит ВПРИТЫК перед концом выреза e (пауза перед словом
+       следующего фрагмента на вырезаемой стороне). 0 = перед e речь → без сдвига. */
+    function silentRoomBefore(e) {
+      var room = 0;
+      for (var i = 0; i < sils.length; i++) {
+        var a = sils[i][0], b = sils[i][1];
+        if (e <= b + EDGE_EPS && e > a + 0.01) {
+          var r = Math.min(e, b) - a;
+          if (r > room) room = r;
+        }
+      }
+      return room;
+    }
+    return intervals.map(function (iv) {
+      if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') return iv;
+      var room = (iv.endSec - iv.startSec) - MIN_DURATION;
+      if (room <= 0) return iv;
+      var shift = Math.min(leadInSec, room, silentRoomBefore(iv.endSec));
+      if (shift <= 0) return iv;
+      var copy = {};
+      for (var kk in iv) { if (Object.prototype.hasOwnProperty.call(iv, kk)) copy[kk] = iv[kk]; }
+      copy.endSec = iv.endSec - shift;
+      return copy;
+    });
   }
 
   /**
@@ -3222,6 +3286,12 @@ PanelBoot.run('ИИ: монтаж', function () {
     var _refined = DeterministicPipelines.refineCutBoundaries(
       snapIntervalsToSegmentBoundaries(paddedIntervals), _cutSilences, { segments: _cutSegments });
     var snappedIntervals = mergeRemoveIntervals(_refined.intervals);
+    /* Лид-ин зазор (2026-07-22): ПОСЛЕ snap+refine+merge тянем конец выреза чуть
+       раньше СКВОЗЬ ТИШИНУ, чтобы следующий фрагмент открывался коротким «вдохом»
+       перед словом, а не кадр-в-кадр с репликой. Здесь — не съедается снапом (он уже
+       отработал). Silence-aware по тем же _cutSilences, что и refineCutBoundaries. */
+    var _leadInSec = typeof args.leadInSec === 'number' ? Math.max(0, args.leadInSec) : 0.12;
+    snappedIntervals = _applyLeadInGap(snappedIntervals, _leadInSec, _cutSilences);
     var verification = computeVerification(snappedIntervals);
 
     /* 19.06.2026: ре-валидация хронометража ПОСЛЕ снапа к границам абзацев.
@@ -4226,7 +4296,10 @@ PanelBoot.run('ИИ: монтаж', function () {
         resolve({ validationError: vr.error });
         return;
       }
-      /* Snap к границам сегментов + merge перекрытий (host не merge'ит) */
+      /* Snap к границам сегментов + merge перекрытий (host не merge'ит).
+         Лид-ин зазор тут НЕ применяем: это гейтованный прямой agent-путь без данных
+         о тишине (_cutSilences), а silence-aware лид-ин без них = no-op. Реальный
+         apply идёт через _pendingProposal, где лид-ин уже вшит на propose-пути. */
       args = Object.assign({}, args, {
         removeIntervals: mergeRemoveIntervals(snapIntervalsToSegmentBoundaries(args.removeIntervals || []))
       });
