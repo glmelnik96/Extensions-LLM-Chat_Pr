@@ -8016,8 +8016,15 @@ PanelBoot.run('ИИ: монтаж', function () {
       });
     }
 
-    async function reelsProofread(cues, settings, onProgress) {
+    async function reelsProofread(cues, settings, onProgress, onFallback) {
       if (!settings.apiKey || !settings.chatModel) throw new Error('нет chat-модели или API-ключа');
+      /* Фолбэк моделей (иначе при офлайн-основной GLM-5.1 корректура висела бы
+         5×300с ≈ 25 мин на «0 из N», без переключения — инцидент 22.07.
+         cloudru-client сам переключится на живую при 5xx/404/таймауте). */
+      var fbMap = (settings.modelFallbacks && typeof settings.modelFallbacks === 'object')
+        ? settings.modelFallbacks : {};
+      var fbList = (fbMap[settings.chatModel] && fbMap[settings.chatModel].length)
+        ? fbMap[settings.chatModel].slice() : [];
       var out = cues;
       var applied = 0, rejected = 0;
       for (var off = 0; off < cues.length; off += REELS_PROOFREAD_BATCH) {
@@ -8031,6 +8038,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           baseUrl: settings.baseUrl,
           apiKey: settings.apiKey,
           model: settings.chatModel,
+          fallbackModels: fbList,
+          onModelFallback: function (info) { if (typeof onFallback === 'function') onFallback(info); },
           temperature: 0,
           enableThinking: false,
           responseFormat: 'json_object',
@@ -8316,6 +8325,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         try {
           var pr = await reelsProofread(cues, settings, function (done, total) {
             toolsStatusUi.show('Рилс: корректура субтитров ' + done + ' из ' + total + '…', true);
+          }, function (info) {
+            toolsStatusUi.show('Рилс: модель ' + info.from + ' недоступна — переключаюсь на ' + info.to + '…', true);
           });
           cues = pr.cues;
           proofApplied = pr.applied;
@@ -8606,6 +8617,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           try {
             var pr = await reelsProofread(cues, settings, function (done, total) {
               toolsStatusUi.show('Субтитры: корректура ' + done + ' из ' + total + '…', true);
+            }, function (info) {
+              toolsStatusUi.show('Субтитры: модель ' + info.from + ' недоступна — переключаюсь на ' + info.to + '…', true);
             });
             cues = pr.cues;
             proofApplied = pr.applied;
