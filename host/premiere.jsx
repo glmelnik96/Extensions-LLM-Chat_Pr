@@ -2060,7 +2060,22 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
 
     for (i = 0; i < list.length; i++) {
       m = list[i];
-      if (typeof m.timeSec !== 'number' || isNaN(m.timeSec)) continue;
+      /* 22.07.2026: строка без валидного timeSec РАНЬШЕ молча пропускалась
+         (continue без записи) — вызывающий видел count<input, но без причины
+         (silent no-op, пойманный внешним premiere-autopilot). Теперь пишем
+         диагностику в failed[]. Частая ошибка — startSec вместо timeSec: host
+         читает именно timeSec, указываем это явно. */
+      if (typeof m.timeSec !== 'number' || isNaN(m.timeSec)) {
+        var _hasStartSec = m && typeof m.startSec === 'number' && !isNaN(m.startSec);
+        failed.push({
+          timeSec: null,
+          name: (m && m.name) || '',
+          error: _hasStartSec
+            ? 'Маркер задан через startSec=' + m.startSec + ', но host читает timeSec — переименуйте поле в timeSec.'
+            : 'Пропущен timeSec (число секунд) — маркер не создан.'
+        });
+        continue;
+      }
       /* 10.07.2026 (Волна 1.4): негативный timeSec — createMarker молча ставит
          в 0 или падает в зависимости от сборки. Отклоняем явно (last line). */
       if (m.timeSec < 0) {
