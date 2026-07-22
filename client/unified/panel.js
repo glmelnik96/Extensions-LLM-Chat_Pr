@@ -5223,6 +5223,41 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   var btnViewTr = document.getElementById('btn-view-transcript');
   if (btnViewTr) btnViewTr.onclick = openTranscriptViewer;
+
+  /* ── Ручной переключатель модели (сессия) ───────────────────────────
+     Заполняем из FM_DEFAULTS.knownModels, текущее значение = эффективная
+     chat-модель (override сессии либо дефолт). Выбор пишем в ContextStore
+     (не персистится — по запросу пользователя, сброс при перезапуске).
+     Автоматический modelFallbacks остаётся поверх выбранной модели. */
+  (function () {
+    var sel = document.getElementById('model-switch');
+    if (!sel || typeof ContextStore === 'undefined' || !ContextStore.setSessionChatModel) return;
+    var d = typeof FM_DEFAULTS !== 'undefined' ? FM_DEFAULTS : {};
+    var known = (d.knownModels && d.knownModels.length) ? d.knownModels : [];
+    if (!known.length) {
+      var bar = document.getElementById('model-bar');
+      if (bar) bar.hidden = true;
+      return;
+    }
+    var cur = ContextStore.getSessionChatModel ? ContextStore.getSessionChatModel() : '';
+    sel.innerHTML = '';
+    for (var i = 0; i < known.length; i++) {
+      if (!known[i] || !known[i].id) continue;
+      var opt = document.createElement('option');
+      opt.value = known[i].id;
+      opt.textContent = known[i].label || known[i].id;
+      if (known[i].id === cur) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.onchange = function () {
+      var applied = ContextStore.setSessionChatModel(sel.value);
+      if (applied !== sel.value) sel.value = applied; /* отклонён невалидный — вернуть */
+      if (typeof statusUi !== 'undefined' && statusUi.show) {
+        statusUi.show('Модель переключена на ' + applied + ' (на сессию)', false);
+        setTimeout(function () { statusUi.hide && statusUi.hide(); }, 1800);
+      }
+    };
+  })();
   (function () {
     var m = _trModalEls();
     if (m.close) m.close.onclick = closeTranscriptViewer;

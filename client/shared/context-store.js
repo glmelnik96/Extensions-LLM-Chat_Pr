@@ -16,6 +16,11 @@
   /** Один файл в CEP userData — общий для всех Extension Id пакета (T3). */
   var _transcriptUserDataFile = null;
 
+  /* Ручной переключатель модели (меню «Ещё ▾»): переопределяет chatModel НА
+     СЕССИЮ. Живёт в памяти модуля — сбрасывается при перезапуске панели (по
+     запросу пользователя не персистим). null = используем fm-defaults.chatModel. */
+  var _sessionChatModelOverride = null;
+
   function keyMessages(panelId) {
     return PREFIX + 'msg_' + panelId;
   }
@@ -229,12 +234,37 @@
       } catch (eU) {}
     },
 
+    /* Ручной переключатель модели (сессия). id из FM_DEFAULTS.knownModels либо
+       '' / null для сброса на дефолт. Валидируем по knownModels, чтобы UI не
+       подсунул несуществующую. Возврат — фактически применённый id. */
+    setSessionChatModel: function (id) {
+      var d = typeof FM_DEFAULTS !== 'undefined' ? FM_DEFAULTS : {};
+      var known = (d.knownModels && d.knownModels.length) ? d.knownModels : [];
+      var wanted = String(id == null ? '' : id).trim();
+      if (!wanted) { _sessionChatModelOverride = null; return this.getSessionChatModel(); }
+      for (var i = 0; i < known.length; i++) {
+        if (known[i] && known[i].id === wanted) { _sessionChatModelOverride = wanted; return wanted; }
+      }
+      return this.getSessionChatModel();
+    },
+    /** Текущая эффективная chat-модель: override сессии либо дефолт. */
+    getSessionChatModel: function () {
+      var d = typeof FM_DEFAULTS !== 'undefined' ? FM_DEFAULTS : {};
+      return _sessionChatModelOverride || String(d.chatModel || '').trim();
+    },
+    /** true — модель переопределена вручную (не дефолт). */
+    isSessionChatModelOverridden: function () {
+      return _sessionChatModelOverride != null;
+    },
+
     getResolvedSettings: function () {
       var d = typeof FM_DEFAULTS !== 'undefined' ? FM_DEFAULTS : {};
       var sec = typeof FM_SECRETS !== 'undefined' ? FM_SECRETS : {};
       var baseUrl = String(d.baseUrl || '').replace(/\/+$/, '');
       var apiKey = String(sec.apiKey || '').trim();
-      var chatModel = String(d.chatModel || '').trim();
+      /* Ручной override (сессия) побеждает дефолт — влияет на chatModel и
+         производный activeAgentModel (чат, агент/монтаж, корректура титров). */
+      var chatModel = _sessionChatModelOverride || String(d.chatModel || '').trim();
       var codeModel = String(d.codeModel || '').trim();
       var whisperModel = String(d.whisperModel || '').trim();
       var analysisModel = String(d.analysisModel || '').trim();

@@ -287,8 +287,18 @@ describe('cloudru-client.isModelUnavailable', () => {
     assert.equal(U(Object.assign(new Error('x'), { httpStatus: 503 })), true);
     assert.equal(U(Object.assign(new Error('model not found'), { httpStatus: 404 })), true);
   });
-  test('400/429 (кривой запрос / rate-limit) → НЕ фолбэк', () => {
+  test('403 (RBAC: модель недоступна аккаунту) → фолбэк (22.07)', () => {
+    assert.equal(U(Object.assign(new Error('forbidden'), { httpStatus: 403 })), true);
+  });
+  test('408/409/425 (транзиентные) → фолбэк', () => {
+    assert.equal(U(Object.assign(new Error('req timeout'), { httpStatus: 408 })), true);
+    assert.equal(U(Object.assign(new Error('conflict'), { httpStatus: 409 })), true);
+    assert.equal(U(Object.assign(new Error('too early'), { httpStatus: 425 })), true);
+  });
+  test('400/401/422/429 (кривой запрос / ключ / rate-limit) → НЕ фолбэк', () => {
     assert.equal(U(Object.assign(new Error('bad request'), { httpStatus: 400 })), false);
+    assert.equal(U(Object.assign(new Error('unauthorized'), { httpStatus: 401 })), false);
+    assert.equal(U(Object.assign(new Error('unprocessable'), { httpStatus: 422 })), false);
     assert.equal(U(Object.assign(new Error('rate'), { httpStatus: 429 })), false);
   });
   test('413 (noFallback) и AbortError → НЕ фолбэк', () => {

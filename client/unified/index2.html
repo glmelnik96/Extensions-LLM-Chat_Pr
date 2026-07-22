@@ -30,6 +30,17 @@
       .view-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
       .view-panel.active { display: flex; }
 
+      /* ── Глобальный переключатель модели ────────────────────────── */
+      .model-bar {
+        display: flex; align-items: center; gap: 8px;
+        padding: 5px 10px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+      }
+      .model-bar label { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+      .model-bar select { flex: 1; min-width: 0; font-size: 11px; padding: 3px 6px; }
+
       /* ── Action bar ─────────────────────────────────────────────── */
       .action-bar {
         display: flex;
@@ -466,6 +477,12 @@
       <div class="view-tabs">
         <button class="view-tab active" data-view="chat">Чат</button>
         <button class="view-tab" data-view="tools">Инструменты</button>
+      </div>
+
+      <!-- ══ Глобальный переключатель модели (на сессию) ═══════════ -->
+      <div class="model-bar" id="model-bar">
+        <label for="model-switch">Модель</label>
+        <select id="model-switch" title="Ручной выбор основной модели чата/агента/корректуры на текущую сессию. Автоматический фолбэк при недоступности остаётся поверх выбранной. Сбрасывается на дефолт при перезапуске панели."></select>
       </div>
 
       <!-- ══ VIEW: Chat ═══════════════════════════════════════════ -->

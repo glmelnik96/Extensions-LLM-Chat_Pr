@@ -55,15 +55,22 @@
        • 5xx после исчерпания ретраев (message «HTTP 5xx»);
        • 404 — модель снята/недоступна на аккаунте (см. fm-defaults: preview-модели
          отдают 404);
+       • 403 — RBAC: модель есть в каталоге, но недоступна аккаунту (живой кейс
+         11.07: внешние vision-модели отдают 403). Запасная из своего пула часто
+         доступна — есть смысл переключиться (22.07);
+       • 408/409/425 — request timeout / conflict / too-early: транзиентные
+         статусы, на другой модели запрос может пройти;
        • сетевой обрыв (fetch failed / ECONNRESET).
      НЕ фолбэчим: AbortError (пользователь нажал Стоп), 413 (payload — на любой
-     модели то же, помечаем err.noFallback), 400/иные 4xx (кривой запрос),
-     «Ответ не JSON» на 200 (тело битое, но модель отвечает). */
+     модели то же, помечаем err.noFallback), 400/401/422 (кривой запрос или ключ —
+     одинаково падает на любой модели), «Ответ не JSON» на 200 (тело битое, но
+     модель отвечает). */
   function isModelUnavailable(err) {
     if (!err || err.noFallback) return false;
     if (err.name === 'AbortError') return false;
     if (typeof err.httpStatus === 'number') {
-      return err.httpStatus >= 500 || err.httpStatus === 404;
+      var s = err.httpStatus;
+      return s >= 500 || s === 404 || s === 403 || s === 408 || s === 409 || s === 425;
     }
     var m = String((err && err.message) || '');
     return /Таймаут запроса|fetch failed|network|ECONNRESET|ETIMEDOUT|ENOTFOUND|HTTP\s*5\d\d/i.test(m);

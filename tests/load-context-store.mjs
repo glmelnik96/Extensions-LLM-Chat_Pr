@@ -49,11 +49,12 @@ export function loadContextStoreWithTempRoot(opts) {
   };
 
   // Свободная переменная localStorage в context-store — не global.localStorage; в браузере это свойство window.
-  vm.runInNewContext(
-    src,
-    { root, localStorage: root.localStorage, require: nodeRequire, console },
-    { filename: 'context-store.js' }
-  );
+  const vmCtx = { root, localStorage: root.localStorage, require: nodeRequire, console };
+  /* opts.fmDefaults — подмена FM_DEFAULTS (context-store читает её как свободную
+     переменную через typeof). Нужно для тестов getResolvedSettings / ручного
+     переключателя модели (knownModels, chatModel). */
+  if (opts.fmDefaults) vmCtx.FM_DEFAULTS = opts.fmDefaults;
+  vm.runInNewContext(src, vmCtx, { filename: 'context-store.js' });
 
   if (!root.ContextStore) {
     throw new Error('ContextStore not attached to root');
