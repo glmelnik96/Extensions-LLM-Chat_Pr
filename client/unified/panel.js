@@ -8540,6 +8540,7 @@ PanelBoot.run('ИИ: монтаж', function () {
             if (!capOk) capErr = (cap && cap.error) || 'нет ответа хоста';
           } catch (eCap) { capErr = String((eCap && eCap.message) || eCap); }
           if (!capOk) notes.push('Caption-дорожка не создана (' + capErr + ') — титры только в ' + (anim !== 'none' ? 'оверлее' : 'SRT: ' + srtPath));
+          else if (anim === 'none') notes.push('Шрифт «' + fontName + '» к CC-дорожке НЕ применён — Premiere красит субтитры дефолтным шрифтом (API не даёт задать стиль). Свой шрифт прожигается только в анимированный оверлей.');
         }
 
         /* 7c. Персист кью — источник правды для модалки «Править титры». */
@@ -8852,6 +8853,7 @@ PanelBoot.run('ИИ: монтаж', function () {
             if (!capOk) capErr = (cap && cap.error) || 'нет ответа хоста';
           } catch (eCap) { capErr = String((eCap && eCap.message) || eCap); }
           if (!capOk) notes.push('Caption-дорожка не создана (' + capErr + ') — титры в SRT: ' + srtPath);
+          else notes.push('Шрифт «' + fontName + '» к CC-дорожке НЕ применён — Premiere красит субтитры своим дефолтным шрифтом (API не даёт задать стиль). Правьте вручную в панели «Скрытые титры», либо используйте «анимированные» (там шрифт прожигается в оверлей).');
         }
 
         /* 5. Персист кью — источник правды для модалки «Править титры».

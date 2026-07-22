@@ -800,7 +800,7 @@
                 <option value="1x1">1:1 (1080×1080)</option>
               </select>
             </div>
-            <div class="param-row" title="Шрифт субтитров. Должен быть установлен в системе (C:\Windows\Fonts).">
+            <div class="param-row" title="Шрифт применяется ТОЛЬКО к анимированному оверлею (караоке-титры, прожжённое ProRes-видео). Должен быть установлен в системе (Windows: C:\Windows\Fonts; macOS: ~/Library/Fonts). Статичные субтитры и caption-дорожка (CC) идут дефолтным шрифтом Premiere — его нельзя задать из API, правьте вручную в панели «Скрытые титры».">
               <span class="param-label">Шрифт</span>
               <select id="rl-font" style="flex:1;min-width:0;">
                 <option value="SB Sans Text SemiBold" selected>SB Sans Text SemiBold</option>
@@ -831,7 +831,7 @@
             <button class="tool-run" data-tool="reels">Собрать рилс</button>
             <div style="display:flex;gap:6px;">
               <button type="button" class="tool-run" data-tool="subtitles-anim" style="flex:1;min-width:0;background:var(--panel-2,#2a2a2a);" title="Анимированные субтитры (караоке-оверлей ProRes) на активную секвенцию — без вертикали/рефрейма. Анимация/шрифт/цвета берутся выше; размер оверлея = разрешение активной секвенции. Оверлей рендерится ffmpeg — для длинных/4K секвенций возможен отказ (сузьте In–Out или используйте «Статичные»).">Субтитры: анимированные</button>
-              <button type="button" class="tool-run" data-tool="subtitles-static" style="flex:1;min-width:0;background:var(--panel-2,#2a2a2a);" title="Статичные субтитры на активную секвенцию: только нативная caption-дорожка (редактируемая), без рендера оверлея. Работает мгновенно для любой длины/разрешения.">Субтитры: статичные</button>
+              <button type="button" class="tool-run" data-tool="subtitles-static" style="flex:1;min-width:0;background:var(--panel-2,#2a2a2a);" title="Статичные субтитры на активную секвенцию: только нативная caption-дорожка (редактируемая), без рендера оверлея. Работает мгновенно для любой длины/разрешения. ВНИМАНИЕ: выбор шрифта сюда НЕ применяется — CC идёт дефолтным шрифтом Premiere (API не даёт задать стиль), правьте вручную в панели «Скрытые титры». Свой шрифт — только у «анимированных».">Субтитры: статичные</button>
             </div>
             <button type="button" class="secondary" id="rl-edit-cues" style="font-size:11px;" title="Открыть сохранённые титры рилса: правка текста, обновление captions, перерендер караоке">Править титры</button>
             <div class="proposal-area" id="rl-result"></div>
