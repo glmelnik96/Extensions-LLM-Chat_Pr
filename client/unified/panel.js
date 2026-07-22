@@ -8232,7 +8232,7 @@ PanelBoot.run('ИИ: монтаж', function () {
               function (err, stdout) { resolve(String(stdout || '')); });
           });
           if (filtersOut.indexOf(' ass ') === -1) {
-            notes.push('Сборка ffmpeg без libass (нет фильтра ass) — караоке-оверлей пропущен, титры только в редактируемой caption-дорожке. Для анимации поставьте полную сборку ffmpeg (например, gyan.dev full).');
+            notes.push('Сборка ffmpeg без libass (нет фильтра «ass») — караоке-оверлей пропущен, титры только в редактируемой caption-дорожке. Для анимации поставьте ffmpeg с libass: macOS — «brew reinstall ffmpeg»; Windows — полная сборка (gyan.dev «full»).');
             anim = 'none';
           }
         }
@@ -8651,8 +8651,17 @@ PanelBoot.run('ИИ: монтаж', function () {
               function (err, stdout) { resolve(String(stdout || '')); });
           });
           if (filtersOut.indexOf(' ass ') === -1) {
-            notes.push('Сборка ffmpeg без libass (нет фильтра ass) — караоке-оверлей пропущен, титры только в редактируемой caption-дорожке. Для анимации поставьте полную сборку ffmpeg (например, gyan.dev full).');
-            anim = 'none';
+            /* 22.07.2026: РАНЬШЕ тут был тихий anim='none' — на явное нажатие
+               «Субтитры: анимированные» пользователь получал СТАТИЧНЫЕ титры,
+               а причина пряталась в примечании (жалоба «на всех Mac создаёт
+               только статичные»: homebrew ffmpeg 8.1 собран без libass —
+               в -filters нет ни ass, ни subtitles, ни drawtext). На явный
+               запрос анимации нельзя молча подменять её статикой. */
+            toolsShowErr('Сборка ffmpeg без libass (в списке фильтров нет «ass») — караоке-оверлей отрендерить нечем.\n' +
+              '• macOS: brew reinstall ffmpeg (обычная сборка Homebrew включает libass; проверка: ffmpeg -hide_banner -filters | grep " ass ").\n' +
+              '• Windows: полная сборка ffmpeg (например, gyan.dev «full»).\n' +
+              'Либо нажмите «Субтитры: статичные» — редактируемая caption-дорожка без рендера (работает без libass).');
+            return;
           }
         }
         var fontName = (document.getElementById('rl-font') || {}).value || 'SB Sans Text SemiBold';
