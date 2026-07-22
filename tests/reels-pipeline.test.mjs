@@ -289,11 +289,11 @@ describe('ASS', () => {
     assert.ok(ass.includes('SB Sans Text SemiBold'));
     assert.ok(ass.includes('Dialogue: 0,0:00:00.00,0:00:02.00,Base,,0,0,0,,привет\\Nмир'));
   });
-  it('buildAss color: \\k-теги в сантисекундах, лид первого слова поглощён', () => {
+  it('buildAss color: \\kf-теги в сантисекундах, лид первого слова поглощён', () => {
     const cue = { startSec: 1, endSec: 3, text: 'раз два', words: [{ w: 'раз', s: 1.5, e: 2 }, { w: 'два', s: 2, e: 3 }] };
     const ass = RP.buildAss([cue], Object.assign({}, baseOpts, { anim: 'color' }));
     /* раз: 1.0→2.0с = 100cs (лид 0.5 влит), два: 2.0→3.0с = 100cs */
-    assert.ok(ass.includes('{\\k100}раз {\\k100}два'), ass);
+    assert.ok(ass.includes('{\\kf100}раз {\\kf100}два'), ass);
     /* караоке: Primary = подсветка, Secondary = цвет текста */
     const styleLine = ass.split('\n').find(l => l.startsWith('Style: Base'));
     assert.ok(styleLine.includes('&H0038A021,&H00FFFFFF'), styleLine);
@@ -314,7 +314,7 @@ describe('ASS', () => {
       words: [{ w: 'раз', s: 0, e: 1 }, { w: 'два', s: 1, e: 2 }]
     };
     const ass = RP.buildAss([cue], Object.assign({}, baseOpts, { anim: 'color' }));
-    assert.ok(ass.includes('{\\k100}раз\\N{\\k100}два'), ass);
+    assert.ok(ass.includes('{\\kf100}раз\\N{\\kf100}два'), ass);
   });
 });
 
@@ -334,6 +334,47 @@ describe('buildOverlayFfmpegArgs', () => {
   it('экранирование пути ass для Windows (C\\:/…)', () => {
     const args = RP.buildOverlayFfmpegArgs({ assPath: 'C:\\Users\\Глеб\\s.ass', w: 1080, h: 1920, fps: 25, durationSec: 1, outPath: 'o.mov' });
     assert.ok(args.join(' ').includes('C\\:/Users/Глеб/s.ass'), args.join(' '));
+  });
+});
+
+/* ═══ checkOverlayAlpha (пост-рендер гейт альфа-канала, инцидент 17.07) ═══ */
+describe('checkOverlayAlpha', () => {
+  /* Реальный вывод: ProRes 4444 повышает yuva444p10le → yuva444p12le. */
+  const okStderr =
+    "Input #0, lavfi, from 'color=...':\n" +
+    "  Stream #0:0: Video: rawvideo, rgba, 1080x1920, 25 fps\n" +
+    "Output #0, mov, to '/t/o.mov':\n" +
+    "  Stream #0:0: Video: prores (4444) (ap4h / 0x68347061), yuva444p12le, 1080x1920, q=2-31\n";
+
+  it('Output с yuva-префиксом (12le после промоушена) → ok', () => {
+    const r = RP.checkOverlayAlpha(okStderr);
+    assert.equal(r.ok, true);
+    assert.equal(r.pixFmt, 'yuva444p12le');
+  });
+  it('исходный yuva444p10le тоже проходит', () => {
+    const s = okStderr.replace('yuva444p12le', 'yuva444p10le');
+    assert.equal(RP.checkOverlayAlpha(s).ok, true);
+  });
+  it('Output без альфы (yuv420p) → блокировка с reason', () => {
+    const s = okStderr.replace('yuva444p12le', 'yuv420p').replace('prores (4444) (ap4h / 0x68347061)', 'h264');
+    const r = RP.checkOverlayAlpha(s);
+    assert.equal(r.ok, false);
+    assert.ok(/yuv420p/.test(r.reason), r.reason);
+  });
+  it('парсит именно Output-поток, игнорируя rgba во Input', () => {
+    /* Input rgba не должен пройти как «валидная альфа» — берём только Output. */
+    const info = RP._parseOutputPixFmt(okStderr);
+    assert.equal(info.codec, 'prores');
+    assert.equal(info.pixFmt, 'yuva444p12le');
+  });
+  it('нераспознанный лог → fail-open (ok:true, skipped)', () => {
+    const r = RP.checkOverlayAlpha('какой-то мусор без Output');
+    assert.equal(r.ok, true);
+    assert.equal(r.skipped, true);
+  });
+  it('пустой/битый вход не падает → fail-open', () => {
+    assert.equal(RP.checkOverlayAlpha('').ok, true);
+    assert.equal(RP.checkOverlayAlpha(null).ok, true);
   });
 });
 

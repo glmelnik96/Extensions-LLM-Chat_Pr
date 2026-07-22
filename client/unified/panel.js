@@ -8357,7 +8357,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           outPath = path.join(dir, safeName + '_' + ts + '.mov');
           fs.writeFileSync(assPath, ass, 'utf8'); /* UTF-8 БЕЗ BOM — libass */
           toolsStatusUi.show('Рилс: рендерю субтитры (' + cues.length + ' титров)…', true);
-          await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
+          var rStderr = await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
             assPath: assPath, w: targetW, h: targetH, fps: fps,
             durationSec: durationSec, outPath: outPath
           }), {
@@ -8371,6 +8371,11 @@ PanelBoot.run('ИИ: монтаж', function () {
           });
           if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 4096) {
             toolsShowErr('Секвенция «' + applied.sequenceName + '» создана, но ffmpeg отрендерил пустой оверлей: ' + outPath);
+            return;
+          }
+          var alphaChk = ReelsPipeline.checkOverlayAlpha(rStderr);
+          if (!alphaChk.ok) {
+            toolsShowErr('Оверлей отрендерился без альфа-канала (' + alphaChk.reason + ') — субтитры легли бы непрозрачным слоем поверх видео. Проверьте кодек ProRes 4444.');
             return;
           }
           /* 7a. Оверлей на новую верхнюю дорожку (активирует рилс-секвенцию). */
@@ -8654,7 +8659,7 @@ PanelBoot.run('ИИ: монтаж', function () {
           outPath = path.join(dir, safeName + '_sub_' + ts + '.mov');
           fs.writeFileSync(assPath, ass, 'utf8'); /* UTF-8 БЕЗ BOM — libass */
           toolsStatusUi.show('Субтитры: рендерю оверлей (' + cues.length + ' титров)…', true);
-          await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
+          var rStderr = await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
             assPath: assPath, w: targetW, h: targetH, fps: fps,
             durationSec: durationSec, outPath: outPath
           }), {
@@ -8668,6 +8673,11 @@ PanelBoot.run('ИИ: монтаж', function () {
           });
           if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 4096) {
             toolsShowErr('ffmpeg отрендерил пустой оверлей: ' + outPath);
+            return;
+          }
+          var alphaChk = ReelsPipeline.checkOverlayAlpha(rStderr);
+          if (!alphaChk.ok) {
+            toolsShowErr('Оверлей отрендерился без альфа-канала (' + alphaChk.reason + ') — субтитры легли бы непрозрачным слоем поверх видео. Проверьте кодек ProRes 4444.');
             return;
           }
           /* Оверлей на новую верхнюю дорожку активной секвенции, старт = overlayOffset. */
@@ -8919,12 +8929,16 @@ PanelBoot.run('ИИ: монтаж', function () {
         fs.writeFileSync(assPath, ass, 'utf8');
         var durationSec = Math.ceil((cues[cues.length - 1].endSec + 0.5) * 100) / 100;
         reelsEditStatus('Рендерю караоке (~' + Math.round(durationSec) + 'с видео)…');
-        await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
+        var rStderr = await reelsRunFfmpeg(ffBin, ReelsPipeline.buildOverlayFfmpegArgs({
           assPath: assPath, w: st.w, h: st.h, fps: st.fps,
           durationSec: durationSec, outPath: outPath
         }));
         if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 4096) {
           throw new Error('ffmpeg отрендерил пустой файл: ' + outPath);
+        }
+        var alphaChk = ReelsPipeline.checkOverlayAlpha(rStderr);
+        if (!alphaChk.ok) {
+          throw new Error('Оверлей без альфа-канала (' + alphaChk.reason + ') — субтитры легли бы непрозрачным слоем. Проверьте кодек ProRes 4444.');
         }
         reelsEditStatus('Заменяю оверлей на таймлайне…');
         var ins = await new Promise(function (resolve, reject) {

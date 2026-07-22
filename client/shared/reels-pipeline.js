@@ -286,8 +286,8 @@
   }
 
   /* ── ASS-генерация ─────────────────────────────────────────────────────
-   * Караоке-приёмы: anim 'color' — \k-теги (Secondary→Primary по мере
-   * произнесения: Primary = подсветка, Secondary = цвет текста);
+   * Караоке-приёмы: anim 'color' — \kf-теги (плавная заливка Secondary→Primary
+   * по мере произнесения: Primary = подсветка, Secondary = цвет текста);
    * anim 'box' — слой 0 статичный текст + слой 1 пословные события стилем
    * Box (BorderStyle=3), не-текущие слова скрыты alpha-масками — libass
    * рисует box per-run, плашка ровно под текущим словом. */
@@ -379,7 +379,10 @@
         var b = _wordBounds(cue);
         var karaoke = _joinTokens(cue, function (wi) {
           var cs = Math.max(1, Math.round((b[wi + 1] - b[wi]) * 100));
-          return '{\\k' + cs + '}' + cue.words[wi].w;
+          /* \kf — плавная заливка слова слева-направо за его длительность
+             (свип), в отличие от \k — мгновенного щелчка цвета. Тайминг тот же,
+             отличие чисто визуальное: подсветка «течёт» по слову. */
+          return '{\\kf' + cs + '}' + cue.words[wi].w;
         });
         lines.push('Dialogue: 0,' + t0 + ',' + t1 + ',Base,,0,0,0,,' + karaoke);
       } else if (anim === 'box' && cue.words && cue.words.length) {
@@ -413,6 +416,39 @@
       '-vf', "ass='" + assEsc + "':alpha=1",
       '-c:v', 'prores_ks', '-profile:v', '4444', '-pix_fmt', 'yuva444p10le',
       '-t', String(o.durationSec), '-y', String(o.outPath)];
+  }
+
+  /**
+   * Пост-рендер проверка альфа-канала оверлея по СОБСТВЕННОМУ stderr ffmpeg
+   * (без второго вызова — блок «Output #…» содержит pix_fmt выходного потока).
+   * Инцидент 17.07: оверлей без альфы = непрозрачный слой поверх видео —
+   * размер файла при этом валиден, поэтому size-гейт его не ловит.
+   *
+   * Контракт (fail-open):
+   *   - в stderr есть Output-видеопоток с pix_fmt на 'yuva' → {ok:true}
+   *   - есть Output-видеопоток, но pix_fmt НЕ 'yuva*' (альфа потеряна) →
+   *     {ok:false, reason} (единственный случай блокировки)
+   *   - Output-видеопоток не распознан → {ok:true, skipped:true} (не блокируем
+   *     валидный по размеру файл из-за неразобранного лога)
+   *
+   * ProRes 4444 повышает yuva444p10le → yuva444p12le на выходе — поэтому
+   * проверяется ПРЕФИКС 'yuva', а не точный формат.
+   */
+  function _parseOutputPixFmt(stderrText) {
+    var s = String(stderrText || '');
+    var oi = s.search(/Output #\d/);
+    if (oi < 0) return null;
+    var tail = s.slice(oi);
+    var m = tail.match(/Stream #\d+:\d+[^\n]*: Video:\s*(\w+)[^\n,]*,\s*(\w+)/);
+    if (!m) return null;
+    return { codec: m[1], pixFmt: m[2] };
+  }
+
+  function checkOverlayAlpha(stderrText) {
+    var info = _parseOutputPixFmt(stderrText);
+    if (!info || !info.pixFmt) return { ok: true, skipped: true };
+    if (/^yuva/.test(info.pixFmt)) return { ok: true, pixFmt: info.pixFmt };
+    return { ok: false, reason: 'pix_fmt=' + info.pixFmt + ' (без альфа-плоскости)', pixFmt: info.pixFmt };
   }
 
   /* ── Vision по клипам таймлайна (спека 2026-07-20) ──────────────────────
@@ -769,6 +805,8 @@
     assTime: assTime,
     buildAss: buildAss,
     buildOverlayFfmpegArgs: buildOverlayFfmpegArgs,
+    checkOverlayAlpha: checkOverlayAlpha,
+    _parseOutputPixFmt: _parseOutputPixFmt,
     planClipFrames: planClipFrames,
     buildVisionBatches: buildVisionBatches,
     parseVisionBatchAnswer: parseVisionBatchAnswer,
