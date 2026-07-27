@@ -2971,3 +2971,106 @@ describe('Зазоро-тишина → refineCutBoundaries снапает ре�
     assert.equal(r.stats.padded, 0);
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * Волна 2 (2026-07-27): «Убрать пробелы» — findTimelineGaps / removeGaps
+ * Пустые дыры таймлайна (без клипов на всех дорожках) → kind='close_gaps',
+ * применяется host closeSequenceGaps (сдвиг влево), НЕ applyTranscriptCuts.
+ * ═══════════════════════════════════════════════════════════════ */
+describe('findTimelineGaps — пустые пробелы таймлайна', () => {
+  it('находит пробел между клипами и ведущий пробел в начале', () => {
+    const clips = [
+      { trackType: 'video', startSec: 2, endSec: 10 },
+      { trackType: 'audio', startSec: 2, endSec: 10 },
+      { trackType: 'video', startSec: 13, endSec: 20 }
+    ];
+    const gaps = DP.findTimelineGaps(clips, { minGapSec: 0.5 });
+    assert.equal(gaps.length, 2);
+    assert.equal(gaps[0].startSec, 0);
+    assert.equal(gaps[0].endSec, 2);
+    assert.equal(gaps[1].startSec, 10);
+    assert.equal(gaps[1].endSec, 13);
+  });
+
+  it('includeLeading:false игнорирует пробел в начале', () => {
+    const clips = [
+      { trackType: 'video', startSec: 2, endSec: 10 },
+      { trackType: 'video', startSec: 13, endSec: 20 }
+    ];
+    const gaps = DP.findTimelineGaps(clips, { minGapSec: 0.5, includeLeading: false });
+    assert.equal(gaps.length, 1);
+    assert.equal(gaps[0].startSec, 10);
+  });
+
+  it('клип на ДРУГОЙ дорожке перекрывает дыру — пробела нет', () => {
+    const clips = [
+      { trackType: 'video', startSec: 0, endSec: 10 },
+      { trackType: 'video', startSec: 15, endSec: 20 },
+      { trackType: 'audio', startSec: 8, endSec: 16 } /* мостик поверх дыры */
+    ];
+    const gaps = DP.findTimelineGaps(clips, { minGapSec: 0.5 });
+    assert.equal(gaps.length, 0);
+  });
+
+  it('пробелы короче minGapSec отфильтрованы; микро-стыки <0.05с слиты', () => {
+    const clips = [
+      { trackType: 'video', startSec: 0, endSec: 10 },
+      { trackType: 'video', startSec: 10.04, endSec: 15 }, /* стык 0.04 — не пробел */
+      { trackType: 'video', startSec: 15.3, endSec: 20 }   /* 0.3 < minGap 0.5 */
+    ];
+    const gaps = DP.findTimelineGaps(clips, { minGapSec: 0.5 });
+    assert.equal(gaps.length, 0);
+  });
+
+  it('битые клипы (без чисел, end<=start) не ломают расчёт', () => {
+    const clips = [
+      { trackType: 'video', startSec: 0, endSec: 10 },
+      { trackType: 'video', startSec: 'x', endSec: 12 },
+      { trackType: 'video', startSec: 14, endSec: 14 },
+      null,
+      { trackType: 'video', startSec: 20, endSec: 30 }
+    ];
+    const gaps = DP.findTimelineGaps(clips, { minGapSec: 1 });
+    assert.equal(gaps.length, 1);
+    assert.equal(gaps[0].startSec, 10);
+    assert.equal(gaps[0].endSec, 20);
+  });
+
+  it('пустой вход → пусто', () => {
+    assert.equal(DP.findTimelineGaps([], {}).length, 0);
+    assert.equal(DP.findTimelineGaps(null, {}).length, 0);
+  });
+});
+
+describe('removeGaps — proposal-пайплайн close_gaps', () => {
+  it('строит proposal kind=close_gaps с суммой и removeSummary', async () => {
+    const ctx = makeCtx({
+      snapshot: {
+        ok: true,
+        clips: [
+          { trackType: 'video', startSec: 0, endSec: 10 },
+          { trackType: 'video', startSec: 12.5, endSec: 20 }
+        ]
+      }
+    });
+    const r = await DP.removeGaps(ctx, { minGapSec: 0.5 });
+    assert.equal(r.ok, true);
+    assert.equal(r.proposal.kind, 'close_gaps');
+    assert.equal(r.proposal.gaps.length, 1);
+    assert.ok(Math.abs(r.proposal.gaps[0].startSec - 10) < 1e-9);
+    assert.ok(Math.abs(r.proposal.gaps[0].endSec - 12.5) < 1e-9);
+    assert.equal(r.proposal.removeSummary.length, 1);
+    assert.ok(r.proposal.summary.indexOf('2.5с') !== -1);
+  });
+
+  it('сплошной таймлайн → noChanges', async () => {
+    const r = await DP.removeGaps(makeCtx(), { minGapSec: 0.5 });
+    assert.equal(r.ok, true);
+    assert.equal(r.noChanges, true);
+  });
+
+  it('пустой снапшот → ошибка без падения', async () => {
+    const r = await DP.removeGaps({ snapshot: { ok: true, clips: [] } }, {});
+    assert.equal(r.ok, false);
+  });
+});

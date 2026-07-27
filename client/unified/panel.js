@@ -5201,8 +5201,31 @@ PanelBoot.run('ИИ: монтаж', function () {
       body: document.getElementById('tr-modal-body'),
       meta: document.getElementById('tr-modal-meta'),
       title: document.getElementById('tr-modal-title'),
-      close: document.getElementById('tr-modal-close')
+      close: document.getElementById('tr-modal-close'),
+      search: document.getElementById('tr-modal-search'),
+      copyBtn: document.getElementById('tr-copy'),
+      saveBtn: document.getElementById('tr-save-txt'),
+      srtBtn: document.getElementById('tr-export-srt'),
+      foot: document.getElementById('tr-foot-status')
     };
+  }
+
+  /* Состояние читалки (27.07.2026): текущий entry/seq — для поиска и экспорта. */
+  var _trViewState = { entry: null, seq: '' };
+
+  /* Подсветка совпадений <mark> БЕЗ innerHTML — только text-узлы (XSS-гигиена). */
+  function _trAppendHighlighted(parent, text, q) {
+    if (!q) { parent.textContent = text; return; }
+    var lower = text.toLowerCase();
+    var pos = 0, idx;
+    while ((idx = lower.indexOf(q, pos)) !== -1) {
+      if (idx > pos) parent.appendChild(document.createTextNode(text.slice(pos, idx)));
+      var mk = document.createElement('mark');
+      mk.textContent = text.slice(idx, idx + q.length);
+      parent.appendChild(mk);
+      pos = idx + q.length;
+    }
+    if (pos < text.length) parent.appendChild(document.createTextNode(text.slice(pos)));
   }
 
   function closeTranscriptViewer() {
@@ -5210,9 +5233,11 @@ PanelBoot.run('ИИ: монтаж', function () {
     if (m.overlay) m.overlay.hidden = true;
   }
 
-  function _renderTranscriptRows(entry, seq) {
+  function _renderTranscriptRows(entry, seq, filter) {
     var m = _trModalEls();
     if (!m.body) return;
+    _trViewState.entry = entry || null;
+    _trViewState.seq = seq || '';
     /* Достроим параграфы, если их ещё нет (как в остальных путях панели). */
     if (entry && (!entry.paragraphs || !entry.paragraphs.length) &&
         typeof TranscriptStructure !== 'undefined') {
@@ -5220,7 +5245,12 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
     var view = TranscriptView.buildTranscriptViewRows(entry);
     m.title.textContent = 'Транскрипт' + (seq ? ' — ' + seq : '');
-    if (view.source === 'empty') {
+    var hasRows = view.source !== 'empty';
+    if (m.copyBtn) m.copyBtn.disabled = !hasRows;
+    if (m.saveBtn) m.saveBtn.disabled = !hasRows;
+    if (m.srtBtn) m.srtBtn.disabled = !(entry && entry.segments && entry.segments.length);
+    if (m.search) m.search.disabled = !hasRows;
+    if (!hasRows) {
       m.meta.textContent = '';
       m.body.innerHTML = '';
       var em = document.createElement('div');
@@ -5236,18 +5266,39 @@ PanelBoot.run('ИИ: монтаж', function () {
     else if (view.meta.segmentCount) metaBits.push(view.meta.segmentCount + ' сегм.');
     if (view.meta.durationSec) metaBits.push('~' + TranscriptView.formatTimecode(view.meta.durationSec));
     if (view.meta.speakers && view.meta.speakers.length) metaBits.push(view.meta.speakers.length + ' спик.');
-    m.meta.textContent = metaBits.join(' · ');
 
     m.body.innerHTML = '';
     if (view.source === 'text') {
+      m.meta.textContent = metaBits.join(' · ');
       var pl = document.createElement('div');
       pl.className = 'tr-plain';
       pl.textContent = view.rows[0].text;
       m.body.appendChild(pl);
       return;
     }
-    for (var i = 0; i < view.rows.length; i++) {
-      var r = view.rows[i];
+    /* Фильтр поиска: по тексту, спикеру и таймкоду (case-insensitive). */
+    var q = String(filter || '').trim().toLowerCase();
+    var rows = view.rows;
+    if (q) {
+      rows = [];
+      for (var fi = 0; fi < view.rows.length; fi++) {
+        var fr = view.rows[fi];
+        if ((fr.text || '').toLowerCase().indexOf(q) !== -1 ||
+            (fr.speaker || '').toLowerCase().indexOf(q) !== -1 ||
+            (fr.time || '').indexOf(q) !== -1) rows.push(fr);
+      }
+      metaBits.push('найдено ' + rows.length);
+    }
+    m.meta.textContent = metaBits.join(' · ');
+    if (q && !rows.length) {
+      var nf = document.createElement('div');
+      nf.className = 'tr-empty';
+      nf.textContent = 'Ничего не найдено.';
+      m.body.appendChild(nf);
+      return;
+    }
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
       var row = document.createElement('div');
       row.className = 'tr-row';
       var t = document.createElement('span');
@@ -5268,7 +5319,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
       var tx = document.createElement('span');
       tx.className = 'tr-text';
-      tx.textContent = r.text;
+      _trAppendHighlighted(tx, r.text, q);
       row.appendChild(tx);
       m.body.appendChild(row);
     }
@@ -5282,6 +5333,8 @@ PanelBoot.run('ИИ: монтаж', function () {
     m.overlay.hidden = false;
     m.title.textContent = 'Транскрипт';
     m.meta.textContent = '';
+    if (m.search) m.search.value = '';
+    if (m.foot) m.foot.textContent = '';
     m.body.innerHTML = '<div class="tr-empty">Загрузка…</div>';
     PremiereBridge.getTimelineSnapshot(function (err, snap) {
       var seq = !err && snap && snap.ok && snap.sequenceName ? snap.sequenceName : '';
@@ -5296,6 +5349,116 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   var btnViewTr = document.getElementById('btn-view-transcript');
   if (btnViewTr) btnViewTr.onclick = openTranscriptViewer;
+
+  /* ── Поиск + экспорт в читалке транскрипта (27.07.2026) ─────────────
+     Не-ИИ улучшения: фильтр строк, копия в буфер, .txt с таймкодами и
+     .srt из Whisper-сегментов (segmentsToSrtCues + cuesToSrt — уже
+     покрыты тестами, до сих пор не были подключены к UI). */
+  (function wireTranscriptViewerExtras() {
+    var m = _trModalEls();
+    function foot(msg, isErr) {
+      if (!m.foot) return;
+      m.foot.textContent = msg || '';
+      m.foot.style.color = isErr ? '#f87171' : '';
+    }
+    if (m.search) {
+      var trSearchTimer = null;
+      m.search.addEventListener('input', function () {
+        if (trSearchTimer) clearTimeout(trSearchTimer);
+        trSearchTimer = setTimeout(function () {
+          _renderTranscriptRows(_trViewState.entry, _trViewState.seq, m.search.value);
+        }, 150);
+      });
+    }
+    /* Полный текст (без фильтра): [время] Спикер: текст */
+    function trPlainText() {
+      var entry = _trViewState.entry;
+      if (!entry) return '';
+      var view = TranscriptView.buildTranscriptViewRows(entry);
+      if (view.source === 'empty') return '';
+      if (view.source === 'text') return String(view.rows[0].text || '');
+      var lines = [];
+      for (var i = 0; i < view.rows.length; i++) {
+        var r = view.rows[i];
+        lines.push('[' + r.time + '] ' + (r.speaker ? r.speaker + ': ' : '') + r.text);
+      }
+      return lines.join('\n');
+    }
+    function trExportsDir() {
+      var fs = require('fs');
+      var path = require('path');
+      var os = require('os');
+      var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'exports');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      return dir;
+    }
+    function trStampName(ext) {
+      var safe = (_trViewState.seq || 'sequence').replace(/[\\\/:*?"<>|]/g, '_');
+      var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      return safe + '_' + ts + ext;
+    }
+    if (m.copyBtn) {
+      m.copyBtn.onclick = function () {
+        var text = trPlainText();
+        if (!text) { foot('Транскрипт пуст.', true); return; }
+        /* CEP Chromium: navigator.clipboard может быть заблокирован политикой —
+           фолбэк через скрытый textarea + execCommand. */
+        var fallback = function () {
+          try {
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            var ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            foot(ok ? 'Скопировано в буфер (' + text.length + ' симв.).' : 'Не удалось скопировать.', !ok);
+          } catch (eC) {
+            foot('Не удалось скопировать: ' + String(eC && eC.message || eC), true);
+          }
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            foot('Скопировано в буфер (' + text.length + ' симв.).');
+          }, fallback);
+        } else fallback();
+      };
+    }
+    if (m.saveBtn) {
+      m.saveBtn.onclick = function () {
+        try {
+          var text = trPlainText();
+          if (!text) { foot('Транскрипт пуст.', true); return; }
+          var p = require('path').join(trExportsDir(), trStampName('.txt'));
+          require('fs').writeFileSync(p, text, 'utf8');
+          foot('Сохранено: ' + p);
+        } catch (eT) {
+          foot('Ошибка сохранения: ' + String(eT && eT.message || eT), true);
+        }
+      };
+    }
+    if (m.srtBtn) {
+      m.srtBtn.onclick = function () {
+        try {
+          var entry = _trViewState.entry;
+          var segs = entry && entry.segments;
+          if (!segs || !segs.length) { foot('Нет Whisper-сегментов — SRT строится из них.', true); return; }
+          var hasSpeakers = false;
+          for (var i = 0; i < segs.length; i++) {
+            if (segs[i] && segs[i].speaker) { hasSpeakers = true; break; }
+          }
+          var cues = DeterministicPipelines.segmentsToSrtCues(segs, { withSpeakers: hasSpeakers });
+          if (!cues.length) { foot('Из сегментов не получилось ни одного титра.', true); return; }
+          var p = require('path').join(trExportsDir(), trStampName('.srt'));
+          require('fs').writeFileSync(p, DeterministicPipelines.cuesToSrt(cues), 'utf8');
+          foot('SRT (' + cues.length + ' титров): ' + p);
+        } catch (eS) {
+          foot('Ошибка экспорта SRT: ' + String(eS && eS.message || eS), true);
+        }
+      };
+    }
+  })();
 
   /* ── Ручной переключатель модели (сессия) ───────────────────────────
      Заполняем из FM_DEFAULTS.knownModels, текущее значение = эффективная
@@ -7225,6 +7388,8 @@ PanelBoot.run('ИИ: монтаж', function () {
     bindSlider('jmp-pause', 'jmp-pause-val', 'с');
     bindSlider('jmp-minseg', 'jmp-minseg-val', 'с');
     bindSlider('jcut-offset', 'jcut-offset-val', '');
+    bindSlider('ln-lufs', 'ln-lufs-val', ' LUFS');
+    bindSlider('gap-min', 'gap-min-val', 'с');
     bindSlider('mc-minhold', 'mc-minhold-val', 'с');
     bindSlider('mc-maxhold', 'mc-maxhold-val', 'с');
 
@@ -7424,7 +7589,9 @@ PanelBoot.run('ИИ: монтаж', function () {
           }
           render(snap);
         }, function (err) {
-          box.innerHTML = '<div style="color:#f59e0b;">' + String(err && err.message || err) + '</div>';
+          /* err.message может содержать HTML-небезопасный текст — только textContent */
+          box.innerHTML = '<div style="color:#f59e0b;"></div>';
+          box.firstChild.textContent = String(err && err.message || err);
         });
       });
     })();
@@ -7751,6 +7918,64 @@ PanelBoot.run('ИИ: монтаж', function () {
         /* B2-9: checkpoint перед ripple-удалениями */
         _makeSequenceCheckpoint('монтаж (tools)', function () {
           tcRunBatch(0);
+        });
+        return;
+      }
+
+      if (prop.kind === 'close_gaps') {
+        toolsStatusUi.show('Закрываю пробелы…', true);
+        toolsDisableRun(true);
+        var cgExpected = (prop.snapshot && prop.snapshot.sequenceName) || '';
+        var cgSeqKey = prop.seqKey || cgExpected || (lastSnap && lastSnap.sequenceName) || '';
+        var cgFinish = function (failMsg, okMsg) {
+          toolsDisableRun(false);
+          endOperation();
+          toolsStatusUi.hide();
+          _snapDirty = true;
+          lastSnap = null;
+          if (failMsg) {
+            toolsShowErr(failMsg);
+            toolsSetCardStatus(prop.cardId, cgSeqKey, String(failMsg).slice(0, 160), 'err');
+            try { window.toolsRefreshLed(); } catch (eLF) {}
+            return;
+          }
+          toolsHideProposal(area);
+          toolsStatusUi.show(okMsg, false);
+          toolsSetCardStatus(prop.cardId, cgSeqKey, okMsg, 'ok');
+          try { window.toolsRefreshLed(); } catch (eL) {}
+          setTimeout(function () { toolsStatusUi.hide(); }, 2500);
+        };
+        /* B2-9: checkpoint перед сдвигом клипов (Cmd+Z на пакет сдвигов ненадёжен) */
+        _makeSequenceCheckpoint('убрать пробелы', function () {
+          PremiereBridge.closeSequenceGaps(
+            { gaps: prop.gaps || [], expectedSequenceName: cgExpected },
+            function (err, data) {
+              if (err || !data || data.ok === false) {
+                cgFinish('Ошибка: ' + (err ? String(err.message || err) : describeHostFailure(data)) +
+                  ' Таймлайн не изменён (или изменён частично — проверьте и откатите ⏪).');
+                return;
+              }
+              /* Ремап кэша транскрипта той же математикой, что ripple-удаления:
+                 закрытые пробелы = вырезанные интервалы (речи в них нет). */
+              var closedIvs = [];
+              var pr = data.perResults || [];
+              for (var pi = 0; pi < pr.length; pi++) {
+                if (pr[pi].ok && prop.gaps && prop.gaps[pr[pi].i]) closedIvs.push(prop.gaps[pr[pi].i]);
+              }
+              try {
+                if (cgSeqKey && closedIvs.length) {
+                  ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, cgSeqKey, closedIvs);
+                }
+              } catch (eR) {
+                console.warn('[tools] gaps: applyRippleDeletionsToTranscript failed:', eR && eR.message);
+              }
+              var failedCnt = (data.requested || 0) - (data.closed || 0);
+              cgFinish(null,
+                'Закрыто пробелов: ' + (data.closed || 0) + ' из ' + (data.requested || 0) +
+                ' (−' + Number(data.closedSec || 0).toFixed(1) + 'с)' +
+                (failedCnt > 0 ? ', ' + failedCnt + ' пропущено' : '') + '. Откат: ⏪ или Cmd+Z');
+            }
+          );
         });
         return;
       }
@@ -9119,6 +9344,337 @@ PanelBoot.run('ИИ: монтаж', function () {
        ручной свотч и нормализация HEX больше не нужны. */
 
     /* ── Run tool ─────────────────────────────────────────── */
+    /* ── «🔊 Громкость» (27.07.2026) — детерминированная LUFS-нормализация
+       (ffmpeg loudnorm, EBU R128). Не proposal: исходник не трогается,
+       результат — новый WAV в bin «AI Renders» (откат = удалить его).
+       Тот же рендерер, что у chat-пути kind==='loudness'. ────────────── */
+    function toolsLnPopulate(snap) {
+      var sel = document.getElementById('ln-source');
+      if (!sel) return 0;
+      var prev = sel.value;
+      var clips = (snap && snap.clips) || [];
+      var seen = {};
+      var items = [];
+      for (var i = 0; i < clips.length; i++) {
+        var c = clips[i];
+        if (c.trackType !== 'audio' || !c.mediaPath) continue;
+        if (seen[c.mediaPath]) continue;
+        seen[c.mediaPath] = 1;
+        items.push(c);
+      }
+      sel.innerHTML = '';
+      for (var k = 0; k < items.length; k++) {
+        var it = items[k];
+        var o = document.createElement('option');
+        o.value = it.mediaPath;
+        var fileName = String(it.mediaPath).split('/').pop();
+        o.textContent = 'A' + (it.trackIndex + 1) + ' · ' + (it.name || fileName);
+        o.title = it.mediaPath;
+        sel.appendChild(o);
+      }
+      if (prev && seen[prev]) sel.value = prev;
+      return items.length;
+    }
+
+    async function toolsRunLoudnorm() {
+      if (!beginOperation('tools:loudnorm')) {
+        toolsShowErr('Идёт обработка в чате — дождитесь завершения (кнопка «Стоп» на вкладке «Чат»).');
+        return;
+      }
+      toolsDisableRun(true);
+      toolsStatusUi.show('Громкость: читаю таймлайн…', true);
+      var resEl = document.getElementById('ln-result');
+      if (resEl) resEl.textContent = '';
+      var keepStatus = false;
+      try {
+        var sel = document.getElementById('ln-source');
+        if (!sel) return;
+        if (!sel.options.length) {
+          var snap0 = await execGetSnapshot(true);
+          if (!snap0 || !snap0.ok) {
+            toolsShowErr(snap0 && snap0.error ? snap0.error : 'Не удалось получить снимок таймлайна.');
+            return;
+          }
+          if (!toolsLnPopulate(snap0)) {
+            toolsShowErr('На таймлайне нет аудиоклипов с медиафайлами (для nest/мультикама нормализуйте исходный файл).');
+            return;
+          }
+          toolsStatusUi.show('Источники загружены — выберите файл и нажмите «Нормализовать» ещё раз.', false);
+          keepStatus = true;
+          return;
+        }
+        var inputPath = sel.value;
+        if (!inputPath) { toolsShowErr('Выберите источник.'); return; }
+        var lufsEl = document.getElementById('ln-lufs');
+        var lufs = lufsEl ? parseInt(lufsEl.value, 10) : -16;
+        if (!isFinite(lufs)) lufs = -16;
+        toolsStatusUi.show('ffmpeg: loudnorm I=' + lufs + '…', true);
+        var rR = await AudioRender.renderLoudnorm({
+          inputPath: inputPath,
+          targetLufs: lufs,
+          onProgress: function (msg) { toolsStatusUi.show(msg, true); }
+        });
+        toolsStatusUi.show('Импорт в проект…', true);
+        var imp = await new Promise(function (resolve) {
+          PremiereBridge.importMediaFile({ path: rR.outputPath, binName: 'AI Renders' }, function (e, d) {
+            resolve({ err: e, data: d });
+          });
+        });
+        var impOk = !imp.err && imp.data && imp.data.ok;
+        var measured = rR.summary && rR.summary.measuredOutputLufs;
+        if (resEl) {
+          resEl.textContent = [
+            'Готово: → ' + lufs + ' LUFS' +
+              (measured !== null && measured !== undefined ? ' (фактически ' + measured + ')' : '') + '.',
+            'Файл: ' + rR.outputPath,
+            impOk
+              ? 'Импортировано в bin «' + (imp.data.binName || 'AI Renders') + '» — перетащите на дорожку поверх оригинала (оригинал замьютьте).'
+              : 'Импорт не удался: ' + String((imp.err && imp.err.message) || (imp.data && imp.data.error) || 'неизв.') + '. Перетащите файл в проект вручную.'
+          ].join('\n');
+        }
+        toolsStatusUi.show('Готово', false);
+        keepStatus = true;
+        setTimeout(function () { toolsStatusUi.hide(); }, 1500);
+      } catch (eLn) {
+        toolsShowErr('Loudnorm упал: ' + String(eLn && eLn.message || eLn));
+      } finally {
+        endOperation();
+        toolsDisableRun(false);
+        if (!keepStatus) toolsStatusUi.hide();
+      }
+    }
+
+    var lnRefreshBtn = document.getElementById('ln-refresh');
+    if (lnRefreshBtn) {
+      lnRefreshBtn.addEventListener('click', function () {
+        lnRefreshBtn.disabled = true;
+        execGetSnapshot(true).then(function (snap) {
+          lnRefreshBtn.disabled = false;
+          if (!snap || !snap.ok) {
+            toolsShowErr(snap && snap.error ? snap.error : 'Не удалось получить снимок таймлайна.');
+            return;
+          }
+          toolsShowErr('');
+          if (!toolsLnPopulate(snap)) {
+            toolsShowErr('На таймлайне нет аудиоклипов с медиафайлами.');
+          }
+        }, function (err) {
+          lnRefreshBtn.disabled = false;
+          toolsShowErr('Ошибка: ' + String(err && err.message || err));
+        });
+      });
+    }
+
+    /* ── Волна 2: экспорт маркеров (YouTube / CSV) ──────────
+       Read-only: host listSequenceMarkers, operation-queue не нужен. */
+    (function wireMarkersExport() {
+      var resEl = document.getElementById('mx-result');
+      function mxStatus(msg, isErr) {
+        if (!resEl) return;
+        resEl.textContent = msg || '';
+        resEl.style.color = isErr ? '#f59e0b' : '';
+      }
+      function mxExportsDir() {
+        var fs = require('fs');
+        var path = require('path');
+        var os = require('os');
+        var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'exports');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        return dir;
+      }
+      function mxStampName(seqName, suffix, ext) {
+        var safe = (seqName || 'sequence').replace(/[\\\/:*?"<>|]/g, '_');
+        var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        return safe + '_' + suffix + '_' + ts + ext;
+      }
+      function mxLoad(btn, cb) {
+        if (!window.PremiereBridge || !PremiereBridge.listSequenceMarkers) {
+          mxStatus('Мост недоступен.', true);
+          return;
+        }
+        if (btn) btn.disabled = true;
+        PremiereBridge.listSequenceMarkers(function (err, data) {
+          if (btn) btn.disabled = false;
+          if (err || !data || data.ok === false) {
+            mxStatus('Ошибка: ' + String((err && err.message) || (data && data.error) || 'неизв.'), true);
+            return;
+          }
+          if (!data.markers || !data.markers.length) {
+            mxStatus('На активной секвенции нет маркеров. Расставьте их вручную или через «📑 Авто-главы».', true);
+            return;
+          }
+          cb(data.markers, data.sequenceName || '');
+        });
+      }
+      function mxYtText(markers) {
+        return _formatChaptersForYouTube(markers.map(function (m) {
+          return { timeSec: m.timeSec, name: m.name || m.comment || 'Глава' };
+        }));
+      }
+      function mxYtWarn(markers) {
+        try {
+          if (typeof YouTubeExport !== 'undefined' && YouTubeExport.validateForYouTube) {
+            var warns = YouTubeExport.validateForYouTube(markers);
+            if (warns.length) return '⚠ ' + warns[0];
+          }
+        } catch (eW) {}
+        return '';
+      }
+      function mxCsv(markers) {
+        function esc(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }
+        function tc(sec) {
+          var t = Math.max(0, sec);
+          var hh = Math.floor(t / 3600), mm = Math.floor((t % 3600) / 60), ss = t % 60;
+          var pad = function (n) { return n < 10 ? '0' + n : String(n); };
+          return pad(hh) + ':' + pad(mm) + ':' + (ss < 10 ? '0' : '') + ss.toFixed(2);
+        }
+        var lines = ['startSec;timecode;durationSec;name;comment'];
+        for (var i = 0; i < markers.length; i++) {
+          var m = markers[i];
+          var dur = (typeof m.endSec === 'number' && m.endSec > m.timeSec) ? (m.endSec - m.timeSec) : 0;
+          lines.push([
+            m.timeSec.toFixed(3), tc(m.timeSec), dur ? dur.toFixed(3) : '0',
+            esc(m.name), esc(m.comment)
+          ].join(';'));
+        }
+        return lines.join('\r\n') + '\r\n';
+      }
+      var ytCopyBtn = document.getElementById('mx-yt-copy');
+      if (ytCopyBtn) {
+        ytCopyBtn.addEventListener('click', function () {
+          mxLoad(ytCopyBtn, function (markers) {
+            var text = mxYtText(markers);
+            var warn = mxYtWarn(markers);
+            var done = function (ok) {
+              mxStatus((ok ? 'Скопировано глав: ' + text.split('\n').length + '.' : 'Не удалось скопировать.') +
+                (warn ? '\n' + warn : ''), !ok);
+            };
+            try {
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(function () { done(true); }, function () {
+                  _fallbackCopy(text, null); done(true);
+                });
+              } else { _fallbackCopy(text, null); done(true); }
+            } catch (eC) { done(false); }
+          });
+        });
+      }
+      var ytSaveBtn = document.getElementById('mx-yt-save');
+      if (ytSaveBtn) {
+        ytSaveBtn.addEventListener('click', function () {
+          mxLoad(ytSaveBtn, function (markers, seqName) {
+            try {
+              var p = require('path').join(mxExportsDir(), mxStampName(seqName, 'youtube', '.txt'));
+              require('fs').writeFileSync(p, mxYtText(markers) + '\n', 'utf8');
+              var warn = mxYtWarn(markers);
+              mxStatus('Сохранено: ' + p + (warn ? '\n' + warn : ''));
+            } catch (eS) {
+              mxStatus('Ошибка сохранения: ' + String(eS.message || eS), true);
+            }
+          });
+        });
+      }
+      var csvSaveBtn = document.getElementById('mx-csv-save');
+      if (csvSaveBtn) {
+        csvSaveBtn.addEventListener('click', function () {
+          mxLoad(csvSaveBtn, function (markers, seqName) {
+            try {
+              var p = require('path').join(mxExportsDir(), mxStampName(seqName, 'markers', '.csv'));
+              /* BOM — чтобы Excel открыл кириллицу как UTF-8. */
+              require('fs').writeFileSync(p, '\uFEFF' + mxCsv(markers), 'utf8');
+              mxStatus('Сохранено ' + markers.length + ' маркеров: ' + p);
+            } catch (eS) {
+              mxStatus('Ошибка сохранения: ' + String(eS.message || eS), true);
+            }
+          });
+        });
+      }
+    })();
+
+    /* ── Волна 2: менеджер бэкап-секвенций ──────────────────
+       Список клонов «[бэкап HH:MM:SS]» + переключение (activateSequenceById).
+       Удаление секвенций через API намеренно НЕ делаем (безопасного пути нет). */
+    (function wireBackupManager() {
+      var listEl = document.getElementById('bk-list');
+      var refreshBtn = document.getElementById('bk-refresh');
+      if (!listEl || !refreshBtn) return;
+      function bkStatus(msg, isErr) {
+        listEl.innerHTML = '';
+        var d = document.createElement('div');
+        d.style.cssText = isErr ? 'color:#f59e0b;' : 'color:#888;';
+        d.textContent = msg;
+        listEl.appendChild(d);
+      }
+      function bkRender(data) {
+        var backups = [];
+        var seqs = (data && data.sequences) || [];
+        for (var i = 0; i < seqs.length; i++) {
+          if (String(seqs[i].name || '').indexOf('[бэкап ') !== -1) backups.push(seqs[i]);
+        }
+        if (!backups.length) {
+          bkStatus('Бэкап-секвенций нет. Они создаются автоматически перед деструктивным монтажом.');
+          return;
+        }
+        listEl.innerHTML = '';
+        for (var k = 0; k < backups.length; k++) {
+          (function (bk) {
+            var row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:3px 0;font-size:11px;';
+            var isActive = data.activeId && String(bk.id) === String(data.activeId);
+            var nameEl = document.createElement('span');
+            nameEl.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+            nameEl.textContent = bk.name + (isActive ? ' (активна)' : '');
+            nameEl.title = bk.name;
+            row.appendChild(nameEl);
+            var openBtn = document.createElement('button');
+            openBtn.type = 'button';
+            openBtn.className = 'secondary';
+            openBtn.style.cssText = 'padding:1px 8px;font-size:10px;';
+            openBtn.textContent = 'Открыть';
+            openBtn.disabled = !!isActive;
+            openBtn.addEventListener('click', function () {
+              /* Смена активной секвенции посреди чужой операции = смена
+                 таймлайна под ножом — взаимоисключаемся через общий queue. */
+              if (!beginOperation('tools:backup-open')) {
+                toolsShowErr('Идёт обработка — дождитесь завершения, потом переключайте бэкап.');
+                return;
+              }
+              openBtn.disabled = true;
+              PremiereBridge.activateSequenceById(bk.id, function (errB, dataB) {
+                endOperation();
+                openBtn.disabled = false;
+                if (errB || !dataB || dataB.ok === false) {
+                  toolsShowErr('Не удалось открыть: ' + String((errB && errB.message) || (dataB && dataB.error) || 'неизв.'));
+                  return;
+                }
+                _snapDirty = true;
+                lastSnap = null;
+                bkStatus('Открыта «' + (dataB.name || bk.name) + '». Оригинал не тронут — вернитесь на него в панели Project.');
+              });
+            });
+            row.appendChild(openBtn);
+            listEl.appendChild(row);
+          })(backups[k]);
+        }
+      }
+      refreshBtn.addEventListener('click', function () {
+        if (!window.PremiereBridge || !PremiereBridge.listProjectSequences) {
+          bkStatus('Мост недоступен.', true);
+          return;
+        }
+        refreshBtn.disabled = true;
+        bkStatus('Читаю список секвенций…');
+        PremiereBridge.listProjectSequences(function (err, data) {
+          refreshBtn.disabled = false;
+          if (err || !data || data.ok === false) {
+            bkStatus('Ошибка: ' + String((err && err.message) || (data && data.error) || 'неизв.'), true);
+            return;
+          }
+          bkRender(data);
+        });
+      });
+    })();
+
     async function toolsRunTool(toolName) {
       toolsShowErr('');
       toolsHideAllProposals();
@@ -9136,6 +9692,9 @@ PanelBoot.run('ИИ: монтаж', function () {
          caption-дорожка, без рендера). Не proposal: откат = удалить дорожку. */
       if (toolName === 'subtitles-anim') { await toolsRunSubtitles('animated'); return; }
       if (toolName === 'subtitles-static') { await toolsRunSubtitles('static'); return; }
+
+      /* «🔊 Громкость» — тоже не proposal: результат — новый WAV в bin. */
+      if (toolName === 'loudnorm') { await toolsRunLoudnorm(); return; }
 
       var pipelineFn, params = {}, proposalId;
 
@@ -9161,6 +9720,13 @@ PanelBoot.run('ИИ: монтаж', function () {
           var jmpMinSegEl = document.getElementById('jmp-minseg');
           if (jmpMinSegEl) params.minSegmentDuration = parseFloat(jmpMinSegEl.value);
           proposalId = 'proposal-jumps';
+          break;
+        case 'gaps':
+          /* «Убрать пробелы» — только снапшот, транскрипт/RMS не нужны. */
+          pipelineFn = DeterministicPipelines.removeGaps;
+          var gapMinEl = document.getElementById('gap-min');
+          if (gapMinEl) params.minGapSec = parseFloat(gapMinEl.value);
+          proposalId = 'proposal-gaps';
           break;
         case 'chapters':
           pipelineFn = DeterministicPipelines.chapterize;

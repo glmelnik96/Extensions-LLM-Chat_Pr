@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.14.0';
+$._EXT_PRM_.version = '2.14.2';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -872,9 +872,22 @@ $._EXT_PRM_._rippleShiftAllClipsFrom = function (seq, fromSec, deltaSec, exclude
     try {
       var ns = c.start.seconds + deltaSec;
       var ne = c.end.seconds + deltaSec;
-      c.start.seconds = ns; $._EXT_PRM_._bump();
-      c.end.seconds = ne; $._EXT_PRM_._bump();
-      log.push({ nodeId: String(c.nodeId), newStartSec: ns, newEndSec: ne });
+      /* Live-находка 2026-07-27: `c.start.seconds = x` на сборке пользователя —
+         тихий no-op (start возвращает копию Time); работает только присваивание
+         целого Time-объекта. При движении вправо порядок end→start (правый край
+         освобождает место), влево — start→end. Read-back отсеивает no-op. */
+      var tS = new Time(); tS.seconds = ns;
+      var tE = new Time(); tE.seconds = ne;
+      if (deltaSec > 0) {
+        c.end = tE; $._EXT_PRM_._bump();
+        c.start = tS; $._EXT_PRM_._bump();
+      } else {
+        c.start = tS; $._EXT_PRM_._bump();
+        c.end = tE; $._EXT_PRM_._bump();
+      }
+      if (Math.abs(c.start.seconds - ns) <= 0.02) {
+        log.push({ nodeId: String(c.nodeId), newStartSec: ns, newEndSec: ne });
+      }
     } catch (eMv) {}
   }
   return { shifted: log, attempted: scored.length };
@@ -4165,6 +4178,264 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
   });
 };
 
+/**
+ * Волна 2 (2026-07-27): закрыть ПУСТЫЕ пробелы таймлайна.
+ * applyTranscriptCuts тут бессилен: razor+remove в интервале без клипов ничего
+ * не удаляет → ripple не происходит. Здесь пробел закрывается сдвигом ВСЕХ
+ * клипов правее пробела влево на его ширину (все дорожки — синхрон сохранён).
+ * Абсолютное присваивание start/end (паттерн _rippleShiftAllClipsFrom) — не
+ * тянет linked-связки повторно. Порядок: пробелы справа-налево (независимость
+ * координат), клипы внутри сдвига — слева-направо (движение влево без коллизий).
+ * Last line of defense: host сам проверяет, что интервал действительно ПУСТ
+ * на всех дорожках — иначе отклоняет этот пробел (fail-soft, не клампит).
+ */
+$._EXT_PRM_.closeSequenceGaps = function (jsonArg) {
+  var undoOpened = false;
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+    var arg = JSON.parse(jsonArg);
+    if (arg.expectedSequenceName && String(seq.name) !== String(arg.expectedSequenceName)) {
+      return JSON.stringify({
+        ok: false,
+        error: 'Активная секвенция «' + seq.name + '» не та, для которой построен план («' +
+          arg.expectedSequenceName + '») — план отклонён, таймлайн не изменён.',
+        hostVersion: $._EXT_PRM_.version
+      });
+    }
+    var lockedTC = $._EXT_PRM_._findLockedTracks(seq, null);
+    if (lockedTC.length) {
+      return JSON.stringify({
+        ok: false,
+        error: 'Заблокированы дорожки: ' + lockedTC.join(', ') + ' — разблокируйте и повторите',
+        lockedTracks: lockedTC
+      });
+    }
+    var gaps = arg.gaps || [];
+    var eps = $._EXT_PRM_._EPS;
+    /* Валидация границ + сортировка справа-налево. */
+    var tagged = [];
+    var ti;
+    for (ti = 0; ti < gaps.length; ti++) {
+      tagged.push({ _origIdx: ti, startSec: gaps[ti].startSec, endSec: gaps[ti].endSec });
+    }
+    tagged.sort(function (x, y) { return y.startSec - x.startSec; });
+    /* Пересечения ломают независимость справа-налево — отклоняем весь план. */
+    var ovPrev = null;
+    for (var ovK = 0; ovK < tagged.length; ovK++) {
+      var ovIv = tagged[ovK];
+      if (typeof ovIv.startSec !== 'number' || typeof ovIv.endSec !== 'number') continue;
+      if (isNaN(ovIv.startSec) || isNaN(ovIv.endSec)) continue;
+      if (ovIv.startSec < 0 || ovIv.endSec <= ovIv.startSec) continue;
+      if (ovPrev !== null && ovIv.endSec > ovPrev.startSec + 0.01) {
+        return JSON.stringify({
+          ok: false,
+          error: 'Пробелы #' + ovIv._origIdx + ' и #' + ovPrev._origIdx +
+            ' пересекаются — план отклонён целиком, таймлайн не изменён.',
+          hostVersion: $._EXT_PRM_.version
+        });
+      }
+      ovPrev = ovIv;
+    }
+    /* Собрать ВСЕ клипы секвенции один раз на пробел (после сдвига коллекция
+       меняется — пересканируем на каждый пробел). */
+    function collectAll() {
+      var out = [];
+      var vi2, ai2, j2, tr2, n2, it2;
+      for (vi2 = 0; vi2 < seq.videoTracks.numTracks; vi2++) {
+        tr2 = seq.videoTracks[vi2];
+        n2 = tr2.clips.numItems;
+        for (j2 = 0; j2 < n2; j2++) {
+          try { it2 = tr2.clips[j2]; if (it2) out.push(it2); } catch (e1) {}
+        }
+      }
+      for (ai2 = 0; ai2 < seq.audioTracks.numTracks; ai2++) {
+        tr2 = seq.audioTracks[ai2];
+        n2 = tr2.clips.numItems;
+        for (j2 = 0; j2 < n2; j2++) {
+          try { it2 = tr2.clips[j2]; if (it2) out.push(it2); } catch (e2) {}
+        }
+      }
+      return out;
+    }
+    if (typeof app.beginUndoGroup === 'function') {
+      app.beginUndoGroup('ИИ: убрать пробелы');
+      undoOpened = true;
+    }
+    $._EXT_PRM_._resetOps();
+    var perResults = [];
+    var closedCount = 0;
+    var closedSec = 0;
+    for (var k = 0; k < tagged.length; k++) {
+      var gp = tagged[k];
+      if (typeof gp.startSec !== 'number' || typeof gp.endSec !== 'number' ||
+          isNaN(gp.startSec) || isNaN(gp.endSec) || gp.startSec < 0 || gp.endSec <= gp.startSec) {
+        perResults.push({ i: gp._origIdx, ok: false, error: 'некорректные границы' });
+        continue;
+      }
+      var width = gp.endSec - gp.startSec;
+      var all = collectAll();
+      /* Last line of defense: интервал обязан быть ПУСТ. Допуск eps на стыки. */
+      var occupied = false;
+      var toShift = [];
+      for (var ci = 0; ci < all.length; ci++) {
+        var cs, ce;
+        try { cs = all[ci].start.seconds; ce = all[ci].end.seconds; } catch (eDead) { continue; }
+        if (cs < gp.endSec - eps && ce > gp.startSec + eps) { occupied = true; break; }
+        if (cs >= gp.endSec - eps) toShift.push({ clip: all[ci], s: cs, e: ce });
+      }
+      if (occupied) {
+        perResults.push({ i: gp._origIdx, ok: false, error: 'интервал не пуст — клип пересекает пробел (таймлайн изменился?)' });
+        continue;
+      }
+      if (!toShift.length) {
+        perResults.push({ i: gp._origIdx, ok: false, error: 'правее пробела нет клипов — закрывать нечем' });
+        continue;
+      }
+      /* Движение влево: сортируем по возрастанию start — левые уезжают первыми. */
+      toShift.sort(function (a, b) { return a.s - b.s; });
+      var moved = 0, failed = 0;
+      for (var m = 0; m < toShift.length; m++) {
+        var c = toShift[m].clip;
+        try {
+          /* Live-находка 2026-07-27: сеттер `c.start.seconds = x` на сборке
+             пользователя — ТИХИЙ no-op (clip.start возвращает копию Time).
+             Работает только присваивание целого Time-объекта: c.start = t.
+             Семантика проверена живьём: чистый move, inPoint/outPoint не
+             трогаются. Порядок start→end безопасен при движении влево. */
+          var tS = new Time(); tS.seconds = toShift[m].s - width;
+          var tE = new Time(); tE.seconds = toShift[m].e - width;
+          c.start = tS; $._EXT_PRM_._bump();
+          c.end = tE; $._EXT_PRM_._bump();
+          /* Read-back верификация: без неё no-op сеттера отчитывался бы как
+             успех (false-success — именно так был пойман баг). */
+          var vS = c.start.seconds;
+          if (Math.abs(vS - (toShift[m].s - width)) <= 0.02) moved++;
+          else failed++;
+        } catch (eMv) { failed++; }
+      }
+      if (failed > 0) {
+        perResults.push({ i: gp._origIdx, ok: false, error: 'сдвинуто ' + moved + ' из ' + toShift.length + ' клипов — проверьте таймлайн', moved: moved, failed: failed });
+      } else {
+        perResults.push({ i: gp._origIdx, ok: true, moved: moved, widthSec: width });
+        closedCount++;
+        closedSec += width;
+      }
+    }
+    return JSON.stringify({
+      ok: true,
+      closed: closedCount,
+      requested: tagged.length,
+      closedSec: closedSec,
+      perResults: perResults,
+      undoSteps: $._EXT_PRM_._opCounter,
+      hostVersion: $._EXT_PRM_.version
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  } finally {
+    if (undoOpened && typeof app.endUndoGroup === 'function') {
+      try { app.endUndoGroup(); } catch (eU) {}
+    }
+  }
+};
+
+/**
+ * Волна 2 (2026-07-27): перечислить маркеры активной секвенции (read-only).
+ * Снапшот таймлайна маркеры не отдаёт — эта функция закрывает пробел для
+ * экспорта глав/маркеров в файл (CSV / YouTube-описание).
+ * Обход коллекции — тот же двухвариантный паттерн, что в removeMarkersBySeconds.
+ */
+$._EXT_PRM_.listSequenceMarkers = function () {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+    var markers = seq.markers;
+    if (!markers) {
+      return JSON.stringify({ ok: false, error: 'Коллекция markers недоступна у активной секвенции' });
+    }
+    var out = [];
+    function pushMk(mm) {
+      if (!mm) return;
+      var startSec = null, endSec = null;
+      try {
+        if (mm.start && typeof mm.start.seconds === 'number') startSec = mm.start.seconds;
+      } catch (eS) {}
+      if (startSec === null) return;
+      try {
+        if (mm.end && typeof mm.end.seconds === 'number' && mm.end.seconds > startSec) {
+          endSec = mm.end.seconds;
+        }
+      } catch (eE) {}
+      var nm = '', cm = '';
+      try { nm = String(mm.name || ''); } catch (eN) {}
+      try { cm = String(mm.comments || ''); } catch (eC) {}
+      out.push({ timeSec: startSec, endSec: endSec, name: nm, comment: cm });
+    }
+    try {
+      if (typeof markers.getFirstMarker === 'function') {
+        var mk = markers.getFirstMarker();
+        var guard = 0;
+        while (mk && guard < 10000) {
+          pushMk(mk);
+          guard++;
+          try { mk = markers.getNextMarker(mk); } catch (eGN) { mk = null; }
+        }
+      } else if (markers.numMarkers !== undefined) {
+        for (var k = 0; k < markers.numMarkers; k++) {
+          try { pushMk(markers[k]); } catch (eIx) {}
+        }
+      }
+    } catch (eIter) {}
+    out.sort(function (a, b) { return a.timeSec - b.timeSec; });
+    return JSON.stringify({
+      ok: true,
+      markers: out,
+      sequenceName: String(seq.name || ''),
+      hostVersion: $._EXT_PRM_.version
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
+ * Волна 2 (2026-07-27): перечислить секвенции проекта (read-only).
+ * Для менеджера бэкап-секвенций: панель фильтрует по « [бэкап » в имени,
+ * активирует через существующий activateSequenceById.
+ */
+$._EXT_PRM_.listProjectSequences = function () {
+  try {
+    if (!app.project) return JSON.stringify({ ok: false, error: 'Нет проекта' });
+    var activeId = '';
+    try {
+      if (app.project.activeSequence) activeId = String(app.project.activeSequence.sequenceID);
+    } catch (eA) {}
+    var seqs = app.project.sequences;
+    var out = [];
+    for (var i = 0; i < seqs.numSequences; i++) {
+      try {
+        out.push({
+          id: String(seqs[i].sequenceID),
+          name: String(seqs[i].name || '')
+        });
+      } catch (eS) {}
+    }
+    return JSON.stringify({
+      ok: true,
+      activeId: activeId,
+      sequences: out,
+      hostVersion: $._EXT_PRM_.version
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
 (function _decorateExportedFunctions() {
   if (typeof $._EXT_PRM_._wrap !== 'function') return;
   var EXPORTED = [
@@ -4186,7 +4457,11 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     'importSrtAsCaptions',
     'getFrameSources',
     'importAndOverlayOnTop',
-    'activateSequenceByName'
+    'activateSequenceByName',
+    'getSequenceRegionInfo',
+    'listSequenceMarkers',
+    'listProjectSequences',
+    'closeSequenceGaps'
   ];
   for (var i = 0; i < EXPORTED.length; i++) {
     var name = EXPORTED[i];

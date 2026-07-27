@@ -448,6 +448,22 @@
       .tr-text { color: var(--text); white-space: pre-wrap; word-break: break-word; }
       .tr-empty { color: var(--muted); text-align: center; padding: 24px 8px; }
       .tr-plain { color: var(--text); white-space: pre-wrap; word-break: break-word; }
+      /* Поиск + экспорт в читалке (27.07.2026, не-ИИ улучшения) */
+      .tr-modal-search {
+        flex-shrink: 0; width: 128px;
+        background: var(--panel, #2a2a2a); color: var(--text);
+        border: 1px solid var(--border); border-radius: 4px;
+        padding: 3px 6px; font-size: 12px;
+      }
+      .tr-modal-foot {
+        display: flex; gap: 8px; padding: 8px 12px;
+        border-top: 1px solid var(--border); align-items: center; flex-shrink: 0;
+      }
+      .tr-foot-status {
+        color: var(--muted); font-size: 11px; flex: 1; min-width: 0;
+        word-break: break-all;
+      }
+      .tr-text mark { background: #c8a200; color: #000; border-radius: 2px; padding: 0 1px; }
 
       /* ── Кастомный тултип (macOS CEP не показывает нативный title) ───── */
       .cc-tooltip {
@@ -630,6 +646,39 @@
             <div class="wave-legend" id="wave-legend-jumps" hidden></div>
             <button class="tool-run" data-tool="jumps">Найти и вырезать</button>
             <div class="proposal-area" id="proposal-jumps"></div>
+          </div>
+
+          <!-- 3b. Громкость (27.07.2026) — детерминированная LUFS-нормализация
+               (ffmpeg loudnorm, EBU R128). Не proposal: исходник не трогается,
+               результат — новый WAV в bin «AI Renders» (откат = удалить его). -->
+          <div class="tool-card" id="card-loudnorm">
+            <div class="tool-card-title">🔊 Громкость (LUFS)</div>
+            <div class="tool-card-desc">Нормализация громкости аудиофайла по EBU R128 (ffmpeg loudnorm, локально). Результат импортируется в bin «AI Renders» — перетащите поверх оригинала.</div>
+            <div class="param-row" title="Аудиофайл с таймлайна, который нормализуем. ⟳ — перечитать список с активной секвенции">
+              <span class="param-label">Источник</span>
+              <select id="ln-source" style="flex:1;min-width:0;"></select>
+              <button type="button" id="ln-refresh" class="secondary" style="padding:2px 8px;" title="Обновить список аудио с таймлайна">⟳</button>
+            </div>
+            <div class="param-row" title="Целевая интегральная громкость. Подкасты/YouTube: −16…−14 LUFS; броадкаст EBU R128: −23">
+              <span class="param-label">Цель</span>
+              <input type="range" id="ln-lufs" min="-24" max="-10" step="1" value="-16" />
+              <span class="param-val" id="ln-lufs-val">-16 LUFS</span>
+            </div>
+            <button class="tool-run" data-tool="loudnorm">Нормализовать</button>
+            <div class="proposal-area" id="ln-result" style="white-space:pre-wrap;"></div>
+          </div>
+
+          <!-- 3b. Убрать пробелы (пустые дыры таймлайна) -->
+          <div class="tool-card" id="card-gaps">
+            <div class="tool-card-title">🧲 Убрать пробелы</div>
+            <div class="tool-card-desc">Закрыть пустые дыры между клипами: всё правее каждого пробела сдвигается влево (все дорожки, синхрон сохраняется). Транскрипту и аудио-анализу не нужен.</div>
+            <div class="param-row" title="Пробелы короче порога не трогаем (могут быть намеренными паузами на стыках)">
+              <span class="param-label">Мин. пробел</span>
+              <input type="range" id="gap-min" min="0.1" max="5" step="0.1" value="0.1" />
+              <span class="param-val" id="gap-min-val">0.1с</span>
+            </div>
+            <button class="tool-run" data-tool="gaps">Найти пробелы</button>
+            <div class="proposal-area" id="proposal-gaps"></div>
           </div>
 
           <!-- 4. Chapterize -->
@@ -838,6 +887,28 @@
           </div>
 
           <!-- 6. J-cuts / L-cuts — ОТКЛЮЧЕНО (ограничение ExtendScript) -->
+          <!-- Экспорт маркеров активной секвенции в файл -->
+          <div class="tool-card" id="card-markers-export">
+            <div class="tool-card-title">🏷 Экспорт маркеров</div>
+            <div class="tool-card-desc">Маркеры активной секвенции → YouTube-описание (главы) или CSV. Файлы сохраняются в ~/.extensions_llm_chat_pr/exports.</div>
+            <div class="param-row" style="flex-wrap:wrap;gap:6px;">
+              <button type="button" id="mx-yt-copy" class="secondary" title="Скопировать главы в формате YouTube-описания (0:00 Название…)">📋 YouTube</button>
+              <button type="button" id="mx-yt-save" class="secondary" title="Сохранить YouTube-описание в .txt">💾 YouTube .txt</button>
+              <button type="button" id="mx-csv-save" class="secondary" title="Сохранить все маркеры в .csv (время, таймкод, имя, комментарий)">💾 CSV</button>
+            </div>
+            <div class="proposal-area" id="mx-result" style="white-space:pre-wrap;"></div>
+          </div>
+
+          <!-- Менеджер бэкап-секвенций (клоны перед деструктивным apply) -->
+          <div class="tool-card" id="card-backups">
+            <div class="tool-card-title">⏪ Бэкапы секвенций</div>
+            <div class="tool-card-desc">Клоны «[бэкап HH:MM:SS]», созданные перед монтажом. Открыть = переключиться на состояние до правки (оригинал не трогается). Удалять — вручную в панели Project.</div>
+            <div class="param-row">
+              <button type="button" id="bk-refresh" class="secondary" title="Перечитать список секвенций проекта">⟳ Обновить список</button>
+            </div>
+            <div class="proposal-area" id="bk-list" style="white-space:normal;"></div>
+          </div>
+
           <div class="tool-card" id="card-jcuts" style="opacity:0.5;pointer-events:none;">
             <div class="tool-card-title">🎬 J-cuts / L-cuts</div>
             <div class="tool-card-desc" style="color:#f59e0b;">
@@ -862,9 +933,17 @@
         <div class="tr-modal-head">
           <span class="tr-modal-title" id="tr-modal-title">Транскрипт</span>
           <span class="tr-modal-meta" id="tr-modal-meta"></span>
+          <input type="search" class="tr-modal-search" id="tr-modal-search"
+                 placeholder="Поиск…" title="Фильтр по тексту, спикеру или таймкоду" />
           <button type="button" class="tr-modal-close" id="tr-modal-close" title="Закрыть (Esc)" aria-label="Закрыть">✕</button>
         </div>
         <div class="tr-modal-body" id="tr-modal-body"></div>
+        <div class="tr-modal-foot">
+          <button type="button" id="tr-copy" title="Скопировать весь транскрипт в буфер обмена">Копировать</button>
+          <button type="button" id="tr-save-txt" title="Сохранить транскрипт с таймкодами в .txt">Сохранить .txt</button>
+          <button type="button" id="tr-export-srt" title="Субтитры .srt из Whisper-сегментов (норматив: ≤2 строки по 42 символа, ≤5с)">Экспорт .srt</button>
+          <span class="tr-foot-status" id="tr-foot-status"></span>
+        </div>
       </div>
     </div>
 

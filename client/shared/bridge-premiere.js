@@ -293,6 +293,22 @@
     activateSequenceById: function (seqId, cb) {
       var s = String(seqId).replace(/"/g, '\\"');
       this.evalJson('$._EXT_PRM_.activateSequenceById("' + s + '")', cb);
+    },
+
+    /** Волна 2: перечислить маркеры активной секвенции (read-only). */
+    listSequenceMarkers: function (cb) {
+      this.evalJson('$._EXT_PRM_.listSequenceMarkers()', cb);
+    },
+
+    /** Волна 2: перечислить секвенции проекта (read-only, менеджер бэкапов). */
+    listProjectSequences: function (cb) {
+      this.evalJson('$._EXT_PRM_.listProjectSequences()', cb);
+    },
+
+    /** Волна 2: закрыть пустые пробелы таймлайна (сдвиг клипов влево). */
+    closeSequenceGaps: function (payloadObj, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify(payloadObj || {}));
+      this.evalJson('$._EXT_PRM_.closeSequenceGaps("' + json + '")', cb, { mutating: true });
     }
   };
 })(window);

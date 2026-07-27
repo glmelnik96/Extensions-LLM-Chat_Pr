@@ -597,6 +597,75 @@
   }
 
   /**
+   * Волна 2 (27.07.2026): чистая функция — найти ПУСТЫЕ пробелы таймлайна:
+   * участки, не покрытые НИ ОДНИМ клипом ни на одной дорожке. Такие пробелы
+   * cutSilences не видит (он смотрит аудио), а applyTranscriptCuts не закрывает
+   * (razor+remove нечего удалять) — их закрывает host closeSequenceGaps сдвигом.
+   */
+  function findTimelineGaps(clips, opts) {
+    opts = opts || {};
+    var minGapSec = typeof opts.minGapSec === 'number' ? opts.minGapSec : 0.1;
+    var includeLeading = opts.includeLeading !== false;
+    var cover = [];
+    (clips || []).forEach(function (c) {
+      if (!c) return;
+      var s = c.startSec, e = c.endSec;
+      if (typeof s !== 'number' || typeof e !== 'number' || !(e > s)) return;
+      cover.push({ startSec: Math.max(0, s), endSec: e, reason: '' });
+    });
+    if (!cover.length) return [];
+    cover = _mergeIntervals(cover);
+    var gaps = [];
+    if (includeLeading && cover[0].startSec >= minGapSec) {
+      gaps.push({ startSec: 0, endSec: cover[0].startSec, reason: 'пробел в начале' });
+    }
+    for (var i = 1; i < cover.length; i++) {
+      var g0 = cover[i - 1].endSec, g1 = cover[i].startSec;
+      if (g1 - g0 >= minGapSec) gaps.push({ startSec: g0, endSec: g1, reason: 'пробел' });
+    }
+    return gaps;
+  }
+
+  /**
+   * «Убрать пробелы» — proposal-пайплайн Tools-вкладки. Работает ТОЛЬКО по
+   * снапшоту (транскрипт/RMS не нужны). kind='close_gaps' → panel применяет
+   * через host closeSequenceGaps (сдвиг всех клипов правее пробела влево).
+   */
+  async function removeGaps(ctx, params) {
+    params = params || {};
+    var snap = ctx && ctx.snapshot;
+    if (!snap || !snap.clips || !snap.clips.length) {
+      return { ok: false, error: 'Таймлайн пуст — нечего сдвигать.' };
+    }
+    var minGapSec = typeof params.minGapSec === 'number' ? params.minGapSec : 0.1;
+    var gaps = findTimelineGaps(snap.clips, {
+      minGapSec: minGapSec,
+      includeLeading: params.includeLeading !== false
+    });
+    if (!gaps.length) {
+      return {
+        ok: true,
+        noChanges: true,
+        summary: 'Пробелов (≥' + minGapSec + 'с) между клипами не найдено — таймлайн сплошной.'
+      };
+    }
+    var total = 0;
+    gaps.forEach(function (g) { total += g.endSec - g.startSec; });
+    return {
+      ok: true,
+      proposal: {
+        kind: 'close_gaps',
+        gaps: gaps,
+        summary: 'Найдено ' + gaps.length + ' пробел(ов), суммарно ' + total.toFixed(1) +
+          'с. Все клипы правее каждого пробела сдвинутся влево (все дорожки, синхрон сохраняется). Закрыть?',
+        removeSummary: gaps.map(function (g) {
+          return { startSec: g.startSec, endSec: g.endSec, reason: g.reason };
+        })
+      }
+    };
+  }
+
+  /**
    * /chapterize — расставить маркеры-главы (1 LLM-вызов через topics).
    * Если topics уже есть в кэше — 0 LLM-вызовов.
    */
@@ -2427,6 +2496,8 @@
   global.DeterministicPipelines = {
     cutFillers: cutFillers,
     cutSilences: cutSilences,
+    findTimelineGaps: findTimelineGaps,
+    removeGaps: removeGaps,
     chapterize: chapterize,
     jumpCuts: jumpCuts,
     jCuts: jCuts,
