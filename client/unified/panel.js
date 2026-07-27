@@ -796,6 +796,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           'детерминированно собирает план keep/cut под цель ±10% и показывает карточку на подтверждение. ' +
           'НЕ передавай blocks — плагин строит их сам. Требуется транскрипт (сначала транскрибируй In–Out). ' +
           'Используй для «сожми до N минут», «сократи сохранив суть», «собери по смыслу». ' +
+          'Если пользователь дал СЦЕНАРИЙ/план ролика («собери по этому сценарию») — передай его текст ' +
+          'ЦЕЛИКОМ в referenceScript: отбор пойдёт по соответствию сценарию, а не по общей важности. ' +
           'Вход должен быть сведён (nest/single-cam): несведённый мультикам плагин отклонит с рекомендацией.',
         parameters: {
           type: 'object',
@@ -803,6 +805,7 @@ PanelBoot.run('ИИ: монтаж', function () {
             sequenceKey: { type: 'string', description: 'Имя секвенции (sequenceName из снимка)' },
             targetDurationSec: { type: 'number', description: 'Целевой хронометраж в секундах, > 0' },
             summary: { type: 'string', description: '1-2 предложения: что получится' },
+            referenceScript: { type: 'string', description: 'Эталонный сценарий/план ролика от пользователя (текст как есть). Разметка смыслов оценит абзацы по соответствию ему: покрывает пункт = ядро, офтоп относительно сценария = мусор. Передавай ТОЛЬКО текст, который дал пользователь, не сочиняй свой.' },
             allowUnconsolidated: { type: 'boolean', description: 'Обойти гейт сведённого входа (мультикам). По умолчанию false — плагин блокирует несведённый вход. Ставь true только если пользователь явно согласился на лид-гэп/десинхрон.' }
           },
           required: ['sequenceKey', 'targetDurationSec', 'summary']
@@ -3449,8 +3452,11 @@ PanelBoot.run('ИИ: монтаж', function () {
       onProgress: function (ev) { if (ev && ev.message) statusUi.show(ev.message, true);
         if (ev && ev.totalChunks && typeof ev.chunkIndex === 'number') statusUi.progress((ev.chunkIndex / ev.totalChunks) * 100); }
     };
+    /* C1 (28.07.2026, AutoCut-паритет): эталонный сценарий — отбор по соответствию ему */
+    var refScript = String(args.referenceScript || '').replace(/^\s+|\s+$/g, '');
+    if (refScript) wOpt.referenceScript = refScript;
 
-    statusUi.show('Разметка смыслов транскрипта…', true);
+    statusUi.show(refScript ? 'Разметка смыслов по сценарию…' : 'Разметка смыслов транскрипта…', true);
     return TranscriptStructure.labelMontageBlocks(paras, wOpt)
       .then(function (w) {
         if (!w || !w.labeled || !w.labeled.length) throw new Error('Воркер не вернул разметку');
@@ -5206,6 +5212,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       copyBtn: document.getElementById('tr-copy'),
       saveBtn: document.getElementById('tr-save-txt'),
       srtBtn: document.getElementById('tr-export-srt'),
+      proofBtn: document.getElementById('tr-proofread'),
       foot: document.getElementById('tr-foot-status')
     };
   }
@@ -5249,6 +5256,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     if (m.copyBtn) m.copyBtn.disabled = !hasRows;
     if (m.saveBtn) m.saveBtn.disabled = !hasRows;
     if (m.srtBtn) m.srtBtn.disabled = !(entry && entry.segments && entry.segments.length);
+    if (m.proofBtn) m.proofBtn.disabled = !(entry && entry.segments && entry.segments.length);
     if (m.search) m.search.disabled = !hasRows;
     if (!hasRows) {
       m.meta.textContent = '';
@@ -5455,6 +5463,143 @@ PanelBoot.run('ИИ: монтаж', function () {
           foot('SRT (' + cues.length + ' титров): ' + p);
         } catch (eS) {
           foot('Ошибка экспорта SRT: ' + String(eS && eS.message || eS), true);
+        }
+      };
+    }
+    /* C5 (27.07.2026, AutoCut-паритет): ИИ-корректура транскрипта.
+       Правим ТОЛЬКО орфографию/пунктуацию в сегментах (guard: число слов
+       не меняется — иначе правка отклоняется, таймкоды сегментов остаются
+       валидными). Результат персистится в кэш → .txt/.srt/анализ/главы
+       дальше работают по исправленному тексту. Темы глав не сбрасываем:
+       орфография смысла не меняет. */
+    if (m.proofBtn) {
+      m.proofBtn.onclick = async function () {
+        var seq = _trViewState.seq;
+        var found = seq ? ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seq) : { entry: null, matchedKey: null };
+        var entry = found && found.entry;
+        if (!entry || !entry.segments || !entry.segments.length) {
+          foot('Нет Whisper-сегментов — корректура работает по ним.', true);
+          return;
+        }
+        var settings = ContextStore.getResolvedSettings();
+        if (!settings.apiKey || !settings.chatModel) {
+          foot('Нет chat-модели или API-ключа (вкладка «Настройки»).', true);
+          return;
+        }
+        if (!beginOperation('transcript:proofread')) {
+          foot('Идёт другая обработка — дождитесь завершения.', true);
+          return;
+        }
+        m.proofBtn.disabled = true;
+        try {
+          var segs = entry.segments;
+          /* Фолбэк моделей — как в reelsProofread (инцидент 22.07: без него
+             офлайн-основная висела 5×300с). */
+          var fbMap = (settings.modelFallbacks && typeof settings.modelFallbacks === 'object')
+            ? settings.modelFallbacks : {};
+          var fbList = (fbMap[settings.chatModel] && fbMap[settings.chatModel].length)
+            ? fbMap[settings.chatModel].slice() : [];
+          var fixes = {};
+          var applied = 0, rejected = 0;
+          var PR_BATCH = 40;
+          for (var off = 0; off < segs.length; off += PR_BATCH) {
+            foot('ИИ-корректура: ' + off + '/' + segs.length + ' сегментов…');
+            var batch = [];
+            var hi = Math.min(off + PR_BATCH, segs.length);
+            for (var i = off; i < hi; i++) {
+              batch.push({ i: i, text: String((segs[i] && segs[i].text) || '').replace(/\n/g, ' ') });
+            }
+            var resp = await CloudRuClient.chatCompletions({
+              baseUrl: settings.baseUrl,
+              apiKey: settings.apiKey,
+              model: settings.chatModel,
+              fallbackModels: fbList,
+              temperature: 0,
+              enableThinking: false,
+              responseFormat: 'json_object',
+              chatParams: { max_tokens: 4096 },
+              messages: [
+                {
+                  role: 'system',
+                  content: 'Ты корректор русской видеорасшифровки. Исправляй ТОЛЬКО орфографию, ' +
+                    'пунктуацию и регистр букв. ЗАПРЕЩЕНО добавлять, удалять или заменять слова, ' +
+                    'менять их порядок или смысл. Верни строго JSON ' +
+                    '{"segs":[{"i":<номер>,"text":"<исправленный текст>"}]} — ' +
+                    'ТОЛЬКО изменённые сегменты (если правок нет — {"segs":[]}).'
+                },
+                { role: 'user', content: JSON.stringify({ segs: batch }) }
+              ]
+            });
+            var content = (resp && resp.choices && resp.choices[0] && resp.choices[0].message)
+              ? String(resp.choices[0].message.content || '') : '';
+            var parsed = null;
+            try { parsed = JSON.parse(content); } catch (ePj) { throw new Error('модель вернула не-JSON'); }
+            var results = (parsed && parsed.segs && parsed.segs.length) ? parsed.segs : [];
+            for (var ri = 0; ri < results.length; ri++) {
+              var r = results[ri];
+              if (!r || typeof r.i !== 'number' || typeof r.text !== 'string') { rejected++; continue; }
+              if (r.i < off || r.i >= hi || !segs[r.i]) { rejected++; continue; }
+              var orig = String(segs[r.i].text || '');
+              var corr = r.text.replace(/^\s+|\s+$/g, '');
+              if (!corr || corr === orig) continue;
+              /* Guard: слова менять нельзя — число слов обязано совпасть. */
+              var ow = orig.replace(/^\s+|\s+$/g, '').split(/\s+/).length;
+              if (ow !== corr.split(/\s+/).length) { rejected++; continue; }
+              fixes[r.i] = corr;
+              applied++;
+            }
+          }
+          if (!applied) {
+            foot('Корректура: правок не потребовалось.' + (rejected ? ' Отклонено (заменяли слова): ' + rejected + '.' : ''));
+            return;
+          }
+          /* Применяем к СВЕЖЕЙ копии entry из кэша (не к _trViewState —
+             за время запросов кэш мог измениться) и персистим. */
+          var found2 = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seq);
+          if (!found2 || !found2.entry || !found2.matchedKey) {
+            foot('Транскрипт исчез из кэша — правки не сохранены.', true);
+            return;
+          }
+          var e2 = found2.entry;
+          var newSegs = (e2.segments || []).slice();
+          var written = 0;
+          for (var k in fixes) {
+            if (!Object.prototype.hasOwnProperty.call(fixes, k)) continue;
+            var ki = parseInt(k, 10);
+            if (newSegs[ki] && typeof newSegs[ki].text === 'string') {
+              var cs = {};
+              for (var pk in newSegs[ki]) {
+                if (Object.prototype.hasOwnProperty.call(newSegs[ki], pk)) cs[pk] = newSegs[ki][pk];
+              }
+              cs.text = fixes[ki];
+              newSegs[ki] = cs;
+              written++;
+            }
+          }
+          e2.segments = newSegs;
+          /* Производные перестраиваем: абзацы (из сегментов) и плоский текст. */
+          delete e2.paragraphs;
+          if (typeof TranscriptStructure !== 'undefined') {
+            try { TranscriptStructure.buildStructure(e2); } catch (eB2) {}
+          }
+          if (e2.text) {
+            var flat = [];
+            for (var si2 = 0; si2 < newSegs.length; si2++) {
+              flat.push(String((newSegs[si2] && newSegs[si2].text) || ''));
+            }
+            e2.text = flat.join(' ');
+          }
+          e2.editHistory = Array.isArray(e2.editHistory) ? e2.editHistory.slice() : [];
+          e2.editHistory.push({ at: Date.now(), kind: 'proofread', applied: written });
+          ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found2.matchedKey, e2);
+          _renderTranscriptRows(e2, seq, m.search ? m.search.value : '');
+          foot('Корректура: исправлено сегментов — ' + written +
+            (rejected ? ', отклонено (заменяли слова) — ' + rejected : '') + '.');
+        } catch (ePr) {
+          foot('Ошибка корректуры: ' + String((ePr && ePr.message) || ePr), true);
+        } finally {
+          m.proofBtn.disabled = !(_trViewState.entry && _trViewState.entry.segments && _trViewState.entry.segments.length);
+          endOperation();
         }
       };
     }
@@ -6969,11 +7114,24 @@ PanelBoot.run('ИИ: монтаж', function () {
       if (toolName === 'silences') {
         var sMin = num('sil-min'); if (sMin !== undefined) params.minDuration = sMin;
         var sPad = num('sil-pad'); if (sPad !== undefined) params.padding = sPad;
+        /* A3: раздельный хвостовой отступ (лид-ин следующей фразы) */
+        var sPadA = num('sil-pad-after'); if (sPadA !== undefined) params.paddingAfter = sPadA;
         var sThr = num('sil-thresh', parseInt); if (sThr !== undefined) params.silenceThresholdDelta = sThr;
+        /* A1: режим — remove / mute / keep_spaces */
+        var sMode = getToggle('sil-mode'); if (sMode) params.cutMode = sMode;
+        /* B1: аудио-кроссфейд на швах */
+        var sXf = document.getElementById('sil-crossfade'); if (sXf) params.crossfade = sXf.checked;
+      } else if (toolName === 'trim-edges') {
+        /* A4: подрезка тишины в начале/конце каждого клипа */
+        var tMin = num('te-min'); if (tMin !== undefined) params.minTrim = tMin;
+        var tThr = num('te-thresh', parseInt); if (tThr !== undefined) params.marginDb = tThr;
+        var tPad = num('te-pad'); if (tPad !== undefined) params.padding = tPad;
       } else if (toolName === 'jumps') {
         var jPause = num('jmp-pause'); if (jPause !== undefined) params.maxPause = jPause;
         var jBreath = num('jmp-breath'); if (jBreath !== undefined) params.keepBreathing = jBreath;
         var jMin = num('jmp-minseg'); if (jMin !== undefined) params.minSegmentDuration = jMin;
+        /* B1: аудио-кроссфейд на швах */
+        var jXf = document.getElementById('jmp-crossfade'); if (jXf) params.crossfade = jXf.checked;
       }
       return params;
     }
@@ -7381,10 +7539,13 @@ PanelBoot.run('ИИ: монтаж', function () {
         if (el) el.addEventListener('input', onInput);
       }
     }
-    bindWaveformRedraw(['sil-min', 'sil-pad', 'sil-thresh'], 'silences');
+    bindWaveformRedraw(['sil-min', 'sil-pad', 'sil-pad-after', 'sil-thresh'], 'silences');
     bindWaveformRedraw(['jmp-pause', 'jmp-breath', 'jmp-minseg'], 'jumps');
     bindSlider('sil-min', 'sil-min-val', 'с');
     bindSlider('sil-pad', 'sil-pad-val', 'с');
+    bindSlider('sil-pad-after', 'sil-pad-after-val', 'с');
+    bindSlider('te-min', 'te-min-val', 'с');
+    bindSlider('te-pad', 'te-pad-val', 'с');
     bindSlider('jmp-pause', 'jmp-pause-val', 'с');
     bindSlider('jmp-minseg', 'jmp-minseg-val', 'с');
     bindSlider('jcut-offset', 'jcut-offset-val', '');
@@ -7392,6 +7553,16 @@ PanelBoot.run('ИИ: монтаж', function () {
     bindSlider('gap-min', 'gap-min-val', 'с');
     bindSlider('mc-minhold', 'mc-minhold-val', 'с');
     bindSlider('mc-maxhold', 'mc-maxhold-val', 'с');
+
+    /* C2: «Цензура мата» — восстановить свои слова из localStorage */
+    (function () {
+      var el = document.getElementById('prof-words');
+      if (!el) return;
+      try {
+        var saved = localStorage.getItem('extllmpr_v1_prof_words');
+        if (saved) el.value = saved;
+      } catch (e) {}
+    })();
 
     /* MultiCam: «X dB», «-X dB», вариативность 0 = «выкл» */
     (function () {
@@ -7681,6 +7852,75 @@ PanelBoot.run('ИИ: монтаж', function () {
       s.addEventListener('input', upd);
       upd();
     })();
+    (function () {
+      var s = document.getElementById('te-thresh');
+      var v = document.getElementById('te-thresh-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = s.value + ' dB'; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+
+    /* A2 (27.07.2026): автоподбор порога dB — долина между модами «тишина» и
+       «речь» в гистограмме уже посчитанного RMS (Оцу, локально, пер-клипово). */
+    (function () {
+      var btn = document.getElementById('sil-thresh-auto');
+      if (!btn) return;
+      btn.addEventListener('click', function () {
+        var entry = (_waveState && _waveState.toolName === 'silences') ? _waveState.entry : null;
+        if (!entry) {
+          var sk = lastSnap && lastSnap.sequenceName;
+          if (sk) {
+            var found = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, sk);
+            entry = found && found.entry;
+          }
+        }
+        var rms = entry && entry.audioAnalysis && entry.audioAnalysis.rmsTimeline;
+        if (!Array.isArray(rms) || rms.length < 2) {
+          toolsShowErr('Для автоподбора нужен RMS: запустите «⚡ Анализ аудио».');
+          return;
+        }
+        var m = DeterministicPipelines.autoSilenceMarginDb(rms, entry.audioAnalysis.clipRanges);
+        if (m == null) {
+          toolsShowErr('Автоподбор не уверен: в гистограмме громкости нет явной «долины» между тишиной и речью — оставил ручной порог.');
+          return;
+        }
+        var s = document.getElementById('sil-thresh');
+        if (s) {
+          s.value = String(m);
+          s.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        toolsStatusUi.show('Порог подобран автоматически: на ' + m + ' dB тише речи.', false);
+        setTimeout(function () { toolsStatusUi.hide(); }, 3000);
+      });
+    })();
+
+    /* A5 (27.07.2026): пресеты темпа silences — один клик выставляет ползунки.
+       Значения дальше можно докручивать вручную (пресет — стартовая точка). */
+    (function () {
+      var PRESETS = {
+        calm:     { 'sil-min': '1.5', 'sil-thresh': '22', 'sil-pad': '0.25', 'sil-pad-after': '0.25' },
+        standard: { 'sil-min': '1.0', 'sil-thresh': '18', 'sil-pad': '0.15', 'sil-pad-after': '0.15' },
+        dynamic:  { 'sil-min': '0.6', 'sil-thresh': '15', 'sil-pad': '0.1',  'sil-pad-after': '0.1' },
+        jumpy:    { 'sil-min': '0.4', 'sil-thresh': '12', 'sil-pad': '0.05', 'sil-pad-after': '0.05' }
+      };
+      var group = document.getElementById('sil-preset');
+      if (!group) return;
+      group.addEventListener('click', function (ev) {
+        var t = ev.target;
+        if (!t || String(t.className).indexOf('toggle-btn') === -1) return;
+        var preset = PRESETS[t.getAttribute('data-val')];
+        if (!preset) return;
+        for (var id in preset) {
+          if (!preset.hasOwnProperty(id)) continue;
+          var el = document.getElementById(id);
+          if (!el) continue;
+          el.value = preset[id];
+          /* input-событие: обновить подпись значения + live-перерисовать waveform */
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      });
+    })();
 
     /* Кол-во глав: 0 = «авто» */
     (function () {
@@ -7688,6 +7928,16 @@ PanelBoot.run('ИИ: монтаж', function () {
       var v = document.getElementById('ch-count-val');
       if (!s || !v) return;
       function upd() { v.textContent = s.value === '0' ? 'авто' : s.value; }
+      s.addEventListener('input', upd);
+      upd();
+    })();
+
+    /* C3: мин. интервал глав: 0 = «авто» (адаптивный 10/20/45с) */
+    (function () {
+      var s = document.getElementById('ch-minlen');
+      var v = document.getElementById('ch-minlen-val');
+      if (!s || !v) return;
+      function upd() { v.textContent = s.value === '0' ? 'авто' : s.value + 'с'; }
       s.addEventListener('input', upd);
       upd();
     })();
@@ -7713,6 +7963,8 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
     bindToggle('filler-mode');
     bindToggle('jcut-mode');
+    bindToggle('sil-mode');
+    bindToggle('sil-preset');
 
     /* ── Инвалидация предложения при смене параметров ─────────
        05.07.2026: план в proposal строится ОДИН РАЗ по параметрам на момент
@@ -7743,6 +7995,21 @@ PanelBoot.run('ИИ: монтаж', function () {
           card.addEventListener('change', onParamChange);
           card.addEventListener('click', onParamChange);
         })(invCards[ci]);
+      }
+      /* B4: глобальный чекбокс «Только In/Out» вне карточек — тоже параметр,
+         его смена делает ЛЮБОЕ видимое предложение неактуальным. */
+      var inOutCb = document.getElementById('tools-inout-only');
+      if (inOutCb) {
+        inOutCb.addEventListener('change', function () {
+          var areas = document.querySelectorAll('.proposal-area');
+          for (var ai = 0; ai < areas.length; ai++) {
+            if (areas[ai].className.indexOf('visible') !== -1) {
+              toolsHideProposal(areas[ai]);
+              toolsStatusUi.show('Параметры изменились — предложение сброшено. Нажмите «Найти…» заново.', false);
+              setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+            }
+          }
+        });
       }
     })();
 
@@ -7846,6 +8113,13 @@ PanelBoot.run('ИИ: монтаж', function () {
         var tcTotal = (prop.removeIntervals || []).length;
         var tcDone = 0;      /* применённых вырезок */
         var tcRemSec = 0;    /* суммарно вырезано, сек */
+        /* 27.07.2026 (AutoCut wave A1): режимы удаления. 'remove' (ripple) —
+           единственный режим, сдвигающий таймлайн → только он ремапит кэш
+           транскрипта. lift/mute не меняют тайм-координаты. */
+        var tcMode = (prop.cutMode === 'mute' || prop.cutMode === 'keep_spaces') ? prop.cutMode : 'remove';
+        /* B1: кроссфейды на швах после всех батчей (только ripple-вырезка) */
+        var tcXfAdded = null;   /* null = не запрашивались */
+        var tcXfWarn = '';
 
         var tcSeqKey = function () {
           return prop.seqKey || tcExpected ||
@@ -7869,8 +8143,14 @@ PanelBoot.run('ИИ: монтаж', function () {
           toolsStatusUi.show('Готово! Откат: Cmd+Z / Ctrl+Z', false);
           /* Статус-UX 11.07.2026: итог остаётся на карточке + немедленный
              пересчёт гейтов (не ждать 4с-интервала — гейт-гонка после ripple). */
+          var tcVerb = tcMode === 'mute' ? 'заглушено (клипы отключены)'
+            : tcMode === 'keep_spaces' ? 'вырезано без сдвига (дыры остались)'
+            : 'вырезок';
+          var tcXfNote = tcXfAdded === null ? ''
+            : ' Кроссфейды: ' + tcXfAdded + (tcXfWarn ? ' (' + tcXfWarn + ')' : '') + '.';
           toolsSetCardStatus(prop.cardId, tcSeqKey(),
-            'Применено: ' + tcDone + ' вырезок (−' + tcRemSec.toFixed(1) + 'с). Откат: Cmd+Z', 'ok');
+            'Применено: ' + tcDone + ' ' + (tcMode === 'remove' ? tcVerb : 'интервалов — ' + tcVerb) +
+            ' (−' + tcRemSec.toFixed(1) + 'с).' + tcXfNote + ' Откат: Cmd+Z', 'ok');
           try { window.toolsRefreshLed(); } catch (eL) {}
           /* Sync chat transcript LED */
           setTranscriptLed('ok');
@@ -7878,14 +8158,48 @@ PanelBoot.run('ИИ: монтаж', function () {
         };
 
         var tcRunBatch = function (bi) {
-          if (bi >= tcBatches.length) { tcFinish(null); return; }
+          if (bi >= tcBatches.length) {
+            /* B1: все батчи применены — вешаем аудио-кроссфейды на швы.
+               Шов k в ПОСТ-монтажных координатах = startSec_k − сумма длительностей
+               вырезанного левее (та же математика, что applyRippleDeletionsToTranscript).
+               Сбой кроссфейдов НЕ фейлит монтаж (резы уже на таймлайне) — warning. */
+            if (prop.crossfade && tcMode === 'remove' && tcDone > 0) {
+              toolsStatusUi.show('Добавляю кроссфейды на швах…', true);
+              var xfSorted = (prop.removeIntervals || []).slice()
+                .sort(function (a, b) { return a.startSec - b.startSec; });
+              var xfTimes = [];
+              var xfCum = 0;
+              for (var xfi = 0; xfi < xfSorted.length; xfi++) {
+                var seam = xfSorted[xfi].startSec - xfCum;
+                if (seam > 0.05) xfTimes.push(Math.round(seam * 1000) / 1000);
+                xfCum += Math.max(0, xfSorted[xfi].endSec - xfSorted[xfi].startSec);
+              }
+              PremiereBridge.addAudioCrossfades(
+                { times: xfTimes, expectedSequenceName: tcExpected },
+                function (errX, dX) {
+                  if (errX || (dX && dX.ok === false)) {
+                    tcXfAdded = (dX && typeof dX.added === 'number') ? dX.added : 0;
+                    tcXfWarn = errX ? String(errX.message || errX).slice(0, 80)
+                      : String((dX && dX.error) || 'не добавились').slice(0, 80);
+                  } else {
+                    tcXfAdded = (dX && typeof dX.added === 'number') ? dX.added : 0;
+                    if (dX && dX.failed > 0) tcXfWarn = dX.failed + ' не добавились';
+                  }
+                  tcFinish(null);
+                }
+              );
+              return;
+            }
+            tcFinish(null);
+            return;
+          }
           var ivs = tcBatches[bi];
           if (tcBatches.length > 1) {
             toolsStatusUi.show('Монтаж: батч ' + (bi + 1) + '/' + tcBatches.length +
               ' (вырезки ' + (tcDone + 1) + '–' + (tcDone + ivs.length) + ' из ' + tcTotal + ')…', true);
           }
           PremiereBridge.applyTranscriptCuts(
-            { removeIntervals: ivs, summary: prop.summary, expectedSequenceName: tcExpected },
+            { removeIntervals: ivs, summary: prop.summary, expectedSequenceName: tcExpected, cutMode: tcMode },
             function (err, dataTC) {
               if (err || (dataTC && dataTC.ok === false)) {
                 var reason = err ? String(err.message || err) : ('НЕ применено: ' + describeHostFailure(dataTC));
@@ -7899,12 +8213,15 @@ PanelBoot.run('ИИ: монтаж', function () {
                 return;
               }
               /* Ремап транскрипта СРАЗУ после батча: батчи независимы (справа-
-                 налево), при сбое следующего кэш останется согласованным. */
-              try {
-                var sk = tcSeqKey();
-                if (sk) ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, sk, ivs);
-              } catch (eR) {
-                console.warn('[tools] applyRippleDeletionsToTranscript failed:', eR && eR.message);
+                 налево), при сбое следующего кэш останется согласованным.
+                 Только для ripple ('remove'): lift/mute таймлайн не сдвигают. */
+              if (tcMode === 'remove') {
+                try {
+                  var sk = tcSeqKey();
+                  if (sk) ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, sk, ivs);
+                } catch (eR) {
+                  console.warn('[tools] applyRippleDeletionsToTranscript failed:', eR && eR.message);
+                }
               }
               tcDone += ivs.length;
               for (var rvi = 0; rvi < ivs.length; rvi++) {
@@ -9339,6 +9656,157 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
     })();
 
+    /* ── C4 (28.07.2026, AutoCut-паритет): viral-скоринг кандидатов ──────
+       «Найти виральные моменты»: LLM оценивает окна абзацев по пресету
+       (Hook/Retention/Emotion + «почему»), НИЧЕГО не применяет. Кнопки:
+       таймкод → плейхед; «In/Out» → границы секвенции (под «Собрать рилс»);
+       «Маркеры» → подписанные маркеры всех кандидатов на таймлайне.
+       Рендер без innerHTML для LLM-текста (XSS-гигиена). */
+    async function toolsFindViralMoments() {
+      var btn = document.getElementById('rl-viral-find');
+      var resEl = document.getElementById('rl-result');
+      if (!beginOperation('tools:viral')) {
+        toolsShowErr('Идёт обработка — дождитесь завершения.');
+        return;
+      }
+      if (btn) btn.disabled = true;
+      try {
+        toolsStatusUi.show('Виральные моменты: читаю транскрипт…', true);
+        var snap = await execGetSnapshot(true);
+        if (!snap || !snap.ok) {
+          toolsShowErr(snap && snap.error ? snap.error : 'Не удалось получить снимок таймлайна.');
+          return;
+        }
+        var seqName = String(snap.sequenceName || '');
+        var found = seqName ? ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName) : { entry: null };
+        var entry = found && found.entry;
+        if (!entry || !entry.segments || !entry.segments.length) {
+          toolsShowErr('Нет транскрипта для «' + seqName + '» — сначала транскрибируйте (вкладка «Чат»).');
+          return;
+        }
+        if ((!entry.paragraphs || !entry.paragraphs.length) && typeof TranscriptStructure !== 'undefined') {
+          try { TranscriptStructure.buildStructure(entry); } catch (eBs) {}
+        }
+        if (!entry.paragraphs || !entry.paragraphs.length) {
+          toolsShowErr('Не удалось построить абзацы транскрипта.');
+          return;
+        }
+        var settings = ContextStore.getResolvedSettings();
+        if (!settings.apiKey || !settings.chatModel) {
+          toolsShowErr('Нет chat-модели или API-ключа (вкладка «Настройки»).');
+          return;
+        }
+        var presetId = (document.getElementById('rl-viral-preset') || {}).value || 'universal';
+        var targetLen = parseInt((document.getElementById('rl-viral-len') || {}).value, 10) || 45;
+        var customEl = document.getElementById('rl-viral-custom');
+        var customPrompt = customEl && customEl.value ? customEl.value.replace(/^\s+|\s+$/g, '') : '';
+        toolsStatusUi.show('Виральные моменты: ИИ оценивает кандидатов…', true);
+        var cands = await TranscriptStructure.scoreViralMomentsWithLLM(entry.paragraphs, {
+          settings: settings,
+          presetId: presetId,
+          customPrompt: customPrompt || undefined,
+          targetLenSec: targetLen,
+          maxCandidates: 5
+        });
+        if (!resEl) return;
+        resEl.innerHTML = '';
+        if (!cands || !cands.length) {
+          resEl.textContent = 'ИИ не нашёл убедительных кандидатов (или ответ не распарсился) — попробуйте другой пресет/длину.';
+          return;
+        }
+        var head = document.createElement('div');
+        head.style.cssText = 'font-weight:600;margin-bottom:4px;';
+        head.textContent = 'Виральные кандидаты (' + cands.length + '), оценки 0–10:';
+        resEl.appendChild(head);
+        for (var i = 0; i < cands.length; i++) {
+          (function (c, n) {
+            var card = document.createElement('div');
+            card.style.cssText = 'border:1px solid var(--border,#444);border-radius:4px;padding:6px;margin:4px 0;';
+            var row1 = document.createElement('div');
+            row1.style.cssText = 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;';
+            var tc = document.createElement('span');
+            tc.style.cssText = 'color:var(--accent,#4ea1ff);cursor:pointer;font-variant-numeric:tabular-nums;';
+            tc.textContent = TranscriptView.formatTimecode(c.startSec) + '–' + TranscriptView.formatTimecode(c.endSec);
+            tc.title = 'Перейти к началу фрагмента';
+            tc.onclick = function () {
+              try { PremiereBridge.setPlayhead(c.startSec, function () {}); } catch (eP) {}
+            };
+            row1.appendChild(tc);
+            var ttl = document.createElement('span');
+            ttl.style.cssText = 'font-weight:600;flex:1;min-width:0;';
+            ttl.textContent = (n + 1) + '. ' + (c.title || 'Без названия');
+            row1.appendChild(ttl);
+            var io = document.createElement('button');
+            io.type = 'button';
+            io.textContent = 'In/Out';
+            io.title = 'Выставить In/Out секвенции по этому фрагменту (дальше — «Собрать рилс»)';
+            io.style.cssText = 'font-size:11px;flex:none;';
+            io.onclick = function () {
+              io.disabled = true;
+              PremiereBridge.setSequenceInOut(c.startSec, c.endSec, function (err, data) {
+                io.disabled = false;
+                if (err || !data || !data.ok) {
+                  toolsShowErr('In/Out не выставлены: ' + ((data && data.error) || err || 'нет ответа'));
+                } else {
+                  toolsStatusUi.show('In/Out: ' + TranscriptView.formatTimecode(data.inSec) + '–' + TranscriptView.formatTimecode(data.outSec), false);
+                  if (typeof window.toolsRefreshLed === 'function') window.toolsRefreshLed();
+                }
+              });
+            };
+            row1.appendChild(io);
+            card.appendChild(row1);
+            var sc = document.createElement('div');
+            sc.style.cssText = 'font-size:11px;color:var(--muted);margin-top:2px;';
+            sc.textContent = 'Хук ' + c.scores.hook + ' · Удержание ' + c.scores.retention +
+              ' · Эмоция ' + c.scores.emotion + ' · Σ ' + c.total + '/30';
+            card.appendChild(sc);
+            if (c.why) {
+              var why = document.createElement('div');
+              why.style.cssText = 'font-size:11px;margin-top:2px;';
+              why.textContent = c.why;
+              card.appendChild(why);
+            }
+            resEl.appendChild(card);
+          })(cands[i], i);
+        }
+        var mkBtn = document.createElement('button');
+        mkBtn.type = 'button';
+        mkBtn.textContent = 'Маркеры на таймлайн';
+        mkBtn.title = 'Поставить подписанный маркер в начале каждого кандидата';
+        mkBtn.style.cssText = 'font-size:11px;margin-top:4px;';
+        mkBtn.onclick = function () {
+          mkBtn.disabled = true;
+          var markers = [];
+          for (var mi = 0; mi < cands.length; mi++) {
+            markers.push({
+              timeSec: cands[mi].startSec,
+              name: '🔥 ' + (mi + 1) + '. ' + (cands[mi].title || 'Виральный момент') + ' (Σ' + cands[mi].total + ')',
+              comment: (cands[mi].why || '') + ' [' + TranscriptView.formatTimecode(cands[mi].startSec) + '–' + TranscriptView.formatTimecode(cands[mi].endSec) + ']'
+            });
+          }
+          PremiereBridge.addSequenceMarkers(markers, function (err, data) {
+            mkBtn.disabled = false;
+            if (err || !data || !data.ok) {
+              toolsShowErr('Маркеры не поставлены: ' + ((data && data.error) || err || 'нет ответа'));
+            } else {
+              toolsStatusUi.show('Маркеры: ' + ((data.created && data.created.length) || markers.length) + ' шт.', false);
+            }
+          });
+        };
+        resEl.appendChild(mkBtn);
+        toolsStatusUi.show('Виральные моменты: ' + cands.length + ' кандидатов.', false);
+      } catch (eV) {
+        toolsShowErr('Виральные моменты: ' + String((eV && eV.message) || eV));
+      } finally {
+        if (btn) btn.disabled = false;
+        endOperation();
+      }
+    }
+    (function () {
+      var vBtn = document.getElementById('rl-viral-find');
+      if (vBtn) vBtn.addEventListener('click', toolsFindViralMoments);
+    })();
+
     /* Цвета рилса — нативные <input type="color"> (CEP 12/CEF открывает
        палитру по клику). value всегда валидный #rrggbb, свой предпросмотр —
        ручной свотч и нормализация HEX больше не нужны. */
@@ -9701,24 +10169,42 @@ PanelBoot.run('ИИ: монтаж', function () {
       switch (toolName) {
         case 'silences':
           pipelineFn = DeterministicPipelines.cutSilences;
-          params.minDuration = parseFloat(document.getElementById('sil-min').value);
-          params.padding = parseFloat(document.getElementById('sil-pad').value);
-          var silThreshEl = document.getElementById('sil-thresh');
-          if (silThreshEl) params.silenceThresholdDelta = parseInt(silThreshEl.value, 10);
+          /* Единый сбор с ползунков (preview==apply): mode/padding after включены */
+          params = toolsCollectParams('silences');
           proposalId = 'proposal-silences';
+          break;
+        case 'trim-edges':
+          /* A4: батч-подрезка тишины в начале/конце каждого клипа */
+          pipelineFn = DeterministicPipelines.trimClipEdges;
+          params = toolsCollectParams('trim-edges');
+          proposalId = 'proposal-trim-edges';
           break;
         case 'fillers':
           pipelineFn = DeterministicPipelines.cutFillers;
           params.sensitivity = getToggle('filler-mode') || 'strict';
           proposalId = 'proposal-fillers';
           break;
+        case 'profanity':
+          /* C2 (28.07.2026, AutoCut-паритет): цензура русского мата по транскрипту.
+             По умолчанию mute (недеструктивно); бип-замена — отдельная волна. */
+          pipelineFn = DeterministicPipelines.muteProfanity;
+          params.cutMode = getToggle('prof-mode') || 'mute';
+          var profWordsEl = document.getElementById('prof-words');
+          if (profWordsEl) {
+            var profRaw = String(profWordsEl.value || '').replace(/^\s+|\s+$/g, '');
+            try { localStorage.setItem('extllmpr_v1_prof_words', profRaw); } catch (eProf) {}
+            if (profRaw) {
+              params.customWords = profRaw.split(/[,;\n]+/)
+                .map(function (w) { return w.replace(/^\s+|\s+$/g, ''); })
+                .filter(function (w) { return w.length >= 2; });
+            }
+          }
+          proposalId = 'proposal-profanity';
+          break;
         case 'jumps':
           pipelineFn = DeterministicPipelines.jumpCuts;
-          params.maxPause = parseFloat(document.getElementById('jmp-pause').value);
-          var jmpBreathEl = document.getElementById('jmp-breath');
-          if (jmpBreathEl) params.keepBreathing = parseFloat(jmpBreathEl.value);
-          var jmpMinSegEl = document.getElementById('jmp-minseg');
-          if (jmpMinSegEl) params.minSegmentDuration = parseFloat(jmpMinSegEl.value);
+          /* Единый сбор с ползунков (preview==apply), + B1 crossfade */
+          params = toolsCollectParams('jumps');
           proposalId = 'proposal-jumps';
           break;
         case 'gaps':
@@ -9734,6 +10220,16 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (chCountEl) {
             var chVal = parseInt(chCountEl.value, 10);
             if (chVal > 0) params.maxChapters = chVal;
+          }
+          /* C3: мин. интервал глав (0 = авто) + доп. указания для ИИ */
+          var chMinEl = document.getElementById('ch-minlen');
+          if (chMinEl) {
+            var chMin = parseFloat(chMinEl.value);
+            if (chMin > 0) params.minChapterSec = chMin;
+          }
+          var chIxEl = document.getElementById('ch-instructions');
+          if (chIxEl && chIxEl.value && chIxEl.value.replace(/^\s+|\s+$/g, '')) {
+            params.customInstructions = chIxEl.value.replace(/^\s+|\s+$/g, '');
           }
           proposalId = 'proposal-chapters';
           break;
@@ -9786,6 +10282,17 @@ PanelBoot.run('ИИ: монтаж', function () {
         default:
           toolsShowErr('Неизвестный инструмент.');
           return;
+      }
+
+      /* B4 (27.07.2026, AutoCut-паритет): глобальный чекбокс «Только In/Out» —
+         режущие инструменты обрабатывают только In/Out-секцию секвенции.
+         Пайплайн сам валидирует секцию (M6-мусор getInPoint) и честно падает,
+         если In/Out не выставлены. */
+      var _inOutOnly = document.getElementById('tools-inout-only');
+      if (_inOutOnly && _inOutOnly.checked &&
+          (toolName === 'silences' || toolName === 'trim-edges' || toolName === 'fillers' ||
+           toolName === 'jumps' || toolName === 'gaps' || toolName === 'profanity')) {
+        params.limitToInOut = true;
       }
 
       /* 19.06.2026: Tools-tab входит в ОБЩИЙ operation-queue. Раньше toolsRunTool

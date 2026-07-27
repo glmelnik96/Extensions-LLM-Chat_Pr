@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.14.2';
+$._EXT_PRM_.version = '2.15.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -698,6 +698,71 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple, stat
       continue;
     }
   }
+};
+
+/**
+ * 2.15.0 (27.07.2026, AutoCut-паритет «Mute»): недеструктивно заглушить
+ * интервал [t0,t1] — razor ТОЛЬКО аудиодорожек на границах, затем
+ * clip.disabled = true для аудиоклипов, целиком попавших в интервал.
+ * Видео не трогаем, таймлайн не сдвигается. Откат: undo или re-enable клипов.
+ *
+ * Требует QE (razor). .disabled read-only на некоторых сборках PP —
+ * такие клипы попадают в stats.failed (fail-soft, как в toggle-клипов).
+ */
+$._EXT_PRM_._muteOneTimelineInterval = function (seq, t0, t1, log, stats) {
+  var eps = $._EXT_PRM_._EPS;
+  if (!stats) stats = { applied: 0, failed: 0, reasons: [] };
+  var fps = $._EXT_PRM_._sequenceFps(seq);
+
+  var qeSeq = null;
+  try {
+    if (typeof app.enableQE === 'function') app.enableQE();
+    if (typeof qe !== 'undefined' && qe.project && typeof qe.project.getActiveSequence === 'function') {
+      qeSeq = qe.project.getActiveSequence();
+    }
+  } catch (eQE) {}
+  if (!qeSeq) {
+    throw new Error('QE DOM недоступен — режим «Заглушить» требует razor().');
+  }
+
+  var tc0 = $._EXT_PRM_._secToTimecode(t0, fps);
+  var tc1 = $._EXT_PRM_._secToTimecode(t1, fps);
+  var numA = 0;
+  try { numA = qeSeq.numAudioTracks; } catch (eNA) { numA = 0; }
+  var ai;
+  for (ai = 0; ai < numA; ai++) {
+    try {
+      var at = qeSeq.getAudioTrackAt(ai);
+      try { at.razor(tc0, true, true); $._EXT_PRM_._bump(); stats.applied++; } catch (eR0) { $._EXT_PRM_._statFail(stats, eR0); }
+      try { at.razor(tc1, true, true); $._EXT_PRM_._bump(); stats.applied++; } catch (eR1) { $._EXT_PRM_._statFail(stats, eR1); }
+    } catch (eAT) { $._EXT_PRM_._statFail(stats, eAT); }
+  }
+
+  var muted = 0;
+  for (ai = 0; ai < seq.audioTracks.numTracks; ai++) {
+    var track = seq.audioTracks[ai];
+    for (var j = 0; j < track.clips.numItems; j++) {
+      try {
+        var c = track.clips[j];
+        if (!c) continue;
+        var cs = c.start.seconds;
+        if (cs >= t1 + eps) break; /* дорожка упорядочена */
+        var ce = c.end.seconds;
+        if (cs >= t0 - eps && ce <= t1 + eps) {
+          if (c.disabled !== true) {
+            c.disabled = true;
+            $._EXT_PRM_._bump();
+            /* read-back: на сборках с read-only .disabled присваивание — no-op */
+            if (c.disabled === true) { muted++; stats.applied++; }
+            else { $._EXT_PRM_._statFail(stats, { message: '.disabled недоступен в этой сборке PP' }); }
+          } else {
+            muted++;
+          }
+        }
+      } catch (eC) { $._EXT_PRM_._statFail(stats, eC); }
+    }
+  }
+  log.push({ op: 'mute_interval', t0: t0, t1: t1, muted: muted });
 };
 
 /**
@@ -1811,6 +1876,14 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
     var seq = app.project.activeSequence;
     var cuts = JSON.parse(jsonCuts);
 
+    /* 2.15.0 (A1, AutoCut-паритет): режим обработки интервалов.
+       'ripple' (default) — razor + ripple-удаление (таймлайн сжимается);
+       'lift' / 'keep_spaces' — razor + lift (дыры остаются, синхрон цел);
+       'mute' — недеструктивно: razor аудио + disable аудиоклипов. */
+    var cutMode = 'ripple';
+    if (cuts.cutMode === 'lift' || cuts.cutMode === 'keep_spaces') cutMode = 'lift';
+    else if (cuts.cutMode === 'mute') cutMode = 'mute';
+
     /* 10.07.2026 (Волна 1.5): сверка секвенции host-side — см. applyTimecodeEdits. */
     if (cuts.expectedSequenceName && String(seq.name) !== String(cuts.expectedSequenceName)) {
       return JSON.stringify({
@@ -1931,9 +2004,14 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       }
       lg = [];
       /* fail-soft: ошибка одного интервала не останавливает остальные
-         (порядок справа-налево → интервалы независимы). */
+         (порядок справа-налево → интервалы независимы; для lift/mute
+         координаты вообще не сдвигаются — порядок безразличен). */
       try {
-        $._EXT_PRM_._applyOneTimelineInterval(seq, iv.startSec, iv.endSec, lg, true, stats);
+        if (cutMode === 'mute') {
+          $._EXT_PRM_._muteOneTimelineInterval(seq, iv.startSec, iv.endSec, lg, stats);
+        } else {
+          $._EXT_PRM_._applyOneTimelineInterval(seq, iv.startSec, iv.endSec, lg, cutMode === 'ripple', stats);
+        }
         perResults.push({ i: iv._origIdx, startSec: iv.startSec, endSec: iv.endSec, ok: true });
         ivOk++;
       } catch (eIv) {
@@ -1950,7 +2028,8 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
        Сентинел «точка не задана» (отрицательное значение) не трогаем.
        Ошибка синка не фатальна для applied-монтажа. */
     var inOutSynced = null;
-    if (ivOk > 0) {
+    /* lift/mute не сдвигают таймлайн — In/Out остаются валидными как есть. */
+    if (ivOk > 0 && cutMode === 'ripple') {
       try {
         var okIv = [];
         var pr2, pi2;
@@ -1996,6 +2075,7 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
     var globalOk = ivOk > 0 || ivFail === 0;
     return JSON.stringify({
       ok: globalOk,
+      cutMode: cutMode,
       inOutSynced: inOutSynced || undefined,
       error: globalOk ? undefined : 'ни одна операция не применилась — проверьте, не заблокированы ли дорожки',
       appliedIntervals: tagged.length,
@@ -2016,6 +2096,150 @@ $._EXT_PRM_.applyTranscriptCuts = function (jsonCuts) {
       try {
         app.endUndoGroup();
       } catch (eU2) {}
+    }
+  }
+};
+
+/**
+ * 2.15.0 (B1, AutoCut-паритет): аудио-кроссфейды на швах после монтажа.
+ * Вход: { times: [сек], expectedSequenceName? } — точки швов В НОВЫХ
+ * (пост-монтажных) координатах; клиент сам пересчитывает их из removeIntervals.
+ * На каждой точке: для каждой QE-аудиодорожки ищем клип, НАЧИНАЮЩИЙСЯ в этой
+ * точке (полкадра допуска), и вешаем переход «Constant Power» на его начало
+ * (qeClip.addTransition — граница клипа = шов). Длительность — дефолт Premiere
+ * (Audio Transition Default Duration): QE-сигнатура с длительностью
+ * недокументирована и нестабильна между сборками.
+ * Fail-soft: каждый шов/дорожка в try/catch, честные счётчики added/failed.
+ */
+$._EXT_PRM_.addAudioCrossfades = function (jsonStr) {
+  var undoOpened = false;
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var seq = app.project.activeSequence;
+    var p = JSON.parse(jsonStr);
+    if (p.expectedSequenceName && String(seq.name) !== String(p.expectedSequenceName)) {
+      return JSON.stringify({
+        ok: false,
+        error: 'Активная секвенция «' + seq.name + '» не та, для которой построен план («' +
+          p.expectedSequenceName + '») — кроссфейды не добавлены.',
+        hostVersion: $._EXT_PRM_.version
+      });
+    }
+    var times = p.times || [];
+    if (!times.length) {
+      return JSON.stringify({ ok: true, added: 0, failed: 0, hostVersion: $._EXT_PRM_.version });
+    }
+
+    /* QE обязателен: без него переходы не добавить — честная ошибка. */
+    var qeSeq = null;
+    try {
+      if (typeof app.enableQE === 'function') app.enableQE();
+      if (typeof qe !== 'undefined' && qe.project && typeof qe.project.getActiveSequence === 'function') {
+        qeSeq = qe.project.getActiveSequence();
+      }
+    } catch (eQE) {}
+    if (!qeSeq) {
+      return JSON.stringify({ ok: false, error: 'QE DOM недоступен — кроссфейды не добавлены (резы уже применены).' });
+    }
+
+    /* Переход: Constant Power / Постоянная мощность (локализованные сборки).
+       getAudioTransitionList → массив объектов с .name; fallback по имени. */
+    var trans = null;
+    var wantRe = /constant\s*power|постоянная\s*мощность/i;
+    try {
+      if (typeof qe.project.getAudioTransitionList === 'function') {
+        var tl = qe.project.getAudioTransitionList();
+        var tCount = tl && typeof tl.numItems === 'number' ? tl.numItems : (tl && tl.length) || 0;
+        var tk;
+        for (tk = 0; tk < tCount; tk++) {
+          var cand = tl[tk] || (typeof tl.getItemAt === 'function' ? tl.getItemAt(tk) : null);
+          if (cand && cand.name && wantRe.test(String(cand.name))) { trans = cand; break; }
+        }
+      }
+    } catch (eTL) {}
+    if (!trans) {
+      try {
+        if (typeof qe.project.getAudioTransitionByName === 'function') {
+          trans = qe.project.getAudioTransitionByName('Constant Power');
+          if (!trans) trans = qe.project.getAudioTransitionByName('Постоянная мощность');
+        }
+      } catch (eTN) {}
+    }
+    if (!trans) {
+      return JSON.stringify({ ok: false, error: 'Переход «Constant Power» не найден в QE (локализация сборки?) — кроссфейды не добавлены.' });
+    }
+
+    var fps = 25;
+    try { fps = Math.round(254016000000 / seq.timebase * 100) / 100 || 25; } catch (eF) {}
+    var halfFrame = 0.5 / (fps || 25);
+
+    if (typeof app.beginUndoGroup === 'function') {
+      app.beginUndoGroup('ИИ: кроссфейды на резах');
+      undoOpened = true;
+    }
+    $._EXT_PRM_._resetOps();
+
+    var added = 0, failed = 0;
+    var reasons = [];
+    var numA = 0;
+    try { numA = qeSeq.numAudioTracks; } catch (eNA) { numA = 0; }
+    var si, ai;
+    for (si = 0; si < times.length; si++) {
+      var t = times[si];
+      if (typeof t !== 'number' || isNaN(t) || t <= halfFrame) continue;
+      for (ai = 0; ai < numA; ai++) {
+        try {
+          var at = qeSeq.getAudioTrackAt(ai);
+          if (!at) continue;
+          var nIt = 0;
+          try { nIt = at.numItems; } catch (eNI) { nIt = 0; }
+          var ji;
+          for (ji = 0; ji < nIt; ji++) {
+            var it = null;
+            try { it = at.getItemAt(ji); } catch (eGI) { continue; }
+            if (!it) continue;
+            /* QE-коллекция содержит и Empty-прокладки — пропускаем. */
+            try { if (String(it.type) === 'Empty') continue; } catch (eTy) {}
+            var itStart = null;
+            try { itStart = it.start && typeof it.start.secs === 'number' ? it.start.secs : null; } catch (eSt) {}
+            if (itStart === null) continue;
+            if (itStart > t + halfFrame) break; /* дорожка упорядочена */
+            if (itStart >= t - halfFrame) {
+              /* Клип начинается в шве → переход на его начало = кроссфейд шва. */
+              try {
+                it.addTransition(trans, true);
+                $._EXT_PRM_._bump();
+                added++;
+              } catch (eAdd) {
+                failed++;
+                if (reasons.length < 5) reasons.push(String(eAdd && eAdd.message ? eAdd.message : eAdd));
+              }
+              break;
+            }
+          }
+        } catch (eTr) {
+          failed++;
+          if (reasons.length < 5) reasons.push(String(eTr && eTr.message ? eTr.message : eTr));
+        }
+      }
+    }
+
+    return JSON.stringify({
+      ok: added > 0 || failed === 0,
+      added: added,
+      failed: failed,
+      failedReasons: reasons,
+      error: (added === 0 && failed > 0) ? 'ни один кроссфейд не добавился: ' + reasons.join('; ') : undefined,
+      undoSteps: $._EXT_PRM_._opCounter,
+      hostVersion: $._EXT_PRM_.version
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  } finally {
+    if (undoOpened && typeof app.endUndoGroup === 'function') {
+      try { app.endUndoGroup(); } catch (eU3) {}
     }
   }
 };
@@ -3823,6 +4047,45 @@ $._EXT_PRM_.setPlayheadSec = function (timeSec) {
     t.seconds = sec;
     seq.setPlayerPosition(t.ticks);
     return JSON.stringify({ ok: true, timeSec: sec });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
+ * C4 (2026-07-28): выставить In/Out активной секвенции в секундах.
+ * Для кнопки «In/Out» у viral-кандидата в карточке «Рилс».
+ * setInPoint/setOutPoint — ЧИСЛА (String молча игнорируется, аудит 17.07.2026).
+ */
+$._EXT_PRM_.setSequenceInOutSec = function (inSec, outSec) {
+  try {
+    if (!app.project || !app.project.activeSequence) {
+      return JSON.stringify({ ok: false, error: 'Нет активной секвенции' });
+    }
+    var nIn = Number(inSec);
+    var nOut = Number(outSec);
+    if (isNaN(nIn) || isNaN(nOut) || nIn < 0 || nOut <= nIn) {
+      return JSON.stringify({ ok: false, error: 'Нужны inSec >= 0 и outSec > inSec (числа)' });
+    }
+    var seq = app.project.activeSequence;
+    var endSec = $._EXT_PRM_._seqEndSec(seq);
+    if (endSec > 0 && nIn >= endSec) {
+      return JSON.stringify({ ok: false, error: 'inSec за концом секвенции (' + endSec + 'с)' });
+    }
+    if (endSec > 0 && nOut > endSec) nOut = endSec;
+    seq.setInPoint(nIn);
+    seq.setOutPoint(nOut);
+    /* Read-back: на некоторых сборках сеттеры молча не срабатывают. */
+    var rIn = parseFloat(seq.getInPoint());
+    var rOut = parseFloat(seq.getOutPoint());
+    var okRb = !isNaN(rIn) && !isNaN(rOut) && Math.abs(rIn - nIn) < 0.05 && Math.abs(rOut - nOut) < 0.05;
+    return JSON.stringify({
+      ok: okRb,
+      error: okRb ? undefined : 'setInPoint/setOutPoint не применились (read-back: in=' + rIn + ', out=' + rOut + ')',
+      inSec: rIn,
+      outSec: rOut,
+      hostVersion: $._EXT_PRM_.HOST_VERSION
+    });
   } catch (e) {
     return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
   }

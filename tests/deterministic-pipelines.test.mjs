@@ -3074,3 +3074,251 @@ describe('removeGaps — proposal-пайплайн close_gaps', () => {
     assert.equal(r.ok, false);
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * B4: sequenceSection / clampIntervalsToSection
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('sequenceSection (B4)', () => {
+  it('валидные In/Out → секция', () => {
+    const s = DP.sequenceSection({ sequenceInSec: 10, sequenceOutSec: 60 });
+    /* по полям: объект из vm-контекста — другой realm, deepEqual(strict) не годится */
+    assert.equal(s.inSec, 10);
+    assert.equal(s.outSec, 60);
+  });
+
+  it('нет полей → null', () => {
+    assert.equal(DP.sequenceSection({}), null);
+    assert.equal(DP.sequenceSection(null), null);
+  });
+
+  it('M6-мусор (гигантские значения) → null', () => {
+    assert.equal(DP.sequenceSection({ sequenceInSec: 1e9, sequenceOutSec: 2e9 }), null);
+    assert.equal(DP.sequenceSection({ sequenceInSec: 0, sequenceOutSec: 400000 }), null);
+  });
+
+  it('out <= in → null', () => {
+    assert.equal(DP.sequenceSection({ sequenceInSec: 30, sequenceOutSec: 30 }), null);
+    assert.equal(DP.sequenceSection({ sequenceInSec: 30, sequenceOutSec: 10 }), null);
+  });
+});
+
+describe('clampIntervalsToSection (B4)', () => {
+  const ivs = [
+    { startSec: 0, endSec: 5, reason: 'до' },
+    { startSec: 8, endSec: 12, reason: 'через границу' },
+    { startSec: 15, endSec: 20, reason: 'внутри' },
+    { startSec: 40, endSec: 45, reason: 'после' }
+  ];
+
+  it('без секции — пропускает как есть', () => {
+    assert.equal(DP.clampIntervalsToSection(ivs, null).length, 4);
+  });
+
+  it('обрезает по границам и выбрасывает внешние', () => {
+    const out = DP.clampIntervalsToSection(ivs, { inSec: 10, outSec: 30 });
+    assert.equal(out.length, 2);
+    assert.equal(out[0].startSec, 10);
+    assert.equal(out[0].endSec, 12);
+    assert.equal(out[1].startSec, 15);
+    assert.equal(out[1].endSec, 20);
+  });
+
+  it('крошечный остаток (<0.05с) выбрасывается', () => {
+    const out = DP.clampIntervalsToSection(
+      [{ startSec: 0, endSec: 10.01, reason: 'x' }], { inSec: 10, outSec: 30 });
+    assert.equal(out.length, 0);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * A2: autoSilenceMarginDb (порог Оцу)
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('autoSilenceMarginDb (A2)', () => {
+  function bimodalTimeline() {
+    /* 300 точек по 0.05с: чередование речь (-18±2 dB) и тишина (-55±2 dB) */
+    const tl = [];
+    for (let i = 0; i < 300; i++) {
+      const t = i * 0.05;
+      const speech = Math.floor(i / 30) % 2 === 0;
+      const base = speech ? -18 : -55;
+      tl.push({ t, rms: base + ((i * 7) % 5) - 2 });
+    }
+    return tl;
+  }
+
+  it('бимодальное распределение → целый margin в [3..30]', () => {
+    const m = DP.autoSilenceMarginDb(bimodalTimeline(), null);
+    assert.notEqual(m, null);
+    assert.equal(m, Math.round(m));
+    assert.ok(m >= 3 && m <= 30, 'margin=' + m);
+  });
+
+  it('мало данных → null', () => {
+    assert.equal(DP.autoSilenceMarginDb([{ t: 0, rms: -20 }], null), null);
+    assert.equal(DP.autoSilenceMarginDb(null, null), null);
+  });
+
+  it('унимодальное (ровная речь без пауз) → null (оставляем ручной порог)', () => {
+    const tl = [];
+    for (let i = 0; i < 300; i++) tl.push({ t: i * 0.05, rms: -20 + ((i * 3) % 3) });
+    assert.equal(DP.autoSilenceMarginDb(tl, null), null);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * A3: silenceIntervalsFromRms — раздельный paddingAfter (лид-ин)
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('silenceIntervalsFromRms paddingAfter (A3)', () => {
+  function speechSilenceSpeech() {
+    /* речь 0–3с, тишина 3–8с, речь 8–11с; шаг 0.05с */
+    const tl = [];
+    for (let i = 0; i <= 220; i++) {
+      const t = i * 0.05;
+      const silent = t >= 3 && t < 8;
+      tl.push({ t, rms: silent ? -60 : -18 });
+    }
+    return tl;
+  }
+
+  it('paddingAfter > padding → хвост интервала короче на лид-ин', () => {
+    const sym = DP.silenceIntervalsFromRms(speechSilenceSpeech(),
+      { minDuration: 1, padding: 0.2, paddingAfter: 0.2, marginDb: 22 });
+    const asym = DP.silenceIntervalsFromRms(speechSilenceSpeech(),
+      { minDuration: 1, padding: 0.2, paddingAfter: 0.8, marginDb: 22 });
+    assert.equal(sym.length, 1);
+    assert.equal(asym.length, 1);
+    /* Начало не должно поменяться, конец — раньше на разницу отступов */
+    assert.ok(Math.abs(sym[0].startSec - asym[0].startSec) < 0.01);
+    assert.ok(Math.abs((sym[0].endSec - asym[0].endSec) - 0.6) < 0.11,
+      'sym.end=' + sym[0].endSec + ' asym.end=' + asym[0].endSec);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * C2: detectProfanityIntervals / muteProfanity
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('detectProfanityIntervals (C2)', () => {
+  it('word-level тайминги: интервал вокруг слова ± pad', () => {
+    const segs = [{
+      startSec: 0, endSec: 2, text: 'привет блядь',
+      words: [{ w: 'привет', s: 0, e: 0.5 }, { w: 'блядь', s: 0.5, e: 1.0 }]
+    }];
+    const out = DP.detectProfanityIntervals(segs, { padSec: 0.12 });
+    assert.equal(out.length, 1);
+    assert.ok(Math.abs(out[0].startSec - 0.38) < 0.001);
+    assert.ok(Math.abs(out[0].endSec - 1.12) < 0.001);
+    assert.match(out[0].reason, /блядь/);
+  });
+
+  it('ложные срабатывания: хуже/психуй/Ебург/образ — чисто', () => {
+    const segs = [{
+      startSec: 0, endSec: 4, text: 'хуже психуй Ебург образ',
+      words: [
+        { w: 'хуже', s: 0, e: 1 }, { w: 'психуй', s: 1, e: 2 },
+        { w: 'Ебург', s: 2, e: 3 }, { w: 'образ', s: 3, e: 4 }
+      ]
+    }];
+    assert.equal(DP.detectProfanityIntervals(segs, {}).length, 0);
+  });
+
+  it('приставки и пунктуация: «Заебало,» и «пиздец!» ловятся', () => {
+    const segs = [{
+      startSec: 0, endSec: 3, text: 'Заебало, ну пиздец!',
+      words: [
+        { w: 'Заебало,', s: 0, e: 1 }, { w: 'ну', s: 1, e: 2 }, { w: 'пиздец!', s: 2, e: 3 }
+      ]
+    }];
+    const out = DP.detectProfanityIntervals(segs, { padSec: 0 });
+    assert.equal(out.length, 2);
+  });
+
+  it('без words → равномерная интерполяция по сегменту', () => {
+    const segs = [{ startSec: 0, endSec: 4, text: 'раз два блядь четыре' }];
+    const out = DP.detectProfanityIntervals(segs, { padSec: 0 });
+    assert.equal(out.length, 1);
+    /* 3-е слово из 4 в сегменте 0–4с → [2.0, 3.0] */
+    assert.ok(Math.abs(out[0].startSec - 2.0) < 0.001);
+    assert.ok(Math.abs(out[0].endSec - 3.0) < 0.001);
+  });
+
+  it('соседние маты сливаются в один интервал', () => {
+    const segs = [{
+      startSec: 0, endSec: 2, text: 'блядь пиздец',
+      words: [{ w: 'блядь', s: 0, e: 1 }, { w: 'пиздец', s: 1, e: 2 }]
+    }];
+    assert.equal(DP.detectProfanityIntervals(segs, { padSec: 0.12 }).length, 1);
+  });
+
+  it('свои слова: префикс-матч с нормализацией ё→е', () => {
+    const segs = [{
+      startSec: 0, endSec: 2, text: 'вот блина чёрт',
+      words: [
+        { w: 'вот', s: 0, e: 0.5 }, { w: 'блина', s: 0.5, e: 1 }, { w: 'чёрт', s: 1, e: 2 }
+      ]
+    }];
+    const out = DP.detectProfanityIntervals(segs, { padSec: 0, customWords: ['блин', 'черт'] });
+    assert.equal(out.length, 1); /* блина+чёрт смежные → merge */
+    assert.ok(Math.abs(out[0].startSec - 0.5) < 0.001);
+    assert.ok(Math.abs(out[0].endSec - 2) < 0.001);
+  });
+});
+
+describe('muteProfanity (C2)', () => {
+  const dirtyEntry = () => makeEntry([{
+    startSec: 0, endSec: 2, text: 'привет блядь',
+    words: [{ w: 'привет', s: 0, e: 0.5 }, { w: 'блядь', s: 0.5, e: 1.0 }]
+  }]);
+
+  it('без транскрипта → ошибка', async () => {
+    const r = await DP.muteProfanity(makeCtx(), {});
+    assert.equal(r.ok, false);
+    assert.match(r.error, /транскрипт/i);
+  });
+
+  it('чистый текст → noChanges', async () => {
+    const entry = makeEntry([{ startSec: 0, endSec: 2, text: 'всё хорошо' }]);
+    const r = await DP.muteProfanity(makeCtx({ transcriptEntry: entry }), {});
+    assert.equal(r.ok, true);
+    assert.equal(r.noChanges, true);
+  });
+
+  it('мат → proposal transcript_cuts, по умолчанию mute', async () => {
+    const r = await DP.muteProfanity(makeCtx({ transcriptEntry: dirtyEntry() }), {});
+    assert.equal(r.ok, true);
+    assert.equal(r.proposal.kind, 'transcript_cuts');
+    assert.equal(r.proposal.cutMode, 'mute');
+    assert.equal(r.proposal.removeIntervals.length, 1);
+    assert.match(r.proposal.summary, /Заглушить/);
+  });
+
+  it('cutMode remove пробрасывается', async () => {
+    const r = await DP.muteProfanity(makeCtx({ transcriptEntry: dirtyEntry() }), { cutMode: 'remove' });
+    assert.equal(r.proposal.cutMode, 'remove');
+    assert.match(r.proposal.summary, /Вырезать/);
+  });
+
+  it('без word-level таймингов → предупреждение об интерполяции', async () => {
+    const entry = makeEntry([{ startSec: 0, endSec: 4, text: 'раз два блядь четыре' }]);
+    const r = await DP.muteProfanity(makeCtx({ transcriptEntry: entry }), {});
+    assert.match(r.proposal.summary, /интерполирован/);
+  });
+
+  it('limitToInOut без выставленных In/Out → честная ошибка', async () => {
+    const r = await DP.muteProfanity(makeCtx({ transcriptEntry: dirtyEntry() }), { limitToInOut: true });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /In\/Out/);
+  });
+
+  it('limitToInOut: мат вне секции → noChanges', async () => {
+    const ctx = makeCtx({ transcriptEntry: dirtyEntry() });
+    ctx.snapshot.sequenceInSec = 10;
+    ctx.snapshot.sequenceOutSec = 20;
+    const r = await DP.muteProfanity(ctx, { limitToInOut: true });
+    assert.equal(r.ok, true);
+    assert.equal(r.noChanges, true);
+  });
+});

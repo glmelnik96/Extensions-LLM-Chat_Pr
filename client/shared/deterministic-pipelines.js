@@ -96,6 +96,61 @@
     return t.split(/\s+/).length;
   }
 
+  /* ── In/Out-секция (B4, AutoCut-паритет, 27.07.2026) ─────── */
+
+  /**
+   * Валидная In/Out-секция из снапшота или null.
+   * M6-ловушка (аудит 04.07.2026): на ряде сборок PP getInPoint()/getOutPoint()
+   * возвращают мусорные гигантские значения — клампим тем же порогом 360000с
+   * (100ч), что и host. null = In/Out не выставлены или мусор.
+   */
+  function sequenceSection(snapshot) {
+    if (!snapshot) return null;
+    var inS = snapshot.sequenceInSec;
+    var outS = snapshot.sequenceOutSec;
+    if (typeof inS !== 'number' || typeof outS !== 'number') return null;
+    if (!isFinite(inS) || !isFinite(outS)) return null;
+    if (inS < 0 || inS > 360000 || outS <= 0 || outS > 360000) return null;
+    if (outS <= inS + 0.05) return null;
+    return { inSec: inS, outSec: outS };
+  }
+
+  /**
+   * Пересечь интервалы с секцией [inSec, outSec], пустые выбросить.
+   * Интервал, частично попадающий в секцию, обрезается по её границе.
+   */
+  function clampIntervalsToSection(intervals, section) {
+    if (!section) return intervals || [];
+    var out = [];
+    (intervals || []).forEach(function (iv) {
+      var s = Math.max(iv.startSec, section.inSec);
+      var e = Math.min(iv.endSec, section.outSec);
+      if (e - s >= 0.05) {
+        out.push({ startSec: s, endSec: e, reason: iv.reason });
+      }
+    });
+    return out;
+  }
+
+  /**
+   * Общий шаг B4 для пайплайнов: если params.limitToInOut — вернуть секцию
+   * (или {error} если In/Out не выставлены), иначе null (без ограничения).
+   */
+  function _resolveSection(ctx, params) {
+    if (!params || !params.limitToInOut) return { section: null };
+    var sec = sequenceSection(ctx && ctx.snapshot);
+    if (!sec) {
+      return { error: 'Включено «Только In/Out», но In/Out не выставлены на секвенции (I/O в Premiere).' };
+    }
+    return { section: sec };
+  }
+
+  function _sectionNote(section) {
+    return section
+      ? ' В пределах In/Out (' + section.inSec.toFixed(1) + '–' + section.outSec.toFixed(1) + 'с).'
+      : '';
+  }
+
   /* ── Pipelines ──────────────────────────────────────────── */
 
   /**
@@ -119,6 +174,11 @@
     var sensitivity = params.sensitivity || 'strict';
     var expanded = sensitivity === 'normal' || sensitivity === 'expanded';
     var maxDur = expanded ? MAX_FILLER_DURATION_NORMAL : MAX_FILLER_DURATION;
+
+    /* B4: ограничение In/Out-секцией */
+    var secR = _resolveSection(ctx, params);
+    if (secR.error) return { ok: false, error: secR.error };
+    var section = secR.section;
 
     var segments = entry.segments;
     var removeIntervals = [];
@@ -199,6 +259,7 @@
 
     /* Merge overlapping/adjacent intervals */
     removeIntervals = _mergeIntervals(removeIntervals);
+    removeIntervals = clampIntervalsToSection(removeIntervals, section);
 
     /* Фильтр микро-зазоров: интервалы < 0.15с оставляют 2-3 кадра мусора после razor */
     var MIN_CUT = 0.15;
@@ -229,7 +290,7 @@
         kind: 'transcript_cuts',
         removeIntervals: removeIntervals,
         summary: 'Найдено ' + removeIntervals.length + ' паразитов (' +
-          totalRemoveSec.toFixed(1) + 'с)' + modeNote + '. Вырезать?',
+          totalRemoveSec.toFixed(1) + 'с)' + modeNote + '.' + _sectionNote(section) + ' Вырезать?',
         removeSummary: removeIntervals.map(function (iv) {
           return { startSec: iv.startSec, endSec: iv.endSec, reason: iv.reason };
         })
@@ -255,6 +316,10 @@
     opts = opts || {};
     var minDuration = typeof opts.minDuration === 'number' ? opts.minDuration : 1.0;
     var padding = typeof opts.padding === 'number' ? opts.padding : 0.15;
+    /* A3 (27.07.2026, AutoCut-паритет): раздельный хвостовой отступ. padding
+       защищает ХВОСТ предыдущей фразы (начало тишины), paddingAfter — ЛИД-ИН
+       следующей (конец тишины). По умолчанию симметричен padding. */
+    var paddingAfter = typeof opts.paddingAfter === 'number' ? opts.paddingAfter : padding;
     var source = opts.source || 'gaps+ffmpeg';
 
     var segs = (entry && entry.segments) || [];
@@ -276,7 +341,7 @@
         var gap = nextStart - prevEnd;
         if (gap < minDuration) continue;
         var gs = prevEnd + padding;
-        var ge = nextStart - padding;
+        var ge = nextStart - paddingAfter;
         if (ge > gs + 0.02) {
           intervals.push({
             startSec: gs,
@@ -299,7 +364,7 @@
         var dur = silEnd - silStart;
         if (dur < minDuration) continue;
         var ss = silStart + padding;
-        var se = silEnd - padding;
+        var se = silEnd - paddingAfter;
         if (se <= ss + 0.02) continue;
         intervals.push({
           startSec: ss,
@@ -415,10 +480,93 @@
     return out;
   }
 
+  /**
+   * A2 (27.07.2026, AutoCut-паритет «Calculate by AI», но локально): автоподбор
+   * относительного порога тишины (marginDb) по гистограмме уже посчитанного RMS.
+   *
+   * Метод: по каждому клипу (clipRanges — как в rmsThresholdSegments) строим
+   * гистограмму dB с шагом 1 dB и ищем порог Оцу (максимум межклассовой
+   * дисперсии) — долину между модой тишины и модой речи. margin = P92(речь) −
+   * порог Оцу. Итог — медиана по клипам, кламп к диапазону ползунка [3..30].
+   *
+   * Возвращает целый marginDb или null (мало данных / распределение унимодально —
+   * тогда честно оставляем ручной порог).
+   */
+  function autoSilenceMarginDb(rmsTimeline, clipRanges) {
+    var tl = Array.isArray(rmsTimeline) ? rmsTimeline : [];
+    if (tl.length < 40) return null;
+    var segs = rmsThresholdSegments(tl, clipRanges, { marginDb: 22 });
+    if (!segs.length) return null;
+    var margins = [];
+    for (var s = 0; s < segs.length; s++) {
+      var seg = segs[s];
+      var vals = [];
+      for (var k = 0; k < tl.length; k++) {
+        var p = tl[k];
+        if (p.t >= seg.startSec && p.t < seg.endSec &&
+            typeof p.rms === 'number' && isFinite(p.rms)) vals.push(p.rms);
+      }
+      if (vals.length < 40 || seg.speechRefDb == null) continue;
+      var lo = Infinity, hi = -Infinity, v;
+      for (v = 0; v < vals.length; v++) {
+        if (vals[v] < lo) lo = vals[v];
+        if (vals[v] > hi) hi = vals[v];
+      }
+      /* Пол среза: -80 dB (глубже — цифровой ноль, раздувает гистограмму). */
+      if (lo < -80) lo = -80;
+      if (hi - lo < 8) continue; /* динамики нет — делить не на что */
+      var bins = Math.max(8, Math.ceil(hi - lo) + 1);
+      var hist = [];
+      var b;
+      for (b = 0; b < bins; b++) hist.push(0);
+      var total = 0;
+      for (v = 0; v < vals.length; v++) {
+        var db = vals[v] < lo ? lo : vals[v];
+        b = Math.min(bins - 1, Math.floor(db - lo));
+        hist[b]++;
+        total++;
+      }
+      /* Порог Оцу по гистограмме. */
+      var sumAll = 0;
+      for (b = 0; b < bins; b++) sumAll += b * hist[b];
+      var wB = 0, sumB = 0, bestVar = -1, bestBin = -1;
+      for (b = 0; b < bins - 1; b++) {
+        wB += hist[b];
+        if (wB === 0) continue;
+        var wF = total - wB;
+        if (wF === 0) break;
+        sumB += b * hist[b];
+        var mB = sumB / wB;
+        var mF = (sumAll - sumB) / wF;
+        var between = wB * wF * (mB - mF) * (mB - mF);
+        if (between > bestVar) { bestVar = between; bestBin = b; }
+      }
+      if (bestBin < 0) continue;
+      var otsuDb = lo + bestBin + 0.5;
+      /* Бимодальность: обе стороны от порога должны быть весомы, иначе Оцу
+         просто отрезал хвост унимодального распределения. */
+      var wLeft = 0;
+      for (b = 0; b <= bestBin; b++) wLeft += hist[b];
+      var frac = wLeft / total;
+      if (frac < 0.05 || frac > 0.95) continue;
+      var margin = seg.speechRefDb - otsuDb;
+      if (isFinite(margin)) margins.push(margin);
+    }
+    if (!margins.length) return null;
+    margins.sort(function (a, b2) { return a - b2; });
+    var med = margins[Math.floor(margins.length / 2)];
+    var out = Math.round(med);
+    if (out < 3) out = 3;
+    if (out > 30) out = 30;
+    return out;
+  }
+
   function silenceIntervalsFromRms(rmsTimeline, opts) {
     opts = opts || {};
     var minDuration = typeof opts.minDuration === 'number' ? opts.minDuration : 1.0;
     var padding = typeof opts.padding === 'number' ? opts.padding : 0.15;
+    /* A3: раздельный хвостовой отступ (лид-ин перед следующей фразой). */
+    var paddingAfter = typeof opts.paddingAfter === 'number' ? opts.paddingAfter : padding;
     var tl = Array.isArray(rmsTimeline) ? rmsTimeline : [];
     if (tl.length < 2) return [];
 
@@ -474,7 +622,7 @@
       var dur = runs[j].e - runs[j].s;
       if (dur < minDuration) continue;
       var ss = runs[j].s + padding;
-      var se = runs[j].e - padding;
+      var se = runs[j].e - paddingAfter;
       if (se - ss < 0.02) continue;
       var rsg = segAt(runs[j].s);
       var relInfo = rsg.speechRefDb != null ? (', речь≈' + Math.round(rsg.speechRefDb) + ' dB') : '';
@@ -507,6 +655,18 @@
 
     var minDuration = typeof params.minDuration === 'number' ? params.minDuration : 1.0;
     var padding = typeof params.padding === 'number' ? params.padding : 0.15;
+    var paddingAfter = typeof params.paddingAfter === 'number' ? params.paddingAfter : padding;
+    /* A1 (AutoCut-паритет): режим обработки найденной тишины.
+       'remove' (default) — razor + ripple-удаление (таймлайн сжимается);
+       'keep_spaces'      — razor + lift (вырезать, дыры остаются, синхрон цел);
+       'mute'             — недеструктивно: disable аудиоклипов в интервалах. */
+    var cutMode = params.cutMode === 'mute' || params.cutMode === 'keep_spaces'
+      ? params.cutMode : 'remove';
+
+    /* B4: ограничение In/Out-секцией */
+    var secR = _resolveSection(ctx, params);
+    if (secR.error) return { ok: false, error: secR.error };
+    var section = secR.section;
 
     var thresholdUsed = (entry.audioAnalysis && typeof entry.audioAnalysis.silenceThresholdUsed === 'number')
       ? entry.audioAnalysis.silenceThresholdUsed : -30;
@@ -533,12 +693,14 @@
         marginDb: userDelta > 0 ? userDelta : 22,  /* относительный порог от уровня речи */
         minDuration: minDuration,
         padding: padding,
+        paddingAfter: paddingAfter,
         clipRanges: entry.audioAnalysis && entry.audioAnalysis.clipRanges  /* порог по каждому клипу */
       });
     } else {
       removeIntervals = detectSilenceIntervals(entry, {
         minDuration: minDuration,
         padding: padding,
+        paddingAfter: paddingAfter,
         thresholdDb: effectiveThreshold,
         source: 'gaps+ffmpeg'
       });
@@ -549,6 +711,7 @@
 
     /* Мержим перекрытия */
     removeIntervals = _mergeIntervals(removeIntervals);
+    removeIntervals = clampIntervalsToSection(removeIntervals, section);
 
     /* Фильтр микро-зазоров: интервалы < 0.15с оставляют 2-3 кадра мусора после razor */
     var MIN_CUT = 0.15;
@@ -582,13 +745,19 @@
     var totalRemoveSec = 0;
     removeIntervals.forEach(function (iv) { totalRemoveSec += iv.endSec - iv.startSec; });
 
+    var modeVerb = cutMode === 'mute' ? 'Заглушить (недеструктивно)?'
+      : cutMode === 'keep_spaces' ? 'Вырезать без сдвига (дыры остаются)?'
+      : 'Вырезать?';
     return {
       ok: true,
       proposal: {
         kind: 'transcript_cuts',
+        cutMode: cutMode,
+        /* B1: аудио-кроссфейды на швах — только для ripple-вырезки (в lift/mute швов нет) */
+        crossfade: !!params.crossfade && cutMode === 'remove',
         removeIntervals: removeIntervals,
         summary: 'Найдено ' + removeIntervals.length + ' пауз (>' + minDuration + 'с, суммарно ' +
-          totalRemoveSec.toFixed(1) + 'с). Порог: ' + threshLabel + '. Вырезать?',
+          totalRemoveSec.toFixed(1) + 'с). Порог: ' + threshLabel + '.' + _sectionNote(section) + ' ' + modeVerb,
         removeSummary: removeIntervals.map(function (iv) {
           return { startSec: iv.startSec, endSec: iv.endSec, reason: iv.reason };
         })
@@ -638,10 +807,21 @@
       return { ok: false, error: 'Таймлайн пуст — нечего сдвигать.' };
     }
     var minGapSec = typeof params.minGapSec === 'number' ? params.minGapSec : 0.1;
+    /* B4: ограничение In/Out-секцией */
+    var secR = _resolveSection(ctx, params);
+    if (secR.error) return { ok: false, error: secR.error };
+    var section = secR.section;
     var gaps = findTimelineGaps(snap.clips, {
       minGapSec: minGapSec,
       includeLeading: params.includeLeading !== false
     });
+    if (section) {
+      /* Пробел закрывается host'ом целиком (сдвиг клипов) — частичная обрезка
+         по границе секции невозможна, берём только пробелы ПОЛНОСТЬЮ внутри. */
+      gaps = gaps.filter(function (g) {
+        return g.startSec >= section.inSec - 0.01 && g.endSec <= section.outSec + 0.01;
+      });
+    }
     if (!gaps.length) {
       return {
         ok: true,
@@ -657,9 +837,276 @@
         kind: 'close_gaps',
         gaps: gaps,
         summary: 'Найдено ' + gaps.length + ' пробел(ов), суммарно ' + total.toFixed(1) +
-          'с. Все клипы правее каждого пробела сдвинутся влево (все дорожки, синхрон сохраняется). Закрыть?',
+          'с.' + _sectionNote(section) + ' Все клипы правее каждого пробела сдвинутся влево (все дорожки, синхрон сохраняется). Закрыть?',
         removeSummary: gaps.map(function (g) {
           return { startSec: g.startSec, endSec: g.endSec, reason: g.reason };
+        })
+      }
+    };
+  }
+
+  /**
+   * A4 (27.07.2026): «Подрезать края клипов» — батч-подрезка тишины ТОЛЬКО в
+   * начале и конце каждого клипа. Незакрытая боль рынка (у AutoCut такого режима
+   * нет — просят на Reddit): типовой кейс «щёлкнул рекорд → пауза → говоришь →
+   * пауза → стоп» на десятках клипов.
+   *
+   * Полностью детерминированный: RMS-таймлайн (из «Анализ аудио») + границы
+   * клипов (audioAnalysis.clipRanges, fallback — аудиоклипы снапшота). Порог —
+   * пер-клиповый (rmsThresholdSegments, та же истина, что «Убрать тишины»).
+   *
+   * params: marginDb (default 22), padding (default 0.1, зазор у речи),
+   *         minTrim (default 0.3, короче не трогаем), cutMode (как в cutSilences).
+   * Возвращает proposal kind='transcript_cuts' (razor+remove по краям клипов).
+   */
+  async function trimClipEdges(ctx, params) {
+    params = params || {};
+    var entry = ctx.transcriptEntry;
+    var rmsTl = entry && entry.audioAnalysis && entry.audioAnalysis.rmsTimeline;
+    if (!Array.isArray(rmsTl) || rmsTl.length < 2) {
+      return { ok: false, error: 'Нужен RMS-таймлайн. Запустите «⚡ Анализ аудио».' };
+    }
+    var marginDb = typeof params.marginDb === 'number' && params.marginDb > 0 ? params.marginDb : 22;
+    var padding = typeof params.padding === 'number' ? params.padding : 0.1;
+    var minTrim = typeof params.minTrim === 'number' ? params.minTrim : 0.3;
+    var cutMode = params.cutMode === 'mute' || params.cutMode === 'keep_spaces'
+      ? params.cutMode : 'remove';
+
+    /* B4: ограничение In/Out-секцией */
+    var secR = _resolveSection(ctx, params);
+    if (secR.error) return { ok: false, error: secR.error };
+    var section = secR.section;
+
+    /* Границы клипов: clipRanges из аудио-анализа; fallback — аудиоклипы снапшота. */
+    var ranges = [];
+    var srcRanges = entry.audioAnalysis.clipRanges;
+    if (Array.isArray(srcRanges) && srcRanges.length) {
+      for (var r = 0; r < srcRanges.length; r++) {
+        var rr = srcRanges[r];
+        if (rr && typeof rr.startSec === 'number' && typeof rr.endSec === 'number' && rr.endSec > rr.startSec) {
+          ranges.push({ startSec: rr.startSec, endSec: rr.endSec });
+        }
+      }
+    }
+    if (!ranges.length && ctx.snapshot && Array.isArray(ctx.snapshot.clips)) {
+      var seen = {};
+      for (var c = 0; c < ctx.snapshot.clips.length; c++) {
+        var cl = ctx.snapshot.clips[c];
+        if (!cl || cl.trackType !== 'audio') continue;
+        if (typeof cl.startSec !== 'number' || typeof cl.endSec !== 'number' || cl.endSec <= cl.startSec) continue;
+        var key = cl.startSec.toFixed(3) + ':' + cl.endSec.toFixed(3);
+        if (seen[key]) continue;
+        seen[key] = 1;
+        ranges.push({ startSec: cl.startSec, endSec: cl.endSec });
+      }
+    }
+    if (!ranges.length) {
+      return { ok: false, error: 'Не нашёл границы клипов (нет clipRanges и аудиоклипов в снапшоте).' };
+    }
+    ranges.sort(function (a, b) { return a.startSec - b.startSec; });
+
+    /* Шаг сетки RMS — для допуска на «дырки» между сэмплами. */
+    var dts = [];
+    for (var i = 1; i < rmsTl.length; i++) {
+      var d = rmsTl[i].t - rmsTl[i - 1].t;
+      if (d > 0 && isFinite(d)) dts.push(d);
+    }
+    dts.sort(function (a, b) { return a - b; });
+    var frameDur = dts.length ? (dts[Math.floor(dts.length / 2)] || 0.05) : 0.05;
+
+    var segs = rmsThresholdSegments(rmsTl, ranges, { marginDb: marginDb });
+    var intervals = [];
+    for (var g = 0; g < ranges.length; g++) {
+      var cs = ranges[g].startSec, ce = ranges[g].endSec;
+      var thr = -80;
+      for (var sg = 0; sg < segs.length; sg++) {
+        if (segs[sg].startSec <= cs + 0.001 && segs[sg].endSec >= ce - 0.001) { thr = segs[sg].thresholdDb; break; }
+        if (cs >= segs[sg].startSec && cs < segs[sg].endSec) thr = segs[sg].thresholdDb;
+      }
+      /* Первый/последний «громкий» момент внутри клипа. */
+      var voiceStart = null, voiceEnd = null;
+      for (var k = 0; k < rmsTl.length; k++) {
+        var p = rmsTl[k];
+        if (typeof p.t !== 'number' || p.t < cs || p.t >= ce) continue;
+        var loud = typeof p.rms === 'number' && isFinite(p.rms) && p.rms >= thr;
+        if (!loud) continue;
+        if (voiceStart === null) voiceStart = p.t;
+        voiceEnd = p.t + frameDur;
+      }
+      if (voiceStart === null) {
+        /* Клип целиком тихий — убираем весь. */
+        if (ce - cs >= minTrim) {
+          intervals.push({ startSec: cs, endSec: ce, reason: 'клип целиком тихий (' + (ce - cs).toFixed(2) + 'с)' });
+        }
+        continue;
+      }
+      var headEnd = voiceStart - padding;
+      if (headEnd - cs >= minTrim) {
+        intervals.push({ startSec: cs, endSec: Math.round(headEnd * 1000) / 1000,
+          reason: 'тишина в начале клипа ' + (voiceStart - cs).toFixed(2) + 'с' });
+      }
+      var tailStart = voiceEnd + padding;
+      if (ce - tailStart >= minTrim) {
+        intervals.push({ startSec: Math.round(tailStart * 1000) / 1000, endSec: ce,
+          reason: 'тишина в конце клипа ' + (ce - voiceEnd).toFixed(2) + 'с' });
+      }
+    }
+
+    intervals = _mergeIntervals(intervals);
+    intervals = clampIntervalsToSection(intervals, section);
+    if (!intervals.length) {
+      return {
+        ok: true, noChanges: true,
+        summary: 'Тишины ≥' + minTrim + 'с в начале/конце клипов не найдено (' + ranges.length +
+          ' клип(ов), порог −' + marginDb + ' dB от речи).'
+      };
+    }
+    var total = 0;
+    intervals.forEach(function (iv) { total += iv.endSec - iv.startSec; });
+    var modeVerb = cutMode === 'mute' ? 'Заглушить (недеструктивно)?'
+      : cutMode === 'keep_spaces' ? 'Вырезать без сдвига (дыры остаются)?'
+      : 'Подрезать?';
+    return {
+      ok: true,
+      proposal: {
+        kind: 'transcript_cuts',
+        cutMode: cutMode,
+        removeIntervals: intervals,
+        summary: 'Края клипов: ' + intervals.length + ' участ.(ов) тишины, суммарно ' +
+          total.toFixed(1) + 'с (' + ranges.length + ' клип(ов)).' + _sectionNote(section) + ' ' + modeVerb,
+        removeSummary: intervals.map(function (iv) {
+          return { startSec: iv.startSec, endSec: iv.endSec, reason: iv.reason };
+        })
+      }
+    };
+  }
+
+  /**
+   * C2: детектор русского мата по словам транскрипта.
+   * \b не работает с кириллицей в JS-регэкспах, поэтому — якорные регэкспы
+   * по нормализованному ЦЕЛОМУ слову (lowercase, ё→е, без краевой пунктуации).
+   * Гварды от ложных срабатываний: психуй/хуже (нет), Ебург (нет), образ (нет).
+   */
+  var PROFANITY_CORE = [
+    /^(о|от|до|за|на|по|про|вы|с|рас|раз|об|при|пере|у|не|них?|ни)?ху[йяеилё]/,
+    /пизд/,
+    /^[её]б(?!ур)/,                /* ебать..., но не Ебург */
+    /^(за|на|до|по|от|вы|у|про|пере|под[ъь]?|раз[ъь]?|рас|с[ъь]|в[ъь]|от[ъь]|об[ъь]?|при|и[зс][ъь]?)[её]б/,
+    /о[её]б(?!раз)/,               /* оЕб..., но не «образ» */
+    /^бля$/,
+    /бля[дт]/,
+    /^(за|о)?муд(ак|ач|ил|о[хз])/,
+    /пид[оа]?р/,
+    /г[ао]ндон/
+  ];
+
+  function _normProfWord(raw) {
+    return String(raw || '').toLowerCase().replace(/ё/g, 'е')
+      .replace(/^[^a-zа-я0-9]+|[^a-zа-я0-9]+$/g, '');
+  }
+
+  /**
+   * Чистая функция: сегменты → интервалы мата [{startSec,endSec,reason}].
+   * Использует word-level тайминги Whisper (seg.words: w/word, s/start, e/end),
+   * при их отсутствии — равномерную интерполяцию по сегменту (точность ~0.2–0.4с).
+   */
+  function detectProfanityIntervals(segments, opts) {
+    opts = opts || {};
+    var padSec = typeof opts.padSec === 'number' && opts.padSec >= 0 ? opts.padSec : 0.12;
+    var custom = [];
+    (opts.customWords || []).forEach(function (w) {
+      var n = _normProfWord(w);
+      if (n.length >= 2) custom.push(n);
+    });
+    var intervals = [];
+    (segments || []).forEach(function (seg) {
+      var segStart = typeof seg.startSec === 'number' ? seg.startSec : seg.start;
+      var segEnd = typeof seg.endSec === 'number' ? seg.endSec : seg.end;
+      if (typeof segStart !== 'number' || typeof segEnd !== 'number') return;
+      var words = [];
+      if (seg.words && seg.words.length) {
+        seg.words.forEach(function (w) {
+          var txt = w.w !== undefined ? w.w : w.word;
+          var s = typeof w.s === 'number' ? w.s : w.start;
+          var e = typeof w.e === 'number' ? w.e : w.end;
+          if (txt !== undefined && typeof s === 'number' && typeof e === 'number') {
+            words.push({ text: String(txt), s: s, e: e });
+          }
+        });
+      }
+      if (!words.length) {
+        /* Равномерная интерполяция по сегменту. */
+        var toks = String(seg.text || '').split(/\s+/).filter(function (t) { return t.length; });
+        if (!toks.length) return;
+        var dur = Math.max(0, segEnd - segStart) / toks.length;
+        toks.forEach(function (t, i) {
+          words.push({ text: t, s: segStart + i * dur, e: segStart + (i + 1) * dur });
+        });
+      }
+      words.forEach(function (w) {
+        var norm = _normProfWord(w.text);
+        if (!norm) return;
+        var hit = false;
+        for (var i = 0; i < PROFANITY_CORE.length; i++) {
+          if (PROFANITY_CORE[i].test(norm)) { hit = true; break; }
+        }
+        if (!hit) {
+          for (var j = 0; j < custom.length; j++) {
+            if (norm.indexOf(custom[j]) === 0) { hit = true; break; }
+          }
+        }
+        if (!hit) return;
+        intervals.push({
+          startSec: Math.max(0, Math.round((w.s - padSec) * 1000) / 1000),
+          endSec: Math.round((w.e + padSec) * 1000) / 1000,
+          reason: 'мат: «' + w.text + '»'
+        });
+      });
+    });
+    return _mergeIntervals(intervals);
+  }
+
+  /**
+   * /profanity — заглушить (или вырезать) русский мат по транскрипту.
+   * По умолчанию cutMode 'mute' — недеструктивный razor+disable на аудиодорожках.
+   * Бип-замена в этой волне НЕ реализована (нужен рендер аудио — отдельная задача).
+   */
+  async function muteProfanity(ctx, params) {
+    params = params || {};
+    var entry = ctx.transcriptEntry;
+    if (!entry || !entry.segments || !entry.segments.length) {
+      return { ok: false, error: 'Нет транскрипта. Сначала расшифруйте секвенцию.' };
+    }
+    var cutMode = params.cutMode === 'remove' ? 'remove' : 'mute';
+    var secRes = _resolveSection(ctx, params);
+    if (secRes.error) return { ok: false, error: secRes.error };
+    var section = secRes.section;
+    var intervals = detectProfanityIntervals(entry.segments, {
+      customWords: params.customWords,
+      padSec: params.padSec
+    });
+    intervals = clampIntervalsToSection(intervals, section);
+    if (!intervals.length) {
+      return { ok: true, noChanges: true, summary: 'Мат в транскрипте не найден.' + _sectionNote(section) };
+    }
+    var hasNativeWords = false;
+    for (var i = 0; i < entry.segments.length; i++) {
+      if (entry.segments[i].words && entry.segments[i].words.length) { hasNativeWords = true; break; }
+    }
+    var total = 0;
+    intervals.forEach(function (iv) { total += iv.endSec - iv.startSec; });
+    var warn = hasNativeWords ? '' : ' ⚠ Тайминги слов интерполированы (Whisper без word-level) — границы ±0.3с.';
+    var modeVerb = cutMode === 'remove' ? 'Вырезать?' : 'Заглушить (недеструктивно)?';
+    return {
+      ok: true,
+      proposal: {
+        kind: 'transcript_cuts',
+        cutMode: cutMode,
+        removeIntervals: intervals,
+        summary: 'Мат: ' + intervals.length + ' участ.(ов), суммарно ' + total.toFixed(1) + 'с.' +
+          _sectionNote(section) + warn + ' ' + modeVerb,
+        removeSummary: intervals.map(function (iv) {
+          return { startSec: iv.startSec, endSec: iv.endSec, reason: iv.reason };
         })
       }
     };
@@ -684,7 +1131,13 @@
       } catch (e) { /* fallback: buildTopicsWithLLM will work with raw segments */ }
     }
 
+    /* C3: кастомные указания к главам. Кэш topics строился под КОНКРЕТНЫЕ
+       указания (или без них) — при смене указаний кэш не подходит, честно
+       перестраиваем (1 LLM-вызов), иначе указания молча игнорировались бы. */
+    var customIx = String(params.customInstructions || '').replace(/^\s+|\s+$/g, '');
+    var cachedIx = String(entry.topicsInstructions || '');
     var topics = entry.topics;
+    if (topics && topics.length && customIx !== cachedIx) topics = null;
     if (!topics || !topics.length) {
       /* Need 1 LLM call for topics */
       if (typeof TranscriptStructure !== 'undefined' && typeof TranscriptStructure.buildTopicsWithLLM === 'function') {
@@ -700,10 +1153,12 @@
         try {
           topics = await TranscriptStructure.buildTopicsWithLLM(paragraphs, {
             settings: ctx.settings,
-            CloudRuClient: typeof CloudRuClient !== 'undefined' ? CloudRuClient : undefined
+            CloudRuClient: typeof CloudRuClient !== 'undefined' ? CloudRuClient : undefined,
+            customInstructions: customIx || undefined
           });
           if (topics && topics.length) {
             entry.topics = topics;
+            entry.topicsInstructions = customIx;
           }
         } catch (e) {
           return { ok: false, error: 'Не удалось определить темы: ' + String(e.message || e) };
@@ -747,9 +1202,13 @@
     });
 
     /* US-005: адаптивный минимальный интервал между главами.
-       <3min=10s, 3-10min=20s, >10min=45s (вместо жёстких 15с) */
+       <3min=10s, 3-10min=20s, >10min=45s (вместо жёстких 15с).
+       C3: params.minChapterSec > 0 — ручной override (merge коротких глав:
+       глава ближе N сек к предыдущей вливается в неё — маркер не ставится). */
     var totalDurForSpacing = _getEntryDuration(entry);
-    var minChapterInterval = _adaptiveChapterMinInterval(totalDurForSpacing);
+    var minChapterInterval = (typeof params.minChapterSec === 'number' && params.minChapterSec > 0)
+      ? params.minChapterSec
+      : _adaptiveChapterMinInterval(totalDurForSpacing);
 
     /* Filter: remove markers too close together */
     var filtered = [markers[0]];
@@ -786,7 +1245,9 @@
       proposal: {
         kind: 'markers',
         markers: filtered,
-        summary: 'Автоматические главы (' + filtered.length + ')' + chNote + ': по темам из транскрипта.'
+        summary: 'Автоматические главы (' + filtered.length + ')' + chNote + ': по темам из транскрипта.' +
+          (customIx ? ' Указания учтены.' : '') +
+          (minChapterInterval ? ' Мин. интервал: ' + minChapterInterval + 'с.' : '')
       }
     };
   }
@@ -820,6 +1281,11 @@
        сегмент речи короче этого — поглотить его (визуальный мусор). */
     var minSegmentDuration = typeof params.minSegmentDuration === 'number' ? params.minSegmentDuration : 0.3;
     if (minSegmentDuration < 0) minSegmentDuration = 0;
+
+    /* B4: ограничение In/Out-секцией */
+    var secR = _resolveSection(ctx, params);
+    if (secR.error) return { ok: false, error: secR.error };
+    var section = secR.section;
 
     var segs = entry.segments || [];
     var silences = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
@@ -863,6 +1329,7 @@
     }
 
     removeIntervals = _mergeIntervals(removeIntervals);
+    removeIntervals = clampIntervalsToSection(removeIntervals, section);
 
     /* R15: поглощаем крошечные речевые сегменты между соседними вырезами.
        Если между cur.endSec и next.startSec меньше minSegmentDuration —
@@ -907,9 +1374,10 @@
       ok: true,
       proposal: {
         kind: 'transcript_cuts',
+        crossfade: !!params.crossfade,
         removeIntervals: removeIntervals,
         summary: 'Jump cuts: ' + removeIntervals.length + ' пауз (>' + maxPause + 'с, суммарно ' +
-          totalRemoveSec.toFixed(1) + 'с' + breathLabel + '). Вырезать?',
+          totalRemoveSec.toFixed(1) + 'с' + breathLabel + ').' + _sectionNote(section) + ' Вырезать?',
         removeSummary: removeIntervals.map(function (iv) {
           return { startSec: iv.startSec, endSec: iv.endSec, reason: iv.reason };
         })
@@ -2517,6 +2985,13 @@
     silenceIntervalsFromRms: silenceIntervalsFromRms,
     rmsThresholdInfo: rmsThresholdInfo,
     rmsThresholdSegments: rmsThresholdSegments,
+    autoSilenceMarginDb: autoSilenceMarginDb,
+    trimClipEdges: trimClipEdges,
+    detectProfanityIntervals: detectProfanityIntervals,
+    muteProfanity: muteProfanity,
+    _normProfWord: _normProfWord,
+    sequenceSection: sequenceSection,
+    clampIntervalsToSection: clampIntervalsToSection,
     parsePipelineCommand: parsePipelineCommand,
     snapIntervalsToFrame: snapIntervalsToFrame,
     splitCutIntervalsIntoBatches: splitCutIntervalsIntoBatches,

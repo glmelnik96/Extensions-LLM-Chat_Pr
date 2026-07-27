@@ -205,6 +205,12 @@
       this.evalJson('$._EXT_PRM_.applyTranscriptCuts("' + json + '")', cb, { mutating: true });
     },
 
+    /** B1 (2.15.0): аудио-кроссфейды «Constant Power» на швах. { times:[сек], expectedSequenceName? } */
+    addAudioCrossfades: function (payloadObj, cb) {
+      var json = escapeDoubleQuoted(JSON.stringify(payloadObj || {}));
+      this.evalJson('$._EXT_PRM_.addAudioCrossfades("' + json + '")', cb, { mutating: true });
+    },
+
     addSequenceMarkers: function (markersArr, cb) {
       var json = escapeDoubleQuoted(JSON.stringify(markersArr));
       this.evalJson('$._EXT_PRM_.addSequenceMarkers("' + json + '")', cb, { mutating: true });
@@ -243,6 +249,11 @@
     /** B1-1: переместить плейхед активной секвенции (клик по таймкоду в карточке). */
     setPlayhead: function (timeSec, cb) {
       this.evalJson('$._EXT_PRM_.setPlayheadSec(' + Number(timeSec) + ')', cb);
+    },
+
+    /** C4 (2.15.0): выставить In/Out активной секвенции (кнопка у viral-кандидата). */
+    setSequenceInOut: function (inSec, outSec, cb) {
+      this.evalJson('$._EXT_PRM_.setSequenceInOutSec(' + Number(inSec) + ',' + Number(outSec) + ')', cb, { mutating: true });
     },
 
     /** B2-9: checkpoint — клон активной секвенции перед разрушительным apply. */

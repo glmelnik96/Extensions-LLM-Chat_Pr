@@ -622,3 +622,104 @@ describe('TranscriptStructure.resolveRefsToIntervals', () => {
     assert.strictEqual(result.intervals[0].reason, 'первый');
   });
 });
+
+/* ═══════════════════════════════════════════════════════════════
+ * C4: normalizeViralCandidates + VIRAL_PRESETS
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('normalizeViralCandidates (C4)', () => {
+  function cand(s, e, hook, ret, emo, title) {
+    return { startSec: s, endSec: e, title: title || 't', why: 'w',
+      scores: { hook, retention: ret, emotion: emo } };
+  }
+
+  test('не-массив → []', () => {
+    assert.strictEqual(TS.normalizeViralCandidates(null, {}).length, 0);
+    assert.strictEqual(TS.normalizeViralCandidates('x', {}).length, 0);
+  });
+
+  test('клампы баллов 0..10, total = сумма', () => {
+    const out = TS.normalizeViralCandidates([cand(0, 10, 15, -3, 'abc')], {});
+    assert.strictEqual(out.length, 1);
+    /* deepEqual (loose): объекты из vm-контекста — другой realm */
+    assert.deepEqual(out[0].scores, { hook: 10, retention: 0, emotion: 0 });
+    assert.strictEqual(out[0].total, 10);
+  });
+
+  test('NaN-времена и окна короче 3с выбрасываются', () => {
+    const out = TS.normalizeViralCandidates([
+      cand(NaN, 10, 5, 5, 5),
+      cand(0, 2.5, 5, 5, 5),
+      cand(0, 10, 5, 5, 5)
+    ], {});
+    assert.strictEqual(out.length, 1);
+  });
+
+  test('сортировка по total desc + отсев перекрытий >50% меньшего окна', () => {
+    const out = TS.normalizeViralCandidates([
+      cand(0, 30, 3, 3, 3, 'слабый'),
+      cand(5, 35, 9, 9, 9, 'сильный'),  /* перекрывает слабого на >50% */
+      cand(100, 130, 5, 5, 5, 'дальний')
+    ], {});
+    assert.strictEqual(out.length, 2);
+    assert.strictEqual(out[0].title, 'сильный');
+    assert.strictEqual(out[1].title, 'дальний');
+  });
+
+  test('durationSec клампит конец кандидата', () => {
+    const out = TS.normalizeViralCandidates([cand(250, 999, 9, 9, 9)], { durationSec: 300 });
+    assert.strictEqual(out.length, 1);
+    assert.strictEqual(out[0].endSec, 300);
+  });
+
+  test('maxCandidates режет список (без перекрытий)', () => {
+    const out = TS.normalizeViralCandidates([
+      cand(0, 40, 9, 9, 9),
+      cand(100, 140, 8, 8, 8),
+      cand(200, 240, 7, 7, 7)
+    ], { maxCandidates: 2 });
+    assert.strictEqual(out.length, 2);
+    assert.strictEqual(out[0].total, 27);
+    assert.strictEqual(out[1].total, 24);
+  });
+});
+
+describe('VIRAL_PRESETS (C4)', () => {
+  test('5 пресетов с id/label/focus', () => {
+    assert.strictEqual(TS.VIRAL_PRESETS.length, 5);
+    const ids = Array.from(TS.VIRAL_PRESETS).map((p) => p.id);
+    assert.strictEqual(ids.join(','), 'universal,hook,emotions,engagement,story');
+    TS.VIRAL_PRESETS.forEach((p) => {
+      assert.ok(p.label && p.focus);
+    });
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * C1: buildMontageSystemPrompt — Reference Script
+ * ═══════════════════════════════════════════════════════════════ */
+
+describe('buildMontageSystemPrompt referenceScript (C1)', () => {
+  test('без сценария — прежний промпт, без блока СЦЕНАРИЙ', () => {
+    const p = TS.buildMontageSystemPrompt();
+    assert.ok(p.indexOf('ЭТАЛОННЫЙ СЦЕНАРИЙ') === -1);
+    assert.ok(p.indexOf('importance') !== -1);
+  });
+
+  test('со сценарием — блок соответствия + текст сценария', () => {
+    const p = TS.buildMontageSystemPrompt('Сначала про запуск, потом вывод.');
+    assert.ok(p.indexOf('ЭТАЛОННЫЙ СЦЕНАРИЙ') !== -1);
+    assert.ok(p.indexOf('Сначала про запуск, потом вывод.') !== -1);
+    assert.ok(p.indexOf('ПО СООТВЕТСТВИЮ') !== -1);
+  });
+
+  test('пустой/пробельный сценарий = как без него', () => {
+    assert.strictEqual(TS.buildMontageSystemPrompt('   '), TS.buildMontageSystemPrompt());
+  });
+
+  test('сценарий обрезается до 4000 символов', () => {
+    const long = new Array(6000).fill('а').join('');
+    const p = TS.buildMontageSystemPrompt(long);
+    assert.ok(p.length < long.length + 2000);
+  });
+});

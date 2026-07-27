@@ -207,6 +207,15 @@
       'startSec первой главы = startSec первого абзаца; endSec последней = endSec последнего. ' +
       'Главы без дыр: endSec текущей = startSec следующей. Между главами не меньше 20 сек. Без markdown, только JSON.';
 
+    /* C3 (27.07.2026, AutoCut-паритет): кастомные указания пользователя к
+       разбиению на главы (язык названий, что выделить отдельно и т.п.).
+       Формат ответа (JSON-схему) указаниям переопределять нельзя. */
+    var customIx = String(opt.customInstructions || '').replace(/^\s+|\s+$/g, '');
+    if (customIx) {
+      sysMsg += ' Дополнительные указания монтажёра (следуй им, если не противоречат формату ответа): ' +
+        customIx.slice(0, 500);
+    }
+
     var userMsg = JSON.stringify({ paragraphs: compact });
 
     /* Phase 1 (Май 2026): chapterModel — отдельная модель для построения глав.
@@ -1154,7 +1163,29 @@
     return out;
   }
 
-  function buildMontageSystemPrompt() {
+  /**
+   * @param {string} [referenceScript] — C1 (28.07.2026, AutoCut-паритет «Reference Script»):
+   *   эталонный сценарий/план ролика от пользователя. Если задан — importance
+   *   ставится по СООТВЕТСТВИЮ сценарию, а не по общей «важности».
+   */
+  function buildMontageSystemPrompt(referenceScript) {
+    var refBlock = [];
+    var ref = String(referenceScript || '').replace(/^\s+|\s+$/g, '');
+    if (ref) {
+      refBlock = [
+        '',
+        'ЭТАЛОННЫЙ СЦЕНАРИЙ. Пользователь дал сценарий/план готового ролика. Оценивай абзацы',
+        'ПО СООТВЕТСТВИЮ ЭТОМУ СЦЕНАРИЮ, а не по абстрактной важности:',
+        '• importance 3 — абзац напрямую покрывает пункт сценария (та же мысль, пусть другими словами);',
+        '• importance 2 — поддерживает пункт сценария (пример/деталь к нему);',
+        '• importance 1 — нейтральное, в сценарии не упомянуто;',
+        '• importance 0 — противоречит сценарию или явный офтоп относительно него (role: offtopic).',
+        'Если мысль сценария встречается в материале НЕСКОЛЬКО раз (дубли) — importance 3 только',
+        'лучшему заходу, остальным role: repeat и importance ниже.',
+        'СЦЕНАРИЙ:',
+        '«' + ref.slice(0, 4000) + '»'
+      ];
+    }
     return [
       'Ты — ассистент видеомонтажёра. Дан список АБЗАЦЕВ транскрипта.',
       'Каждый абзац: {i: индекс, t0: начало (сек), t1: конец (сек), text: текст}.',
@@ -1177,7 +1208,7 @@
       'ФОРМАТ — строго JSON, без markdown:',
       '{"blocks":[{"i":0,"importance":3,"role":"hook","theme":"Завязка спора","blockId":"b0"},...]}',
       'Верни ВСЕ абзацы из входа. Ни один не пропускай.'
-    ].join('\n');
+    ].concat(refBlock).join('\n');
   }
 
   /**
@@ -1205,7 +1236,7 @@
       }));
     }
 
-    var sysPrompt = buildMontageSystemPrompt();
+    var sysPrompt = buildMontageSystemPrompt(opt.referenceScript);
     var all = [];
     var failedChunks = [];
     var total = chunks.length;
@@ -1303,13 +1334,20 @@
     }
     var summary = order.map(function (id) { return byId[id]; });
 
+    var calibRef = String(opt.referenceScript || '').replace(/^\s+|\s+$/g, '');
     var sys = [
       'Тебе дана СВОДКА смысловых блоков видео (без полного текста).',
       'Каждый блок: {blockId, theme, role, importance (0-3), durationSec, startSec}.',
       'Задача: откалибруй importance ГЛОБАЛЬНО (баллы ставились по частям, теперь ты видишь целое).',
-      'Подними ядро истории и опусти проходное. Пометь protect:"start" у завязки и protect:"end" у финала/вывода.',
+      'Подними ядро истории и опусти проходное. Пометь protect:"start" у завязки и protect:"end" у финала/вывода.'
+    ].concat(calibRef ? [
+      /* C1: баллы уже стоят ПО СЦЕНАРИЮ — калибровка не должна «возвращать» офтоп */
+      'ВАЖНО: баллы ставились по соответствию эталонному сценарию пользователя. НЕ поднимай блоки,',
+      'которых нет в сценарии, даже если сами по себе они яркие. СЦЕНАРИЙ (сокращённо):',
+      '«' + calibRef.slice(0, 1500) + '»'
+    ] : []).concat([
       'ФОРМАТ строго JSON: {"calib":[{"blockId":"b0","importance":3,"protect":"start"},...]}. Верни только изменённые/ключевые блоки.'
-    ].join('\n');
+    ]).join('\n');
 
     return CC.chatCompletions({
       baseUrl: settings.baseUrl, apiKey: settings.apiKey, model: model,
@@ -1328,10 +1366,152 @@
     }, function () { return fallbackCalibration(labeled); });
   }
 
+  /* ── C4 (2026-07-28, AutoCut-паритет): viral-скоринг кандидатов ────────
+     Пресеты промпта (5, как у AutoViral) + кастом. Кандидаты — окна из
+     соседних абзацев ~целевой длины; каждому — оценки Hook/Retention/Emotion
+     и объяснение «почему». Никакого apply: результат только информирует
+     (плейхед, In/Out, маркеры) — решение за монтажёром. */
+  var VIRAL_PRESETS = [
+    { id: 'universal', label: 'Универсальный', focus: 'Сбалансированно: сильный хук, самодостаточная мысль, эмоция.' },
+    { id: 'hook', label: 'Хук (первые 3 сек)', focus: 'Главное — первые 1-2 фразы окна: интрига, провокация, неожиданный факт, вопрос. Окно без мгновенного хука — низкий балл.' },
+    { id: 'emotions', label: 'Эмоции', focus: 'Главное — эмоциональный накал: смех, спор, восторг, возмущение, личные истории. Ровное изложение — низкий балл.' },
+    { id: 'engagement', label: 'Вовлечение/споры', focus: 'Главное — потенциал комментариев и споров: спорные тезисы, «непопулярное мнение», вопросы к зрителю, советы с несогласием.' },
+    { id: 'story', label: 'История/арка', focus: 'Главное — законченная мини-история: завязка → поворот → развязка внутри окна. Обрывки без развязки — низкий балл.' }
+  ];
+
+  /**
+   * Чистая пост-обработка ответа LLM (тестируемая): валидация, клампы,
+   * сортировка по total, обрезка до maxCandidates, отсев дублей-перекрытий.
+   * @param {Array} raw — j.candidates из ответа модели
+   * @param {{durationSec:number, maxCandidates:number}} o
+   */
+  function normalizeViralCandidates(raw, o) {
+    o = o || {};
+    var dur = typeof o.durationSec === 'number' && o.durationSec > 0 ? o.durationSec : null;
+    var maxN = typeof o.maxCandidates === 'number' && o.maxCandidates > 0 ? o.maxCandidates : 5;
+    if (!Array.isArray(raw)) return [];
+    function clampScore(v) {
+      var n = Number(v);
+      if (isNaN(n)) return 0;
+      return Math.max(0, Math.min(10, Math.round(n)));
+    }
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      var c = raw[i];
+      if (!c) continue;
+      var s = Number(c.startSec), e = Number(c.endSec);
+      if (isNaN(s) || isNaN(e)) continue;
+      if (s < 0) s = 0;
+      if (dur !== null && e > dur + 0.5) e = dur;
+      if (e - s < 3) continue; /* короче 3с — не клип */
+      var sc = c.scores || {};
+      var hook = clampScore(sc.hook), ret = clampScore(sc.retention), emo = clampScore(sc.emotion);
+      out.push({
+        startSec: Math.round(s * 100) / 100,
+        endSec: Math.round(e * 100) / 100,
+        title: String(c.title || '').slice(0, 80),
+        why: String(c.why || '').slice(0, 300),
+        scores: { hook: hook, retention: ret, emotion: emo },
+        total: hook + ret + emo
+      });
+    }
+    out.sort(function (a, b) { return b.total - a.total; });
+    /* Отсев сильных перекрытий (>50% меньшего окна) — оставляем сильнейший. */
+    var kept = [];
+    for (var k = 0; k < out.length && kept.length < maxN; k++) {
+      var cand = out[k], overlapped = false;
+      for (var j = 0; j < kept.length; j++) {
+        var ov = Math.min(cand.endSec, kept[j].endSec) - Math.max(cand.startSec, kept[j].startSec);
+        var minLen = Math.min(cand.endSec - cand.startSec, kept[j].endSec - kept[j].startSec);
+        if (ov > 0 && minLen > 0 && ov / minLen > 0.5) { overlapped = true; break; }
+      }
+      if (!overlapped) kept.push(cand);
+    }
+    return kept;
+  }
+
+  /**
+   * scoreViralMomentsWithLLM(paragraphs, opt) → Promise<[{startSec,endSec,title,why,scores,total}]>
+   * opt: { settings, CloudRuClient, presetId, customPrompt, targetLenSec,
+   *        maxCandidates, signal, abortCheck }
+   */
+  function scoreViralMomentsWithLLM(paragraphs, opt) {
+    opt = opt || {};
+    var settings = opt.settings || {};
+    var CC = opt.CloudRuClient || global.CloudRuClient;
+    if (!CC || !paragraphs || !paragraphs.length) return Promise.resolve([]);
+    var targetLen = typeof opt.targetLenSec === 'number' && opt.targetLenSec >= 10 ? opt.targetLenSec : 45;
+    var maxN = typeof opt.maxCandidates === 'number' && opt.maxCandidates > 0 ? opt.maxCandidates : 5;
+    var preset = VIRAL_PRESETS[0];
+    for (var pi = 0; pi < VIRAL_PRESETS.length; pi++) {
+      if (VIRAL_PRESETS[pi].id === opt.presetId) { preset = VIRAL_PRESETS[pi]; break; }
+    }
+    var compact = paragraphs.map(function (p, idx) {
+      var words = String(p.text || '').split(/\s+/).slice(0, 60).join(' ');
+      return {
+        i: idx,
+        t0: Math.round((p.startSec || 0) * 10) / 10,
+        t1: Math.round((p.endSec || 0) * 10) / 10,
+        text: words + (p.text && p.text.split(/\s+/).length > 60 ? '…' : '')
+      };
+    });
+    var durationSec = paragraphs[paragraphs.length - 1].endSec || 0;
+    var sysMsg =
+      'Ты — продюсер коротких вертикальных видео (Reels/Shorts). ' +
+      'На входе — абзацы расшифровки ролика с таймкодами (секунды таймлайна). ' +
+      'Найди до ' + maxN + ' лучших фрагментов-кандидатов длиной ~' + targetLen + ' сек ' +
+      '(допустимо ' + Math.round(targetLen * 0.6) + '–' + Math.round(targetLen * 1.6) + ' сек). ' +
+      'Границы фрагмента — СТРОГО по границам абзацев (t0 первого, t1 последнего), фрагмент должен быть самодостаточным (понятен без остального ролика). ' +
+      'Критерий отбора: ' + preset.focus + ' ' +
+      'Каждому кандидату поставь оценки 0–10: hook (цепляет ли первая фраза), retention (удержит ли до конца), emotion (эмоциональный заряд). ' +
+      'Поле why — 1-2 предложения ПО-РУССКИ: почему фрагмент сработает и с чего он начинается. ' +
+      'Возвращай СТРОГО JSON {"candidates":[{"startSec":N,"endSec":N,"title":"3-6 слов","why":"…","scores":{"hook":N,"retention":N,"emotion":N}}]}. Без markdown.';
+    var customIx = String(opt.customPrompt || '').replace(/^\s+|\s+$/g, '');
+    if (customIx) {
+      sysMsg += ' Дополнительные указания монтажёра (следуй им, если не противоречат формату ответа): ' +
+        customIx.slice(0, 500);
+    }
+    return CC.chatCompletions({
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+      model: settings.findMomentsModel || settings.chapterModel || settings.analysisModel || settings.chatModel,
+      messages: [
+        { role: 'system', content: sysMsg },
+        { role: 'user', content: JSON.stringify({ paragraphs: compact }) }
+      ],
+      chatParams: { max_tokens: Math.min(16000, 6000 + Math.floor(paragraphs.length * 20)), temperature: 0.3 },
+      responseFormat: 'json_object',
+      enableThinking: (settings.thinkingPolicy && typeof settings.thinkingPolicy.chapter === 'boolean')
+        ? settings.thinkingPolicy.chapter
+        : settings.enableThinking,
+      signal: opt.signal,
+      abortCheck: opt.abortCheck
+    }).then(function (resp) {
+      try {
+        var choice = resp && resp.choices && resp.choices[0];
+        var content = choice && choice.message && choice.message.content;
+        if (!content) return [];
+        var m = String(content).match(/\{[\s\S]*\}/);
+        if (!m) return [];
+        var j;
+        try { j = JSON.parse(m[0]); } catch (ePv) { return []; }
+        return normalizeViralCandidates(j && j.candidates, {
+          durationSec: durationSec,
+          maxCandidates: maxN
+        });
+      } catch (e) {
+        return [];
+      }
+    }, function () { return []; });
+  }
+
   global.TranscriptStructure = {
     buildParagraphs: buildParagraphs,
     buildSpeakers: buildSpeakers,
     buildTopicsWithLLM: buildTopicsWithLLM,
+    VIRAL_PRESETS: VIRAL_PRESETS,
+    normalizeViralCandidates: normalizeViralCandidates,
+    scoreViralMomentsWithLLM: scoreViralMomentsWithLLM,
     analyzeForCutsWithLLM: analyzeForCutsWithLLM,
     parseMontageChunk: parseMontageChunk,
     buildMontageSystemPrompt: buildMontageSystemPrompt,

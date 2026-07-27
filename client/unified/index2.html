@@ -571,6 +571,12 @@
             <span id="tools-led-text">нужен анализ</span>
           </span>
           <span class="grow"></span>
+          <!-- B4 (27.07.2026, AutoCut-паритет): все режущие инструменты работают
+               только внутри In/Out-секции секвенции (I/O в Premiere) -->
+          <label class="param-row" style="margin:0;gap:4px;font-size:11px;cursor:pointer;" title="Режущие инструменты (тишины, паразиты, jump cuts, пробелы, края клипов) обрабатывают только участок между In и Out секвенции. Если In/Out не выставлены — инструмент сообщит об этом">
+            <input type="checkbox" id="tools-inout-only" />
+            <span>Только In/Out</span>
+          </label>
         </div>
 
         <div class="err" id="tools-err" style="display:none;padding:6px 10px;font-size:11px;color:#f88;background:#2a1a1a;border-bottom:1px solid var(--danger);"></div>
@@ -581,6 +587,25 @@
           <div class="tool-card needs-audio" id="card-silences">
             <div class="tool-card-title">🔇 Убрать тишины</div>
             <div class="tool-card-desc">Гигиена звука: убирает явные паузы ≥1с, сохраняет естественный ритм речи.</div>
+            <!-- A5 (27.07.2026): пресеты темпа — один клик выставляет все ползунки -->
+            <div class="param-row" title="Пресеты темпа: от бережного (длинные паузы остаются) до плотного YouTube-ритма. Клик выставляет все ползунки — их можно докрутить вручную">
+              <span class="param-label">Темп</span>
+              <div class="toggle-group" id="sil-preset">
+                <button type="button" class="toggle-btn" data-val="calm" title="Мин. 1.5с, порог 22 dB, отступы 0.25с">Спокойный</button>
+                <button type="button" class="toggle-btn" data-val="standard" title="Мин. 1.0с, порог 18 dB, отступы 0.15с">Стандарт</button>
+                <button type="button" class="toggle-btn" data-val="dynamic" title="Мин. 0.6с, порог 15 dB, отступы 0.1с">Динамичный</button>
+                <button type="button" class="toggle-btn" data-val="jumpy" title="Мин. 0.4с, порог 12 dB, отступы 0.05с">Jumpy</button>
+              </div>
+            </div>
+            <!-- A1 (27.07.2026): режим обработки найденной тишины -->
+            <div class="param-row" title="Вырезать — razor + ripple, таймлайн сжимается. Заглушить — недеструктивно выключает аудиоклипы в паузах (видео и длина не меняются). Без сдвига — вырезает, но дыры остаются (синхрон с другими дорожками цел)">
+              <span class="param-label">Режим</span>
+              <div class="toggle-group" id="sil-mode">
+                <button type="button" class="toggle-btn active" data-val="remove">Вырезать</button>
+                <button type="button" class="toggle-btn" data-val="mute">Заглушить</button>
+                <button type="button" class="toggle-btn" data-val="keep_spaces">Без сдвига</button>
+              </div>
+            </div>
             <div class="param-row" title="Паузы короче этого значения не трогаем. Меньше = агрессивнее (вырезаются и короткие паузы)">
               <span class="param-label">Мин. длительность</span>
               <input type="range" id="sil-min" min="0.3" max="3.0" step="0.1" value="1.0" />
@@ -588,21 +613,58 @@
             </div>
             <!-- P1-1: честная подпись — значение НЕ абсолютный dBFS-порог,
                  а дельта от измеренной громкости речи (порог = inputI − N dB) -->
-            <div class="param-row" title="Тишина = всё, что на N dB тише средней громкости речи (порог адаптируется к записи автоматически). Больше = осторожнее (тишиной считается только совсем тихое)">
+            <div class="param-row" title="Тишина = всё, что на N dB тише средней громкости речи (порог адаптируется к записи автоматически). Больше = осторожнее (тишиной считается только совсем тихое). «Авто» подбирает порог по гистограмме громкости (нужен «Анализ аудио»)">
               <span class="param-label">Тише речи на</span>
               <input type="range" id="sil-thresh" min="3" max="30" step="1" value="18" />
               <span class="param-val" id="sil-thresh-val">18 dB</span>
+              <button type="button" id="sil-thresh-auto" class="secondary" style="padding:2px 8px;" title="Автоподбор порога: долина между «тишиной» и «речью» в гистограмме RMS (локально, по каждому клипу)">Авто</button>
             </div>
-            <div class="param-row" title="Отступ от границ тишины: сколько оставить до/после реза, чтобы не обрезать начало или хвост слова">
-              <span class="param-label">Padding</span>
+            <!-- A3 (27.07.2026): раздельные отступы до/после (padding before/after) -->
+            <div class="param-row" title="Сколько тишины оставить ПОСЛЕ конца фразы (хвост дыхания перед резом)">
+              <span class="param-label">Отступ до</span>
               <input type="range" id="sil-pad" min="0" max="0.5" step="0.05" value="0.15" />
               <span class="param-val" id="sil-pad-val">0.15с</span>
+            </div>
+            <div class="param-row" title="Сколько тишины оставить ПЕРЕД началом следующей фразы (лид-ин, чтобы не резать вдох/атаку слова)">
+              <span class="param-label">Отступ после</span>
+              <input type="range" id="sil-pad-after" min="0" max="0.5" step="0.05" value="0.15" />
+              <span class="param-val" id="sil-pad-after-val">0.15с</span>
+            </div>
+            <!-- B1 (27.07.2026): аудио-кроссфейд «Constant Power» на каждом шве.
+                 Только для режима «Вырезать»; длительность — из настроек Premiere -->
+            <div class="param-row" title="После вырезки повесить аудиопереход «Constant Power» на каждый шов — сгладит щелчки на резах. Длительность перехода — из настроек Premiere (Default Audio Transition Duration). Работает только в режиме «Вырезать»">
+              <span class="param-label">Кроссфейд на швах</span>
+              <input type="checkbox" id="sil-crossfade" />
             </div>
             <canvas class="tool-waveform" id="wave-silences" height="72" hidden
                     title="Waveform региона In–Out. Жёлтая линия — порог среза; красным — что будет вырезано; двигайте ползунки — обновляется вживую."></canvas>
             <div class="wave-legend" id="wave-legend-silences" hidden></div>
             <button class="tool-run" data-tool="silences">Найти и вырезать</button>
             <div class="proposal-area" id="proposal-silences"></div>
+          </div>
+
+          <!-- 1b. A4 (27.07.2026): батч-подрезка тишины в начале/конце каждого клипа.
+               Незакрытая боль рынка (в AutoCut такого режима нет). -->
+          <div class="tool-card needs-audio" id="card-trim-edges">
+            <div class="tool-card-title">✂ Подрезать края клипов</div>
+            <div class="tool-card-desc">Убирает тишину только в начале и конце каждого клипа («нажал запись → пауза → речь → пауза → стоп»). Середину клипов не трогает.</div>
+            <div class="param-row" title="Тишина у края клипа короче этого значения не трогается">
+              <span class="param-label">Мин. тишина</span>
+              <input type="range" id="te-min" min="0.1" max="2.0" step="0.05" value="0.3" />
+              <span class="param-val" id="te-min-val">0.3с</span>
+            </div>
+            <div class="param-row" title="Тишина = всё, что на N dB тише средней громкости речи клипа (порог по каждому клипу свой)">
+              <span class="param-label">Тише речи на</span>
+              <input type="range" id="te-thresh" min="3" max="30" step="1" value="22" />
+              <span class="param-val" id="te-thresh-val">22 dB</span>
+            </div>
+            <div class="param-row" title="Сколько тишины оставить у речи (зазор до первого и после последнего слова клипа)">
+              <span class="param-label">Отступ</span>
+              <input type="range" id="te-pad" min="0" max="0.5" step="0.05" value="0.1" />
+              <span class="param-val" id="te-pad-val">0.1с</span>
+            </div>
+            <button class="tool-run" data-tool="trim-edges">Найти и подрезать</button>
+            <div class="proposal-area" id="proposal-trim-edges"></div>
           </div>
 
           <!-- 2. Cut Fillers -->
@@ -618,6 +680,26 @@
             </div>
             <button class="tool-run" data-tool="fillers">Найти и вырезать</button>
             <div class="proposal-area" id="proposal-fillers"></div>
+          </div>
+
+          <!-- 2b. C2 (28.07.2026, AutoCut-паритет): цензура русского мата по транскрипту.
+               Mute = недеструктивный razor+disable аудио; бип-замена — отдельная волна. -->
+          <div class="tool-card needs-transcript" id="card-profanity">
+            <div class="tool-card-title">🤬 Цензура мата</div>
+            <div class="tool-card-desc">Находит русский мат по словам транскрипта и глушит (или вырезает) эти места. Точность зависит от word-level таймингов Whisper.</div>
+            <div class="param-row" title="Заглушить — недеструктивно (аудио режется и отключается, видео не трогается). Вырезать — ripple-удаление участков целиком">
+              <span class="param-label">Режим</span>
+              <div class="toggle-group" id="prof-mode">
+                <button class="toggle-btn active" data-val="mute">Заглушить</button>
+                <button class="toggle-btn" data-val="remove">Вырезать</button>
+              </div>
+            </div>
+            <div class="param-row" title="Свои слова для глушения (через запятую или с новой строки). Ищутся по началу слова: «блин» найдёт и «блина». Сохраняются между сессиями">
+              <span class="param-label">Свои слова</span>
+              <textarea id="prof-words" rows="2" placeholder="через запятую: блин, чёрт…" style="flex:1; resize: vertical;"></textarea>
+            </div>
+            <button class="tool-run" data-tool="profanity">Найти мат</button>
+            <div class="proposal-area" id="proposal-profanity"></div>
           </div>
 
           <!-- 3. Jump Cuts -->
@@ -640,6 +722,10 @@
               <span class="param-label">Мин. сегмент</span>
               <input type="range" id="jmp-minseg" min="0" max="1.0" step="0.05" value="0.3" />
               <span class="param-val" id="jmp-minseg-val">0.3с</span>
+            </div>
+            <div class="param-row" title="После вырезки повесить аудиопереход «Constant Power» на каждый шов — сгладит щелчки на резах. Длительность перехода — из настроек Premiere (Default Audio Transition Duration)">
+              <span class="param-label">Кроссфейд на швах</span>
+              <input type="checkbox" id="jmp-crossfade" />
             </div>
             <canvas class="tool-waveform" id="wave-jumps" height="72" hidden
                     title="Waveform региона In–Out. Жёлтая линия — порог среза; красным — что будет вырезано; двигайте ползунки — зоны обновляются вживую."></canvas>
@@ -689,6 +775,15 @@
               <span class="param-label">Кол-во глав</span>
               <input type="range" id="ch-count" min="0" max="20" step="1" value="0" />
               <span class="param-val" id="ch-count-val">авто</span>
+            </div>
+            <!-- C3 (27.07.2026): merge коротких глав + кастомные указания LLM -->
+            <div class="param-row" title="Глава, начинающаяся раньше чем через N секунд после предыдущей, вливается в неё (маркер не ставится). 0 = авто: 10с/20с/45с по длине ролика">
+              <span class="param-label">Мин. интервал глав</span>
+              <input type="range" id="ch-minlen" min="0" max="180" step="5" value="0" />
+              <span class="param-val" id="ch-minlen-val">авто</span>
+            </div>
+            <div class="param-row" title="Необязательные указания модели: язык названий, что выделить отдельной главой, стиль. Смена указаний перестраивает темы заново (1 вызов LLM)">
+              <textarea id="ch-instructions" rows="2" placeholder="Доп. указания ИИ (напр.: «названия на английском, спонсорский блок — отдельной главой»)" style="width:100%;resize:vertical;font-size:11px;"></textarea>
             </div>
             <button class="tool-run" data-tool="chapters">Расставить главы</button>
             <div class="proposal-area" id="proposal-chapters"></div>
@@ -877,6 +972,28 @@
               <span class="param-label">Фокус камер</span>
               <input type="text" id="rl-offsets" placeholder="Гость: -20 (пусто = vision)" style="flex:1;min-width:0;" />
             </div>
+            <!-- C4 (AutoCut-паритет): viral-скоринг кандидатов с объяснениями.
+                 Ничего не применяет: результат — список фрагментов с оценками,
+                 кнопками плейхеда/In/Out и маркерами. -->
+            <div class="param-row" title="Критерий отбора виральных фрагментов: что модель считает главным при оценке.">
+              <span class="param-label">Виральность</span>
+              <select id="rl-viral-preset" style="flex:1;min-width:0;">
+                <option value="universal" selected>Универсальный</option>
+                <option value="hook">Хук (первые 3 сек)</option>
+                <option value="emotions">Эмоции</option>
+                <option value="engagement">Вовлечение/споры</option>
+                <option value="story">История/арка</option>
+              </select>
+              <select id="rl-viral-len" title="Целевая длина фрагмента (допуск ±40-60%)." style="flex:none;width:70px;">
+                <option value="20">~20с</option>
+                <option value="30">~30с</option>
+                <option value="45" selected>~45с</option>
+                <option value="60">~60с</option>
+                <option value="90">~90с</option>
+              </select>
+            </div>
+            <textarea id="rl-viral-custom" rows="2" placeholder="Доп. указания ИИ к отбору (напр.: «только моменты про деньги, без вступлений»)" style="width:100%;box-sizing:border-box;resize:vertical;font-size:11px;"></textarea>
+            <button type="button" class="tool-run" id="rl-viral-find" style="background:var(--panel-2,#2a2a2a);" title="ИИ оценит фрагменты транскрипта по критерию выше: оценки Hook/Retention/Emotion + «почему сработает». Ничего не режет: таймкоды кликабельны, кнопка «In/Out» выставляет границы под «Собрать рилс», «Маркеры» подписывает кандидатов на таймлайне.">Найти виральные моменты</button>
             <button class="tool-run" data-tool="reels">Собрать рилс</button>
             <div style="display:flex;gap:6px;">
               <button type="button" class="tool-run" data-tool="subtitles-anim" style="flex:1;min-width:0;background:var(--panel-2,#2a2a2a);" title="Анимированные субтитры (караоке-оверлей ProRes) на активную секвенцию — без вертикали/рефрейма. Анимация/шрифт/цвета берутся выше; размер оверлея = разрешение активной секвенции. Оверлей рендерится ffmpeg — для длинных/4K секвенций возможен отказ (сузьте In–Out или используйте «Статичные»).">Субтитры: анимированные</button>
@@ -942,6 +1059,7 @@
           <button type="button" id="tr-copy" title="Скопировать весь транскрипт в буфер обмена">Копировать</button>
           <button type="button" id="tr-save-txt" title="Сохранить транскрипт с таймкодами в .txt">Сохранить .txt</button>
           <button type="button" id="tr-export-srt" title="Субтитры .srt из Whisper-сегментов (норматив: ≤2 строки по 42 символа, ≤5с)">Экспорт .srt</button>
+          <button type="button" id="tr-proofread" title="ИИ исправит орфографию и пунктуацию в сегментах транскрипта. Слова и таймкоды не меняются; правки сохраняются в кэш и попадают в .txt/.srt/анализ">ИИ-корректура</button>
           <span class="tr-foot-status" id="tr-foot-status"></span>
         </div>
       </div>
