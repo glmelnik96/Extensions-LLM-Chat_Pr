@@ -7224,6 +7224,17 @@ PanelBoot.run('ИИ: монтаж', function () {
       toolsRenderWaveform();
     }
 
+    /* UI-переработка 28.07.2026: перерисовка waveform после раскрытия
+       группы/спойлера аккордеона (в скрытом контейнере canvas был нулевой
+       ширины). Зовёт tools-accordion.js. Присваивание (не addEventListener) —
+       на reload панели переопределяется без утечки старого замыкания. */
+    window.__omcToolsWaveformReveal = function () {
+      var st = _waveState;
+      if (st && st.entry && st.canvas && !st.canvas.hidden) {
+        toolsShowWaveform(st.toolName, st.entry);
+      }
+    };
+
     function toolsShowErr(t) {
       if (!toolsErr) return;
       var msg = t || '';
@@ -7483,7 +7494,13 @@ PanelBoot.run('ИИ: монтаж', function () {
       var d = new Date();
       var stamp = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
       _toolsCardStatus[seqKey][cardId] = { text: String(text || ''), kind: kind || 'info', stamp: stamp };
-      if (seqKey === _toolsStatusSeqKey) _renderCardStatus(cardId, _toolsCardStatus[seqKey][cardId]);
+      if (seqKey === _toolsStatusSeqKey) {
+        _renderCardStatus(cardId, _toolsCardStatus[seqKey][cardId]);
+        /* UI-переработка 28.07.2026: итог не должен потеряться в свёрнутой
+           группе аккордеона. Reveal именно здесь (не в _renderCardStatus) —
+           иначе смена секвенции раскрывала бы группы без действия юзера. */
+        if (window.toolsRevealCard) window.toolsRevealCard(cardId);
+      }
     }
     function _renderCardStatus(cardId, st) {
       var card = document.getElementById(cardId);
@@ -7978,7 +7995,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         var area = card.querySelector('.proposal-area');
         if (!area || area.className.indexOf('visible') === -1) return;
         toolsHideProposal(area);
-        toolsStatusUi.show('Параметры изменились — предложение сброшено. Нажмите «Найти и вырезать» заново.', false);
+        toolsStatusUi.show('Параметры изменились — предложение сброшено. Нажмите «Найти» заново.', false);
         setTimeout(function () { toolsStatusUi.hide(); }, 4000);
       }
       var invCards = document.querySelectorAll('.tool-card');
@@ -8021,6 +8038,8 @@ PanelBoot.run('ИИ: монтаж', function () {
       _toolsProposalArea = area;
       area.innerHTML = '';
       area.className = 'proposal-area visible';
+      /* UI-переработка 28.07.2026: раскрыть группу, если карточка свёрнута */
+      if (window.toolsRevealCard) window.toolsRevealCard(areaId);
       var sum = document.createElement('div');
       sum.className = 'proposal-summary';
       /* UX 10.07.2026: многострочные сводки (мультикам: экранное время/батчи) */

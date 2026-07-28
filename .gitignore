@@ -29,3 +29,4 @@ host/_llm_transcript_cache.json.tmp
 .omc/notepad.md
 .omc/project-memory.json
 .omc/logs/
+.superpowers/

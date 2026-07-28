@@ -278,6 +278,48 @@
         color: var(--muted);
         margin: 0 0 8px;
       }
+      /* ── Аккордеон групп инструментов (28.07.2026, UI-переработка) ── */
+      .tools-group {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        margin-bottom: 8px;
+      }
+      .tools-group-head {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 10px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        user-select: none;
+      }
+      .tools-group-head:hover { background: rgba(255,255,255,0.04); }
+      .tools-group-cnt { color: var(--muted); font-weight: 400; font-size: 11px; }
+      .tools-group-arrow { margin-left: auto; color: var(--muted); font-size: 10px; }
+      .tools-group-arrow::before { content: '▸'; }
+      .tools-group.open .tools-group-arrow::before { content: '▾'; }
+      .tools-group-body { display: none; border-top: 1px solid var(--border); padding: 8px 8px 2px; }
+      .tools-group.open .tools-group-body { display: block; }
+      /* «Откат маркеров» внутри поповера «Ещё» (28.07.2026) */
+      .more-popover .undo-menu { display: block; position: relative; }
+      .more-popover .undo-menu > button { display: block; width: 100%; text-align: left; }
+      .more-popover .undo-menu .undo-popover {
+        right: calc(100% + 6px);
+        left: auto;
+        top: 0;
+      }
+      /* Компактный бейдж токенов */
+      .usage-menu .usage-badge {
+        font-size: 10px;
+        padding: 1px 6px;
+        background: var(--border);
+        border-radius: 8px;
+        color: var(--muted);
+        white-space: nowrap;
+        display: inline-block;
+      }
       .param-row {
         display: flex;
         align-items: center;
@@ -301,8 +343,8 @@
         min-width: 32px;
         text-align: right;
       }
-      .mc-advanced { margin: 8px 0 4px; border-top: 1px solid var(--border); padding-top: 6px; }
-      .mc-advanced > summary {
+      .tool-advanced { margin: 8px 0 4px; border-top: 1px solid var(--border); padding-top: 6px; }
+      .tool-advanced > summary {
         font-size: 11px;
         font-weight: 600;
         color: var(--muted);
@@ -311,9 +353,9 @@
         padding: 2px 0;
         user-select: none;
       }
-      .mc-advanced > summary::-webkit-details-marker { display: none; }
-      .mc-advanced > summary::before { content: '▸ '; }
-      .mc-advanced[open] > summary::before { content: '▾ '; }
+      .tool-advanced > summary::-webkit-details-marker { display: none; }
+      .tool-advanced > summary::before { content: '▸ '; }
+      .tool-advanced[open] > summary::before { content: '▾ '; }
       .mc-section-title {
         font-size: 10px;
         font-weight: 600;
@@ -514,13 +556,16 @@
             <div class="more-popover usage-popover" id="usage-popover"></div>
           </span>
           <span class="grow"></span>
-          <span class="more-menu undo-menu" id="undo-menu">
-            <button type="button" id="btn-undo" class="secondary">Откат маркеров</button>
-            <div class="more-popover undo-popover" id="undo-popover"></div>
-          </span>
           <div class="more-menu" id="more-menu">
             <button type="button" class="more-btn" id="more-btn">Ещё ▾</button>
             <div class="more-popover">
+              <!-- UI-переработка 28.07.2026: «Откат маркеров» переехал из
+                   action-bar внутрь «Ещё» (те же ID, обвязка panel.js не менялась) -->
+              <span class="more-menu undo-menu" id="undo-menu">
+                <button type="button" id="btn-undo">Откат маркеров</button>
+                <div class="more-popover undo-popover" id="undo-popover"></div>
+              </span>
+              <hr />
               <button type="button" id="btn-view-transcript">Читать транскрипт</button>
               <button type="button" id="btn-clear-chat">Очистить чат</button>
               <button type="button" id="btn-clear-cache">Очистить кэш транскриптов</button>
@@ -582,11 +627,17 @@
         <div class="err" id="tools-err" style="display:none;padding:6px 10px;font-size:11px;color:#f88;background:#2a1a1a;border-bottom:1px solid var(--danger);"></div>
 
         <div class="tools-scroll" id="tools-scroll">
+          <!-- ══ UI-переработка 28.07.2026: аккордеон смысловых групп.
+               Карточки перенесены как есть (все ID сохранены), логика panel.js
+               не знает про группы. Механика — tools-accordion.js. ══ -->
+          <div class="tools-group" data-group="cleanup">
+            <div class="tools-group-head">🧹 Чистка речи <span class="tools-group-cnt">6 инструментов</span><span class="tools-group-arrow"></span></div>
+            <div class="tools-group-body">
           <!-- 1. Cut Silences -->
           <!-- P0-2: достаточно аудиоанализа (ffmpeg) — транскрипт не обязателен -->
           <div class="tool-card needs-audio" id="card-silences">
             <div class="tool-card-title">🔇 Убрать тишины</div>
-            <div class="tool-card-desc">Гигиена звука: убирает явные паузы ≥1с, сохраняет естественный ритм речи.</div>
+            <div class="tool-card-desc">Находит паузы по громкости (ffmpeg, без транскрипта) и по выбранному режиму вырезает, глушит или оставляет дыры. План виден на waveform до применения.</div>
             <!-- A5 (27.07.2026): пресеты темпа — один клик выставляет все ползунки -->
             <div class="param-row" title="Пресеты темпа: от бережного (длинные паузы остаются) до плотного YouTube-ритма. Клик выставляет все ползунки — их можно докрутить вручную">
               <span class="param-label">Темп</span>
@@ -597,6 +648,10 @@
                 <button type="button" class="toggle-btn" data-val="jumpy" title="Мин. 0.4с, порог 12 dB, отступы 0.05с">Jumpy</button>
               </div>
             </div>
+            <!-- UI-переработка 28.07.2026: тонкая настройка в спойлере,
+                 пресет «Темп» задаёт разумные дефолты этих же ползунков -->
+            <details class="tool-advanced" data-adv="card-silences">
+              <summary>⚙ Тонкая настройка (6)</summary>
             <!-- A1 (27.07.2026): режим обработки найденной тишины -->
             <div class="param-row" title="Вырезать — razor + ripple, таймлайн сжимается. Заглушить — недеструктивно выключает аудиоклипы в паузах (видео и длина не меняются). Без сдвига — вырезает, но дыры остаются (синхрон с другими дорожками цел)">
               <span class="param-label">Режим</span>
@@ -636,41 +691,18 @@
               <span class="param-label">Кроссфейд на швах</span>
               <input type="checkbox" id="sil-crossfade" />
             </div>
+            </details>
             <canvas class="tool-waveform" id="wave-silences" height="72" hidden
                     title="Waveform региона In–Out. Жёлтая линия — порог среза; красным — что будет вырезано; двигайте ползунки — обновляется вживую."></canvas>
             <div class="wave-legend" id="wave-legend-silences" hidden></div>
-            <button class="tool-run" data-tool="silences">Найти и вырезать</button>
+            <button class="tool-run" data-tool="silences">Найти</button>
             <div class="proposal-area" id="proposal-silences"></div>
-          </div>
-
-          <!-- 1b. A4 (27.07.2026): батч-подрезка тишины в начале/конце каждого клипа.
-               Незакрытая боль рынка (в AutoCut такого режима нет). -->
-          <div class="tool-card needs-audio" id="card-trim-edges">
-            <div class="tool-card-title">✂ Подрезать края клипов</div>
-            <div class="tool-card-desc">Убирает тишину только в начале и конце каждого клипа («нажал запись → пауза → речь → пауза → стоп»). Середину клипов не трогает.</div>
-            <div class="param-row" title="Тишина у края клипа короче этого значения не трогается">
-              <span class="param-label">Мин. тишина</span>
-              <input type="range" id="te-min" min="0.1" max="2.0" step="0.05" value="0.3" />
-              <span class="param-val" id="te-min-val">0.3с</span>
-            </div>
-            <div class="param-row" title="Тишина = всё, что на N dB тише средней громкости речи клипа (порог по каждому клипу свой)">
-              <span class="param-label">Тише речи на</span>
-              <input type="range" id="te-thresh" min="3" max="30" step="1" value="22" />
-              <span class="param-val" id="te-thresh-val">22 dB</span>
-            </div>
-            <div class="param-row" title="Сколько тишины оставить у речи (зазор до первого и после последнего слова клипа)">
-              <span class="param-label">Отступ</span>
-              <input type="range" id="te-pad" min="0" max="0.5" step="0.05" value="0.1" />
-              <span class="param-val" id="te-pad-val">0.1с</span>
-            </div>
-            <button class="tool-run" data-tool="trim-edges">Найти и подрезать</button>
-            <div class="proposal-area" id="proposal-trim-edges"></div>
           </div>
 
           <!-- 2. Cut Fillers -->
           <div class="tool-card needs-transcript" id="card-fillers">
             <div class="tool-card-title">✂ Убрать паразиты</div>
-            <div class="tool-card-desc">Находит слова-паразиты в начале/конце фраз и короткие сегменты-филлеры.</div>
+            <div class="tool-card-desc">Вырезает слова-паразиты по word-таймингам транскрипта: строгий режим — только однозначные («эээ», «ммм», «ну», «блин»), расширенный — плюс контекстные и филлер-сегменты до 2.5с.</div>
             <div class="param-row" title="Строгий — только однозначные паразиты («эээ», «ммм», «ну», «блин»), минимум ложных срабатываний. Расширенный — плюс контекстные («как бы», «типа», «короче», «вот», «значит»…) и более длинные сегменты-филлеры (до 2.5с вместо 1.5с).">
               <span class="param-label">Режим</span>
               <div class="toggle-group" id="filler-mode">
@@ -678,7 +710,7 @@
                 <button class="toggle-btn active" data-val="normal">Расширенный</button>
               </div>
             </div>
-            <button class="tool-run" data-tool="fillers">Найти и вырезать</button>
+            <button class="tool-run" data-tool="fillers">Найти</button>
             <div class="proposal-area" id="proposal-fillers"></div>
           </div>
 
@@ -707,7 +739,7 @@
                RMS-таймлайну/silencedetect без Whisper, как «Тишины». -->
           <div class="tool-card needs-audio" id="card-jumps">
             <div class="tool-card-title">⚡ Jump cuts</div>
-            <div class="tool-card-desc">Ритм: агрессивно сжимает паузы, YouTube-стиль. Оставляет «дыхание» чтобы не звучало клиппированно.</div>
+            <div class="tool-card-desc">Сжимает все паузы длиннее порога до короткого «дыхания» (по громкости, без транскрипта) — плотный YouTube-ритм. План виден на waveform до применения.</div>
             <div class="param-row" title="Паузы длиннее этого сжимаются. Меньше = агрессивнее (плотнее ритм)">
               <span class="param-label">Макс. пауза</span>
               <input type="range" id="jmp-pause" min="0.1" max="2.0" step="0.05" value="0.5" />
@@ -730,28 +762,32 @@
             <canvas class="tool-waveform" id="wave-jumps" height="72" hidden
                     title="Waveform региона In–Out. Жёлтая линия — порог среза; красным — что будет вырезано; двигайте ползунки — зоны обновляются вживую."></canvas>
             <div class="wave-legend" id="wave-legend-jumps" hidden></div>
-            <button class="tool-run" data-tool="jumps">Найти и вырезать</button>
+            <button class="tool-run" data-tool="jumps">Найти</button>
             <div class="proposal-area" id="proposal-jumps"></div>
           </div>
 
-          <!-- 3b. Громкость (27.07.2026) — детерминированная LUFS-нормализация
-               (ffmpeg loudnorm, EBU R128). Не proposal: исходник не трогается,
-               результат — новый WAV в bin «AI Renders» (откат = удалить его). -->
-          <div class="tool-card" id="card-loudnorm">
-            <div class="tool-card-title">🔊 Громкость (LUFS)</div>
-            <div class="tool-card-desc">Нормализация громкости аудиофайла по EBU R128 (ffmpeg loudnorm, локально). Результат импортируется в bin «AI Renders» — перетащите поверх оригинала.</div>
-            <div class="param-row" title="Аудиофайл с таймлайна, который нормализуем. ⟳ — перечитать список с активной секвенции">
-              <span class="param-label">Источник</span>
-              <select id="ln-source" style="flex:1;min-width:0;"></select>
-              <button type="button" id="ln-refresh" class="secondary" style="padding:2px 8px;" title="Обновить список аудио с таймлайна">⟳</button>
+          <!-- 1b. A4 (27.07.2026): батч-подрезка тишины в начале/конце каждого клипа.
+               Незакрытая боль рынка (в AutoCut такого режима нет). -->
+          <div class="tool-card needs-audio" id="card-trim-edges">
+            <div class="tool-card-title">✂ Подрезать края клипов</div>
+            <div class="tool-card-desc">Убирает тишину только в начале и конце каждого клипа («нажал запись → пауза → речь → пауза → стоп»). Середину клипов не трогает.</div>
+            <div class="param-row" title="Тишина у края клипа короче этого значения не трогается">
+              <span class="param-label">Мин. тишина</span>
+              <input type="range" id="te-min" min="0.1" max="2.0" step="0.05" value="0.3" />
+              <span class="param-val" id="te-min-val">0.3с</span>
             </div>
-            <div class="param-row" title="Целевая интегральная громкость. Подкасты/YouTube: −16…−14 LUFS; броадкаст EBU R128: −23">
-              <span class="param-label">Цель</span>
-              <input type="range" id="ln-lufs" min="-24" max="-10" step="1" value="-16" />
-              <span class="param-val" id="ln-lufs-val">-16 LUFS</span>
+            <div class="param-row" title="Тишина = всё, что на N dB тише средней громкости речи клипа (порог по каждому клипу свой)">
+              <span class="param-label">Тише речи на</span>
+              <input type="range" id="te-thresh" min="3" max="30" step="1" value="22" />
+              <span class="param-val" id="te-thresh-val">22 dB</span>
             </div>
-            <button class="tool-run" data-tool="loudnorm">Нормализовать</button>
-            <div class="proposal-area" id="ln-result" style="white-space:pre-wrap;"></div>
+            <div class="param-row" title="Сколько тишины оставить у речи (зазор до первого и после последнего слова клипа)">
+              <span class="param-label">Отступ</span>
+              <input type="range" id="te-pad" min="0" max="0.5" step="0.05" value="0.1" />
+              <span class="param-val" id="te-pad-val">0.1с</span>
+            </div>
+            <button class="tool-run" data-tool="trim-edges">Найти</button>
+            <div class="proposal-area" id="proposal-trim-edges"></div>
           </div>
 
           <!-- 3b. Убрать пробелы (пустые дыры таймлайна) -->
@@ -766,38 +802,17 @@
             <button class="tool-run" data-tool="gaps">Найти пробелы</button>
             <div class="proposal-area" id="proposal-gaps"></div>
           </div>
+            </div><!-- /tools-group-body cleanup -->
+          </div><!-- /tools-group cleanup -->
 
-          <!-- 4. Chapterize -->
-          <div class="tool-card needs-transcript" id="card-chapters">
-            <div class="tool-card-title">📑 Авто-главы</div>
-            <div class="tool-card-desc">Маркеры-главы по темам. 1 вызов LLM если темы не в кэше.</div>
-            <div class="param-row" title="0 = авто: модель сама решает, сколько тем в материале">
-              <span class="param-label">Кол-во глав</span>
-              <input type="range" id="ch-count" min="0" max="20" step="1" value="0" />
-              <span class="param-val" id="ch-count-val">авто</span>
-            </div>
-            <!-- C3 (27.07.2026): merge коротких глав + кастомные указания LLM -->
-            <div class="param-row" title="Глава, начинающаяся раньше чем через N секунд после предыдущей, вливается в неё (маркер не ставится). 0 = авто: 10с/20с/45с по длине ролика">
-              <span class="param-label">Мин. интервал глав</span>
-              <input type="range" id="ch-minlen" min="0" max="180" step="5" value="0" />
-              <span class="param-val" id="ch-minlen-val">авто</span>
-            </div>
-            <div class="param-row" title="Необязательные указания модели: язык названий, что выделить отдельной главой, стиль. Смена указаний перестраивает темы заново (1 вызов LLM)">
-              <textarea id="ch-instructions" rows="2" placeholder="Доп. указания ИИ (напр.: «названия на английском, спонсорский блок — отдельной главой»)" style="width:100%;resize:vertical;font-size:11px;"></textarea>
-            </div>
-            <button class="tool-run" data-tool="chapters">Расставить главы</button>
-            <div class="proposal-area" id="proposal-chapters"></div>
-          </div>
-
+          <div class="tools-group" data-group="multicam">
+            <div class="tools-group-head">🎥 Мультикам и спикеры <span class="tools-group-cnt">2</span><span class="tools-group-arrow"></span></div>
+            <div class="tools-group-body">
           <!-- 5. Авто-MultiCam (Phase 1 MVP) -->
           <!-- P0-2: транскрипт НЕ нужен — нужен только снимок таймлайна + ffmpeg (RMS) -->
           <div class="tool-card" id="card-multicam">
             <div class="tool-card-title">🎥 Авто-MultiCam (β)</div>
-            <div class="tool-card-desc">
-              Подкаст-нарезка: V1 wide + V2..Vn гости, A1..An микрофоны →
-              автопереключение по RMS-громкости микрофонов (ffmpeg, без
-              транскрипции). Razor + отключение неактивных клипов.
-            </div>
+            <div class="tool-card-desc">Автопереключение камер по громкости микрофонов (ffmpeg, без транскрипта): razor + включение активной камеры. Кнопка только предлагает план — применение отдельным шагом.</div>
             <!-- Кастомный выбор дорожек (AutoPod-паттерн «теги дорожек»):
                  авто-схема ломается, когда микрофоны не на первых A-дорожках
                  или аудио не засинхронено с порядком видео -->
@@ -820,18 +835,19 @@
               </select>
               <button type="button" id="mc-preset-save" class="secondary" style="padding:2px 8px;" title="Сохранить текущие слайдеры как «Мой пресет»">💾</button>
             </div>
-            <div class="param-row" title="Минимум секунд на одной камере. Влево = чаще режем, живее. Вправо = спокойнее, реже.">
-              <span class="param-label">Мин. план</span>
-              <input type="range" id="mc-minhold" min="0.5" max="4" step="0.1" value="1.5" />
-              <span class="param-val" id="mc-minhold-val">1.5с</span>
-            </div>
-            <div class="param-row" title="Насколько микрофон громче остальных, чтобы забрать план. Вправо = увереннее держим одного, реже дёргаемся на чужой звук.">
-              <span class="param-label">Порог лидера</span>
-              <input type="range" id="mc-margin" min="3" max="12" step="1" value="6" />
-              <span class="param-val" id="mc-margin-val">6 dB</span>
-            </div>
-            <details class="mc-advanced">
-              <summary>⚙ Тонкая настройка</summary>
+            <details class="tool-advanced" data-adv="card-multicam">
+              <summary>⚙ Тонкая настройка (14)</summary>
+
+              <div class="param-row" title="Минимум секунд на одной камере. Влево = чаще режем, живее. Вправо = спокойнее, реже.">
+                <span class="param-label">Мин. план</span>
+                <input type="range" id="mc-minhold" min="0.5" max="4" step="0.1" value="1.5" />
+                <span class="param-val" id="mc-minhold-val">1.5с</span>
+              </div>
+              <div class="param-row" title="Насколько микрофон громче остальных, чтобы забрать план. Вправо = увереннее держим одного, реже дёргаемся на чужой звук.">
+                <span class="param-label">Порог лидера</span>
+                <input type="range" id="mc-margin" min="3" max="12" step="1" value="6" />
+                <span class="param-val" id="mc-margin-val">6 dB</span>
+              </div>
 
               <div class="mc-section-title">Ритм и перебивки</div>
               <div class="param-row" title="Дольше этого один спикер в кадре не держится — вставляем общий план, чтобы картинка не застыла.">
@@ -922,7 +938,12 @@
             <button class="tool-run" data-tool="speakers">Разметить спикеров</button>
             <div class="proposal-area" id="dz-result"></div>
           </div>
+            </div><!-- /tools-group-body multicam -->
+          </div><!-- /tools-group multicam -->
 
+          <div class="tools-group" data-group="reels">
+            <div class="tools-group-head">🎬 Рилс и субтитры <span class="tools-group-cnt">1</span><span class="tools-group-arrow"></span></div>
+            <div class="tools-group-body">
           <!-- 5c. Рилс (17.07.2026) — объединяет «Вертикаль 9:16» и «Субтитры»:
                clone → 1080×1920 / 1080×1080 → Motion cover-кроп (позиция от
                vision-модели по кадру из середины источника, ручные смещения
@@ -944,6 +965,9 @@
                 <option value="1x1">1:1 (1080×1080)</option>
               </select>
             </div>
+            <!-- UI-переработка 28.07.2026: настройки субтитров в спойлере -->
+            <details class="tool-advanced" data-adv="card-reels">
+              <summary>⚙ Тонкая настройка субтитров (3)</summary>
             <div class="param-row" title="Шрифт применяется ТОЛЬКО к анимированному оверлею (караоке-титры, прожжённое ProRes-видео). Должен быть установлен в системе (Windows: C:\Windows\Fonts; macOS: ~/Library/Fonts). Статичные субтитры и caption-дорожка (CC) идут дефолтным шрифтом Premiere — его нельзя задать из API, правьте вручную в панели «Скрытые титры».">
               <span class="param-label">Шрифт</span>
               <select id="rl-font" style="flex:1;min-width:0;">
@@ -968,6 +992,7 @@
                 <input type="color" id="rl-hl-color" value="#21A038" title="Цвет подсветки произносимого слова (перекраска/плашка)" style="width:30px;height:22px;padding:1px;border:1px solid var(--border,#444);border-radius:3px;background:none;cursor:pointer;flex:none;" />
               </label>
             </div>
+            </details>
             <div class="param-row" title="Куда смотреть в кадре у каждой камеры: «имя клипа: сдвиг%». Минус = левее, плюс = правее. Пример: «Гость: -20; Ведущий: 15». Пусто = позицию решает vision-модель (по кадру из середины источника), при её недоступности — центр. Ручное значение побеждает vision.">
               <span class="param-label">Фокус камер</span>
               <input type="text" id="rl-offsets" placeholder="Гость: -20 (пусто = vision)" style="flex:1;min-width:0;" />
@@ -1002,8 +1027,34 @@
             <button type="button" class="secondary" id="rl-edit-cues" style="font-size:11px;" title="Открыть сохранённые титры рилса: правка текста, обновление captions, перерендер караоке">Править титры</button>
             <div class="proposal-area" id="rl-result"></div>
           </div>
+            </div><!-- /tools-group-body reels -->
+          </div><!-- /tools-group reels -->
 
-          <!-- 6. J-cuts / L-cuts — ОТКЛЮЧЕНО (ограничение ExtendScript) -->
+          <div class="tools-group" data-group="structure">
+            <div class="tools-group-head">📑 Структура ролика <span class="tools-group-cnt">2</span><span class="tools-group-arrow"></span></div>
+            <div class="tools-group-body">
+          <!-- 4. Chapterize -->
+          <div class="tool-card needs-transcript" id="card-chapters">
+            <div class="tool-card-title">📑 Авто-главы</div>
+            <div class="tool-card-desc">Разбивает транскрипт на темы (1 вызов LLM, темы кэшируются) и ставит маркеры-главы на таймлайн. Свои указания перестраивают разбивку.</div>
+            <div class="param-row" title="0 = авто: модель сама решает, сколько тем в материале">
+              <span class="param-label">Кол-во глав</span>
+              <input type="range" id="ch-count" min="0" max="20" step="1" value="0" />
+              <span class="param-val" id="ch-count-val">авто</span>
+            </div>
+            <!-- C3 (27.07.2026): merge коротких глав + кастомные указания LLM -->
+            <div class="param-row" title="Глава, начинающаяся раньше чем через N секунд после предыдущей, вливается в неё (маркер не ставится). 0 = авто: 10с/20с/45с по длине ролика">
+              <span class="param-label">Мин. интервал глав</span>
+              <input type="range" id="ch-minlen" min="0" max="180" step="5" value="0" />
+              <span class="param-val" id="ch-minlen-val">авто</span>
+            </div>
+            <div class="param-row" title="Необязательные указания модели: язык названий, что выделить отдельной главой, стиль. Смена указаний перестраивает темы заново (1 вызов LLM)">
+              <textarea id="ch-instructions" rows="2" placeholder="Доп. указания ИИ (напр.: «названия на английском, спонсорский блок — отдельной главой»)" style="width:100%;resize:vertical;font-size:11px;"></textarea>
+            </div>
+            <button class="tool-run" data-tool="chapters">Расставить главы</button>
+            <div class="proposal-area" id="proposal-chapters"></div>
+          </div>
+
           <!-- Экспорт маркеров активной секвенции в файл -->
           <div class="tool-card" id="card-markers-export">
             <div class="tool-card-title">🏷 Экспорт маркеров</div>
@@ -1015,6 +1066,31 @@
             </div>
             <div class="proposal-area" id="mx-result" style="white-space:pre-wrap;"></div>
           </div>
+            </div><!-- /tools-group-body structure -->
+          </div><!-- /tools-group structure -->
+
+          <div class="tools-group" data-group="service">
+            <div class="tools-group-head">🔧 Сервис <span class="tools-group-cnt">2</span><span class="tools-group-arrow"></span></div>
+            <div class="tools-group-body">
+          <!-- 3b. Громкость (27.07.2026) — детерминированная LUFS-нормализация
+               (ffmpeg loudnorm, EBU R128). Не proposal: исходник не трогается,
+               результат — новый WAV в bin «AI Renders» (откат = удалить его). -->
+          <div class="tool-card" id="card-loudnorm">
+            <div class="tool-card-title">🔊 Громкость (LUFS)</div>
+            <div class="tool-card-desc">Нормализация громкости аудиофайла по EBU R128 (ffmpeg loudnorm, локально). Результат импортируется в bin «AI Renders» — перетащите поверх оригинала.</div>
+            <div class="param-row" title="Аудиофайл с таймлайна, который нормализуем. ⟳ — перечитать список с активной секвенции">
+              <span class="param-label">Источник</span>
+              <select id="ln-source" style="flex:1;min-width:0;"></select>
+              <button type="button" id="ln-refresh" class="secondary" style="padding:2px 8px;" title="Обновить список аудио с таймлайна">⟳</button>
+            </div>
+            <div class="param-row" title="Целевая интегральная громкость. Подкасты/YouTube: −16…−14 LUFS; броадкаст EBU R128: −23">
+              <span class="param-label">Цель</span>
+              <input type="range" id="ln-lufs" min="-24" max="-10" step="1" value="-16" />
+              <span class="param-val" id="ln-lufs-val">-16 LUFS</span>
+            </div>
+            <button class="tool-run" data-tool="loudnorm">Нормализовать</button>
+            <div class="proposal-area" id="ln-result" style="white-space:pre-wrap;"></div>
+          </div>
 
           <!-- Менеджер бэкап-секвенций (клоны перед деструктивным apply) -->
           <div class="tool-card" id="card-backups">
@@ -1025,15 +1101,8 @@
             </div>
             <div class="proposal-area" id="bk-list" style="white-space:normal;"></div>
           </div>
-
-          <div class="tool-card" id="card-jcuts" style="opacity:0.5;pointer-events:none;">
-            <div class="tool-card-title">🎬 J-cuts / L-cuts</div>
-            <div class="tool-card-desc" style="color:#f59e0b;">
-              Временно недоступно. Связанные клипы (V1+A1) обрезаются вместе —
-              ExtendScript не поддерживает unlink(). Выполните J/L-cuts вручную.
-            </div>
-            <button class="tool-run" data-tool="jcuts" disabled>Недоступно</button>
-          </div>
+            </div><!-- /tools-group-body service -->
+          </div><!-- /tools-group service -->
         </div><!-- /tools-scroll -->
 
         <div class="status-bar" id="tools-statusBar" hidden role="status" aria-live="polite">
@@ -1137,7 +1206,8 @@
           '../shared/starters-ui.js',
           '../shared/reels-pipeline.js',
           '../shared/self-update.js',
-          'panel.js'
+          'panel.js',
+          'tools-accordion.js'
         ];
         scripts.forEach(function (src) {
           document.write('<script src="' + src + '?' + CB + '"><\/script>');
