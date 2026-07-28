@@ -1141,6 +1141,60 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
   }
 };
 
+/* __FP_HELPERS_BEGIN__ */
+/**
+ * FNV-1a 32-bit по код-юнитам строки (ES3: умножение на 16777619 через сдвиги,
+ * суммы точны в double до 2^53, >>>0 усекает по модулю 2^32). Возврат — 8 hex.
+ */
+function _extFnv1a(str) {
+  var h = 0x811c9dc5;
+  for (var i = 0; i < str.length; i++) {
+    h = h ^ str.charCodeAt(i);
+    h = (h + (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24)) >>> 0;
+  }
+  var hex = h.toString(16);
+  while (hex.length < 8) hex = '0' + hex;
+  return hex;
+}
+
+/**
+ * Строка-отпечаток АУДИО-дорожек секвенции: по клипу
+ * «trackIdx|mediaPath|start.ticks|end.ticks|inPoint.ticks», клипы через «;».
+ * Тики (целые), не секунды — без float-сравнений. Видео-дорожки не участвуют:
+ * транскрипт — про звук (спека 2026-07-28). Известное ограничение V1:
+ * mute/громкость НЕ входят (позиции клипов не двигают).
+ */
+function _extAudioFpString(seq) {
+  var parts = [];
+  for (var t = 0; t < seq.audioTracks.numTracks; t++) {
+    var tr = seq.audioTracks[t];
+    var n = tr.clips.numItems;
+    for (var c = 0; c < n; c++) {
+      var cl = tr.clips[c];
+      if (!cl) continue;
+      var mp = '';
+      try {
+        var pi = cl.projectItem;
+        if (pi && typeof pi.getMediaPath === 'function') mp = String(pi.getMediaPath() || '');
+        else if (pi && pi.mediaPath) mp = String(pi.mediaPath);
+      } catch (eMP) {}
+      if (!mp) { try { mp = String(cl.name || ''); } catch (eN) {} }
+      var st = '', en = '', ip = '';
+      try { st = String(cl.start.ticks); } catch (eS) {}
+      try { en = String(cl.end.ticks); } catch (eE) {}
+      try { ip = String(cl.inPoint.ticks); } catch (eI) {}
+      parts[parts.length] = t + '|' + mp.replace(/\\/g, '/') + '|' + st + '|' + en + '|' + ip;
+    }
+  }
+  return parts.join(';');
+}
+
+/** Хэш-отпечаток аудио-таймлайна секвенции; null при сбое. */
+function _extAudioFingerprint(seq) {
+  try { return _extFnv1a(_extAudioFpString(seq)); } catch (eF) { return null; }
+}
+/* __FP_HELPERS_END__ */
+
 /**
  * Лёгкий опрос региона: только имя активной секвенции + In/Out.
  * Для LED/гейтов вкладки «Инструменты»: полный getTimelineSnapshot (сотни
