@@ -3005,6 +3005,17 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (_ck && ContextStore.getTranscriptEntry) {
             var _ent = ContextStore.getTranscriptEntry(TRANSCRIPT_PID, _ck);
             if (_ent) _transcriptCheckpoints[data.backupId] = { key: _ck, entry: JSON.parse(JSON.stringify(_ent)), _ts: Date.now() };
+            /* Спека 2026-07-28: бэкап наследует транскрипт под СВОИМ sequenceID —
+               откат на бэкап = транскрипт валиден сразу (клип-раскладка идентична,
+               отпечаток совпадает). */
+            if (_ent && data.backupId) {
+              try {
+                var _bkEnt = JSON.parse(JSON.stringify(_ent));
+                _bkEnt.seqId = String(data.backupId);
+                _bkEnt.seqName = String(data.backupName || '');
+                ContextStore.setTranscriptEntry(TRANSCRIPT_PID, String(data.backupId), _bkEnt);
+              } catch (eBk) {}
+            }
           }
           if (_evicted && _evicted.length) {
             for (var _ei = 0; _ei < _evicted.length; _ei++) {
