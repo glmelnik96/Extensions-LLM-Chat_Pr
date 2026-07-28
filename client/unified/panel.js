@@ -6546,7 +6546,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         });
       });
       if (!snap || !snap.ok) throw new Error((snap && snap.error) || 'Нет активной секвенции');
-      var key = snap.sequenceName || 'sequence';
+      var key = snap.sequenceId || snap.sequenceName || 'sequence';
+      var seqDisplayName = snap.sequenceName || 'sequence';
 
       var norm = await TimelineTranscribe.runFromPrep(prep, {
         settings: settings,
@@ -6585,6 +6586,15 @@ PanelBoot.run('ИИ: монтаж', function () {
         };
         if (norm.audioAnalysis) norm.audioAnalysis.analyzedRegion = regionT;
         norm.analyzedRegion = regionT;
+        /* Спека 2026-07-28: идентичность + отпечаток аудио-таймлайна на момент
+           экспорта. timelineFp — за транскриптом; analyzedFp — за аудио-анализом
+           (обновляется независимо «⚡ Анализом»). */
+        norm.seqId = snap.sequenceId || '';
+        norm.seqName = seqDisplayName;
+        if (snap.audioFp) {
+          norm.timelineFp = { hash: snap.audioFp, at: Date.now() };
+          if (norm.audioAnalysis) norm.audioAnalysis.analyzedFp = snap.audioFp;
+        }
       } catch (eAR) {}
       ContextStore.setTranscriptEntry(TRANSCRIPT_PID, key, norm);
 
@@ -6658,7 +6668,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       } else {
         setTranscriptLed('ok');
       }
-      statusUi.show('Транскрипт в кэше: «' + key + '»', false);
+      statusUi.show('Транскрипт в кэше: «' + seqDisplayName + '»', false);
       setTimeout(function () {
         statusUi.hide();
       }, 2500);
@@ -6730,7 +6740,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         });
       });
       if (!snap || !snap.ok) throw new Error((snap && snap.error) || 'Нет активной секвенции');
-      var key = snap.sequenceName || 'sequence';
+      var key = snap.sequenceId || snap.sequenceName || 'sequence';
+      var seqDisplayName = snap.sequenceName || 'sequence';
 
       var entry = await TimelineTranscribe.runAudioOnlyAnalysis(prep, function (msg) {
         statusUi.show(msg, true);
@@ -6744,22 +6755,32 @@ PanelBoot.run('ИИ: монтаж', function () {
           inSec: normInOutSec(snap.sequenceInSec),
           outSec: normInOutSec(snap.sequenceOutSec)
         };
+        /* Спека 2026-07-28: отпечаток аудио-таймлайна за анализом (раздельно от
+           timelineFp транскрипта — анализ обновляется независимо). */
+        if (snap.audioFp) entry.audioAnalysis.analyzedFp = snap.audioFp;
+      }
+      if (entry) {
+        entry.seqId = snap.sequenceId || '';
+        entry.seqName = seqDisplayName;
       }
 
       /* Phase 1.6 (6 мая 2026, P0 #2): MERGE not REPLACE.
          Если уже есть полный транскрипт в кеше — НЕ затираем segments/paragraphs/text.
          Просто обновляем audioAnalysis (новые тишины с актуальным порогом). */
-      var existing = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, key);
+      var existing = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, snap.sequenceName || '', snap.sequenceId || '');
       var preservedSegments = 0;
       if (existing && existing.entry && Array.isArray(existing.entry.segments) && existing.entry.segments.length > 0) {
-        /* Сохраняем существующие данные, обновляем только audioAnalysis. */
+        /* Сохраняем существующие данные, обновляем только audioAnalysis;
+           timelineFp транскрипта остаётся СТАРЫМ (транскрипт не трогали). */
         var merged = Object.assign({}, existing.entry, {
           audioAnalysis: entry.audioAnalysis,
           builtAt: entry.builtAt,
           /* mode НЕ перезаписываем — сохраняем 'transcribe' / 'whisper' и т.д. */
-          analysisOnly: false
+          analysisOnly: false,
+          seqId: snap.sequenceId || existing.entry.seqId || '',
+          seqName: snap.sequenceName || existing.entry.seqName || ''
         });
-        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, key, merged);
+        ContextStore.setTranscriptEntry(TRANSCRIPT_PID, existing.matchedKey || key, merged);
         preservedSegments = existing.entry.segments.length;
       } else {
         /* Чистый кеш или предыдущий тоже audio-only — пишем как есть. */
@@ -6775,7 +6796,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       }
       statusUi.show(msg, false);
       setTimeout(function () { statusUi.hide(); }, 4500);
-      var errMsg = 'Аудио-анализ «' + key + '»: ' + sCount + ' тишин.';
+      var errMsg = 'Аудио-анализ «' + seqDisplayName + '»: ' + sCount + ' тишин.';
       if (preservedSegments > 0) {
         errMsg += ' Транскрипт сохранён (' + preservedSegments + ' сегм.).';
       } else {
