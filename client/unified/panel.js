@@ -10282,10 +10282,15 @@ PanelBoot.run('ИИ: монтаж', function () {
                 if (!okGo) {
                   toolsStatusUi.show(mode === 'audio'
                     ? 'Рекомендуется «⚡ Анализ аудио» заново.'
-                    : 'Рекомендуется повторная транскрибация.', false);
+                    : 'Рекомендуется повторная транскрибация (вкладка «Чат»).', false);
                   setTimeout(function () { toolsStatusUi.hide(); }, 4000);
-                  var tb = document.getElementById('tools-btn-transcribe');
-                  if (tb && mode !== 'audio') {
+                  /* Пульс рекомендованного действия: транскрибация живёт на вкладке
+                     «Чат» (btn-transcribe, тут не видна) — во вкладке Инструменты
+                     пульсируем «⚡ Анализ аудио» (audio) или LED-блок (transcript). */
+                  var tb = (mode === 'audio')
+                    ? document.querySelector('#view-tools [data-action="audio-only-analyze"]')
+                    : document.getElementById('tools-led-wrap');
+                  if (tb) {
                     tb.classList.add('attn');
                     setTimeout(function () { tb.classList.remove('attn'); }, 3000);
                   }
