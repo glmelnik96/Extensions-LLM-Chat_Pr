@@ -7363,9 +7363,10 @@ PanelBoot.run('ИИ: монтаж', function () {
     function _applyToolsLedForSeq(snap) {
       var seqName = (snap && typeof snap === 'object') ? (snap.sequenceName || '') : (typeof snap === 'string' ? snap : '');
       var hasTranscript = false, hasAudio = false, staleAudio = false, staleTranscript = false;
+      var fpStale = false; /* мягкий флаг: только LED, карточки НЕ блокируем (спека 2026-07-28) */
       try {
-        if (seqName) {
-          var f = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName);
+        if (seqName || (snap && typeof snap === 'object' && snap.sequenceId)) {
+          var f = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName, (snap && typeof snap === 'object' && snap.sequenceId) || '');
           if (f && f.entry) {
             hasTranscript = !!(f.entry.segments && f.entry.segments.length);
             /* P0-2: аудиоанализ (ffmpeg) без Whisper достаточен для «Тишины» */
@@ -7379,6 +7380,15 @@ PanelBoot.run('ИИ: монтаж', function () {
             var arT = f.entry.analyzedRegion || (f.entry.audioAnalysis && f.entry.audioAnalysis.analyzedRegion);
             if (hasAudio) staleAudio = _regionStale(arA, snap);
             if (hasTranscript) staleTranscript = _regionStale(arT, snap);
+            /* Отпечаток аудио-таймлайна: ловит РУЧНЫЕ правки в Premiere, которые
+               панель не видит (спека 2026-07-28). Legacy-entry без fp → «неизвестно»,
+               молчим. Собственные правки панели fp обновляют (см. ripple-listener). */
+            var curFp = (snap && typeof snap === 'object' && snap.audioFp) || null;
+            if (curFp) {
+              if (hasTranscript && f.entry.timelineFp && f.entry.timelineFp.hash && f.entry.timelineFp.hash !== curFp) fpStale = true;
+              var aFp = f.entry.audioAnalysis && f.entry.audioAnalysis.analyzedFp;
+              if (!fpStale && aFp && aFp !== curFp) fpStale = true;
+            }
           }
         }
       } catch (e) { /* findTranscriptEntry не должен падать */ }
@@ -7391,6 +7401,9 @@ PanelBoot.run('ИИ: монтаж', function () {
       } else if (staleAudio || staleTranscript) {
         /* часть данных актуальна — жёлтый: смотри гейты на карточках */
         toolsSetLed('busy', 'часть анализа устарела' + seqLabel);
+      } else if (fpStale) {
+        /* мягко: жёлтый LED, кнопки живы — честность обеспечит confirm перед запуском */
+        toolsSetLed('busy', 'транскрипт устарел — таймлайн изменился' + seqLabel);
       } else {
         toolsSetLed(hasTranscript ? 'ok' : 'audio', 'анализ готов' + seqLabel);
       }
