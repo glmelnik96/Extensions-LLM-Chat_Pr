@@ -356,6 +356,10 @@
       .tool-advanced > summary::-webkit-details-marker { display: none; }
       .tool-advanced > summary::before { content: '▸ '; }
       .tool-advanced[open] > summary::before { content: '▾ '; }
+      /* Спека 2026-07-28: пульс кнопки транскрибации после отказа от запуска
+         по устаревшему транскрипту — рекомендованное действие. */
+      @keyframes attn-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,193,7,.7); } 50% { box-shadow: 0 0 0 6px rgba(255,193,7,0); } }
+      .attn { animation: attn-pulse 1s ease-in-out 3; }
       .mc-section-title {
         font-size: 10px;
         font-weight: 600;

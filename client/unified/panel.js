@@ -10229,9 +10229,66 @@ PanelBoot.run('ИИ: монтаж', function () {
       });
     })();
 
+    /* Спека 2026-07-28, мягкий гейт: свежий отпечаток прямо перед запуском
+       (не полагаемся на последний poll — окно 4с). При сбое опроса НЕ блокируем:
+       ложный отказ хуже честного предупреждения. mode: 'transcript' → timelineFp,
+       'audio' → audioAnalysis.analyzedFp. */
+    function _confirmCacheFresh(mode) {
+      return new Promise(function (resolve) {
+        var done = false;
+        var t = setTimeout(function () { if (!done) { done = true; resolve(true); } }, 12000);
+        function finish(v) { if (!done) { done = true; clearTimeout(t); resolve(v); } }
+        try {
+          PremiereBridge.getSequenceRegionInfo(function (err, info) {
+            try {
+              if (err || !info || !info.ok || !info.audioFp) { finish(true); return; }
+              var f = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, info.sequenceName || '', info.sequenceId || '');
+              var entry = f && f.entry;
+              if (!entry) { finish(true); return; } /* «нет транскрипта» отработают гейты карточек */
+              var stored = null;
+              if (mode === 'audio') stored = entry.audioAnalysis && entry.audioAnalysis.analyzedFp;
+              else stored = entry.timelineFp && entry.timelineFp.hash;
+              if (stored && stored !== info.audioFp) {
+                var okGo = window.confirm(
+                  'Таймлайн изменился после ' + (mode === 'audio' ? 'аудио-анализа' : 'транскрибации') +
+                  ' — тайминги могут не совпадать.\n\nПродолжить по устаревшим данным?'
+                );
+                if (!okGo) {
+                  toolsStatusUi.show(mode === 'audio'
+                    ? 'Рекомендуется «⚡ Анализ аудио» заново.'
+                    : 'Рекомендуется повторная транскрибация.', false);
+                  setTimeout(function () { toolsStatusUi.hide(); }, 4000);
+                  var tb = document.getElementById('tools-btn-transcribe');
+                  if (tb && mode !== 'audio') {
+                    tb.classList.add('attn');
+                    setTimeout(function () { tb.classList.remove('attn'); }, 3000);
+                  }
+                }
+                finish(okGo);
+                return;
+              }
+              finish(true);
+            } catch (e) { finish(true); }
+          });
+        } catch (e2) { finish(true); }
+      });
+    }
+
     async function toolsRunTool(toolName) {
       toolsShowErr('');
       toolsHideAllProposals();
+
+      /* Мягкий гейт по отпечатку (спека 2026-07-28). По timelineFp — потребители
+         сегментов транскрипта; по analyzedFp — потребители кэша audioAnalysis
+         (silences/jumps: их proposal строится из кэшированных координат).
+         trim-edges/gaps/multicam/loudnorm работают по свежему снимку — не проверяем. */
+      var FP_TRANSCRIPT_TOOLS = { fillers: 1, profanity: 1, speakers: 1, reels: 1, chapters: 1, 'subtitles-anim': 1, 'subtitles-static': 1 };
+      var FP_AUDIO_TOOLS = { silences: 1, jumps: 1 };
+      if (FP_TRANSCRIPT_TOOLS[toolName]) {
+        if (!(await _confirmCacheFresh('transcript'))) return;
+      } else if (FP_AUDIO_TOOLS[toolName]) {
+        if (!(await _confirmCacheFresh('audio'))) return;
+      }
 
       /* «🗣 Спикеры» — не proposal-пайплайн (ничего не режет): своя ветка
          с записью меток прямо в кэш транскрипта. */
