@@ -43,7 +43,8 @@ trackIdx|mediaPath|start.ticks|end.ticks|inPoint.ticks
 ### 2. Хранение и ключ кэша
 
 - В entry транскрипта добавляются поля:
-  - `timelineFp: { hash: string, at: timestamp }` — записывается при завершении транскрибации;
+  - `timelineFp: { hash: string, at: timestamp }` — отпечаток за **транскриптом** (segments), записывается при завершении полной транскрибации;
+  - `audioAnalysis.analyzedFp: string` — отпечаток за **аудио-анализом**, записывается при транскрибации (если анализ построен) и при «⚡ Анализ аудио». Раздельно, потому что аудио-анализ обновляется независимо («⚡ Обновить анализ» освежает только его) — зеркально существующему паттерну раздельных `analyzedRegion`;
   - `seqName: string` — имя для отображения (ключом больше не является);
   - `seqId: string` — дублирует ключ для самодостаточности entry.
 - Ключ кэша в `_llm_transcript_cache.json` = **sequenceID**.
@@ -54,14 +55,14 @@ trackIdx|mediaPath|start.ticks|end.ticks|inPoint.ticks
 
 **Polling (~4с, существующий setInterval в panel.js):**
 - `getSequenceRegionInfo` теперь возвращает `audioFp` и `sequenceID`.
-- Панель сравнивает `info.audioFp` с `entry.timelineFp.hash`.
-- Mismatch → LED «транскрипт устарел» + статусы на транскрипт-зависимых карточках (fillers, profanity, jumps по сегментам, chapters, reels, markers, montage).
-- Отсутствие `timelineFp` у legacy-entry → считается «неизвестно», показывается мягкое предупреждение того же рода (не блокировка).
+- Панель сравнивает `info.audioFp` с `entry.timelineFp.hash` (транскрипт) и `entry.audioAnalysis.analyzedFp` (аудио-анализ).
+- Mismatch → LED «транскрипт устарел — таймлайн изменился». **Только LED, без карточных гейтов**: существующий механизм гейтов (`toolsUpdateCards`) жёстко блокирует кнопки, что противоречит утверждённому мягкому гейту — кнопки остаются живыми, честность обеспечивает confirm перед запуском.
+- Отсутствие `timelineFp` у legacy-entry → считается «неизвестно», предупреждений нет (не блокировка).
 
 **Перед запуском транскрипт-зависимого инструмента:**
 - Свежий host-вызов отпечатка (не полагаться на последний poll — окно 4с).
 - Mismatch → confirm-диалог: «Таймлайн изменился после транскрибации. Тайминги транскрипта могут не совпадать. Продолжить по устаревшему транскрипту?» [Продолжить / Отмена]. При отмене — подсветить кнопку транскрибации как рекомендованное действие.
-- Инструменты, НЕ зависящие от транскрипта (silences по громкости, trim-edges, gaps, loudnorm, multicam по RMS), проверку не проходят.
+- Проверяемые инструменты (вкладка Инструменты): по `timelineFp` — fillers, profanity, speakers, reels, chapters, subtitles-anim, subtitles-static; по `audioAnalysis.analyzedFp` — silences, jumps (их proposal строится из кэшированного audioAnalysis, ручные правки сдвигают его координаты так же). Не проверяются: trim-edges, gaps, multicam, loudnorm, markers-export, backups (работают по свежему снимку/без кэша). Montage из чата — вне объёма V1 (LED предупреждает).
 
 ### 4. Синхронизация после собственных правок панели
 
