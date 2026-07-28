@@ -7336,7 +7336,7 @@ PanelBoot.run('ИИ: монтаж', function () {
        филлеров/jump cuts из ЛЮБОЙ вкладки — ContextStore диспатчит). Waveform и
        proposal построены в СТАРЫХ координатах — прячем; LED пересчитает гейты
        (audioAnalysis при ripple сбрасывается — нужен новый «Анализ аудио»). */
-    document.addEventListener('omc:transcript-rippled', function () {
+    document.addEventListener('omc:transcript-rippled', function (ev) {
       try {
         _waveState = null;
         var ws2 = document.getElementById('wave-silences'); if (ws2) ws2.hidden = true;
@@ -7344,7 +7344,22 @@ PanelBoot.run('ИИ: монтаж', function () {
         var ls2 = document.getElementById('wave-legend-silences'); if (ls2) ls2.hidden = true;
         var lj2 = document.getElementById('wave-legend-jumps'); if (lj2) lj2.hidden = true;
         toolsHideAllProposals();
-        window.toolsRefreshLed();
+        /* kind==='ripple': транскрипт честно пересчитан под новый таймлайн →
+           освежаем отпечаток, иначе наша же правка выглядела бы как «устарел».
+           kind==='stale' (unknown shift): fp НЕ трогаем — расхождение желанно. */
+        var kind = ev && ev.detail && ev.detail.kind;
+        if (kind === 'ripple') {
+          PremiereBridge.getSequenceRegionInfo(function (err, info) {
+            try {
+              if (!err && info && info.ok && info.audioFp) {
+                ContextStore.updateTranscriptFingerprint(TRANSCRIPT_PID, info.sequenceName || '', info.sequenceId || '', info.audioFp);
+              }
+            } catch (eU) {}
+            try { window.toolsRefreshLed(); } catch (eL) {}
+          });
+        } else {
+          window.toolsRefreshLed();
+        }
       } catch (e) {}
     });
     /* Анализ устарел? — сравниваем In/Out, для которого считали анализ, с текущим
