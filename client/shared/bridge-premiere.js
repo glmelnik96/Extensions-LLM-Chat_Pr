@@ -306,6 +306,12 @@
       this.evalJson('$._EXT_PRM_.activateSequenceById("' + s + '")', cb);
     },
 
+    /** 2.15.1: удалить бэкап-секвенцию по sequenceID (host отклоняет не-бэкапы и активную). */
+    deleteBackupSequenceById: function (seqId, cb) {
+      var s = String(seqId).replace(/"/g, '\\"');
+      this.evalJson('$._EXT_PRM_.deleteBackupSequenceById("' + s + '")', cb, { mutating: true });
+    },
+
     /** Волна 2: перечислить маркеры активной секвенции (read-only). */
     listSequenceMarkers: function (cb) {
       this.evalJson('$._EXT_PRM_.listSequenceMarkers()', cb);

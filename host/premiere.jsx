@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.15.0';
+$._EXT_PRM_.version = '2.15.1';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -4163,6 +4163,61 @@ $._EXT_PRM_.activateSequenceById = function (seqId) {
 };
 
 /**
+ * 2.15.1 (28.07.2026): удалить БЭКАП-секвенцию по sequenceID.
+ * app.project.deleteSequence() существует на PP 26.x (проверено вживую) —
+ * запись в CHANGELOG «ExtendScript не умеет deleteSequence» устарела.
+ * Самовалидация (last line of defense, деструктивная операция):
+ *  • удаляем ТОЛЬКО секвенции с « [бэкап » в имени — оригинал этим путём
+ *    удалить нельзя, даже если панель прислала не тот id;
+ *  • отказ (не кламп) если секвенция активна — нельзя выдёргивать таймлайн
+ *    из-под пользователя/другой операции;
+ *  • read-back: после deleteSequence перечитываем список и проверяем,
+ *    что id действительно исчез.
+ */
+$._EXT_PRM_.deleteBackupSequenceById = function (seqId) {
+  try {
+    if (!app.project) return JSON.stringify({ ok: false, error: 'Нет проекта' });
+    if (typeof app.project.deleteSequence !== 'function') {
+      return JSON.stringify({ ok: false, error: 'deleteSequence недоступен в этой версии Premiere — удалите вручную в панели Project' });
+    }
+    var want = String(seqId || '');
+    if (!want) return JSON.stringify({ ok: false, error: 'Пустой sequenceID' });
+    var seqs = app.project.sequences;
+    var target = null;
+    for (var i = 0; i < seqs.numSequences; i++) {
+      if (String(seqs[i].sequenceID) === want) { target = seqs[i]; break; }
+    }
+    if (!target) return JSON.stringify({ ok: false, error: 'Секвенция не найдена: ' + want });
+    var name = String(target.name || '');
+    if (name.indexOf(' [бэкап ') === -1) {
+      return JSON.stringify({ ok: false, error: 'Отказ: «' + name + '» — не бэкап-секвенция (нет « [бэкап » в имени). Этим путём удаляются только бэкапы.' });
+    }
+    try {
+      if (app.project.activeSequence &&
+          String(app.project.activeSequence.sequenceID) === want) {
+        return JSON.stringify({ ok: false, error: 'Отказ: «' + name + '» сейчас активна. Переключитесь на другую секвенцию и повторите.' });
+      }
+    } catch (eA) {}
+    var delOk = false;
+    try { delOk = app.project.deleteSequence(target); } catch (eD) {
+      return JSON.stringify({ ok: false, error: 'deleteSequence: ' + String(eD && eD.message ? eD.message : eD) });
+    }
+    /* Read-back: id должен исчезнуть из списка независимо от возврата API */
+    var still = false;
+    seqs = app.project.sequences;
+    for (var j = 0; j < seqs.numSequences; j++) {
+      if (String(seqs[j].sequenceID) === want) { still = true; break; }
+    }
+    if (still) {
+      return JSON.stringify({ ok: false, error: 'deleteSequence вернул ' + String(delOk) + ', но «' + name + '» осталась в проекте' });
+    }
+    return JSON.stringify({ ok: true, deletedName: name, hostVersion: $._EXT_PRM_.version });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+};
+
+/**
  * Phase 1 (PP-26 stabilization, 2026-04-29):
  * Декорируем все экспортируемые функции через _wrap. Каждый необработанный
  * exception теперь попадёт в bridge как структурированный JSON
@@ -4714,6 +4769,7 @@ $._EXT_PRM_.listProjectSequences = function () {
     'setPlayheadSec',
     'backupActiveSequence',
     'activateSequenceById',
+    'deleteBackupSequenceById',
     'getDiarizeMicSources',
     'getVerticalReframeSources',
     'applyVerticalReframe',

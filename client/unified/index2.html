@@ -671,7 +671,7 @@
           <div class="tool-card needs-transcript" id="card-fillers">
             <div class="tool-card-title">✂ Убрать паразиты</div>
             <div class="tool-card-desc">Находит слова-паразиты в начале/конце фраз и короткие сегменты-филлеры.</div>
-            <div class="param-row">
+            <div class="param-row" title="Строгий — только однозначные паразиты («эээ», «ммм», «ну», «блин»), минимум ложных срабатываний. Расширенный — плюс контекстные («как бы», «типа», «короче», «вот», «значит»…) и более длинные сегменты-филлеры (до 2.5с вместо 1.5с).">
               <span class="param-label">Режим</span>
               <div class="toggle-group" id="filler-mode">
                 <button class="toggle-btn" data-val="strict">Строгий</button>
@@ -992,7 +992,7 @@
                 <option value="90">~90с</option>
               </select>
             </div>
-            <textarea id="rl-viral-custom" rows="2" placeholder="Доп. указания ИИ к отбору (напр.: «только моменты про деньги, без вступлений»)" style="width:100%;box-sizing:border-box;resize:vertical;font-size:11px;"></textarea>
+            <textarea id="rl-viral-custom" rows="2" title="Свободные указания ИИ при отборе виральных моментов: тематика, что исключить, тон. Пусто = отбор только по пресету критерия выше." placeholder="Доп. указания ИИ к отбору (напр.: «только моменты про деньги, без вступлений»)" style="width:100%;box-sizing:border-box;resize:vertical;font-size:11px;"></textarea>
             <button type="button" class="tool-run" id="rl-viral-find" style="background:var(--panel-2,#2a2a2a);" title="ИИ оценит фрагменты транскрипта по критерию выше: оценки Hook/Retention/Emotion + «почему сработает». Ничего не режет: таймкоды кликабельны, кнопка «In/Out» выставляет границы под «Собрать рилс», «Маркеры» подписывает кандидатов на таймлайне.">Найти виральные моменты</button>
             <button class="tool-run" data-tool="reels">Собрать рилс</button>
             <div style="display:flex;gap:6px;">
@@ -1019,7 +1019,7 @@
           <!-- Менеджер бэкап-секвенций (клоны перед деструктивным apply) -->
           <div class="tool-card" id="card-backups">
             <div class="tool-card-title">⏪ Бэкапы секвенций</div>
-            <div class="tool-card-desc">Клоны «[бэкап HH:MM:SS]», созданные перед монтажом. Открыть = переключиться на состояние до правки (оригинал не трогается). Удалять — вручную в панели Project.</div>
+            <div class="tool-card-desc">Клоны «[бэкап HH:MM:SS]», созданные перед монтажом. Открыть = переключиться на состояние до правки (оригинал не трогается). Удалить = убрать бэкап из проекта безвозвратно.</div>
             <div class="param-row">
               <button type="button" id="bk-refresh" class="secondary" title="Перечитать список секвенций проекта">⟳ Обновить список</button>
             </div>

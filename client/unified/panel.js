@@ -10060,8 +10060,8 @@ PanelBoot.run('ИИ: монтаж', function () {
     })();
 
     /* ── Волна 2: менеджер бэкап-секвенций ──────────────────
-       Список клонов «[бэкап HH:MM:SS]» + переключение (activateSequenceById).
-       Удаление секвенций через API намеренно НЕ делаем (безопасного пути нет). */
+       Список клонов «[бэкап HH:MM:SS]» + переключение (activateSequenceById)
+       + удаление (2.15.1: host сам отклоняет не-бэкапы и активную секвенцию). */
     (function wireBackupManager() {
       var listEl = document.getElementById('bk-list');
       var refreshBtn = document.getElementById('bk-refresh');
@@ -10121,6 +10121,39 @@ PanelBoot.run('ИИ: монтаж', function () {
               });
             });
             row.appendChild(openBtn);
+            var delBtn = document.createElement('button');
+            delBtn.type = 'button';
+            delBtn.className = 'secondary';
+            delBtn.style.cssText = 'padding:1px 8px;font-size:10px;color:#f87171;';
+            delBtn.textContent = 'Удалить';
+            /* Активную секвенцию host всё равно отклонит — не даём и кликнуть. */
+            delBtn.disabled = !!isActive;
+            delBtn.title = isActive
+              ? 'Нельзя удалить активную секвенцию — сначала переключитесь на другую.'
+              : 'Удалить бэкап-секвенцию из проекта (безвозвратно).';
+            delBtn.addEventListener('click', function () {
+              if (!window.confirm('Удалить бэкап «' + bk.name + '» из проекта? Это безвозвратно.')) return;
+              if (!window.PremiereBridge || !PremiereBridge.deleteBackupSequenceById) {
+                toolsShowErr('Мост не поддерживает удаление — перезапустите панель.');
+                return;
+              }
+              if (!beginOperation('tools:backup-delete')) {
+                toolsShowErr('Идёт обработка — дождитесь завершения, потом удаляйте бэкап.');
+                return;
+              }
+              delBtn.disabled = true;
+              PremiereBridge.deleteBackupSequenceById(bk.id, function (errD, dataD) {
+                endOperation();
+                if (errD || !dataD || dataD.ok === false) {
+                  delBtn.disabled = false;
+                  toolsShowErr('Не удалось удалить: ' + String((errD && errD.message) || (dataD && dataD.error) || 'неизв.'));
+                  return;
+                }
+                /* Успех — перечитываем список, чтобы строка исчезла честно. */
+                refreshBtn.click();
+              });
+            });
+            row.appendChild(delBtn);
             listEl.appendChild(row);
           })(backups[k]);
         }
