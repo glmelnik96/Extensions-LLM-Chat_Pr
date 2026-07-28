@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.15.1';
+$._EXT_PRM_.version = '2.16.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -1122,6 +1122,8 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
     return JSON.stringify({
       ok: true,
       sequenceName: seq.name,
+      sequenceId: (function () { try { return String(seq.sequenceID); } catch (eSid) { return ''; } })(),
+      audioFp: _extAudioFingerprint(seq),
       timebase: tb,
       fps: fps,
       frameSizeH: seq.frameSizeHorizontal || 0,
@@ -1210,9 +1212,14 @@ $._EXT_PRM_.getSequenceRegionInfo = function () {
     var inSec = null, outSec = null;
     try { inSec = parseFloat(seq.getInPoint()); if (isNaN(inSec)) inSec = null; } catch (eI) {}
     try { outSec = parseFloat(seq.getOutPoint()); if (isNaN(outSec)) outSec = null; } catch (eO) {}
+    var sid = '';
+    try { sid = String(seq.sequenceID); } catch (eSid) {}
+    var afp = _extAudioFingerprint(seq);
     return JSON.stringify({
       ok: true,
       sequenceName: seq.name || '',
+      sequenceId: sid,
+      audioFp: afp,
       sequenceInSec: inSec,
       sequenceOutSec: outSec
     });
