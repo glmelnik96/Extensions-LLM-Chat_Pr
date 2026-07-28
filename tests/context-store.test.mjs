@@ -313,3 +313,64 @@ describe('ContextStore — ручной переключатель модели 
     cleanup();
   });
 });
+
+describe('findTranscriptEntry: ключ по sequenceID + миграция (спека 2026-07-28)', () => {
+  test('ID-first — прямое попадание по seqId', () => {
+    const { ContextStore, cleanup } = loadContextStoreWithTempRoot();
+    try {
+      ContextStore.setTranscriptEntry('p1', 'seq-123', { segments: [{ startSec: 0, endSec: 1, text: 'x' }] });
+      const f = ContextStore.findTranscriptEntry('p1', 'Другое имя', 'seq-123');
+      assert.ok(f.entry);
+      assert.equal(f.matchedKey, 'seq-123');
+    } finally { cleanup(); }
+  });
+
+  test('legacy-запись по имени мигрирует на seqId', () => {
+    const { ContextStore, cleanup } = loadContextStoreWithTempRoot();
+    try {
+      ContextStore.setTranscriptEntry('p1', 'Моя секвенция', { segments: [{ startSec: 0, endSec: 1, text: 'x' }] });
+      const f = ContextStore.findTranscriptEntry('p1', 'Моя секвенция', 'seq-777');
+      assert.ok(f.entry);
+      assert.equal(f.matchedKey, 'seq-777');           /* перепривязано */
+      const map = ContextStore.getTranscriptCache('p1');
+      assert.ok(map['seq-777']);
+      assert.equal(map['Моя секвенция'], undefined);   /* старый ключ удалён */
+      assert.equal(map['seq-777'].seqId, 'seq-777');
+      assert.equal(map['seq-777'].seqName, 'Моя секвенция');
+    } finally { cleanup(); }
+  });
+
+  test('поиск по имени находит ID-ключёванную запись через entry.seqName', () => {
+    const { ContextStore, cleanup } = loadContextStoreWithTempRoot();
+    try {
+      ContextStore.setTranscriptEntry('p1', 'seq-42', { seqName: 'Интервью', segments: [{ startSec: 0, endSec: 1, text: 'x' }] });
+      const f = ContextStore.findTranscriptEntry('p1', 'интервью'); /* только имя, без ID, другой регистр */
+      assert.ok(f.entry);
+      assert.equal(f.matchedKey, 'seq-42');
+    } finally { cleanup(); }
+  });
+
+  test('без seqId поведение прежнее (REELS-регрессия)', () => {
+    const { ContextStore, cleanup } = loadContextStoreWithTempRoot();
+    try {
+      ContextStore.setTranscriptEntry('p1', 'Reels 1', { any: 1 });
+      const f = ContextStore.findTranscriptEntry('p1', ' reels 1 ');
+      assert.ok(f.entry);
+      assert.equal(f.matchedKey, 'Reels 1');
+    } finally { cleanup(); }
+  });
+
+  test('updateTranscriptFingerprint: пишет timelineFp, не трогая остальное', () => {
+    const { ContextStore, cleanup } = loadContextStoreWithTempRoot();
+    try {
+      ContextStore.setTranscriptEntry('p1', 'seq-9', { segments: [{ startSec: 0, endSec: 1, text: 'x' }], topics: [1] });
+      assert.equal(ContextStore.updateTranscriptFingerprint('p1', 'имя', 'seq-9', 'aabbccdd'), true);
+      const e = ContextStore.getTranscriptCache('p1')['seq-9'];
+      assert.equal(e.timelineFp.hash, 'aabbccdd');
+      assert.ok(e.timelineFp.at > 0);
+      /* массив из vm-realm: сравниваем структурно через JSON, не по прототипу */
+      assert.equal(JSON.stringify(e.topics), '[1]');
+      assert.equal(ContextStore.updateTranscriptFingerprint('p1', 'нет такой', 'seq-none', 'ff'), false);
+    } finally { cleanup(); }
+  });
+});

@@ -188,10 +188,10 @@
   /* Аудит 04.07.2026: единая точка «координаты транскрипта сдвинулись» (ripple/
      unknown shift) — UI (waveform-превью, proposal-карточки, LED) подписывается
      и сбрасывает своё состояние. Guard: в node-тестах document нет. */
-  function notifyTranscriptShifted() {
+  function notifyTranscriptShifted(kind) {
     try {
       if (typeof document !== 'undefined' && typeof CustomEvent === 'function') {
-        document.dispatchEvent(new CustomEvent('omc:transcript-rippled'));
+        document.dispatchEvent(new CustomEvent('omc:transcript-rippled', { detail: { kind: kind || 'ripple' } }));
       }
     } catch (e) {}
   }
@@ -495,7 +495,7 @@
       var map = this.getTranscriptCache(panelId);
       map[found.matchedKey] = entry;
       this.setTranscriptCache(panelId, map);
-      notifyTranscriptShifted();
+      notifyTranscriptShifted('ripple');
       return true;
     },
 
@@ -517,7 +517,7 @@
       var map = this.getTranscriptCache(panelId);
       map[found.matchedKey] = entry;
       this.setTranscriptCache(panelId, map);
-      notifyTranscriptShifted();
+      notifyTranscriptShifted('stale');
       return true;
     },
 
@@ -526,21 +526,62 @@
     },
 
     /**
-     * Точное совпадение ключа, затем trim, затем без учёта регистра.
+     * Поиск entry: сначала по seqId (стабильный Premiere sequenceID), затем
+     * legacy-цепочка по имени (точное → без регистра → по entry.seqName).
+     * При находке legacy-записи по имени с известным seqId — миграция на лету:
+     * entry перепривязывается к seqId, старый ключ удаляется (спека 2026-07-28).
      * @returns {{ entry: *, matchedKey: string|null }}
      */
-    findTranscriptEntry: function (panelId, sequenceKey) {
+    findTranscriptEntry: function (panelId, sequenceKey, seqId) {
       var map = this.getTranscriptCache(panelId);
+      var idKey = normSeqKey(seqId);
+      if (idKey && map[idKey]) return { entry: map[idKey], matchedKey: idKey };
       var want = normSeqKey(sequenceKey);
-      if (!want) return { entry: null, matchedKey: null };
-      if (map[want]) return { entry: map[want], matchedKey: want };
-      var k,
-        low = want.toLowerCase();
-      for (k in map) {
-        if (!Object.prototype.hasOwnProperty.call(map, k)) continue;
-        if (normSeqKey(k).toLowerCase() === low) return { entry: map[k], matchedKey: k };
+      if (!want && !idKey) return { entry: null, matchedKey: null };
+      var hit = null;
+      if (want) {
+        if (map[want]) hit = { entry: map[want], matchedKey: want };
+        if (!hit) {
+          var k, low = want.toLowerCase();
+          for (k in map) {
+            if (!Object.prototype.hasOwnProperty.call(map, k)) continue;
+            if (normSeqKey(k).toLowerCase() === low) { hit = { entry: map[k], matchedKey: k }; break; }
+          }
+        }
+        if (!hit) {
+          /* запись уже ключёвана по ID — ищем по сохранённому имени */
+          var k2;
+          for (k2 in map) {
+            if (!Object.prototype.hasOwnProperty.call(map, k2)) continue;
+            var e2 = map[k2];
+            if (e2 && e2.seqName && normSeqKey(e2.seqName).toLowerCase() === low) { hit = { entry: e2, matchedKey: k2 }; break; }
+          }
+        }
       }
-      return { entry: null, matchedKey: null };
+      if (!hit) return { entry: null, matchedKey: null };
+      if (idKey && hit.matchedKey !== idKey) {
+        /* миграция: перепривязать к стабильному ID */
+        var entry = shallowCopy(hit.entry);
+        entry.seqId = idKey;
+        if (!entry.seqName && want) entry.seqName = want;
+        delete map[hit.matchedKey];
+        map[idKey] = entry;
+        this.setTranscriptCache(panelId, map);
+        return { entry: entry, matchedKey: idKey };
+      }
+      return hit;
+    },
+
+    /** Обновить отпечаток таймлайна у entry (после наших ripple-правок). */
+    updateTranscriptFingerprint: function (panelId, sequenceKey, seqId, fpHash) {
+      if (!fpHash) return false;
+      var found = this.findTranscriptEntry(panelId, sequenceKey, seqId);
+      if (!found || !found.entry) return false;
+      var entry = shallowCopy(found.entry);
+      entry.timelineFp = { hash: String(fpHash), at: Date.now() };
+      var map = this.getTranscriptCache(panelId);
+      map[found.matchedKey] = entry;
+      return this.setTranscriptCache(panelId, map);
     },
 
     listTranscriptCacheKeys: function (panelId) {
