@@ -47,6 +47,15 @@
     return status >= 500 || status === 429;
   }
 
+  /* Пассивная телеметрия доступности моделей (04.08.2026): единственная точка,
+     через которую панель узнаёт, какие модели реально отвечают. Наблюдатель
+     необязателен — клиент остаётся самодостаточным. */
+  function notifyModelHealth(ev) {
+    try {
+      if (typeof global.__onModelHealthEvent === 'function') global.__onModelHealthEvent(ev);
+    } catch (e) {}
+  }
+
   /* Фолбэк на запасную модель (21.07.2026). Триггерим ТОЛЬКО когда сама модель
      недоступна, а не когда запрос кривой:
        • наш таймаут (fetchWithRetry:184 «Таймаут запроса») — модель молча висит
@@ -496,9 +505,12 @@
       for (var mi = 0; mi < modelList.length; mi++) {
         var isLast = mi === modelList.length - 1;
         try {
-          return await attemptModel(modelList[mi], isLast ? undefined : retriesBeforeFallback);
+          var okRes = await attemptModel(modelList[mi], isLast ? undefined : retriesBeforeFallback);
+          notifyModelHealth({ model: modelList[mi], ok: true });
+          return okRes;
         } catch (err) {
           lastErr = err;
+          notifyModelHealth({ model: modelList[mi], error: err });
           if (err && err.name === 'AbortError') throw err;
           if (isLast || !isModelUnavailable(err)) throw err;
           if (typeof opts.onModelFallback === 'function') {

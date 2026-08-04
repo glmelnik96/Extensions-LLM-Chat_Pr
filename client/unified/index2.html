@@ -40,6 +40,8 @@
       }
       .model-bar label { font-size: 11px; color: var(--muted); flex-shrink: 0; }
       .model-bar select { flex: 1; min-width: 0; font-size: 11px; padding: 3px 6px; }
+      .model-bar .model-check { font-size: 11px; padding: 3px 8px; flex-shrink: 0; }
+      .model-bar .model-health-note { font-size: 10px; color: var(--muted); flex-shrink: 0; white-space: nowrap; }
 
       /* ── Action bar ─────────────────────────────────────────────── */
       .action-bar {
@@ -545,6 +547,8 @@
       <div class="model-bar" id="model-bar">
         <label for="model-switch">Модель</label>
         <select id="model-switch" title="Ручной выбор основной модели чата/агента/корректуры на текущую сессию. Автоматический фолбэк при недоступности остаётся поверх выбранной. Сбрасывается на дефолт при перезапуске панели."></select>
+        <button type="button" id="btn-check-models" class="model-check" title="Проверить доступность моделей: микро-запрос к каждой (1 токен). ✓ доступна · ✗ недоступна · · неизвестно">Проверить</button>
+        <span id="model-health-note" class="model-health-note" aria-live="polite"></span>
       </div>
 
       <!-- ══ VIEW: Chat ═══════════════════════════════════════════ -->
@@ -1193,6 +1197,7 @@
           '../shared/transcript-structure.js',
           '../shared/transcript-view.js',
           '../shared/transcript-io.js',
+          '../shared/model-health.js',
           '../shared/analysis-routing.js',
           '../shared/montage-plan.js',
           '../shared/youtube-export.js',

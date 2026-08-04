@@ -5751,16 +5751,90 @@ PanelBoot.run('ИИ: монтаж', function () {
       if (bar) bar.hidden = true;
       return;
     }
-    var cur = ContextStore.getSessionChatModel ? ContextStore.getSessionChatModel() : '';
-    sel.innerHTML = '';
-    for (var i = 0; i < known.length; i++) {
-      if (!known[i] || !known[i].id) continue;
-      var opt = document.createElement('option');
-      opt.value = known[i].id;
-      opt.textContent = known[i].label || known[i].id;
-      if (known[i].id === cur) opt.selected = true;
-      sel.appendChild(opt);
+    /* ── Доступность моделей (04.08.2026) ──────────────────────────────
+       Часть каталога Cloud.ru закрыта RBAC (403) или снята (404), и раньше
+       это выяснялось только падением посреди длинной операции. Статусы
+       собираем из проб по кнопке и из реальных запросов (пассивно), с TTL —
+       протухшее «недоступна» вреднее честного «неизвестно». */
+    var health = (typeof ModelHealth !== 'undefined')
+      ? ModelHealth.createStore({ storage: (function () { try { return window.localStorage; } catch (e) { return null; } })() })
+      : null;
+    var note = document.getElementById('model-health-note');
+    var checkBtn = document.getElementById('btn-check-models');
+
+    function renderOptions() {
+      var curVal = sel.value || (ContextStore.getSessionChatModel ? ContextStore.getSessionChatModel() : '');
+      sel.innerHTML = '';
+      for (var i = 0; i < known.length; i++) {
+        if (!known[i] || !known[i].id) continue;
+        var id = known[i].id;
+        var label = known[i].label || id;
+        var opt = document.createElement('option');
+        opt.value = id;
+        if (health) {
+          var st = health.get(id);
+          opt.textContent = ModelHealth.decorateLabel(label, st);
+          opt.title = ModelHealth.statusTitle(id, st);
+        } else {
+          opt.textContent = label;
+        }
+        if (id === curVal) opt.selected = true;
+        sel.appendChild(opt);
+      }
     }
+    renderOptions();
+
+    /* Пассивные наблюдения из cloudru-client: любой реальный запрос уточняет
+       статус модели. Перерисовку троттлим — запросов много, селект один. */
+    if (health) {
+      var repaintTimer = null;
+      window.__onModelHealthEvent = function (ev) {
+        if (!ev || !ev.model) return;
+        if (ev.ok) health.noteSuccess(ev.model);
+        else health.noteError(ev.model, ev.error);
+        if (repaintTimer) clearTimeout(repaintTimer);
+        repaintTimer = setTimeout(renderOptions, 500);
+      };
+    }
+
+    if (checkBtn && health) {
+      checkBtn.onclick = async function () {
+        checkBtn.disabled = true;
+        var settings = ContextStore.getResolvedSettings();
+        var results = [];
+        try {
+          for (var i = 0; i < known.length; i++) {
+            var id = known[i] && known[i].id;
+            if (!id) continue;
+            if (note) note.textContent = 'проверка ' + (i + 1) + '/' + known.length + '…';
+            var verdict;
+            try {
+              /* Микро-запрос: 1 токен, без запасных моделей — иначе статус
+                 достанется чужой модели, которая подхватила фолбэк. */
+              await CloudRuClient.chatCompletions({
+                baseUrl: settings.baseUrl,
+                apiKey: settings.apiKey,
+                model: id,
+                temperature: 0,
+                enableThinking: false,
+                chatParams: { max_tokens: 1 },
+                messages: [{ role: 'user', content: 'ping' }]
+              });
+              verdict = { state: ModelHealth.OK, reason: '' };
+            } catch (eP) {
+              verdict = ModelHealth.classifyError(eP);
+            }
+            health.set(id, verdict.state, verdict.reason, 'проверка');
+            results.push(verdict);
+            renderOptions();
+          }
+          if (note) note.textContent = ModelHealth.summarize(results);
+        } finally {
+          checkBtn.disabled = false;
+        }
+      };
+    }
+
     sel.onchange = function () {
       var applied = ContextStore.setSessionChatModel(sel.value);
       if (applied !== sel.value) sel.value = applied; /* отклонён невалидный — вернуть */
