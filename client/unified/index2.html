@@ -571,6 +571,8 @@
               </span>
               <hr />
               <button type="button" id="btn-view-transcript">Читать транскрипт</button>
+              <button type="button" id="btn-save-transcript" title="Сохранить транскрипт активной секвенции в .json (сегменты, отпечатки, аудио-анализ) — файл можно загрузить обратно">Сохранить транскрипт…</button>
+              <button type="button" id="btn-load-transcript" title="Загрузить транскрипт из .json и привязать к активной секвенции">Загрузить транскрипт…</button>
               <button type="button" id="btn-clear-chat">Очистить чат</button>
               <button type="button" id="btn-clear-cache">Очистить кэш транскриптов</button>
               <button type="button" id="btn-export-session">Сохранить сессию (JSON)</button>
@@ -1190,6 +1192,7 @@
           '../shared/timeline-transcribe.js',
           '../shared/transcript-structure.js',
           '../shared/transcript-view.js',
+          '../shared/transcript-io.js',
           '../shared/analysis-routing.js',
           '../shared/montage-plan.js',
           '../shared/youtube-export.js',

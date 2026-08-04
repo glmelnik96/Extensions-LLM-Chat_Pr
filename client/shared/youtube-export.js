@@ -87,9 +87,8 @@
     validateForYouTube: validateForYouTube
   };
 
-  if (typeof module !== 'undefined' && module.exports) {
-    module.exports = api;
-  } else {
-    global.YouTubeExport = api;
-  }
+  /* Только global: в CEP есть Node-интеграция, `module` определён — UMD-ветка
+     уводила api в module.exports, и window.YouTubeExport оставался undefined
+     (главы для YouTube молча не форматировались). */
+  global.YouTubeExport = api;
 })(typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : this));

@@ -5369,6 +5369,124 @@ PanelBoot.run('ИИ: монтаж', function () {
   var btnViewTr = document.getElementById('btn-view-transcript');
   if (btnViewTr) btnViewTr.onclick = openTranscriptViewer;
 
+  /* ── Файловые диалоги CEP (04.08.2026) ────────────────────────────────
+     cep.fs.showSaveDialogEx / showOpenDialogEx есть не на всех сборках
+     (и отключаются политикой), поэтому оба хелпера умеют молча падать в
+     автопапку панели — сохранение не должно срываться из-за диалога. */
+  function _cepFs() {
+    try { return (window.cep && window.cep.fs) ? window.cep.fs : null; } catch (e) { return null; }
+  }
+
+  /** Путь для записи. exts: ['json']. Возвращает '' при явной отмене пользователем. */
+  function _dialogSavePath(title, defaultName, exts, fallbackDir) {
+    var fsc = _cepFs();
+    if (fsc && typeof fsc.showSaveDialogEx === 'function') {
+      try {
+        var r = fsc.showSaveDialogEx(title, fallbackDir || '', exts, defaultName, '');
+        if (r && r.err === 0 && r.data) return String(r.data);
+        if (r && r.err === 0) return '';       /* диалог отработал, пользователь отменил */
+      } catch (eD) {}
+    }
+    return require('path').join(fallbackDir, defaultName);
+  }
+
+  /** Путь для чтения. Возвращает '' при отмене или недоступности диалога. */
+  function _dialogOpenPath(title, exts, initialDir) {
+    var fsc = _cepFs();
+    if (!fsc || typeof fsc.showOpenDialogEx !== 'function') return '';
+    try {
+      var r = fsc.showOpenDialogEx(false, false, title, initialDir || '', exts, '', '');
+      if (r && r.err === 0 && r.data && r.data.length) return String(r.data[0]);
+    } catch (eO) {}
+    return '';
+  }
+
+  /* ── Сохранение / загрузка транскрипта в файл (04.08.2026) ────────────
+     Кэш транскрипта живёт в служебных папках и привязан к sequenceID —
+     файл нужен для переноса на другую машину и отката к прошлой версии. */
+  function _transcriptFilesDir() {
+    var fs = require('fs');
+    var path = require('path');
+    var os = require('os');
+    var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'transcripts');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  function _closeMoreMenu() {
+    if (el.moreMenu) el.moreMenu.classList.remove('open');
+  }
+
+  var btnSaveTr = document.getElementById('btn-save-transcript');
+  if (btnSaveTr) {
+    btnSaveTr.onclick = function () {
+      _closeMoreMenu();
+      PremiereBridge.getTimelineSnapshot(function (err, snap) {
+        try {
+          if (err || !snap || !snap.ok) { showErr('Нет активной секвенции: ' + String(err || '')); return; }
+          var found = ContextStore.findTranscriptEntry(
+            TRANSCRIPT_PID, snap.sequenceName || '', snap.sequenceId || '');
+          var entry = found && found.entry ? found.entry : null;
+          if (!entry || !(entry.segments && entry.segments.length)) {
+            showErr('Для секвенции «' + (snap.sequenceName || '') + '» транскрипта нет — сохранять нечего.');
+            return;
+          }
+          var payload = TranscriptIO.buildExportPayload(entry, {
+            seqId: snap.sequenceId || '', seqName: snap.sequenceName || ''
+          });
+          var name = TranscriptIO.defaultFileName(snap.sequenceName || 'sequence', 'json');
+          var target = _dialogSavePath('Сохранить транскрипт', name, ['json'], _transcriptFilesDir());
+          if (!target) return;
+          require('fs').writeFileSync(target, JSON.stringify(payload, null, 2), 'utf8');
+          showErr('Транскрипт сохранён (' + entry.segments.length + ' сегм.): ' + target);
+          setTimeout(function () { showErr(''); }, 5000);
+        } catch (eS) {
+          showErr('Ошибка сохранения транскрипта: ' + String(eS && eS.message || eS));
+        }
+      });
+    };
+  }
+
+  var btnLoadTr = document.getElementById('btn-load-transcript');
+  if (btnLoadTr) {
+    btnLoadTr.onclick = function () {
+      _closeMoreMenu();
+      PremiereBridge.getTimelineSnapshot(function (err, snap) {
+        try {
+          if (err || !snap || !snap.ok) { showErr('Нет активной секвенции: ' + String(err || '')); return; }
+          var src = _dialogOpenPath('Загрузить транскрипт', ['json'], _transcriptFilesDir());
+          if (!src) { showErr('Выбор файла недоступен или отменён.'); setTimeout(function () { showErr(''); }, 4000); return; }
+          var parsed = TranscriptIO.parseImportPayload(require('fs').readFileSync(src, 'utf8'));
+          if (!parsed.ok) { showErr('Не удалось загрузить: ' + parsed.error); return; }
+
+          var seqName = snap.sequenceName || '';
+          var seqId = snap.sequenceId || '';
+          var existing = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqName, seqId);
+          var hadSegs = existing && existing.entry && existing.entry.segments ? existing.entry.segments.length : 0;
+          var foreign = String(parsed.entry.seqId || '') && String(parsed.entry.seqId || '') !== String(seqId);
+          var q = 'Загрузить транскрипт (' + parsed.entry.segments.length + ' сегм.) в секвенцию «' + seqName + '»?';
+          if (hadSegs) q += '\n\nТекущий транскрипт этой секвенции (' + hadSegs + ' сегм.) будет заменён.';
+          if (foreign) q += '\n\nФайл сохранён из другой секвенции — отпечаток не совпадёт, панель пометит транскрипт как устаревший.';
+          if (!window.confirm(q)) return;
+
+          var entry = TranscriptIO.rebindEntry(parsed.entry, seqId, seqName);
+          var key = seqId || seqName || 'sequence';
+          ContextStore.setTranscriptEntry(TRANSCRIPT_PID, key, entry);
+          if (existing && existing.matchedKey && existing.matchedKey !== key) {
+            try { ContextStore.setTranscriptEntry(TRANSCRIPT_PID, existing.matchedKey, entry); } catch (eK) {}
+          }
+          var warn = parsed.warnings && parsed.warnings.length ? ' ⚠ ' + parsed.warnings.join(' ') : '';
+          showErr('Транскрипт загружен: ' + entry.segments.length + ' сегм. для «' + seqName + '».' + warn);
+          setTimeout(function () { showErr(''); }, 6000);
+          /* setTranscriptLed сам транслирует состояние на LED «Инструментов». */
+          setTranscriptLed('ok');
+        } catch (eI) {
+          showErr('Ошибка загрузки транскрипта: ' + String(eI && eI.message || eI));
+        }
+      });
+    };
+  }
+
   /* ── Поиск + экспорт в читалке транскрипта (27.07.2026) ─────────────
      Не-ИИ улучшения: фильтр строк, копия в буфер, .txt с таймкодами и
      .srt из Whisper-сегментов (segmentsToSrtCues + cuesToSrt — уже
@@ -5449,7 +5567,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         try {
           var text = trPlainText();
           if (!text) { foot('Транскрипт пуст.', true); return; }
-          var p = require('path').join(trExportsDir(), trStampName('.txt'));
+          var p = _dialogSavePath('Сохранить текст транскрипта', trStampName('.txt'), ['txt'], trExportsDir());
+          if (!p) return;
           require('fs').writeFileSync(p, text, 'utf8');
           foot('Сохранено: ' + p);
         } catch (eT) {
@@ -5469,7 +5588,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           }
           var cues = DeterministicPipelines.segmentsToSrtCues(segs, { withSpeakers: hasSpeakers });
           if (!cues.length) { foot('Из сегментов не получилось ни одного титра.', true); return; }
-          var p = require('path').join(trExportsDir(), trStampName('.srt'));
+          var p = _dialogSavePath('Сохранить SRT', trStampName('.srt'), ['srt'], trExportsDir());
+          if (!p) return;
           require('fs').writeFileSync(p, DeterministicPipelines.cuesToSrt(cues), 'utf8');
           foot('SRT (' + cues.length + ' титров): ' + p);
         } catch (eS) {
