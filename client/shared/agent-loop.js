@@ -416,7 +416,27 @@
              раньше дельты между эмитами просто терялись, и собрать связный
              текст на стороне UI было невозможно. */
           var acc = '';
+          /* 05.08.2026: размышления копим отдельным аккумулятором и со своим
+             throttle — иначе поток мыслей и поток ответа глушили бы друг друга. */
+          var accR = '';
+          var lastReasonTs = 0;
           return function (delta) {
+            if (delta.reasoning) {
+              accR += delta.reasoning;
+              var nowR = Date.now();
+              if (nowR - lastReasonTs >= THROTTLE_MS) {
+                lastReasonTs = nowR;
+                onStatus({
+                  phase: 'reasoning',
+                  step: step,
+                  maxSteps: maxSteps,
+                  model: reqModel,
+                  message: 'Шаг ' + step + '/' + maxSteps + ' · модель рассуждает…',
+                  chunk: delta.reasoning,
+                  accumulated: accR
+                });
+              }
+            }
             if (delta.content) {
               if (!firstVisibleTs) {
                 firstVisibleTs = Date.now();
@@ -446,6 +466,20 @@
       if (!choice) throw new Error('Пустой ответ модели');
 
       var assistantMsg = choice.message;
+      /* Финальные размышления шага. Нужны в двух случаях: без стриминга
+         промежуточных событий не было вовсе, а со стримингом throttle
+         (150мс) съедает хвост — последние мысли иначе не увидеть.
+         accumulated здесь полный, UI перезапишет им текст этого шага. */
+      if (assistantMsg && typeof assistantMsg.reasoning_content === 'string' && assistantMsg.reasoning_content) {
+        onStatus({
+          phase: 'reasoning',
+          step: step,
+          maxSteps: maxSteps,
+          model: reqModel,
+          message: 'Шаг ' + step + '/' + maxSteps + ' · модель рассуждает…',
+          accumulated: assistantMsg.reasoning_content
+        });
+      }
       lastAssistantText = msgContent(choice) || lastAssistantText;
 
       var toolCalls = assistantMsg.tool_calls;
@@ -559,9 +593,23 @@
                 name: n,
                 step: step,
                 maxSteps: maxSteps,
+                /* args — для короткой сводки в журнале «ход мыслей» (05.08.2026) */
+                args: ar,
                 message: 'Шаг ' + step + '/' + maxSteps + ' · инструмент: ' + n
               });
-              return _execTool(ex, ar, tcId);
+              var tStart = Date.now();
+              return _execTool(ex, ar, tcId).then(function (res) {
+                onStatus({
+                  phase: 'tool-done',
+                  name: n,
+                  step: step,
+                  maxSteps: maxSteps,
+                  ms: Date.now() - tStart,
+                  ok: !isFailedToolResult(res && res.content),
+                  message: 'Шаг ' + step + '/' + maxSteps + ' · готово: ' + n
+                });
+                return res;
+              });
             };
           })(exec, args, tc.id, name));
         }

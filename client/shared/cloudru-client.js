@@ -256,7 +256,7 @@
    * Returns aggregated response equivalent to non-streaming response.
    *
    * onChunk(delta) — optional callback for progressive text display.
-   * delta = { content?: string, tool_calls?: [...] }
+   * delta = { content?: string, reasoning?: string, tool_calls?: [...] }
    */
   async function parseSSEStream(response, onChunk, abortCheck) {
     var reader = response.body.getReader();
@@ -265,6 +265,11 @@
 
     /* Accumulated result */
     var fullContent = '';
+    /* 05.08.2026: поток размышлений модели. Раньше reasoning_content молча
+       выбрасывался — при thinking=ON GLM-5.1 «молчит» 30-45с, и показать
+       пользователю было нечего. Имя поля у провайдеров плавает:
+       reasoning_content (GLM/DeepSeek) либо reasoning (часть OpenAI-прокси). */
+    var fullReasoning = '';
     var toolCallsMap = {}; /* index → {id, type, function: {name, arguments}} */
     var finishReason = null;
     var model = '';
@@ -318,6 +323,16 @@
             }
           }
 
+          /* Reasoning (thinking) — отдельный поток, в content не подмешиваем:
+             иначе размышления попали бы в историю чата и ушли обратно в модель. */
+          var rDelta = delta.reasoning_content || delta.reasoning;
+          if (typeof rDelta === 'string' && rDelta) {
+            fullReasoning += rDelta;
+            if (onChunk) {
+              try { onChunk({ reasoning: rDelta }); } catch (e) {}
+            }
+          }
+
           /* Tool calls (streamed as deltas with index) */
           if (delta.tool_calls) {
             for (var ti = 0; ti < delta.tool_calls.length; ti++) {
@@ -361,6 +376,9 @@
     };
     if (toolCallsList.length > 0) {
       message.tool_calls = toolCallsList;
+    }
+    if (fullReasoning) {
+      message.reasoning_content = fullReasoning;
     }
 
     return {

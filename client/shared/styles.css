@@ -461,6 +461,60 @@ button.hint-chip:hover {
 @keyframes stream-blink {
   to { opacity: 0; }
 }
+/* ── «Ход мыслей»: журнал шагов агента + поток размышлений (5 авг 2026) ──
+   Кнопка живёт в шапке пузыря, блок раскрывается под ней. */
+.think-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  margin-left: auto; /* прижимаем вправо, к краю шапки */
+  text-transform: none;
+  flex-shrink: 0;
+}
+.think-btn:hover { color: var(--text); border-color: var(--muted); }
+.think-panel {
+  margin: 4px 0 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.22);
+  font-size: 11px;
+  white-space: normal;
+}
+.think-panel[hidden] { display: none; }
+.think-feed { margin: 0; }
+.think-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.think-row .think-mark { flex-shrink: 0; width: 1.1em; text-align: center; }
+.think-row .think-text { word-break: break-word; }
+.think-row .think-ms { color: var(--muted); opacity: 0.75; flex-shrink: 0; }
+.think-row.k-warn { color: #e0b050; }
+.think-row.k-fail .think-text { color: #e07a5a; }
+.think-row.k-done { color: var(--text); }
+.think-row.k-pending .think-mark { animation: stream-blink 1s steps(2) infinite; }
+.think-reason {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-family: Consolas, Menlo, monospace;
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.think-empty { color: var(--muted); opacity: 0.7; }
 .composer {
   padding: 10px;
   border-top: 1px solid var(--border);

@@ -4646,12 +4646,20 @@ PanelBoot.run('ИИ: монтаж', function () {
       _streamBubble.className = 'bubble assistant streaming';
       var sRole = document.createElement('div');
       sRole.className = 'role';
-      sRole.textContent = 'assistant · печатает…';
+      /* Текст живёт в отдельном span: ETA-таймер обновляет только его.
+         Раньше writeText шёл в role.textContent и сносил кнопку «ход мыслей»,
+         которая тоже лежит в шапке (05.08.2026). */
+      var sLabel = document.createElement('span');
+      sLabel.className = 'role-label';
+      sLabel.textContent = 'assistant · печатает…';
+      sRole.appendChild(sLabel);
       _streamBubble.appendChild(sRole);
       var sBody = document.createElement('div');
       sBody.className = 'bubble-body';
       _streamBubble.appendChild(sBody);
       el.chat.appendChild(_streamBubble);
+      _thinkPanel = ensureThinkPanel(_streamBubble);
+      renderThinkPanel(_thinkPanel);
       if (chatNearBottom()) el.chat.scrollTop = el.chat.scrollHeight;
     }
     return _streamBubble;
@@ -4666,6 +4674,135 @@ PanelBoot.run('ИИ: монтаж', function () {
     stopWaitIndicator();
     if (_streamBubble && _streamBubble.parentNode) _streamBubble.parentNode.removeChild(_streamBubble);
     _streamBubble = null;
+    _thinkPanel = null;
+  }
+
+  /* ── «Ход мыслей» (5 августа 2026) ───────────────────────────────────
+     При thinking=ON GLM-5.1 молчит 30-45с: ETA-таймер сообщал, сколько ждём,
+     но не ЧТО происходит — выглядело как зависание. Кнопка в шапке пузыря
+     раскрывает журнал шагов агента (запросы к модели, вызовы инструментов с
+     длительностью, фолбэки) и живой поток размышлений модели.
+     Состояние «раскрыто» переживает перезапуск панели, сам журнал — нет. */
+  var THINK_OPEN_LS = 'omcThinkOpen';
+  var _thinkLog = null;
+  var _thinkPanel = null;
+  var _thinkRepaint = null;
+  var _thinkOpen = (function () {
+    try { return window.localStorage.getItem(THINK_OPEN_LS) === '1'; } catch (e) { return false; }
+  })();
+
+  function thinkLog() {
+    if (!_thinkLog && window.ThinkingLog) _thinkLog = ThinkingLog.createLog();
+    return _thinkLog;
+  }
+
+  function setThinkOpen(open) {
+    _thinkOpen = !!open;
+    try { window.localStorage.setItem(THINK_OPEN_LS, _thinkOpen ? '1' : '0'); } catch (e) {}
+  }
+
+  /** Кнопка + контейнер в шапке пузыря. Создаётся один раз на пузырь. */
+  function ensureThinkPanel(bubble) {
+    if (!bubble || !window.ThinkingLog) return null;
+    var existing = bubble.querySelector('.think-panel');
+    if (existing) return existing;
+
+    var roleEl = bubble.querySelector('.role');
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'think-btn';
+    var panel = document.createElement('div');
+    panel.className = 'think-panel';
+    panel.hidden = !_thinkOpen;
+
+    function syncBtn() {
+      btn.textContent = (_thinkOpen ? '▾' : '▸') + ' 💭 ход мыслей';
+      btn.title = _thinkOpen ? 'Скрыть ход мыслей' : 'Показать, что панель делает прямо сейчас';
+    }
+    btn.onclick = function () {
+      setThinkOpen(!_thinkOpen);
+      panel.hidden = !_thinkOpen;
+      syncBtn();
+      if (_thinkOpen) renderThinkPanel(panel);
+    };
+    syncBtn();
+
+    if (roleEl) roleEl.appendChild(btn);
+    else bubble.insertBefore(btn, bubble.firstChild);
+    /* Панель — под шапкой, над телом ответа. */
+    if (roleEl && roleEl.nextSibling) bubble.insertBefore(panel, roleEl.nextSibling);
+    else bubble.appendChild(panel);
+    return panel;
+  }
+
+  function renderThinkPanel(panel) {
+    if (!panel || panel.hidden) return;
+    var log = thinkLog();
+    if (!log) return;
+    panel.innerHTML = '';
+
+    var entries = log.entries();
+    if (!entries.length) {
+      var empty = document.createElement('div');
+      empty.className = 'think-empty';
+      empty.textContent = 'Пока нечего показать — ждём первый шаг.';
+      panel.appendChild(empty);
+    } else {
+      var feed = document.createElement('div');
+      feed.className = 'think-feed';
+      entries.forEach(function (e) {
+        var row = document.createElement('div');
+        row.className =
+          'think-row k-' + e.kind +
+          (e.pending ? ' k-pending' : '') +
+          (e.ok === false ? ' k-fail' : '');
+        var mark = document.createElement('span');
+        mark.className = 'think-mark';
+        mark.textContent = ThinkingLog.markerFor(e.kind);
+        var txt = document.createElement('span');
+        txt.className = 'think-text';
+        txt.textContent = e.text;
+        row.appendChild(mark);
+        row.appendChild(txt);
+        var msTxt = e.pending ? '' : ThinkingLog.fmtMs(e.ms);
+        if (msTxt) {
+          var ms = document.createElement('span');
+          ms.className = 'think-ms';
+          ms.textContent = msTxt;
+          row.appendChild(ms);
+        }
+        feed.appendChild(row);
+      });
+      panel.appendChild(feed);
+    }
+
+    var reason = log.reasoning();
+    if (reason) {
+      var pre = document.createElement('div');
+      pre.className = 'think-reason';
+      pre.textContent = reason;
+      panel.appendChild(pre);
+      /* Мысли листаем к свежим — иначе видно только начало рассуждения. */
+      pre.scrollTop = pre.scrollHeight;
+    }
+  }
+
+  /** Событие agent-loop → журнал + отрисовка (не чаще 4 раз в секунду). */
+  function noteThinking(ev) {
+    var log = thinkLog();
+    if (!log) return;
+    log.push(ev);
+    if (!_thinkOpen) return;
+    if (_thinkRepaint) return;
+    _thinkRepaint = setTimeout(function () {
+      _thinkRepaint = null;
+      renderThinkPanel(_thinkPanel);
+    }, 250);
+  }
+
+  function resetThinking() {
+    if (_thinkRepaint) { clearTimeout(_thinkRepaint); _thinkRepaint = null; }
+    if (_thinkLog) _thinkLog.clear();
   }
 
   /* ETA-индикатор (10 июня 2026): GLM-5.1 с thinking может «молчать» 30+ сек.
@@ -4673,10 +4810,15 @@ PanelBoot.run('ИИ: монтаж', function () {
      AgentLoopStats (EMA прошлых ответов модели), чтобы пользователь не думал,
      что панель зависла. */
   var _waitTicker = null;
+  /** Текстовая часть шапки пузыря (не вся шапка — рядом живёт кнопка). */
+  function streamRoleLabel() {
+    if (!_streamBubble) return null;
+    return _streamBubble.querySelector('.role-label') || _streamBubble.querySelector('.role');
+  }
   function startWaitIndicator(model, etaMs) {
     stopWaitIndicator();
     ensureStreamBubble();
-    var roleEl = _streamBubble.querySelector('.role');
+    var roleEl = streamRoleLabel();
     var startTs = Date.now();
     var etaTxt = etaMs ? ' · обычно ~' + Math.max(1, Math.round(etaMs / 1000)) + 'с' : '';
     function tick() {
@@ -4690,7 +4832,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   function stopWaitIndicator(roleText) {
     if (_waitTicker) { clearInterval(_waitTicker); _waitTicker = null; }
     if (roleText && _streamBubble) {
-      var r = _streamBubble.querySelector('.role');
+      var r = streamRoleLabel();
       if (r) r.textContent = roleText;
     }
   }
@@ -4699,6 +4841,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     var wasNearBottom = chatNearBottom();
     removeStreamBubble();
     el.chat.innerHTML = '';
+    var lastAnswerDiv = null;
     msgs.forEach(function (m) {
       if (m.role === 'system') return;
 
@@ -4757,7 +4900,15 @@ PanelBoot.run('ИИ: монтаж', function () {
       setBubbleBody(body, collapsible ? 'tool' : m.role, bodyText);
       div.appendChild(body);
       el.chat.appendChild(div);
+      if (m.role === 'assistant' && !collapsible) lastAnswerDiv = div;
     });
+    /* Ход мыслей переезжает из живого пузыря в финальный ответ — иначе журнал
+       исчезал ровно в тот момент, когда его хочется перечитать. Живёт до
+       перезагрузки панели: в историю не пишем (лишние килобайты на каждый ход). */
+    if (lastAnswerDiv && _thinkLog && !_thinkLog.isEmpty()) {
+      _thinkPanel = ensureThinkPanel(lastAnswerDiv);
+      renderThinkPanel(_thinkPanel);
+    }
     /* Пустой чат → welcome-карточка «что умеет плагин» (12 июня 2026).
        Исчезает с первым сообщением, возвращается после «Очистить чат». */
     if (!el.chat.children.length && !_pendingProposal) renderWelcomeCard();
@@ -6545,6 +6696,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     el.stop.disabled = false;
     runAbort = createAbortPair();
     var ac = runAbort;
+    resetThinking(); /* журнал «ход мыслей» — свой на каждый ход */
 
     /* P0-1: Auto-inject timeline snapshot — убираем 1 обязательный round-trip.
        11.07.2026: логика вынесена в EditPlanSimulator.buildAutoSnapshotText
@@ -6595,9 +6747,13 @@ PanelBoot.run('ИИ: монтаж', function () {
             updateStreamBubble(ev.accumulated);
           }
           if (ev.phase === 'tool') stopWaitIndicator('assistant · инструмент: ' + (ev.name || '…'));
+          /* Журнал «ход мыслей»: пузырь нужен до записи — в нём живёт панель */
+          if (ev.phase === 'reasoning') ensureStreamBubble();
+          noteThinking(ev);
         }
       });
       statusUi.show('Готово', false);
+      if (_thinkLog) _thinkLog.finish('Готово');
       setTimeout(function () {
         statusUi.hide();
       }, 1200);
@@ -6617,6 +6773,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       renderMessages(ContextStore.getMessages(panelId));
     } catch (e) {
       statusUi.hide();
+      if (_thinkLog) _thinkLog.finish(e && e.name === 'AbortError' ? 'Остановлено' : 'Ошибка');
       if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1)) {
         showErr('Остановлено (запрос к API FM прерван).');
       } else {

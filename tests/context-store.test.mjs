@@ -282,6 +282,21 @@ describe('ContextStore — ручной переключатель модели 
     cleanup();
   });
 
+  test('enableStreaming пробрасывается из дефолтов (флаг был мёртвым до 05.08.2026)', () => {
+    const on = loadContextStoreWithTempRoot({ fmDefaults: { ...FM, enableStreaming: true } });
+    assert.equal(on.ContextStore.getResolvedSettings().enableStreaming, true);
+    on.cleanup();
+
+    const off = loadContextStoreWithTempRoot({ fmDefaults: { ...FM, enableStreaming: false } });
+    assert.equal(off.ContextStore.getResolvedSettings().enableStreaming, false);
+    off.cleanup();
+
+    /* поля нет вовсе → строго false, а не undefined (panel.js читает напрямую) */
+    const absent = freshCS();
+    assert.equal(absent.ContextStore.getResolvedSettings().enableStreaming, false);
+    absent.cleanup();
+  });
+
   test('setSessionChatModel валидной id → override применён везде (chat+agent)', () => {
     const { ContextStore: CS, cleanup } = freshCS();
     const applied = CS.setSessionChatModel('openai/gpt-oss-120b');

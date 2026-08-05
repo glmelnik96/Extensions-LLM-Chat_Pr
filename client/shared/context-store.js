@@ -306,6 +306,9 @@
         chapterModel: chapterModel || analysisModel || agentModel,
         findMomentsModel: findMomentsModel || analysisModel || agentModel,
         enableThinking: enableThinking,
+        /* 05.08.2026: поле не пробрасывалось — panel.js читал undefined, и
+           стриминг был выключен всегда, независимо от fm-defaults. */
+        enableStreaming: d.enableStreaming === true,
         thinkingPolicy: thinkingPolicy,
         analyzeConcurrency: analyzeConcurrency,
         transcriptTimelineOffsetSec: transcriptTimelineOffsetSec,

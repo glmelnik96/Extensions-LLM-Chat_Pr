@@ -149,6 +149,75 @@ describe('cloudru-client.parseSSEStream', () => {
     assert.equal(res.choices[0].finish_reason, 'stop'); /* дефолт когда finish_reason не пришёл */
   });
 
+  test('reasoning_content собирается отдельно от content', async () => {
+    const text = sse([
+      { choices: [{ delta: { reasoning_content: 'Счи' } }] },
+      { choices: [{ delta: { reasoning_content: 'таю…' } }] },
+      { choices: [{ delta: { content: 'Ответ: 391' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] }
+    ]);
+    const got = [];
+    const res = await CR.parseSSEStream(makeSSEResponse(text), (d) => got.push(d));
+    const msg = res.choices[0].message;
+    assert.equal(msg.reasoning_content, 'Считаю…');
+    assert.equal(msg.content, 'Ответ: 391', 'мысли не подмешиваются в ответ');
+    /* JSON: объекты приходят из vm-песочницы (чужой realm) — deepEqual их не сводит */
+    assert.equal(
+      JSON.stringify(got),
+      JSON.stringify([{ reasoning: 'Счи' }, { reasoning: 'таю…' }, { content: 'Ответ: 391' }])
+    );
+  });
+
+  test('альтернативный ключ reasoning (часть OpenAI-прокси)', async () => {
+    const text = sse([
+      { choices: [{ delta: { reasoning: 'мысль' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] }
+    ]);
+    const res = await CR.parseSSEStream(makeSSEResponse(text), null);
+    assert.equal(res.choices[0].message.reasoning_content, 'мысль');
+  });
+
+  test('без размышлений поля reasoning_content нет вовсе', async () => {
+    const text = sse([
+      { choices: [{ delta: { content: 'ok' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] }
+    ]);
+    const res = await CR.parseSSEStream(makeSSEResponse(text), null);
+    assert.equal('reasoning_content' in res.choices[0].message, false);
+  });
+
+  test('размышления доезжают при нарезке на мелкие чанки', async () => {
+    const text = sse([
+      { choices: [{ delta: { reasoning_content: 'думаю про ' } }] },
+      { choices: [{ delta: { reasoning_content: 'монтаж' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] }
+    ]);
+    const res = await CR.parseSSEStream(makeSSEResponse(text, 3), null);
+    assert.equal(res.choices[0].message.reasoning_content, 'думаю про монтаж');
+  });
+
+  test('не-строка в reasoning_content игнорируется', async () => {
+    const text = sse([
+      { choices: [{ delta: { reasoning_content: { a: 1 } } }] },
+      { choices: [{ delta: { content: 'ok' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] }
+    ]);
+    const res = await CR.parseSSEStream(makeSSEResponse(text), null);
+    assert.equal('reasoning_content' in res.choices[0].message, false);
+    assert.equal(res.choices[0].message.content, 'ok');
+  });
+
+  test('исключение из onChunk на размышлениях не роняет стрим', async () => {
+    const text = sse([
+      { choices: [{ delta: { reasoning_content: 'r' } }] },
+      { choices: [{ delta: { content: 'ok' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] }
+    ]);
+    const res = await CR.parseSSEStream(makeSSEResponse(text), () => { throw new Error('UI упал'); });
+    assert.equal(res.choices[0].message.content, 'ok');
+    assert.equal(res.choices[0].message.reasoning_content, 'r');
+  });
+
   test('две параллельные tool_calls (index 0 и 1) собираются раздельно', async () => {
     const text = sse([
       { choices: [{ delta: { tool_calls: [
