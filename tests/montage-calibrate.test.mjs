@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadTranscriptStructure } from './load-transcript-structure.mjs';
+import { loadIife } from './helpers.mjs';
 
-const TS = loadTranscriptStructure();
+const TS = loadIife('client/shared/transcript-structure.js', 'TranscriptStructure');
 
 test('applyCalibration: корректировки по blockId накладываются на labeled', () => {
   const labeled = [

@@ -333,6 +333,25 @@ describe('cloudru-client.fetchWithRetry + Retry-After', () => {
     assert.equal(res.status, 500);
     assert.equal(calls, 1, 'при maxRetries=1 — ровно одна попытка');
   });
+
+  test('AbortError при отменённом fetchOpts.signal (без abortCheck) → пробрасывается, без ретраев', async () => {
+    /* Регрессия: вызовы только с signal (без abortCheck) превращали отмену
+       пользователя в retryable «Таймаут» и продолжали долбить сеть. */
+    let calls = 0;
+    const signal = { aborted: false, addEventListener() {}, removeEventListener() {} };
+    const fetchImpl = async () => {
+      calls++;
+      /* пользователь жмёт «Стоп» во время запроса */
+      signal.aborted = true;
+      throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    };
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    await assert.rejects(
+      () => CR2.fetchWithRetry('http://x', { signal }, null),
+      (err) => err.name === 'AbortError'
+    );
+    assert.equal(calls, 1, 'ровно одна попытка — отмена не ретраится');
+  });
 });
 
 /* ═══════════════════════════════════════════════════════════════

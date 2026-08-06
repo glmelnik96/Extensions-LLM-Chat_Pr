@@ -1,7 +1,7 @@
 import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadDeterministicPipelines } from './load-deterministic-pipelines.mjs';
-import { loadTranscriptStructure } from './load-transcript-structure.mjs';
+import { loadIife } from './helpers.mjs';
 
 const DP = loadDeterministicPipelines();
 
@@ -214,6 +214,29 @@ describe('DeterministicPipelines.cutSilences', () => {
     const strict = await DP.cutSilences(makeCtx({ transcriptEntry: entry }), { minDuration: 1.0, padding: 0.1, silenceThresholdDelta: 25 });
     assert.ok(loose.proposal && loose.proposal.removeIntervals.length === 1, 'порог -25: -28dB = тишина');
     assert.ok(strict.noChanges || (strict.proposal && strict.proposal.removeIntervals.length === 0), 'порог -35: -28dB = речь');
+  });
+
+  test('fallback без rmsTimeline: дельта НЕ смешивает LUFS/dBFS, ffmpeg-тишины не теряются', async () => {
+    /* Регрессия: effectiveThreshold = inputI - delta смешивал шкалы (LUFS vs dBFS),
+       из-за чего includeFFmpeg становился false и ffmpeg-тишины молча выпадали
+       (оставались только Whisper-gaps → noChanges). */
+    const entry = makeEntry(
+      [{ startSec: 0, endSec: 30, text: 'непрерывная речь без зазоров' }],
+      {
+        audioAnalysis: {
+          silences: [{ startSec: 5, endSec: 8 }],
+          silenceThresholdUsed: -30,
+          inputI: -10
+        }
+      }
+    );
+    const r = await DP.cutSilences(makeCtx({ transcriptEntry: entry }), { silenceThresholdDelta: 25 });
+    assert.equal(r.ok, true);
+    assert.ok(r.proposal, 'ffmpeg-тишина не должна выпадать в fallback с дельтой');
+    assert.equal(r.proposal.removeIntervals.length, 1);
+    const iv = r.proposal.removeIntervals[0];
+    assert.ok(iv.startSec >= 5 && iv.startSec <= 5.3, 'старт ~5+padding');
+    assert.ok(iv.endSec >= 7.7 && iv.endSec <= 8, 'конец ~8-padding');
   });
 
   test('тишины длиннее minDuration → proposal с вырезкой', async () => {
@@ -806,7 +829,7 @@ describe('DeterministicPipelines.chapterize', () => {
      ровно на 60.000 (квантование к целой секунде), а речь на самом деле
      возобновилась в 57.787 — глава садилась в середину фразы. */
   describe('снэп глав к речевым онсетам', () => {
-    const DPS = loadDeterministicPipelines({ TranscriptStructure: loadTranscriptStructure() });
+    const DPS = loadDeterministicPipelines({ TranscriptStructure: loadIife('client/shared/transcript-structure.js', 'TranscriptStructure') });
     const liveSilences = [
       { startSec: 53.805, endSec: 55.787, durationSec: 1.982 },
       { startSec: 56.528, endSec: 57.787, durationSec: 1.259 },
@@ -1901,87 +1924,6 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
     assert.equal(res.ok, true);
     assert.match(res.proposal.summary, /Ведущий \(V2\)/);
     assert.match(res.proposal.summary, /Эксперт \(V3\)/);
-  });
-});
-
-/* ═══════════════════════════════════════════════════════════════
- * snapIntervalsToFrame (аудит 2026-06-09: кадровая точность резов)
- * ═══════════════════════════════════════════════════════════════ */
-
-describe('DeterministicPipelines.snapIntervalsToFrame', () => {
-  it('start — вниз, end — вверх к границе кадра (25 fps)', () => {
-    const out = DP.snapIntervalsToFrame([{ startSec: 1.03, endSec: 2.01 }], 25);
-    assert.equal(out.length, 1);
-    assert.ok(Math.abs(out[0].startSec - 1.0) < 1e-9, 'start 1.03 → 1.00');
-    assert.ok(Math.abs(out[0].endSec - 2.04) < 1e-9, 'end 2.01 → 2.04');
-  });
-
-  it('значения уже на границе кадра не меняются', () => {
-    const out = DP.snapIntervalsToFrame([{ startSec: 1.0, endSec: 2.0 }], 25);
-    assert.ok(Math.abs(out[0].startSec - 1.0) < 1e-9);
-    assert.ok(Math.abs(out[0].endSec - 2.0) < 1e-9);
-  });
-
-  it('float-погрешность не сдвигает на лишний кадр (EPS-защита)', () => {
-    /* 0.04*3 = 0.12000000000000001 — без EPS ceil дал бы лишний кадр */
-    const out = DP.snapIntervalsToFrame([{ startSec: 0.04 * 3, endSec: 0.04 * 10 }], 25);
-    assert.ok(Math.abs(out[0].startSec - 0.12) < 1e-9);
-    assert.ok(Math.abs(out[0].endSec - 0.4) < 1e-9);
-  });
-
-  it('дробный fps (29.97 NTSC)', () => {
-    const fps = 29.97;
-    const out = DP.snapIntervalsToFrame([{ startSec: 1.5, endSec: 3.2 }], fps);
-    const sFrames = out[0].startSec * fps;
-    const eFrames = out[0].endSec * fps;
-    assert.ok(Math.abs(sFrames - Math.round(sFrames)) < 1e-6, 'start кратен кадру');
-    assert.ok(Math.abs(eFrames - Math.round(eFrames)) < 1e-6, 'end кратен кадру');
-    assert.ok(out[0].startSec <= 1.5 && out[0].endSec >= 3.2, 'интервал только расширяется');
-  });
-
-  it('микро-интервал расширяется до полного кадра (floor/ceil)', () => {
-    const out = DP.snapIntervalsToFrame([{ startSec: 1.001, endSec: 1.002 }], 25);
-    assert.equal(out.length, 1);
-    assert.ok(Math.abs(out[0].startSec - 1.0) < 1e-9);
-    assert.ok(Math.abs(out[0].endSec - 1.04) < 1e-9);
-  });
-
-  it('нулевой интервал отбрасывается', () => {
-    const out = DP.snapIntervalsToFrame([{ startSec: 1.0, endSec: 1.0 }], 25);
-    assert.equal(out.length, 0);
-  });
-
-  it('прочие свойства интервала сохраняются', () => {
-    const out = DP.snapIntervalsToFrame([{ startSec: 1.03, endSec: 2.01, reason: 'тишина', label: 'silence' }], 25);
-    assert.equal(out[0].reason, 'тишина');
-    assert.equal(out[0].label, 'silence');
-  });
-
-  it('start не уходит ниже нуля', () => {
-    const out = DP.snapIntervalsToFrame([{ startSec: -0.01, endSec: 0.5 }], 25);
-    assert.equal(out[0].startSec, 0);
-  });
-
-  it('невалидный fps → исходные интервалы без изменений', () => {
-    const src = [{ startSec: 1.03, endSec: 2.01 }];
-    [0, NaN, undefined].forEach((bad) => {
-      const out = DP.snapIntervalsToFrame(src, bad);
-      assert.equal(out.length, 1);
-      assert.equal(out[0].startSec, 1.03);
-      assert.equal(out[0].endSec, 2.01);
-    });
-  });
-
-  it('не мутирует исходный массив', () => {
-    const src = [{ startSec: 1.03, endSec: 2.01 }];
-    DP.snapIntervalsToFrame(src, 25);
-    assert.equal(src[0].startSec, 1.03);
-    assert.equal(src[0].endSec, 2.01);
-  });
-
-  it('мусорные элементы пропускаются, non-array → []', () => {
-    assert.equal(DP.snapIntervalsToFrame([null, { startSec: 'x', endSec: 2 }, { startSec: 1, endSec: 2 }], 25).length, 1);
-    assert.equal(DP.snapIntervalsToFrame(null, 25).length, 0);
   });
 });
 

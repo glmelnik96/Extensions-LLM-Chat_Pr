@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
-import { loadTranscriptStructure } from './load-transcript-structure.mjs';
+import { loadIife } from './helpers.mjs';
 
-const TS = loadTranscriptStructure();
+const TS = loadIife('client/shared/transcript-structure.js', 'TranscriptStructure');
 
 /* ─── buildParagraphs ─── */
 describe('TranscriptStructure.buildParagraphs', () => {
@@ -446,6 +446,50 @@ describe('TranscriptStructure.analyzeForCutsWithLLM + local pre-labels', () => {
     assert.ok(result.labels[0].reason.includes('[local]'));
     /* LLM должен был получить только сегмент 1 */
     assert.ok(llmSegments.length <= 1, 'LLM должен получить ≤1 сегмент, получил ' + llmSegments.length);
+  });
+
+  test('сегменты без .i + локальный пропуск: в LLM уходят ОРИГИНАЛЬНЫЕ индексы', async () => {
+    /* Регрессия 06.08.2026: fallback брал позицию в отфильтрованном массиве
+       (ci+idx) → при пропуске локально размеченного сегмента LLM-метки
+       уезжали на чужие сегменты. */
+    let llmSegments = [];
+    const mockCC = {
+      chatCompletions: (opts) => {
+        const msg = opts.messages.find(m => m.role === 'user');
+        if (msg) {
+          try { llmSegments = JSON.parse(msg.content.split('\n')[0]).segments; } catch (e) {}
+        }
+        return Promise.resolve({
+          choices: [{ message: { content: JSON.stringify({
+            labels: llmSegments.map(s => ({ i: s.i, label: 'outtake', reason: 'test' }))
+          })}}]
+        });
+      }
+    };
+
+    /* Сегменты БЕЗ поля .i — работает fallback-индексация */
+    const segs = [
+      { startSec: 0, endSec: 3, text: 'Локально размеченный сегмент' },
+      { startSec: 3, endSec: 8, text: 'Второй сегмент для LLM' },
+      { startSec: 8, endSec: 12, text: 'Третий сегмент для LLM' }
+    ];
+
+    const result = await TS.analyzeForCutsWithLLM(segs, {
+      CloudRuClient: mockCC,
+      settings: { baseUrl: 'http://test', apiKey: 'key', chatModel: 'test' },
+      /* Сегмент 0 размечен локально с confidence high → в LLM не идёт */
+      preLabels: [{ i: 0, label: 'filler', confidence: 'high', reason: '[local] тест' }]
+    });
+
+    /* В LLM ушли оригинальные индексы 1 и 2 (старый код слал 0 и 1) */
+    assert.strictEqual(llmSegments.length, 2);
+    assert.strictEqual(llmSegments[0].i, 1);
+    assert.strictEqual(llmSegments[1].i, 2);
+    /* Метки легли на свои сегменты: 0 = локальный filler, 1–2 = outtake от LLM */
+    assert.strictEqual(result.labels.length, 3);
+    assert.strictEqual(result.labels[0].label, 'filler');
+    assert.strictEqual(result.labels[1].label, 'outtake');
+    assert.strictEqual(result.labels[2].label, 'outtake');
   });
 });
 

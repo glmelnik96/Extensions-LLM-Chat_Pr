@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadTranscriptStructure } from './load-transcript-structure.mjs';
+import { loadIife } from './helpers.mjs';
 
-const TS = loadTranscriptStructure();
+const TS = loadIife('client/shared/transcript-structure.js', 'TranscriptStructure');
 
 test('parseMontageChunk: валидный JSON → нормализованные метки', () => {
   const raw = '{"blocks":[{"i":0,"importance":3,"role":"hook","theme":"Завязка","blockId":"b0"},{"i":1,"importance":1,"role":"filler","theme":"","blockId":"b0"}]}';

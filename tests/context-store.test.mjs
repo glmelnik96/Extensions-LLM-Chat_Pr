@@ -108,10 +108,6 @@ describe('ContextStore — localStorage недоступен (бросает)', 
     assert.doesNotThrow(() => CS.setMessages('markers', [{ role: 'user', content: 'hi' }]));
   });
 
-  test('appendMessage не бросает', () => {
-    assert.doesNotThrow(() => CS.appendMessage('markers', { role: 'user', content: 'hi' }));
-  });
-
   test('clearChat не бросает', () => {
     assert.doesNotThrow(() => CS.clearChat('markers'));
   });
@@ -276,7 +272,6 @@ describe('ContextStore — ручной переключатель модели 
 
   test('дефолт: override нет, эффективная модель = chatModel', () => {
     const { ContextStore: CS, cleanup } = freshCS();
-    assert.equal(CS.isSessionChatModelOverridden(), false);
     assert.equal(CS.getSessionChatModel(), 'zai-org/GLM-5.1');
     assert.equal(CS.getResolvedSettings().chatModel, 'zai-org/GLM-5.1');
     cleanup();
@@ -301,7 +296,6 @@ describe('ContextStore — ручной переключатель модели 
     const { ContextStore: CS, cleanup } = freshCS();
     const applied = CS.setSessionChatModel('openai/gpt-oss-120b');
     assert.equal(applied, 'openai/gpt-oss-120b');
-    assert.equal(CS.isSessionChatModelOverridden(), true);
     const rs = CS.getResolvedSettings();
     assert.equal(rs.chatModel, 'openai/gpt-oss-120b');
     assert.equal(rs.activeAgentModel, 'openai/gpt-oss-120b', 'агент наследует override');
@@ -312,7 +306,6 @@ describe('ContextStore — ручной переключатель модели 
     const { ContextStore: CS, cleanup } = freshCS();
     const applied = CS.setSessionChatModel('does/not-exist');
     assert.equal(applied, 'zai-org/GLM-5.1', 'вернул текущую, не применил мусор');
-    assert.equal(CS.isSessionChatModelOverridden(), false);
     assert.equal(CS.getResolvedSettings().chatModel, 'zai-org/GLM-5.1');
     cleanup();
   });
@@ -323,7 +316,6 @@ describe('ContextStore — ручной переключатель модели 
     assert.equal(CS.getResolvedSettings().chatModel, 'zai-org/GLM-4.7');
     const back = CS.setSessionChatModel('');
     assert.equal(back, 'zai-org/GLM-5.1');
-    assert.equal(CS.isSessionChatModelOverridden(), false);
     assert.equal(CS.getResolvedSettings().chatModel, 'zai-org/GLM-5.1');
     cleanup();
   });

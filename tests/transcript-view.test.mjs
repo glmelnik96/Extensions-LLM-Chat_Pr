@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadTranscriptView } from './load-transcript-view.mjs';
-const { buildTranscriptViewRows, formatTimecode } = loadTranscriptView();
+import { loadIife } from './helpers.mjs';
+const { buildTranscriptViewRows, formatTimecode } = loadIife('client/shared/transcript-view.js', 'TranscriptView');
 
 test('formatTimecode: M:SS under an hour, H:MM:SS at/над часом', () => {
   assert.equal(formatTimecode(0), '0:00');

@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadYouTubeExport } from './load-youtube-export.mjs';
+import { loadIife } from './helpers.mjs';
 
-const YT = loadYouTubeExport();
+const YT = loadIife('client/shared/youtube-export.js', 'YouTubeExport');
 
 describe('YouTubeExport.formatTimestamp', () => {
   test('M:SS для < 1 часа', () => {

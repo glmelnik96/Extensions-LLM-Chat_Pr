@@ -1,8 +1,8 @@
 import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadMulticamPlan } from './load-multicam-plan.mjs';
+import { loadIife } from './helpers.mjs';
 
-const MP = loadMulticamPlan();
+const MP = loadIife('client/shared/multicam-plan.js', 'MulticamPlan');
 
 /* ──────────────────────────────────────────────────────────────
  * Helpers — генератор кадров для тестов.

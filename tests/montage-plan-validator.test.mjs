@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadMontagePlan } from './load-montage-plan-module.mjs';
+import { loadIife } from './helpers.mjs';
 
-const MP = loadMontagePlan();
+const MP = loadIife('client/shared/montage-plan.js', 'MontagePlan');
 
 /** Нормализация cross-realm объектов (vm-песочница создаёт объекты с другим прототипом,
  *  deepStrictEqual падает). JSON round-trip — стандартный паттерн в этом репо. */

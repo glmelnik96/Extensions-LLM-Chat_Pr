@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadMontagePlan } from './load-montage-plan-module.mjs';
+import { loadIife } from './helpers.mjs';
 
-const MP = loadMontagePlan();
+const MP = loadIife('client/shared/montage-plan.js', 'MontagePlan');
 
 /* Хелпер: транскрипт из N абзацев по dur сек каждый */
 function mkEntry(durs) {

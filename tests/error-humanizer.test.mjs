@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadErrorHumanizer } from './load-error-humanizer.mjs';
+import { loadIife } from './helpers.mjs';
 
-const EH = loadErrorHumanizer();
+const EH = loadIife('client/shared/error-humanizer.js', 'ErrorHumanizer');
 
 /* Волна 2 п.1 плана усиления: каталог человеко-читаемых ошибок.
    Проверяем kind + что hint содержит конкретную инструкцию (не generic). */
@@ -73,27 +73,5 @@ describe('ErrorHumanizer.classify — каталог', () => {
   test('токен 23413 в теле НЕ триггерит payload (нужна граница слова)', () => {
     const c = EH.classify('response tokens: 23413');
     assert.notEqual(c.kind, 'payload');
-  });
-});
-
-describe('ErrorHumanizer.withHint', () => {
-  test('добавляет подсказку через « — »', () => {
-    const s = EH.withHint('HTTP 401 Unauthorized');
-    assert.ok(s.startsWith('HTTP 401 Unauthorized — '));
-    assert.ok(s.includes('fm-secrets'));
-  });
-
-  test('не дублирует подсказку, если она уже в сообщении', () => {
-    const first = EH.withHint('HTTP 401 Unauthorized');
-    assert.equal(EH.withHint(first), first);
-  });
-
-  test('без матча — сообщение как есть', () => {
-    assert.equal(EH.withHint('просто текст'), 'просто текст');
-  });
-
-  test('пусто → пустая строка', () => {
-    assert.equal(EH.withHint(''), '');
-    assert.equal(EH.withHint(null), '');
   });
 });

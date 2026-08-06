@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadThinkingLog } from './load-thinking-log.mjs';
+import { loadIife } from './helpers.mjs';
 
-const TL = loadThinkingLog();
+const TL = loadIife('client/shared/thinking-log.js', 'ThinkingLog');
 
 /** Лог с управляемыми часами — иначе длительности не проверить. */
 function clockLog(extra) {

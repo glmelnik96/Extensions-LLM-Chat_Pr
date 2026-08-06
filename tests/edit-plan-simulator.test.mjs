@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
-import { loadEditPlanSimulator } from './load-edit-plan-simulator.mjs';
+import { loadIife } from './helpers.mjs';
 
-const EP = loadEditPlanSimulator();
+const EP = loadIife('client/shared/edit-plan-simulator.js', 'EditPlanSimulator');
 
 const snap = {
   ok: true,
@@ -85,6 +85,14 @@ describe('EditPlanSimulator.simulateUnified — новый контракт', ()
     });
     // Не найдено — клипов с nodeId='123' нет, rejected нет (синтаксически валиден)
     assert.equal(r.normalizedOperations[0].nodeId, '123');
+  });
+
+  test('mute_track без trackType — дефолт video (как в host и валидаторе)', () => {
+    const norm = EP.normalizeUnifiedPlan({
+      operations: [{ kind: 'mute_track', trackIndex: 0, muted: true }]
+    });
+    assert.equal(norm.operations.length, 1);
+    assert.equal(norm.operations[0].trackType, 'video');
   });
 });
 

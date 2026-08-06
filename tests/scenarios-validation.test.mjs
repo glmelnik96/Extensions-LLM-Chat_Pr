@@ -1,7 +1,7 @@
 /**
  * scenarios-validation.test.mjs (7 мая 2026)
  *
- * Валидация быстрых сценариев на реальном транскрипт-кэше.
+ * Валидация быстрых сценариев на синтетических транскриптах разной длины.
  *
  * Идея: для каждого стартера эмулируем «правильный» ответ LLM (цепочку tool-calls),
  * прогоняем через те же executors что и панель, проверяем что:
@@ -10,56 +10,22 @@
  *   - результат не пустой / соответствует ожиданиям
  *
  * Если сценарий fail'ит — он НЕ добавляется в conversation-starters.js.
+ *
+ * Ревью 06.08.2026: тест герметизирован — раньше читал реальный кэш пользователя
+ * (~/.extensions_llm_chat_pr/_llm_transcript_cache.json), из-за чего результат
+ * зависел от машины; плюс Math.random() в генераторе делал прогоны недетерминированными.
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
 
-import { loadAnalysisRouting } from './load-analysis-routing.mjs';
-import { loadTranscriptStructure } from './load-transcript-structure.mjs';
-import { loadFindMoments } from './load-find-moments.mjs';
-import { loadToolValidators } from './load-tool-validators.mjs';
+import { loadIife } from './helpers.mjs';
 
-const AR = loadAnalysisRouting();
-const TS = loadTranscriptStructure();
-const FM = loadFindMoments();
-const TV = loadToolValidators();
+const AR = loadIife('client/shared/analysis-routing.js', 'AnalysisRouting');
+const TS = loadIife('client/shared/transcript-structure.js', 'TranscriptStructure');
+const FM = loadIife('client/shared/find-moments.js', 'FindMoments');
+const TV = loadIife('client/shared/tool-validators.js', 'ToolValidators');
 
-/* YouTubeExport грузим напрямую через vm. */
-import vm from 'node:vm';
-import { fileURLToPath } from 'node:url';
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-function loadYouTubeExport() {
-  const src = fs.readFileSync(
-    path.join(__dirname, '..', 'client', 'shared', 'youtube-export.js'),
-    'utf8'
-  );
-  const root = {};
-  /* youtube-export.js: если есть module.exports — экспорт идёт туда (Node-режим);
-     если нет — на global. Чтобы получить через root.window, передаём global=root
-     и НЕ передаём module → IIFE attaches to global.YouTubeExport. */
-  vm.runInNewContext(src, { window: root, global: root, console });
-  return root.YouTubeExport;
-}
-const YT = loadYouTubeExport();
-
-/* ─── Реальный кэш транскрипта ───────────────────────────────────────── */
-const CACHE_PATH = path.join(os.homedir(), '.extensions_llm_chat_pr', '_llm_transcript_cache.json');
-let cacheEntry = null;
-let cacheKey = null;
-try {
-  const raw = fs.readFileSync(CACHE_PATH, 'utf8');
-  const data = JSON.parse(raw);
-  const keys = Object.keys(data);
-  if (keys.length) {
-    cacheKey = keys[0];
-    cacheEntry = data[keys[0]];
-  }
-} catch (e) {
-  /* Если кэша нет — fallback на синтетику. */
-}
+const YT = loadIife('client/shared/youtube-export.js', 'YouTubeExport');
 
 /**
  * 7 мая 2026: ролики разной длительности — стартеры должны работать на всех.
@@ -87,7 +53,8 @@ function buildSyntheticEntry(targetDur) {
   const segments = [];
   let t = 0;
   for (let i = 0; i < phrases.length && t < targetDur; i++) {
-    const len = 6 + (i % 4) + Math.random() * 4;
+    /* Детерминированный «шум» вместо Math.random(): (i*37 % 40)/10 ∈ [0, 3.9] */
+    const len = 6 + (i % 4) + ((i * 37) % 40) / 10;
     const e = Math.min(targetDur, t + len);
     segments.push({ startSec: t, endSec: e, text: phrases[i] });
     /* случайные мини-паузы для buildParagraphs */
@@ -98,15 +65,13 @@ function buildSyntheticEntry(targetDur) {
   return entry;
 }
 
-/* Реальный кэш + синтетические разной длины. Каждый сценарий гоняем по всем. */
-const FIXTURES = [];
-if (cacheEntry) FIXTURES.push({ name: 'real-cache', entry: cacheEntry });
-FIXTURES.push({ name: 'short-1min', entry: buildSyntheticEntry(60) });
-FIXTURES.push({ name: 'medium-10min', entry: buildSyntheticEntry(600) });
-FIXTURES.push({ name: 'long-1h', entry: buildSyntheticEntry(3600) });
+/* Синтетические фикстуры разной длины. Каждый сценарий гоняем по всем. */
+const FIXTURES = [
+  { name: 'short-1min', entry: buildSyntheticEntry(60) },
+  { name: 'medium-10min', entry: buildSyntheticEntry(600) },
+  { name: 'long-1h', entry: buildSyntheticEntry(3600) }
+];
 
-/* Берём максимум из segments + paragraphs — на реальном кэше после ripple_delete
-   segments могут быть короче чем paragraphs (stale), это валидный edge case. */
 function _maxEnd(arr) {
   let m = 0;
   for (const x of arr || []) {
@@ -116,20 +81,12 @@ function _maxEnd(arr) {
   return m;
 }
 
-/* Реальный кэш используем как основной entry только если он содержательный.
-   Smoke-кэш после install-теста бывает 1 абзац на ~8с — на нём структурные сценарии
-   («выбери каждый 2-й абзац», «уложи в 50%») вырожденны: нечего удалять / ничего не влезает.
-   Реальный кэш всё равно прогоняется в общем цикле по FIXTURES ниже. */
-function _isRichEntry(e) {
-  return !!e && Array.isArray(e.paragraphs) && e.paragraphs.length >= 4
-    && Math.max(_maxEnd(e.segments), _maxEnd(e.paragraphs)) >= 60;
-}
-const entry = _isRichEntry(cacheEntry) ? cacheEntry : buildSyntheticEntry(600);
+const entry = buildSyntheticEntry(600);
 const totalDur = Math.max(_maxEnd(entry.segments), _maxEnd(entry.paragraphs)) || 60;
 
-describe('Scenario validation: real transcript cache', () => {
-  test('cache загружен (или synthetic fallback)', () => {
-    assert.ok(entry, 'нет ни кэша ни synthetic');
+describe('Scenario validation: synthetic transcript', () => {
+  test('fixture построена корректно', () => {
+    assert.ok(entry, 'нет synthetic entry');
     assert.ok(Array.isArray(entry.segments) && entry.segments.length > 0);
     assert.ok(Array.isArray(entry.paragraphs) && entry.paragraphs.length > 0);
   });
@@ -213,7 +170,7 @@ describe('Scenario: Filler Cleanup (paraziti, паузы, оговорки)', ()
     }));
     const res = TS.runLocalDetectors(segs);
     assert.ok(Array.isArray(res.labels), 'labels массив');
-    /* На реальном кэше кол-во маркируемых может быть 0 (чистая речь) — это ок,
+    /* Кол-во маркируемых может быть 0 (чистая речь) — это ок,
        главное чтобы функция не упала и формат был корректным. */
     res.labels.forEach(lb => {
       assert.equal(typeof lb.i, 'number');
@@ -240,7 +197,7 @@ describe('Scenario: Filler Cleanup (paraziti, паузы, оговорки)', ()
 
     const snap = {
       ok: true,
-      sequenceName: cacheKey || 'test',
+      sequenceName: 'test',
       sequenceEndSec: totalDur,
       inPointSec: 0,
       outPointSec: totalDur,
@@ -262,7 +219,7 @@ describe('Scenario: YouTube Chapters (propose_markers)', () => {
       name: 'Глава ' + (i + 1),
       type: 'chapter'
     }));
-    /* На коротком кэше может быть < 3 параграфов — это норма, сценарий тогда
+    /* На короткой фикстуре может быть < 3 параграфов — это норма, сценарий тогда
        вернёт warning, и это допустимое поведение для validateForYouTube. */
     const warns = YT.validateForYouTube(markers);
     assert.ok(Array.isArray(warns));
@@ -323,8 +280,8 @@ describe('Scenario: Highlights (comment markers)', () => {
  * SCENARIO 6: Find Moments — семантический поиск
  * ─────────────────────────────────────────────────────────────────────── */
 /* ───────────────────────────────────────────────────────────────────────
- * SCENARIO 7: Multi-length validation — каждый сценарий по 4 фикстурам
- * (real cache + 1мин, 10мин, 1ч synthetic). Гарантирует что стартеры
+ * SCENARIO 7: Multi-length validation — каждый сценарий по 3 фикстурам
+ * (1мин, 10мин, 1ч synthetic). Гарантирует что стартеры
  * работают на роликах любой длины.
  * ─────────────────────────────────────────────────────────────────────── */
 describe('Multi-length validation: starters work on any video duration', () => {

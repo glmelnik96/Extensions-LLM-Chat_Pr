@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadNestReconstruct } from './load-nest-reconstruct.mjs';
-const { buildNestReconstructFilter, isReconstructableMediaPath } = loadNestReconstruct();
+import { loadIife } from './helpers.mjs';
+const { buildNestReconstructFilter, isReconstructableMediaPath } = loadIife('client/shared/nest-reconstruct.js', 'NestReconstruct');
 
 test('single segment: one input, adelay by localOffset, single-input mix passthrough', () => {
   const segs = [{ mediaPath: 'D:/a.braw', srcStart: 10, segDur: 5, localOffset: 0, streamIndex: 2 }];

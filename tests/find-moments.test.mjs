@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
-import { loadFindMoments } from './load-find-moments.mjs';
+import { loadIife } from './helpers.mjs';
 
-const FM = loadFindMoments();
+const FM = loadIife('client/shared/find-moments.js', 'FindMoments');
 
 const entry = {
   segments: [

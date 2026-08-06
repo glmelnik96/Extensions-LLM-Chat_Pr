@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadToolValidators } from './load-tool-validators.mjs';
+import { loadIife } from './helpers.mjs';
 
-const TV = loadToolValidators();
+const TV = loadIife('client/shared/tool-validators.js', 'ToolValidators');
 
 describe('validateEditPlan (§2.1)', () => {
   const snap = {
@@ -43,6 +43,13 @@ describe('validateEditPlan (§2.1)', () => {
     assert.match(
       TV.validateEditPlan(snap, { ops: [{ kind: 'remove_clip', nodeId: 'missing' }] }),
       /не найден/
+    );
+  });
+
+  test('remove_clip без nodeId — ошибка (не молчаливый пропуск)', () => {
+    assert.match(
+      TV.validateEditPlan(snap, { ops: [{ kind: 'remove_clip' }] }),
+      /nodeId/
     );
   });
 

@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadAnalysisRouting } from './load-analysis-routing.mjs';
+import { loadIife } from './helpers.mjs';
 
-const AR = loadAnalysisRouting();
+const AR = loadIife('client/shared/analysis-routing.js', 'AnalysisRouting');
 
 describe('AnalysisRouting.shouldRemoveLabel', () => {
   test('content никогда не режется (ни при одном режиме)', () => {
