@@ -919,17 +919,36 @@
         } catch (eACQ) {}
 
         /* Дедупликация сегментов: убрать перекрытия (например, музыка + речь дают
-           сегменты на одних и тех же таймкодах). Приоритет — более длинный текст. */
+           сегменты на одних и тех же таймкодах). Приоритет — более длинный текст.
+           Перф (ревью 06.08.2026): раньше попарный O(n²)-скан — на мультимик-
+           подкастах (тысячи сегментов) миллионы сравнений. mergedSegs отсортирован
+           по startSec: доминатор обязан начинаться не позже startSec+0.1 (бинпоиск
+           правой границы) и накрывать endSec−0.1 — префикс-максимум концов
+           обрывает обратный скан, когда слева уже некому накрывать. */
         var mergedSegs = mergeSegmentLists(segLists);
+        var maxEndUpTo = new Array(mergedSegs.length);
+        var runMax = -Infinity;
+        for (var pm = 0; pm < mergedSegs.length; pm++) {
+          if (mergedSegs[pm].endSec > runMax) runMax = mergedSegs[pm].endSec;
+          maxEndUpTo[pm] = runMax;
+        }
         var dedupedSegs = [];
         for (var di = 0; di < mergedSegs.length; di++) {
           var seg = mergedSegs[di];
+          var startLim = seg.startSec + 0.1;
+          /* Первый индекс с startSec > startLim — правее доминаторов нет. */
+          var lo = 0, hi = mergedSegs.length;
+          while (lo < hi) {
+            var mid = (lo + hi) >> 1;
+            if (mergedSegs[mid].startSec <= startLim) lo = mid + 1; else hi = mid;
+          }
           var dominated = false;
-          for (var dj = 0; dj < mergedSegs.length; dj++) {
-            if (di === dj) continue;
+          for (var dj = lo - 1; dj >= 0; dj--) {
+            if (maxEndUpTo[dj] < seg.endSec - 0.1) break; /* слева некому накрывать */
+            if (dj === di) continue;
             var other = mergedSegs[dj];
             /* seg полностью внутри other И текст other длиннее → seg дубликат */
-            if (other.startSec <= seg.startSec + 0.1 && other.endSec >= seg.endSec - 0.1 &&
+            if (other.endSec >= seg.endSec - 0.1 &&
                 (other.text || '').length > (seg.text || '').length) {
               dominated = true;
               break;

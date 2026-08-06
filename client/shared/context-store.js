@@ -109,6 +109,28 @@
     }
   }
 
+  /* Перф (ревью 06.08.2026): getTranscriptCache зовётся LED-поллингом каждые
+     ~4с и каждым findTranscriptEntry — раньше это давало до 6 readFileSync +
+     JSON.parse многомегабайтного кэша на КАЖДЫЙ вызов. Держим merged-результат
+     в памяти и перечитываем только когда mtime какого-то файла изменился
+     (например, записала другая панель). statSync по 6 путям на порядки дешевле
+     парсинга мегабайтов JSON. */
+  var _mergedCache = null;
+  var _mergedStamp = '';
+
+  function _stampPaths(paths) {
+    var fs;
+    try { fs = require('fs'); } catch (e) { return ''; }
+    if (!fs || typeof fs.statSync !== 'function') return '';
+    var parts = [];
+    for (var i = 0; i < paths.length; i++) {
+      var m = 0;
+      try { m = fs.statSync(paths[i]).mtimeMs || 0; } catch (e2) { m = 0; }
+      parts.push(paths[i] + ':' + m);
+    }
+    return parts.join('|');
+  }
+
   function readOneJsonFile(p) {
     try {
       var fs = require('fs');
@@ -125,6 +147,10 @@
   function readTranscriptFileMerged() {
     var paths = transcriptCacheFilePaths();
     if (!paths.length) return null;
+    var stamp = _stampPaths(paths);
+    if (_mergedCache !== null && stamp && stamp === _mergedStamp) {
+      return _mergedCache;
+    }
     var merged = {};
     var pi,
       part,
@@ -137,7 +163,10 @@
         }
       }
     }
-    return Object.keys(merged).length ? merged : null;
+    var result = Object.keys(merged).length ? merged : null;
+    _mergedCache = result;
+    _mergedStamp = stamp;
+    return result;
   }
 
   function writeTranscriptFileToAll(map) {
@@ -170,6 +199,12 @@
     }
     if (!ok && typeof console !== 'undefined' && console.warn) {
       console.warn('[ContextStore] Не удалось записать кэш транскрипта ни в один путь:', paths.join(' | '));
+    }
+    if (ok) {
+      /* Свежая запись = канонное состояние: обновляем in-memory кэш и штамп,
+         чтобы следующий read не перечитывал только что записанные файлы. */
+      _mergedCache = (map && Object.keys(map).length) ? map : null;
+      _mergedStamp = _stampPaths(paths);
     }
     return ok;
   }
@@ -252,11 +287,6 @@
       var d = typeof FM_DEFAULTS !== 'undefined' ? FM_DEFAULTS : {};
       return _sessionChatModelOverride || String(d.chatModel || '').trim();
     },
-    /** true — модель переопределена вручную (не дефолт). */
-    isSessionChatModelOverridden: function () {
-      return _sessionChatModelOverride != null;
-    },
-
     getResolvedSettings: function () {
       var d = typeof FM_DEFAULTS !== 'undefined' ? FM_DEFAULTS : {};
       var sec = typeof FM_SECRETS !== 'undefined' ? FM_SECRETS : {};
@@ -361,12 +391,6 @@
         return false;
       }
     },
-    appendMessage: function (panelId, msg) {
-      var m = this.getMessages(panelId);
-      m.push(msg);
-      this.setMessages(panelId, m);
-    },
-
     getTranscriptCache: function (panelId) {
       var fromFile = readTranscriptFileMerged();
       if (fromFile && typeof fromFile === 'object') {

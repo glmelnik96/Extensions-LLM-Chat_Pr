@@ -312,7 +312,9 @@
     if (k === 'mute_track') {
       return {
         action: 'mute_track',
-        trackType: String(op.trackType || 'audio'),
+        /* 06.08.2026 (ревью): default 'video' — как в host (premiere.jsx
+           mute_track) и валидаторе; 'audio' расходился с реальным поведением. */
+        trackType: String(op.trackType || 'video'),
         trackIndex: +op.trackIndex,
         muted: !!op.muted,
         _reason: op.reason

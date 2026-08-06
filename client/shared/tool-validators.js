@@ -85,7 +85,11 @@
             a.indexOf('timeline') >= 0 ||
             a === 'set_timeline_bounds');
         if (needsNodeId) {
-          if (!op.nodeId) continue;
+          /* 06.08.2026 (ревью): отсутствующий nodeId раньше молча пропускался
+             (continue) — заведомо неуспешный план уходил на host. */
+          if (!op.nodeId) {
+            return a + ': нужен nodeId клипа из последнего снимка таймлайна';
+          }
           if (!ids[String(op.nodeId)]) {
             return 'nodeId не найден на таймлайне в последнем снимке: ' + op.nodeId;
           }

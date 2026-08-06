@@ -28,7 +28,6 @@ PanelBoot.run('ИИ: монтаж', function () {
     stop: document.getElementById('stop'),
     err: document.getElementById('err'),
     transcribe: document.getElementById('btn-transcribe'),
-    hintBox: document.getElementById('hint-chips'),
     startersBox: document.getElementById('starters-container'),
     ledText: document.getElementById('transcript-led-text'),
     usageBadge: document.getElementById('usage-badge'),
@@ -3178,6 +3177,9 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     /* US-004: если keepIntervals — инвертируем в removeIntervals. */
     var workingArgs = args;
+    /* 06.08.2026 (ревью): сброс до ветки — иначе warning от ПРЕДЫДУЩЕГО
+       keep-предложения утекал в следующее (remove-only) предложение. */
+    _keepInvertWarning = null;
     if (hasKeep) {
       /* Sentence-end подрезка keep (2026-07-21, фикс «фраза обрывается» / часть C):
          LLM иногда ставит границу keep ВНУТРИ предложения (сегмент без терминальной
@@ -4550,14 +4552,6 @@ PanelBoot.run('ИИ: монтаж', function () {
     placeholder: 'Опишите задачу обычными словами…'
   };
 
-  /* Legacy aliases для совместимости */
-  var PRESETS = {
-    unified: UNIFIED_PRESET,
-    timecode: UNIFIED_PRESET,
-    textmontage: UNIFIED_PRESET,
-    markers: UNIFIED_PRESET
-  };
-
   var active = UNIFIED_PRESET;
 
   /* ─── Render history ────────────────────────────────────────────── */
@@ -4868,75 +4862,130 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
   }
 
+  /* Перф (ревью 06.08.2026): инкрементальный рендер чата. В агент-цикле каждый
+     шаг зовёт renderMessages на одном и том же массиве (push + render), а полный
+     ребилд заново markdown-парсил ВСЕ пузыри — O(N²) DOM-работы за цикл. Если
+     новый список — продолжение прошлого (ссылки по префиксу совпадают),
+     дорисовываем только хвост. Иначе (очистка, смена вкладки, свежий
+     getMessages) — полный ребилд, как раньше. Бонус: раскрытые tool-пузыри
+     не схлопываются при дорисовке. */
+  var _rmPrev = [];  /* видимые сообщения прошлого рендера (ссылки) */
+  var _rmNodes = []; /* их DOM-пузыри, 1:1 с _rmPrev */
+
+  function _buildBubble(m) {
+    var isToolRole = m.role === 'tool';
+    var isAssistantToolCalls = m.role === 'assistant' && m.tool_calls && !m.content;
+    var collapsible = isToolRole || isAssistantToolCalls;
+
+    var div = document.createElement('div');
+    div.className =
+      'bubble ' +
+      (m.role === 'user' ? 'user' : m.role === 'assistant' ? 'assistant' : 'tool') +
+      (collapsible ? ' collapsible collapsed' : '');
+
+    var role = document.createElement('div');
+    role.className = 'role';
+
+    if (collapsible) {
+      var toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'bubble-toggle';
+      toggle.textContent = '▸';
+      var label = isAssistantToolCalls
+        ? 'assistant · tools (' +
+          m.tool_calls
+            .map(function (t) {
+              return t.function.name;
+            })
+            .join(', ') +
+          ')'
+        : 'tool result';
+      var roleText = document.createElement('span');
+      roleText.textContent = label;
+      toggle.onclick = function () {
+        var isCollapsed = div.classList.toggle('collapsed');
+        toggle.textContent = isCollapsed ? '▸' : '▾';
+      };
+      role.appendChild(toggle);
+      role.appendChild(roleText);
+    } else {
+      role.textContent = m.role + (m.tool_calls ? ' · tools' : '');
+    }
+    div.appendChild(role);
+
+    var body = document.createElement('div');
+    body.className = 'bubble-body';
+    var bodyText =
+      m.content ||
+      (m.tool_calls
+        ? JSON.stringify(
+            m.tool_calls.map(function (t) {
+              return t.function.name;
+            })
+          )
+        : '');
+    /* Markdown — только для развёрнутых ответов ассистента (не tool-результатов) */
+    setBubbleBody(body, collapsible ? 'tool' : m.role, bodyText);
+    div.appendChild(body);
+    return { div: div, isAnswer: m.role === 'assistant' && !collapsible };
+  }
+
   function renderMessages(msgs) {
     var wasNearBottom = chatNearBottom();
     removeStreamBubble();
-    el.chat.innerHTML = '';
-    var lastAnswerDiv = null;
-    msgs.forEach(function (m) {
-      if (m.role === 'system') return;
 
-      var isToolRole = m.role === 'tool';
-      var isAssistantToolCalls = m.role === 'assistant' && m.tool_calls && !m.content;
-      var collapsible = isToolRole || isAssistantToolCalls;
+    var vis = [];
+    for (var vi = 0; vi < msgs.length; vi++) {
+      if (msgs[vi] && msgs[vi].role !== 'system') vis.push(msgs[vi]);
+    }
 
-      var div = document.createElement('div');
-      div.className =
-        'bubble ' +
-        (m.role === 'user' ? 'user' : m.role === 'assistant' ? 'assistant' : 'tool') +
-        (collapsible ? ' collapsible collapsed' : '');
-
-      var role = document.createElement('div');
-      role.className = 'role';
-
-      if (collapsible) {
-        var toggle = document.createElement('button');
-        toggle.type = 'button';
-        toggle.className = 'bubble-toggle';
-        toggle.textContent = '▸';
-        var label = isAssistantToolCalls
-          ? 'assistant · tools (' +
-            m.tool_calls
-              .map(function (t) {
-                return t.function.name;
-              })
-              .join(', ') +
-            ')'
-          : 'tool result';
-        var roleText = document.createElement('span');
-        roleText.textContent = label;
-        toggle.onclick = function () {
-          var isCollapsed = div.classList.toggle('collapsed');
-          toggle.textContent = isCollapsed ? '▸' : '▾';
-        };
-        role.appendChild(toggle);
-        role.appendChild(roleText);
-      } else {
-        role.textContent = m.role + (m.tool_calls ? ' · tools' : '');
+    var incremental = _rmNodes.length > 0 && vis.length >= _rmPrev.length;
+    if (incremental) {
+      for (var p = 0; p < _rmPrev.length; p++) {
+        if (vis[p] !== _rmPrev[p] || _rmNodes[p].parentNode !== el.chat) {
+          incremental = false;
+          break;
+        }
       }
-      div.appendChild(role);
+    }
 
-      var body = document.createElement('div');
-      body.className = 'bubble-body';
-      var bodyText =
-        m.content ||
-        (m.tool_calls
-          ? JSON.stringify(
-              m.tool_calls.map(function (t) {
-                return t.function.name;
-              })
-            )
-          : '');
-      /* Markdown — только для развёрнутых ответов ассистента (не tool-результатов) */
-      setBubbleBody(body, collapsible ? 'tool' : m.role, bodyText);
-      div.appendChild(body);
-      el.chat.appendChild(div);
-      if (m.role === 'assistant' && !collapsible) lastAnswerDiv = div;
-    });
+    var startIdx;
+    if (incremental) {
+      startIdx = _rmPrev.length;
+      /* Служебные карточки в конце ленты убираем, чтобы хвост встал по порядку
+         (proposal-карточка пере-рендерится ниже, welcome при пустом чате). */
+      var wc = el.chat.querySelector('.welcome-card');
+      if (wc && wc.parentNode) wc.parentNode.removeChild(wc);
+      var pc = document.getElementById('pending-proposal-card');
+      if (pc && pc.parentNode === el.chat) el.chat.removeChild(pc);
+    } else {
+      el.chat.innerHTML = '';
+      _rmPrev = [];
+      _rmNodes = [];
+      startIdx = 0;
+    }
+
+    var lastAnswerDiv = null;
+    for (var i = startIdx; i < vis.length; i++) {
+      var built = _buildBubble(vis[i]);
+      el.chat.appendChild(built.div);
+      _rmPrev.push(vis[i]);
+      _rmNodes.push(built.div);
+      if (built.isAnswer) lastAnswerDiv = built.div;
+    }
     /* Ход мыслей переезжает из живого пузыря в финальный ответ — иначе журнал
        исчезал ровно в тот момент, когда его хочется перечитать. Живёт до
        перезагрузки панели: в историю не пишем (лишние килобайты на каждый ход). */
     if (lastAnswerDiv && _thinkLog && !_thinkLog.isEmpty()) {
+      if (incremental) {
+        /* Панель могла остаться в предыдущем ответе — переносим в новый. */
+        var oldPanel = el.chat.querySelector('.think-panel');
+        if (oldPanel && !lastAnswerDiv.contains(oldPanel)) {
+          var oldBtn = el.chat.querySelector('.think-btn');
+          if (oldBtn && oldBtn.parentNode) oldBtn.parentNode.removeChild(oldBtn);
+          if (oldPanel.parentNode) oldPanel.parentNode.removeChild(oldPanel);
+        }
+      }
       _thinkPanel = ensureThinkPanel(lastAnswerDiv);
       renderThinkPanel(_thinkPanel);
     }
@@ -5031,12 +5080,6 @@ PanelBoot.run('ИИ: монтаж', function () {
     else _expandedCat = _storedCat;                         /* явный выбор категории */
   } catch (e) {
     console.warn('[panel] localStorage read for expanded_cat failed:', e && e.message);
-  }
-
-  /* Hint-chips теперь рендерятся ВНУТРИ развёрнутой категории, не отдельно */
-  function rebuildHintChips() {
-    if (!el.hintBox) return;
-    el.hintBox.innerHTML = ''; /* hint-box больше не используется как отдельная строка */
   }
 
   /**
@@ -7340,14 +7383,11 @@ PanelBoot.run('ИИ: монтаж', function () {
     active = UNIFIED_PRESET;
     if (el.input) el.input.placeholder = active.placeholder || '';
     renderMessages(ContextStore.getMessages(active.panelId));
-    rebuildHintChips();
     rebuildStarters();
     refreshUndoButton();
     refreshTranscriptBanner();
   }
 
-  /* Legacy-совместимость: если где-то вызывается activatePreset — просто noop */
-  function activatePreset() { /* единая панель, переключения нет */ }
 
   initUnifiedPanel();
 
@@ -7381,7 +7421,6 @@ PanelBoot.run('ИИ: монтаж', function () {
     var toolsErr = document.getElementById('tools-err');
     var toolsLed = document.getElementById('tools-led');
     var toolsLedText = document.getElementById('tools-led-text');
-    var toolsTranscribe = document.getElementById('tools-btn-transcribe');
     var _toolsProposal = null;
     var _toolsProposalArea = null;
     var _toolsBusy = false; /* идёт «Анализ аудио» — держим LED busy, не перетираем */
@@ -11037,18 +11076,6 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (tool) toolsRunTool(tool);
         });
       })(runBtns[ri]);
-    }
-
-    /* ── Tools transcribe button → same as chat's ─────────── */
-    if (toolsTranscribe) {
-      toolsTranscribe.onclick = function () {
-        /* Switch to chat view and trigger transcribe there */
-        var chatTab = document.querySelector('.view-tab[data-view="chat"]');
-        if (chatTab) chatTab.click();
-        setTimeout(function () {
-          if (el.transcribe) el.transcribe.click();
-        }, 100);
-      };
     }
 
     /* ── Init LED ─────────────────────────────────────────── */

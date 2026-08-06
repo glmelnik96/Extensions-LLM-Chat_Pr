@@ -221,9 +221,13 @@
         } catch (_ra) {}
       } catch (fetchErr) {
         _cleanupAttempt();
-        /* AbortError от внешнего abortCheck — пробрасываем. */
+        /* AbortError от внешней отмены — пробрасываем. 06.08.2026 (ревью):
+           раньше проверялся только abortCheck; если caller передал ТОЛЬКО
+           abortSignal, отмена превращалась в «Таймаут» → ретраи и фолбэк
+           модели по уже отменённому запросу. */
         if (fetchErr && fetchErr.name === 'AbortError') {
-          if (typeof abortCheck === 'function' && abortCheck()) throw fetchErr;
+          if ((typeof abortCheck === 'function' && abortCheck()) ||
+              (fetchOpts && fetchOpts.signal && fetchOpts.signal.aborted)) throw fetchErr;
           /* Иначе это наш таймаут — делаем retryable ошибкой. */
           lastErr = new Error('Таймаут запроса (' + (timeoutMs / 1000).toFixed(0) + 'с)');
           if (attempt === maxRetries - 1) throw lastErr;

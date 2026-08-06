@@ -29,6 +29,22 @@
     return /[.!?…]$/.test(t);
   }
 
+  /* Перф (ревью 06.08.2026): бинпоиск по отсортированным паузам.
+   * Паузы silencedetect не перекрываются ⇒ отсортированность по startSec
+   * влечёт отсортированность по endSec — ищем первый индекс с endSec >= t.
+   * Плотная карта (d=0.15) на длинном ролике — тысячи пауз; линейный скан
+   * на каждую границу сегмента давал O(N×M). */
+  function firstSilenceEndingAfter(sil, t) {
+    var lo = 0, hi = sil.length;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      var s = sil[mid];
+      var e = s ? Number(typeof s.endSec === 'number' ? s.endSec : s.end) : NaN;
+      if (isFinite(e) && e < t) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  }
+
   /**
    * Строит paragraphs[] по segments + silences.
    * silences: [{startSec, endSec, durationSec}] в координатах ТАЙМЛАЙНА (совпадает с segments).
@@ -46,7 +62,7 @@
     function silenceBetween(tA, tB) {
       if (tB <= tA) return 0;
       var acc = 0;
-      for (var i = 0; i < sil.length; i++) {
+      for (var i = firstSilenceEndingAfter(sil, tA); i < sil.length; i++) {
         var s = sil[i].startSec, e = sil[i].endSec;
         if (e <= tA) continue;
         if (s >= tB) break;
@@ -779,10 +795,16 @@
 
     /* Фильтруем сегменты: в LLM отправляем только те, что не размечены локально с confidence='high' */
     var segmentsForLLM = [];
+    /* 06.08.2026 (ревью): параллельный массив ОРИГИНАЛЬНЫХ индексов. Раньше
+       fallback в чанке брал позицию в ОТФИЛЬТРОВАННОМ массиве (ci+idx) —
+       при пропуске локально размеченных сегментов LLM-метки уезжали на
+       чужие сегменты. */
+    var llmOrigIdx = [];
     for (var fi = 0; fi < segments.length; fi++) {
       var fIdx = segments[fi].i !== undefined ? segments[fi].i : fi;
       if (preByIndex[fIdx] && preByIndex[fIdx].confidence === 'high') continue;
       segmentsForLLM.push(segments[fi]);
+      llmOrigIdx.push(fIdx);
     }
 
     onProgress({
@@ -852,7 +874,7 @@
       var slice = segmentsForLLM.slice(ci, ci + ANALYSIS_CHUNK_SIZE);
       chunks.push(slice.map(function (s, idx) {
         var item = {
-          i: s.i !== undefined ? s.i : (ci + idx),
+          i: llmOrigIdx[ci + idx],
           t0: s.startSec,
           t1: s.endSec,
           text: truncText(s.text)
@@ -1623,12 +1645,16 @@
    * Возврат {timeSec, inGap} | null. */
   function _nearestSpeechEdge(t, silences, kind, wide, narrow) {
     var best = null;
-    for (var i = 0; i < silences.length; i++) {
+    /* Перф: silences отсортированы вызывающим (verifySegmentBoundaries);
+       релевантны лишь паузы в окне ±win вокруг t — бинпоиск + ранний выход. */
+    var win = wide > narrow ? wide : narrow;
+    for (var i = firstSilenceEndingAfter(silences, t - win); i < silences.length; i++) {
       var s = silences[i];
       if (!s) continue;
       var a = Number(typeof s.startSec === 'number' ? s.startSec : s.start);
       var b = Number(typeof s.endSec === 'number' ? s.endSec : s.end);
       if (!isFinite(a) || !isFinite(b) || b < a) continue;
+      if (a > t + win) break; /* дальше паузы только позже — не релевантны */
       /* Граница внутри паузы — точный ответ без окон: речь возобновляется
          в её конце (onset) / закончилась в её начале (offset). */
       if (t >= a && t <= b) return { timeSec: kind === 'onset' ? b : a, inGap: true };
@@ -1654,7 +1680,13 @@
     var wide = typeof opts.wideSec === 'number' ? opts.wideSec : VERIFY_WIDE_SEC;
     var narrow = typeof opts.narrowSec === 'number' ? opts.narrowSec : VERIFY_NARROW_SEC;
     var list = Array.isArray(segments) ? segments : [];
-    var sil = Array.isArray(silencesDense) ? silencesDense : [];
+    /* Сортированная копия — контракт бинпоиска в _nearestSpeechEdge. */
+    var sil = (Array.isArray(silencesDense) ? silencesDense : []).slice()
+      .sort(function (x, y) {
+        var xa = x ? Number(typeof x.startSec === 'number' ? x.startSec : x.start) : 0;
+        var ya = y ? Number(typeof y.startSec === 'number' ? y.startSec : y.start) : 0;
+        return (isFinite(xa) ? xa : 0) - (isFinite(ya) ? ya : 0);
+      });
     if (!list.length || !sil.length) {
       return {
         segments: list,

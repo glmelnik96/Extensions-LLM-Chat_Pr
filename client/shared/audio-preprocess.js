@@ -51,7 +51,7 @@
     return null;
   }
 
-  function runFfmpeg(args, timeoutMs) {
+  function runFfmpeg(args, timeoutMs, opts) {
     return new Promise(function (resolve, reject) {
       if (!hasNode()) return reject(new Error('Node.js недоступен'));
       var bin = findFfmpegPath();
@@ -74,11 +74,17 @@
           if (err && /maxbuffer/i.test(String(err.message || ''))) {
             return reject(new Error('вывод ffmpeg превысил буфер (32 МБ) — результат неполный. Файл слишком длинный для этого анализа.'));
           }
-          /* ffmpeg даже при "успехе" пишет метрики в stderr и иногда выходит с кодом 0.
-             Также для -f null детектор выходит с кодом 0 и всей информацией в stderr. */
+          /* 06.08.2026 (ревью): ненулевой exit — ВСЕГДА ошибка (битый файл,
+             нет аудиопотока, неверный фильтр). Раньше непустой stderr резолвил
+             такой вызов как успех → анализ тишин молча возвращал пустую карту.
+             Успешные анализы (-f null) выходят с кодом 0, метрики в stderr —
+             это норма. opts.tolerateExit — только для probe-вызовов: «ffmpeg -i»
+             без выходного файла всегда завершается ошибкой, но Duration/Stream
+             уже в stderr. */
           var exitCode = (err && (err.code != null)) ? err.code : 0;
-          if (err && err.code !== 0 && err.code !== null && !(stderr && stderr.length)) {
-            return reject(new Error('ffmpeg exit: ' + String(err.message || err)));
+          if (exitCode !== 0 && !(opts && opts.tolerateExit)) {
+            var tail = String(stderr || '').split('\n').slice(-6).join('\n').slice(0, 500);
+            return reject(new Error('ffmpeg exit ' + exitCode + ': ' + (tail || String(err && err.message || err))));
           }
           resolve({ stdout: String(stdout || ''), stderr: String(stderr || ''), exitCode: exitCode });
         });
@@ -94,8 +100,8 @@
    */
   function probeDurationSec(inputPath) {
     /* Без выходного файла ffmpeg завершается с ошибкой, но Duration уже в stderr —
-       runFfmpeg резолвит, т.к. stderr непустой. */
-    return runFfmpeg(['-hide_banner', '-i', inputPath], 30000).then(function (res) {
+       tolerateExit пропускает ненулевой exit. */
+    return runFfmpeg(['-hide_banner', '-i', inputPath], 30000, { tolerateExit: true }).then(function (res) {
       var m = String(res.stderr || '').match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
       if (!m) return null;
       var sec = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
@@ -109,7 +115,7 @@
    * от родных размеров исходника. Promise<{width, height}|null>.
    */
   function probeVideoDimensions(inputPath) {
-    return runFfmpeg(['-hide_banner', '-i', inputPath], 30000).then(function (res) {
+    return runFfmpeg(['-hide_banner', '-i', inputPath], 30000, { tolerateExit: true }).then(function (res) {
       var lines = String(res.stderr || '').split('\n');
       for (var i = 0; i < lines.length; i++) {
         if (!/Stream #\d+:\d+.*: Video:/.test(lines[i])) continue;
@@ -406,7 +412,10 @@
       '-frames:v', '1', '-vf', 'scale=min(' + maxW + '\\,iw):-2',
       '-q:v', '3', '-y', tmp
     ];
-    return runFfmpeg(args, 60000).then(function (res) {
+    /* tolerateExit: успех определяется наличием выходного jpg, а из stderr
+       строим осмысленную подсказку (BRAW/за концом файла) — строгий reject
+       её бы потерял. */
+    return runFfmpeg(args, 60000, { tolerateExit: true }).then(function (res) {
       var buf = null;
       try { if (fs.existsSync(tmp)) buf = fs.readFileSync(tmp); } catch (eR) {}
       try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (eU) {}

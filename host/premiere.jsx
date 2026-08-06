@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.16.0';
+$._EXT_PRM_.version = '2.16.1';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -197,18 +197,15 @@ $._EXT_PRM_._wrap = function (name, fn) {
 };
 
 /**
- * Тики на секунде для активной секвенции (timebase в тиках/сек, см. getTimelineSnapshot).
- * Fallback ~25 fps, если timebase недоступен.
+ * Тики на секунду. 06.08.2026 (ревью): БАГ — раньше возвращали seq.timebase,
+ * но timebase = тики на КАДР (254016000000 / fps), не на секунду. Все
+ * тиковые вычисления (move(ticks), маркер-стратегии 3/4, span-маркеры)
+ * получались в ~fps раз меньше нужного и отбраковывались верификацией
+ * дрейфа. TICKS_PER_SECOND в Premiere — фиксированная константа,
+ * от секвенции не зависит.
  */
-$._EXT_PRM_._ticksPerSecond = function (seq) {
-  var tb = parseFloat(seq.timebase);
-  if (!tb || isNaN(tb)) tb = 10160640000;
-  return tb;
-};
-
-/** Конвертация секунд → строка тиков (insertClip и др.). */
-$._EXT_PRM_._ticksStr = function (seq, sec) {
-  return String(Math.round(sec * $._EXT_PRM_._ticksPerSecond(seq)));
+$._EXT_PRM_._ticksPerSecond = function () {
+  return 254016000000;
 };
 
 /**
@@ -268,28 +265,6 @@ $._EXT_PRM_._findClipByNodeId = function (seq, nodeId) {
     }
   }
   return null;
-};
-
-$._EXT_PRM_._findClipAtTimelineStart = function (seq, isVideo, trackIndex, targetSec, epsOverride) {
-  var tr = isVideo ? seq.videoTracks[trackIndex] : seq.audioTracks[trackIndex];
-  var eps = typeof epsOverride === 'number' ? epsOverride : $._EXT_PRM_._EPS;
-  var j,
-    n = tr.clips.numItems,
-    it,
-    best = null,
-    bestD = 1e9;
-  for (j = 0; j < n; j++) {
-    try {
-      it = tr.clips[j];
-      if (!it) continue;
-      var d = Math.abs(it.start.seconds - targetSec);
-      if (d < eps && d < bestD) {
-        bestD = d;
-        best = it;
-      }
-    } catch (e2) {}
-  }
-  return best;
 };
 
 /**
@@ -670,31 +645,63 @@ $._EXT_PRM_._applyOneTimelineInterval = function (seq, t0, t1, log, ripple, stat
       continue;
     }
 
+    /* 06.08.2026 (ревью): сеттер `.seconds` на Time-свойствах клипа — ТИХИЙ
+       no-op (clip.inPoint/start возвращают КОПИЮ Time; live-находка 27.07).
+       Работает только присваивание целого Time-объекта + read-back
+       верификация (без неё no-op отчитывался бы как applied). */
+
     /* Case 2: отрезает начало клипа */
     if (i0 <= s + eps && i1 < e - eps) {
-      clip.inPoint.seconds = srcIn + (i1 - s); $._EXT_PRM_._bump();
-      if (Math.abs(clip.start.seconds - i1) > eps) { clip.start.seconds = i1; $._EXT_PRM_._bump(); }
-      stats.applied++;
-      log.push({ op: 'trim_prefix', nodeId: String(clip.nodeId), newStartSec: i1 });
+      var tIn2 = new Time(); tIn2.seconds = srcIn + (i1 - s);
+      clip.inPoint = tIn2; $._EXT_PRM_._bump();
+      if (Math.abs(clip.start.seconds - i1) > eps) {
+        var tSt2 = new Time(); tSt2.seconds = i1;
+        clip.start = tSt2; $._EXT_PRM_._bump();
+      }
+      if (Math.abs(clip.start.seconds - i1) <= 0.02) {
+        stats.applied++;
+        log.push({ op: 'trim_prefix', nodeId: String(clip.nodeId), newStartSec: i1 });
+      } else {
+        $._EXT_PRM_._statFail(stats, 'trim_prefix: start не применился (read-back ' + clip.start.seconds + ' ≠ ' + i1 + ')');
+        log.push({ op: 'trim_prefix_failed', nodeId: String(clip.nodeId), newStartSec: i1 });
+      }
       continue;
     }
 
     /* Case 3: отрезает конец клипа */
     if (i0 > s + eps && i1 >= e - eps) {
-      clip.outPoint.seconds = srcIn + (i0 - s); $._EXT_PRM_._bump();
-      if (Math.abs(clip.end.seconds - i0) > eps) { clip.end.seconds = i0; $._EXT_PRM_._bump(); }
-      stats.applied++;
-      log.push({ op: 'trim_suffix', nodeId: String(clip.nodeId), newEndSec: i0 });
+      var tOut3 = new Time(); tOut3.seconds = srcIn + (i0 - s);
+      clip.outPoint = tOut3; $._EXT_PRM_._bump();
+      if (Math.abs(clip.end.seconds - i0) > eps) {
+        var tEn3 = new Time(); tEn3.seconds = i0;
+        clip.end = tEn3; $._EXT_PRM_._bump();
+      }
+      if (Math.abs(clip.end.seconds - i0) <= 0.02) {
+        stats.applied++;
+        log.push({ op: 'trim_suffix', nodeId: String(clip.nodeId), newEndSec: i0 });
+      } else {
+        $._EXT_PRM_._statFail(stats, 'trim_suffix: end не применился (read-back ' + clip.end.seconds + ' ≠ ' + i0 + ')');
+        log.push({ op: 'trim_suffix_failed', nodeId: String(clip.nodeId), newEndSec: i0 });
+      }
       continue;
     }
 
     /* Case 4: середина — без QE только обрезка до t0 (правая часть потеряна) */
     if (i0 > s + eps && i1 < e - eps) {
-      clip.outPoint.seconds = srcIn + (i0 - s); $._EXT_PRM_._bump();
-      if (Math.abs(clip.end.seconds - i0) > eps) { clip.end.seconds = i0; $._EXT_PRM_._bump(); }
-      stats.applied++;
-      log.push({ op: 'trim_suffix_no_split', nodeId: String(clip.nodeId), newEndSec: i0,
-        warn: 'QE DOM недоступен — правая часть клипа после ' + i1.toFixed(2) + ' с потеряна. Включите QE DOM.' });
+      var tOut4 = new Time(); tOut4.seconds = srcIn + (i0 - s);
+      clip.outPoint = tOut4; $._EXT_PRM_._bump();
+      if (Math.abs(clip.end.seconds - i0) > eps) {
+        var tEn4 = new Time(); tEn4.seconds = i0;
+        clip.end = tEn4; $._EXT_PRM_._bump();
+      }
+      if (Math.abs(clip.end.seconds - i0) <= 0.02) {
+        stats.applied++;
+        log.push({ op: 'trim_suffix_no_split', nodeId: String(clip.nodeId), newEndSec: i0,
+          warn: 'QE DOM недоступен — правая часть клипа после ' + i1.toFixed(2) + ' с потеряна. Включите QE DOM.' });
+      } else {
+        $._EXT_PRM_._statFail(stats, 'trim_suffix_no_split: end не применился (read-back ' + clip.end.seconds + ' ≠ ' + i0 + ')');
+        log.push({ op: 'trim_suffix_no_split_failed', nodeId: String(clip.nodeId), newEndSec: i0 });
+      }
       continue;
     }
   }
@@ -968,22 +975,31 @@ $._EXT_PRM_._setTimelineIn = function (found, newStartSec) {
   var seq = app.project.activeSequence;
   var linked = seq ? $._EXT_PRM_._findLinkedClips(seq, clip) : [clip];
   var delta = newStartSec - s;
+  /* 06.08.2026 (ревью): `.seconds`-сеттер на Time-свойствах — тихий no-op
+     (live-находка 27.07): присваиваем целый Time-объект + read-back,
+     иначе функция отчитывалась бы ok:true при неизменном клипе. */
+  var applied = 0;
   for (var k = 0; k < linked.length; k++) {
     try {
       /* Premiere: end = start + (outPoint - inPoint).
          Для trim-left: увеличиваем inPoint → Premiere сокращает clip с начала.
          Затем двигаем start на новую позицию. */
       var c = linked[k];
-      var newIn = c.inPoint.seconds + delta;
-      c.inPoint.seconds = newIn; $._EXT_PRM_._bump();
+      var tIn = new Time(); tIn.seconds = c.inPoint.seconds + delta;
+      c.inPoint = tIn; $._EXT_PRM_._bump();
       /* Premiere может автоматически скорректировать start/end.
          Если start не сместился — двигаем вручную: */
       if (Math.abs(c.start.seconds - newStartSec) > $._EXT_PRM_._EPS) {
-        c.start.seconds = newStartSec; $._EXT_PRM_._bump();
+        var tSt = new Time(); tSt.seconds = newStartSec;
+        c.start = tSt; $._EXT_PRM_._bump();
       }
+      if (Math.abs(c.start.seconds - newStartSec) <= 0.02) applied++;
     } catch (eL) {}
   }
-  return { ok: true, trimmedClips: linked.length };
+  if (!applied) {
+    return { ok: false, error: 'set_timeline_in не применился ни к одному из ' + linked.length + ' связанных клипов (read-back не подтвердил новый start)' };
+  }
+  return { ok: true, trimmedClips: applied };
 };
 
 $._EXT_PRM_._setTimelineOut = function (found, newEndSec) {
@@ -996,19 +1012,28 @@ $._EXT_PRM_._setTimelineOut = function (found, newEndSec) {
   var seq = app.project.activeSequence;
   var linked = seq ? $._EXT_PRM_._findLinkedClips(seq, clip) : [clip];
   var delta = e - newEndSec;
+  /* 06.08.2026 (ревью): Time-присваивание + read-back вместо no-op
+     `.seconds`-сеттера (см. _setTimelineIn). */
+  var applied = 0;
   for (var k = 0; k < linked.length; k++) {
     try {
       /* Premiere: end = start + (outPoint - inPoint).
          Для trim-right: уменьшаем outPoint → Premiere сокращает clip с конца. */
       var c = linked[k];
-      c.outPoint.seconds = c.outPoint.seconds - delta; $._EXT_PRM_._bump();
+      var tOut = new Time(); tOut.seconds = c.outPoint.seconds - delta;
+      c.outPoint = tOut; $._EXT_PRM_._bump();
       /* Если end не скорректировался — поправляем вручную: */
       if (Math.abs(c.end.seconds - newEndSec) > $._EXT_PRM_._EPS) {
-        c.end.seconds = newEndSec; $._EXT_PRM_._bump();
+        var tEn = new Time(); tEn.seconds = newEndSec;
+        c.end = tEn; $._EXT_PRM_._bump();
       }
+      if (Math.abs(c.end.seconds - newEndSec) <= 0.02) applied++;
     } catch (eL) {}
   }
-  return { ok: true, trimmedClips: linked.length };
+  if (!applied) {
+    return { ok: false, error: 'set_timeline_out не применился ни к одному из ' + linked.length + ' связанных клипов (read-back не подтвердил новый end)' };
+  }
+  return { ok: true, trimmedClips: applied };
 };
 
 $._EXT_PRM_.getTimelineSnapshot = function () {
@@ -1144,6 +1169,25 @@ $._EXT_PRM_.getTimelineSnapshot = function () {
 };
 
 /* __FP_HELPERS_BEGIN__ */
+/* Перф (ревью 06.08.2026): getMediaPath() — дорогой DOM-вызов, а LED-поллинг
+   считает отпечаток каждые 4с. Путь projectItem в рамках сессии стабилен
+   (relink — редкость и позиции клипов не двигает), кэшируем по nodeId.
+   Пустые пути не кэшируем — offline-медиа может стать online. */
+var _extMediaPathCache = {};
+function _extMediaPathOf(pi) {
+  if (!pi) return '';
+  var key = '';
+  try { key = String(pi.nodeId || ''); } catch (eK) {}
+  if (key && _extMediaPathCache.hasOwnProperty(key)) return _extMediaPathCache[key];
+  var mp = '';
+  try {
+    if (typeof pi.getMediaPath === 'function') mp = String(pi.getMediaPath() || '');
+    else if (pi.mediaPath) mp = String(pi.mediaPath);
+  } catch (eMP) {}
+  if (key && mp) _extMediaPathCache[key] = mp;
+  return mp;
+}
+
 /**
  * FNV-1a 32-bit по код-юнитам строки (ES3: умножение на 16777619 через сдвиги,
  * суммы точны в double до 2^53, >>>0 усекает по модулю 2^32). Возврат — 8 hex.
@@ -1175,11 +1219,7 @@ function _extAudioFpString(seq) {
       var cl = tr.clips[c];
       if (!cl) continue;
       var mp = '';
-      try {
-        var pi = cl.projectItem;
-        if (pi && typeof pi.getMediaPath === 'function') mp = String(pi.getMediaPath() || '');
-        else if (pi && pi.mediaPath) mp = String(pi.mediaPath);
-      } catch (eMP) {}
+      try { mp = _extMediaPathOf(cl.projectItem); } catch (eMP) {}
       if (!mp) { try { mp = String(cl.name || ''); } catch (eN) {} }
       var st = '', en = '', ip = '';
       try { st = String(cl.start.ticks); } catch (eS) {}
@@ -1680,7 +1720,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
         if (!moved && Math.abs(deltaSec) > $._EXT_PRM_._EPS) {
           try {
             if (typeof leadClip.move === 'function') {
-              var tps2 = $._EXT_PRM_._ticksPerSecond(seq);
+              var tps2 = $._EXT_PRM_._ticksPerSecond();
               leadClip.move(Math.round(deltaSec * tps2)); $._EXT_PRM_._bump();
               moved = _verifyMove();
             }
@@ -1800,10 +1840,20 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
           });
           for (var lm = 0; lm < mvOrder.length; lm++) {
             try {
-              mvOrder[lm].start.seconds = op.newStartSec; $._EXT_PRM_._bump();
-              mvOrder[lm].end.seconds = op.newStartSec + dur; $._EXT_PRM_._bump();
+              /* 06.08.2026 (ревью): `.seconds`-сеттер — тихий no-op (live 27.07),
+                 стратегия была мертва. Присваиваем целые Time-объекты; порядок
+                 start/end зависит от направления (правый край освобождает место). */
+              var tMvS = new Time(); tMvS.seconds = op.newStartSec;
+              var tMvE = new Time(); tMvE.seconds = op.newStartSec + dur;
+              if (goingRight) {
+                mvOrder[lm].end = tMvE; $._EXT_PRM_._bump();
+                mvOrder[lm].start = tMvS; $._EXT_PRM_._bump();
+              } else {
+                mvOrder[lm].start = tMvS; $._EXT_PRM_._bump();
+                mvOrder[lm].end = tMvE; $._EXT_PRM_._bump();
+              }
             } catch (eMv) {
-              mvErr = (mvErr ? mvErr + '; ' : '') + 'start.seconds=: ' + String(eMv.message || eMv);
+              mvErr = (mvErr ? mvErr + '; ' : '') + 'start=Time: ' + String(eMv.message || eMv);
             }
           }
           moved = _verifyMove();
@@ -2328,7 +2378,7 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
       mk;
     var created = [];
     var failed = [];
-    var tps = $._EXT_PRM_._ticksPerSecond(seq);
+    var tps = $._EXT_PRM_._ticksPerSecond();
     /* Вспом.: проверить, куда встал маркер после создания. */
     var _mkPos = function (mm) {
       try {
@@ -2412,7 +2462,8 @@ $._EXT_PRM_.addSequenceMarkers = function (jsonMarkers) {
 
         /* Если встал с дрейфом > DRIFT_OK — пытаемся откорректировать mk.start.seconds. */
         if (res.drift !== null && res.drift > DRIFT_OK) {
-          try { res.mk.start.seconds = targetSec; } catch (eFix) {}
+          /* 06.08.2026: Time-присваивание вместо no-op `.seconds`-сеттера. */
+          try { var tFix = new Time(); tFix.seconds = targetSec; res.mk.start = tFix; } catch (eFix) {}
           var vs2 = _mkPos(res.mk);
           if (vs2 !== null) {
             res.verifiedSec = vs2;
@@ -4351,6 +4402,49 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     });
   }
 
+  /* 06.08.2026 (ревью): самовалидация границ — last line of defense, как в
+     applyTranscriptCuts. NaN/negative/inverted сегменты и время за концом
+     секвенции (QE-таймкод заворачивает по модулю 24ч → razor режет реальный
+     контент не там, P0) отклоняют ВЕСЬ план ДО undo group. Per-segment
+     fail-soft невозможен: сегменты взаимозависимы (общие razor-границы).
+     Отклоняем, не клампим. */
+  var seqEndMC = $._EXT_PRM_._seqEndSec(seq);
+  var chk = [];
+  var vk, vs;
+  for (vk = 0; vk < plan.segments.length; vk++) {
+    vs = plan.segments[vk];
+    /* 06.08.2026 (live-тест): не-числовые tStart/tEnd (null после JSON и т.п.)
+       раньше пропускались через continue, но их числовой tEnd всё равно попадал
+       в razor cutTimes без валидации. Отклоняем весь план. */
+    if (!vs || typeof vs.tStart !== 'number' || typeof vs.tEnd !== 'number') {
+      return JSON.stringify({ ok: false, error: 'Сегмент #' + vk + ': tStart/tEnd отсутствуют или не числа — план отклонён, таймлайн не изменён.', hostVersion: $._EXT_PRM_.version });
+    }
+    if (isNaN(vs.tStart) || isNaN(vs.tEnd)) {
+      return JSON.stringify({ ok: false, error: 'Сегмент #' + vk + ': tStart/tEnd = NaN — план отклонён, таймлайн не изменён.', hostVersion: $._EXT_PRM_.version });
+    }
+    if (vs.tStart < 0) {
+      return JSON.stringify({ ok: false, error: 'Сегмент #' + vk + ': tStart отрицательный (' + vs.tStart + ') — план отклонён, таймлайн не изменён.', hostVersion: $._EXT_PRM_.version });
+    }
+    if (vs.tEnd <= vs.tStart) {
+      return JSON.stringify({ ok: false, error: 'Сегмент #' + vk + ': tEnd <= tStart [' + vs.tStart + '–' + vs.tEnd + '] — план отклонён, таймлайн не изменён.', hostVersion: $._EXT_PRM_.version });
+    }
+    if (seqEndMC > 0 && vs.tEnd > seqEndMC + 120) {
+      return JSON.stringify({ ok: false, error: 'Сегмент #' + vk + ': tEnd (' + vs.tEnd + 'с) далеко за концом секвенции (' + seqEndMC + 'с) — план отклонён, таймлайн не изменён.', hostVersion: $._EXT_PRM_.version });
+    }
+    chk.push({ i: vk, s: vs.tStart, e: vs.tEnd });
+  }
+  chk.sort(function (a, b) { return a.s - b.s; });
+  for (vk = 1; vk < chk.length; vk++) {
+    if (chk[vk].s < chk[vk - 1].e - 0.01) {
+      return JSON.stringify({
+        ok: false,
+        error: 'Сегменты #' + chk[vk - 1].i + ' [' + chk[vk - 1].s + '–' + chk[vk - 1].e + '] и #' + chk[vk].i +
+          ' [' + chk[vk].s + '–' + chk[vk].e + '] пересекаются — план отклонён целиком, таймлайн не изменён.',
+        hostVersion: $._EXT_PRM_.version
+      });
+    }
+  }
+
   /* Открываем undo group если поддерживается. */
   var undoOpened = false;
   try {
@@ -4434,10 +4528,13 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
       var tTail = plan.segments[plan.segments.length - 1].tEnd;
       if (typeof tTail === 'number') cutTimes.push(tTail);
     }
-    /* Дедупликация (на случай если соседние сегменты одинаковые). */
+    /* Дедупликация (на случай если соседние сегменты одинаковые).
+       06.08.2026: + отбрасываем точки за концом секвенции — там нет клипов,
+       а QE razor завернул бы таймкод по модулю 24ч и порезал реальный контент. */
     cutTimes.sort(function (a, b) { return a - b; });
     var dedup = [];
     for (var ct = 0; ct < cutTimes.length; ct++) {
+      if (seqEndMC > 0 && cutTimes[ct] >= seqEndMC - eps) continue;
       if (ct === 0 || Math.abs(cutTimes[ct] - cutTimes[ct - 1]) > eps) {
         dedup.push(cutTimes[ct]);
       }
