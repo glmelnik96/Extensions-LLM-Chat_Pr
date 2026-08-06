@@ -11,68 +11,33 @@
  *   - tryBegin(label) — захватить, если свободно (политика reject-if-busy:
  *     для правок таймлайна параллелизм небезопасен, очередь на устаревшем
  *     снимке хуже явного отказа);
- *   - end()           — освободить и разбудить следующего в FIFO-очереди;
- *   - enqueue(fn)     — поставить задачу в FIFO и выполнить, когда освободится.
+ *   - end()           — освободить.
+ * FIFO-режим enqueue() удалён в ревью 06.08.2026 — панель нигде его
+ * не использовала (везде reject-if-busy).
  */
 (function (global) {
   function createOperationQueue() {
     var running = false;
     var runningLabel = null;
-    var waiters = []; /* [{ resolve, label }] — FIFO */
 
-    function _acquire(label) {
-      running = true;
-      runningLabel = label != null ? label : null;
-    }
-
-    var q = {
+    return {
       /** Захватить мьютекс, если свободно. true — захвачено, false — занято. */
       tryBegin: function (label) {
         if (running) return false;
-        _acquire(label);
+        running = true;
+        runningLabel = label != null ? label : null;
         return true;
       },
 
-      /** Освободить мьютекс и передать его следующему ожидающему (FIFO). */
+      /** Освободить мьютекс. */
       end: function () {
-        if (waiters.length) {
-          var next = waiters.shift();
-          runningLabel = next.label != null ? next.label : null;
-          /* running остаётся true — мьютекс сразу переходит к next */
-          next.resolve();
-          return;
-        }
         running = false;
         runningLabel = null;
       },
 
-      /** Поставить задачу в FIFO-очередь. Возвращает promise результата taskFn.
-       *  Мьютекс захватывается/освобождается автоматически. */
-      enqueue: function (taskFn, label) {
-        var turn;
-        if (!running) {
-          _acquire(label);
-          turn = Promise.resolve();
-        } else {
-          turn = new Promise(function (resolve) {
-            waiters.push({ resolve: resolve, label: label });
-          });
-        }
-        return turn.then(function () {
-          return Promise.resolve()
-            .then(taskFn)
-            .then(
-              function (v) { q.end(); return v; },
-              function (e) { q.end(); throw e; }
-            );
-        });
-      },
-
       isBusy: function () { return running; },
-      label: function () { return runningLabel; },
-      pendingCount: function () { return waiters.length; }
+      label: function () { return runningLabel; }
     };
-    return q;
   }
 
   global.OperationQueue = { create: createOperationQueue };

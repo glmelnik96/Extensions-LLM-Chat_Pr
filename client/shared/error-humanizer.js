@@ -102,17 +102,7 @@
     return { kind: 'other', hint: '' };
   }
 
-  /** Сообщение + подсказка одной строкой (для однострочных плашек, напр. tools-таба). */
-  function withHint(err) {
-    var msg = String((err && err.message) || err || '');
-    if (!msg) return '';
-    var c = classify(msg);
-    if (c.hint && msg.indexOf(c.hint) === -1) return msg + ' — ' + c.hint;
-    return msg;
-  }
-
   global.ErrorHumanizer = {
-    classify: classify,
-    withHint: withHint
+    classify: classify
   };
 })(window);

@@ -677,18 +677,25 @@
        середину речи и резал её. Теперь N передаётся как marginDb в
        silenceIntervalsFromRms, который сам берёт уровень речи из сигнала. */
     var userDelta = typeof params.silenceThresholdDelta === 'number' ? params.silenceThresholdDelta : 0;
-    var inputI = (entry.audioAnalysis && typeof entry.audioAnalysis.inputI === 'number')
-      ? entry.audioAnalysis.inputI : -24;
-    var effectiveThreshold = userDelta > 0 ? Math.floor(inputI - userDelta) : thresholdUsed;
-    var threshLabel = effectiveThreshold + ' dB';
+    /* 06.08.2026 (ревью): в fallback-пути (без RMS-таймлайна) относительную
+       дельту применить не к чему. Старое вычисление inputI(LUFS) − delta
+       давало абсолютный порог в ЧУЖОЙ шкале (astats dBFS), который вдобавок
+       отключал ffmpeg-тишины в detectSilenceIntervals (порог < thresholdUsed
+       → includeFFmpeg=false → молча оставались только Whisper-зазоры).
+       Без RMS дельта честно игнорируется: измеренные тишины как есть. */
+    var effectiveThreshold = thresholdUsed;
 
     /* preview==apply: если есть RMS-таймлайн (после «Анализ аудио»), детекция тишин
        идёт через silenceIntervalsFromRms — ТУ ЖЕ функцию, что waveform-превью
        «Инструментов» фильтрует на лету при движении ползунков. Fallback на
        detectSilenceIntervals (gaps+ffmpeg) — когда RMS не считался. */
     var rmsTl = entry.audioAnalysis && entry.audioAnalysis.rmsTimeline;
+    var hasRms = Array.isArray(rmsTl) && rmsTl.length > 1;
+    var threshLabel = (hasRms && userDelta > 0)
+      ? ('речь − ' + userDelta + ' dB')
+      : (effectiveThreshold + ' dB' + (userDelta > 0 ? ' (дельта требует «Анализ аудио»)' : ''));
     var removeIntervals;
-    if (Array.isArray(rmsTl) && rmsTl.length > 1) {
+    if (hasRms) {
       removeIntervals = silenceIntervalsFromRms(rmsTl, {
         marginDb: userDelta > 0 ? userDelta : 22,  /* относительный порог от уровня речи */
         minDuration: minDuration,
@@ -1600,42 +1607,6 @@
     return result;
   }
 
-  /**
-   * Снэппинг интервалов к границам кадров (аудит 2026-06-09, HIGH quality).
-   *
-   * Проблема: интервалы идут float-секундами, округление к кадру происходит
-   * только в _secToTimecode на хосте → дрейф 1-3 кадра, накапливается на ripple.
-   *
-   * Правило: startSec — ВНИЗ (floor), endSec — ВВЕРХ (ceil) к границе кадра:
-   * вырез никогда не оставляет частичный кадр мусора по краям. После снэппинга
-   * фильтруем схлопнувшиеся интервалы (< 1 кадра).
-   *
-   * fps может быть дробным (29.97 NTSC). Прочие свойства интервалов сохраняются.
-   * Возвращает НОВЫЙ массив; при невалидном fps — исходные интервалы как есть.
-   */
-  function snapIntervalsToFrame(intervals, fps) {
-    if (!Array.isArray(intervals)) return [];
-    if (typeof fps !== 'number' || !isFinite(fps) || fps <= 0) return intervals.slice();
-    var frameDur = 1 / fps;
-    var EPS = 1e-6;
-    var out = [];
-    for (var i = 0; i < intervals.length; i++) {
-      var iv = intervals[i];
-      if (!iv || typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') continue;
-      var snapped = {};
-      for (var k in iv) {
-        if (Object.prototype.hasOwnProperty.call(iv, k)) snapped[k] = iv[k];
-      }
-      snapped.startSec = Math.floor(iv.startSec * fps + EPS) / fps;
-      snapped.endSec = Math.ceil(iv.endSec * fps - EPS) / fps;
-      if (snapped.startSec < 0) snapped.startSec = 0;
-      /* Схлопнувшийся интервал (< 1 кадра) — пропускаем */
-      if (snapped.endSec - snapped.startSec < frameDur - EPS) continue;
-      out.push(snapped);
-    }
-    return out;
-  }
-
   function _mergeIntervals(intervals) {
     if (!intervals.length) return intervals;
     intervals.sort(function (a, b) { return a.startSec - b.startSec; });
@@ -1728,150 +1699,6 @@
       return { pipeline: PIPELINES[cmd], params: params, name: cmd };
     }
     return null;
-  }
-
-  /**
-   * MultiCam Phase 1 MVP (2026-04-30):
-   * Авто-нарезка multicam-композиции (3V+2A) для подкаста.
-   *
-   * MVP-стратегия (без ffmpeg-астатс):
-   *   - Используем транскрипт как proxy для активности.
-   *   - Пока что НЕ можем определить кто из 2 спикеров говорит — у нас один
-   *     транскрипт на всю секвенцию. В Phase 1.5 добавим per-track audio analysis.
-   *   - Поэтому MVP делает простую нарезку: чередует V2/V3 каждые ~6 секунд
-   *     по абзацам транскрипта, между ними wide-вставки.
-   *
-   * Это даёт пользователю РАБОЧУЮ нарезку для теста razor+disabled пайплайна
-   * в Premiere. Реальный «кто говорит» — следующий шаг.
-   *
-   * См. .omc/plans/multicam-phase1-mvp.md
-   */
-  async function multicamFromTranscript(ctx, params) {
-    params = params || {};
-    var entry = ctx.transcriptEntry;
-    if (!entry || !entry.segments || !entry.segments.length) {
-      return { ok: false, error: 'Нет транскрипта. Транскрибируйте секвенцию (In-Out).' };
-    }
-    var snap = ctx.snapshot;
-    if (!snap || !snap.ok) {
-      return { ok: false, error: 'Нет снимка таймлайна.' };
-    }
-
-    /* Проверка структуры: нужно >=3 видео и >=2 аудио. */
-    var vTracks = (snap.tracks || []).filter(function (t) { return t.type === 'video'; });
-    var aTracks = (snap.tracks || []).filter(function (t) { return t.type === 'audio'; });
-    if (vTracks.length < 3) {
-      return { ok: false, error: 'Нужно ≥3 видеодорожки (V1=wide, V2/V3=гости). Найдено ' + vTracks.length + '.' };
-    }
-    if (aTracks.length < 2) {
-      return { ok: false, error: 'Нужно ≥2 аудиодорожки. Найдено ' + aTracks.length + '.' };
-    }
-
-    /* Hardcoded mapping для Phase 1 MVP. */
-    var mapping = {
-      wideVideoTrack: 0,
-      speakers: [
-        { audioTrack: 0, videoTrack: 1, label: 'Гость 1' },
-        { audioTrack: 1, videoTrack: 2, label: 'Гость 2' }
-      ]
-    };
-
-    /* Phase 1 MVP: чередуем V2/V3 по абзацам.
-       Если paragraphs нет — сделаем из сегментов (~6с группы). */
-    var paragraphs = entry.paragraphs;
-    if (!paragraphs || !paragraphs.length) {
-      paragraphs = _buildSimpleParagraphs(entry.segments, 6);
-    }
-    if (!paragraphs.length) {
-      return { ok: false, error: 'Не удалось построить абзацы из транскрипта.' };
-    }
-
-    /* Простой план: чередование V2/V3 для абзацев, wide между ними при паузах ≥1с. */
-    var segments = [];
-    for (var pi = 0; pi < paragraphs.length; pi++) {
-      var p = paragraphs[pi];
-      var ps = typeof p.startSec === 'number' ? p.startSec : p.start;
-      var pe = typeof p.endSec === 'number' ? p.endSec : p.end;
-      if (typeof ps !== 'number' || typeof pe !== 'number' || pe <= ps) continue;
-      /* Если перед этим абзацем — длинная пауза, вставляем wide. */
-      var prevEnd = pi === 0 ? 0 : (segments.length ? segments[segments.length - 1].tEnd : 0);
-      if (ps - prevEnd >= 1.0) {
-        segments.push({ tStart: prevEnd, tEnd: ps, activeVideoTrack: mapping.wideVideoTrack });
-      } else if (segments.length) {
-        /* Иначе расширяем предыдущий до начала текущего. */
-        segments[segments.length - 1].tEnd = ps;
-      }
-      var activeVT = (pi % 2 === 0) ? mapping.speakers[0].videoTrack : mapping.speakers[1].videoTrack;
-      segments.push({ tStart: ps, tEnd: pe, activeVideoTrack: activeVT });
-    }
-
-    /* Объединяем подряд идущие одинаковые segments. */
-    var merged = [];
-    for (var mi = 0; mi < segments.length; mi++) {
-      var s = segments[mi];
-      var last = merged[merged.length - 1];
-      if (last && last.activeVideoTrack === s.activeVideoTrack && Math.abs(last.tEnd - s.tStart) < 0.05) {
-        last.tEnd = s.tEnd;
-      } else {
-        merged.push({ tStart: s.tStart, tEnd: s.tEnd, activeVideoTrack: s.activeVideoTrack });
-      }
-    }
-
-    if (!merged.length) {
-      return { ok: false, error: 'Не удалось построить план переключений.' };
-    }
-
-    /* Стат для UI. */
-    var perTrack = {};
-    for (var ms = 0; ms < merged.length; ms++) {
-      var k = String(merged[ms].activeVideoTrack);
-      perTrack[k] = (perTrack[k] || 0) + (merged[ms].tEnd - merged[ms].tStart);
-    }
-
-    var plan = {
-      version: 1,
-      rangeSec: [merged[0].tStart, merged[merged.length - 1].tEnd],
-      mapping: mapping,
-      params: { mode: 'disable' },
-      segments: merged
-    };
-
-    return {
-      ok: true,
-      proposal: {
-        kind: 'multicam_cuts',
-        plan: plan,
-        summary: 'Авто-MultiCam: ' + merged.length + ' сегментов, ' + (merged.length - 1) +
-          ' переключений. V1: ' + ((perTrack['0'] || 0).toFixed(1)) + 'с, V2: ' +
-          ((perTrack['1'] || 0).toFixed(1)) + 'с, V3: ' + ((perTrack['2'] || 0).toFixed(1)) + 'с.',
-        stats: { perTrackSeconds: perTrack, switchCount: merged.length - 1 }
-      }
-    };
-  }
-
-  /**
-   * Простые абзацы из сегментов (если transcript-structure не сработал).
-   * Группирует подряд идущие сегменты пока сумма не превысит maxSec.
-   */
-  function _buildSimpleParagraphs(segments, maxSec) {
-    var out = [];
-    var cur = null;
-    for (var i = 0; i < segments.length; i++) {
-      var s = segments[i];
-      var ss = typeof s.startSec === 'number' ? s.startSec : s.start;
-      var se = typeof s.endSec === 'number' ? s.endSec : s.end;
-      if (typeof ss !== 'number' || typeof se !== 'number') continue;
-      if (!cur) {
-        cur = { startSec: ss, endSec: se };
-      } else if (se - cur.startSec > maxSec) {
-        out.push(cur);
-        cur = { startSec: ss, endSec: se };
-      } else {
-        cur.endSec = se;
-      }
-    }
-    if (cur) out.push(cur);
-    return out;
   }
 
   /**
@@ -3030,7 +2857,6 @@
     chapterize: chapterize,
     jumpCuts: jumpCuts,
     jCuts: jCuts,
-    multicamFromTranscript: multicamFromTranscript,
     multicamFromAudio: multicamFromAudio,
     remapRmsToSequenceTime: remapRmsToSequenceTime,
     assignSpeakersByRms: assignSpeakersByRms,
@@ -3054,7 +2880,6 @@
     sequenceSection: sequenceSection,
     clampIntervalsToSection: clampIntervalsToSection,
     parsePipelineCommand: parsePipelineCommand,
-    snapIntervalsToFrame: snapIntervalsToFrame,
     splitCutIntervalsIntoBatches: splitCutIntervalsIntoBatches,
     refineCutBoundaries: refineCutBoundaries,
     trimKeepsToSentenceBoundaries: trimKeepsToSentenceBoundaries,
@@ -3062,7 +2887,6 @@
     _mergeIntervals: _mergeIntervals,
     _detectSharedAudio: _detectSharedAudio,
     _detectFlatAudio: _detectFlatAudio,
-    _silencesFromSegmentGaps: _silencesFromSegmentGaps,
-    _buildSimpleParagraphs: _buildSimpleParagraphs
+    _silencesFromSegmentGaps: _silencesFromSegmentGaps
   };
 })(window);
