@@ -305,6 +305,22 @@
     opt = opt || {};
     var silenceOpt = opt.silence || {};
     var requestedThreshold = typeof silenceOpt.thresholdDb === 'number' ? silenceOpt.thresholdDb : -30;
+    /* Плотная карта пауз (спека 06.08.2026, верификация таймингов): отдельный
+       проход silencedetect с коротким d (0.15с) — видит межфразовые паузы,
+       невидимые основному проходу (d=0.5). Порог берём ФИНАЛЬНЫЙ (после
+       retry), чтобы обе карты были согласованы. Ошибка плотного прохода не
+       валит анализ — silencesDense просто пустой. */
+    var wantDense = !!opt.silenceDense;
+    var denseDur = (opt.silenceDense && typeof opt.silenceDense.minDurationSec === 'number')
+      ? opt.silenceDense.minDurationSec : 0.15;
+    function withDense(result) {
+      if (!wantDense) return result;
+      var thr = typeof result.silenceThresholdUsed === 'number' ? result.silenceThresholdUsed : requestedThreshold;
+      return detectSilences(inputPath, { thresholdDb: thr, minDurationSec: denseDur }).then(
+        function (dense) { result.silencesDense = dense; return result; },
+        function () { result.silencesDense = []; return result; }
+      );
+    }
 
     /* Шаг 1: loudness + rms параллельно */
     return Promise.all([
@@ -340,24 +356,24 @@
             return detectSilences(inputPath, { thresholdDb: retryThreshold, minDurationSec: silOpt.minDurationSec })
               .then(
                 function (sils2) {
-                  return {
+                  return withDense({
                     silences: sils2,
                     loudness: loudness,
                     rms: rms,
                     silenceThresholdUsed: sils2.length > 0 ? retryThreshold : adaptiveThreshold
-                  };
+                  });
                 },
                 function () {
-                  return { silences: sils, loudness: loudness, rms: rms, silenceThresholdUsed: adaptiveThreshold };
+                  return withDense({ silences: sils, loudness: loudness, rms: rms, silenceThresholdUsed: adaptiveThreshold });
                 }
               );
           }
-          return {
+          return withDense({
             silences: sils,
             loudness: loudness,
             rms: rms,
             silenceThresholdUsed: adaptiveThreshold
-          };
+          });
         },
         function (e) {
           return { silences: { error: String(e.message || e) }, loudness: loudness, rms: rms };

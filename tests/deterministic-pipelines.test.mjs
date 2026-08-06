@@ -1,6 +1,7 @@
 import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadDeterministicPipelines } from './load-deterministic-pipelines.mjs';
+import { loadTranscriptStructure } from './load-transcript-structure.mjs';
 
 const DP = loadDeterministicPipelines();
 
@@ -798,6 +799,62 @@ describe('DeterministicPipelines.chapterize', () => {
     );
     const r = await DP.chapterize(makeCtx({ transcriptEntry: entry }));
     assert.equal(r.proposal.markers.length, 2);
+  });
+
+  /* Снэп глав к измеренным речевым онсетам (05.08.2026).
+     Данные — живой замер Nested Sequence 02: Whisper поставил границу темы
+     ровно на 60.000 (квантование к целой секунде), а речь на самом деле
+     возобновилась в 57.787 — глава садилась в середину фразы. */
+  describe('снэп глав к речевым онсетам', () => {
+    const DPS = loadDeterministicPipelines({ TranscriptStructure: loadTranscriptStructure() });
+    const liveSilences = [
+      { startSec: 53.805, endSec: 55.787, durationSec: 1.982 },
+      { startSec: 56.528, endSec: 57.787, durationSec: 1.259 },
+      { startSec: 61.71, endSec: 62.728, durationSec: 1.018 }
+    ];
+    function liveEntry() {
+      return makeEntry(
+        [
+          { startSec: 0, endSec: 50, text: 'Вы считали, да?' },
+          { startSec: 50, endSec: 59, text: 'Вот и разобрались.' },
+          { startSec: 60, endSec: 103, text: 'Так, ну что, сейчас мы все готовы увидеть.' }
+        ],
+        {
+          audioAnalysis: { silences: liveSilences },
+          topics: [
+            { startSec: 0, endSec: 60, title: 'Подсчет свечей', summary: '' },
+            { startSec: 60, endSec: 103, title: 'Задувание свечей', summary: '' }
+          ]
+        }
+      );
+    }
+
+    test('глава на целой секунде уезжает на измеренный онсет речи', async () => {
+      const r = await DPS.chapterize(makeCtx({ transcriptEntry: liveEntry() }));
+      assert.equal(r.ok, true);
+      assert.equal(r.proposal.markers.length, 2);
+      assert.equal(r.proposal.markers[1].timeSec, 57.787);
+      assert.equal(r.proposal.markers[1].snappedFromSec, 60);
+    });
+
+    test('первая глава остаётся на 0:00 — требование YouTube-глав', async () => {
+      const r = await DPS.chapterize(makeCtx({ transcriptEntry: liveEntry() }));
+      assert.equal(r.proposal.markers[0].timeSec, 0);
+      assert.equal(r.proposal.markers[0].snappedFromSec, undefined);
+    });
+
+    test('summary честно сообщает, сколько глав уточнено', async () => {
+      const r = await DPS.chapterize(makeCtx({ transcriptEntry: liveEntry() }));
+      assert.match(r.proposal.summary, /Уточнено по паузам: 1 из 2/);
+    });
+
+    test('без audioAnalysis снэпить нечем — времена как были', async () => {
+      const entry = liveEntry();
+      entry.audioAnalysis = null;
+      const r = await DPS.chapterize(makeCtx({ transcriptEntry: entry }));
+      assert.equal(r.proposal.markers[1].timeSec, 60);
+      assert.doesNotMatch(r.proposal.summary, /Уточнено по паузам/);
+    });
   });
 
   test('time-based fallback при пустых topics и длинном транскрипте', async () => {
@@ -2969,6 +3026,103 @@ describe('Зазоро-тишина → refineCutBoundaries снапает ре�
     /* segment-aware без зазор-тишины держит границы на месте (не падит в речь) */
     assert.equal(r.stats.kept, 2);
     assert.equal(r.stats.padded, 0);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * Верификация таймингов в источнике (спека 2026-08-06):
+ * refineCutBoundaries — плотная карта пауз (silencesDense) + строгий режим
+ * («метить и защищать»: неподтверждённый интервал исключается с причиной).
+ * ═══════════════════════════════════════════════════════════════ */
+describe('refineCutBoundaries — silencesDense + строгий режим (2026-08-06)', () => {
+  it('плотная карта при наличии используется вместо обычной', () => {
+    /* обычная карта пуста → без dense был бы padding; dense видит паузу 0.3с */
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10.0, endSec: 20.0 }],
+      [],
+      { silencesDense: [{ startSec: 9.7, endSec: 10.0 }, { startSec: 19.9, endSec: 20.2 }] });
+    assert.ok(Math.abs(r.intervals[0].startSec - 9.85) < 1e-9);
+    assert.ok(Math.abs(r.intervals[0].endSec - 20.05) < 1e-9);
+    assert.equal(r.stats.snapped, 2);
+  });
+
+  it('пустая плотная карта → фолбэк на обычные silences', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10.0, endSec: 20.0 }],
+      [{ startSec: 9.5, endSec: 9.9 }],
+      { silencesDense: [] });
+    assert.ok(Math.abs(r.intervals[0].startSec - 9.7) < 1e-9);
+    assert.equal(r.stats.snapped, 1);
+  });
+
+  it('строгий режим: обе границы снэпнуты → интервал в плане', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10.0, endSec: 20.0 }],
+      [{ startSec: 9.5, endSec: 9.9 }, { startSec: 20.1, endSec: 20.5 }],
+      { strict: true });
+    assert.equal(r.intervals.length, 1);
+    assert.equal(r.stats.unconfirmed, 0);
+    assert.equal(r.skipped.length, 0);
+  });
+
+  it('строгий режим: граница без паузы → интервал исключён с причиной', () => {
+    /* старт снапается, конец — нет (паузы рядом нет) */
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10.0, endSec: 20.0 }],
+      [{ startSec: 9.5, endSec: 9.9 }],
+      { strict: true });
+    assert.equal(r.intervals.length, 0);
+    assert.equal(r.stats.unconfirmed, 1);
+    assert.equal(r.skipped.length, 1);
+    assert.equal(r.skipped[0].startSec, 10.0);
+    assert.equal(r.skipped[0].endSec, 20.0);
+    assert.match(r.skipped[0].reason, /конец/);
+    /* счётчики границ не инкрементированы для исключённого интервала */
+    assert.equal(r.stats.snapped, 0);
+    assert.equal(r.stats.padded, 0);
+  });
+
+  it('строгий режим: граница уже внутри измеренной паузы → подтверждена без снапа', () => {
+    /* segment-aware + длинные паузы: границы дальше 0.7с от центров пауз →
+       снап невозможен (kept), но границы лежат ВНУТРИ пауз → подтверждены */
+    const segs = [
+      { startSec: 0, endSec: 9.0, text: 'а.' },
+      { startSec: 11.0, endSec: 20.0, text: 'б.' },
+      { startSec: 22.0, endSec: 30.0, text: 'в.' }
+    ];
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 9.1, endSec: 21.9 }],
+      [{ startSec: 9.0, endSec: 11.0 }, { startSec: 20.0, endSec: 22.0 }],
+      { segments: segs, strict: true });
+    assert.equal(r.intervals.length, 1);
+    assert.equal(r.stats.kept, 2);
+    assert.equal(r.stats.unconfirmed, 0);
+  });
+
+  it('строгий режим: обе границы вне пауз → причина «обе границы»', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 10.0, endSec: 20.0 }],
+      [],
+      { strict: true, silencesDense: [{ startSec: 50, endSec: 51 }] });
+    assert.equal(r.intervals.length, 0);
+    assert.match(r.skipped[0].reason, /обе границы/);
+  });
+
+  it('строгий режим: старт на t=0 — край материала, подтверждение не требуется', () => {
+    const r = DP.refineCutBoundaries(
+      [{ startSec: 0, endSec: 5.0 }],
+      [{ startSec: 4.9, endSec: 5.3 }],
+      { strict: true });
+    assert.equal(r.intervals.length, 1);
+    assert.equal(r.stats.unconfirmed, 0);
+  });
+
+  it('без строгого режима поведение прежнее: неподтверждённые границы падятся', () => {
+    const r = DP.refineCutBoundaries([{ startSec: 10, endSec: 20 }], [], {});
+    assert.equal(r.intervals.length, 1);
+    assert.equal(r.stats.padded, 2);
+    assert.equal(r.stats.unconfirmed, 0);
+    assert.equal(r.skipped.length, 0);
   });
 });
 

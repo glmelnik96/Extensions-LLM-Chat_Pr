@@ -479,6 +479,15 @@
          оставались активными и следующий прогон резал бы по СТАРЫМ таймкодам.
          Честно инвалидируем: гейт попросит новый «Анализ аудио» (30 сек). */
       delete entry.audioAnalysis;
+      /* Аудит 05.08.2026: paragraphs/topics/speakers держат СВОИ копии таймкодов
+         и после ripple указывают в никуда — главы вставали в середину фраз.
+         Ремапить их незачем: paragraphs строятся из segments заново, topics —
+         это 1 дешёвый LLM-вызов. Сбрасываем и перестраиваем по требованию. */
+      delete entry.paragraphs;
+      delete entry.topics;
+      delete entry.topicsInstructions;
+      delete entry.speakers;
+      delete entry.structureMeta;
       /* analyzedRegion транскрипта сдвигаем той же математикой, что сегменты:
          In/Out в Premiere ripple тоже смещает, транскрипт остаётся валидным. */
       if (entry.analyzedRegion) {
@@ -513,6 +522,13 @@
       /* Аудит 04.07.2026: сдвиг неизвестен → координаты rmsTimeline/silences
          невалидны, честно требуем новый «Анализ аудио». */
       delete entry.audioAnalysis;
+      /* Аудит 05.08.2026: производные структуры с собственными таймкодами тоже
+         невалидны — перестроятся из segments по требованию (см. ripple). */
+      delete entry.paragraphs;
+      delete entry.topics;
+      delete entry.topicsInstructions;
+      delete entry.speakers;
+      delete entry.structureMeta;
       entry.editHistory = Array.isArray(found.entry.editHistory) ? found.entry.editHistory.slice() : [];
       entry.editHistory.push({ at: Date.now(), kind: 'unknown_shift', reason: String(reason || '') });
       entry.editedAfterTranscribe = true;

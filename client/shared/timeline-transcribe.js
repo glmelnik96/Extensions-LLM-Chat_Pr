@@ -421,7 +421,13 @@
     var off = typeof timelineOffsetSec === 'number' && !isNaN(timelineOffsetSec) ? timelineOffsetSec : 0;
     try {
       if (progress) progress('Анализ аудио (silencedetect + loudnorm)…');
-      var analyzeOpts = { silence: { thresholdDb: -30, minDurationSec: 0.5 } };
+      /* silenceDense — плотная карта пауз (d=0.15) для верификации границ
+         Whisper-сегментов (спека 06.08.2026). Основной silences (d=0.5)
+         остаётся для резки тишин — ему нужны именно длинные паузы. */
+      var analyzeOpts = {
+        silence: { thresholdDb: -30, minDurationSec: 0.5 },
+        silenceDense: { minDurationSec: 0.15 }
+      };
       /* wantRms — RMS-таймлайн для waveform-превью «Инструментов». Opt-in: дорого
          на длинных файлах (лишний astats-проход), поэтому запрашивается только из
          «⚡ Анализ аудио» (подготовка к инструментам), не из транскрибации. */
@@ -447,6 +453,16 @@
         loudnessError: res.loudness && res.loudness.error ? res.loudness.error : null,
         silenceThresholdUsed: typeof res.silenceThresholdUsed === 'number' ? res.silenceThresholdUsed : null
       };
+      /* Плотная карта → таймлайн-координаты, той же математикой, что silences. */
+      if (Array.isArray(res.silencesDense)) {
+        out.silencesDense = res.silencesDense.map(function (s) {
+          return {
+            startSec: Math.round((s.startSec + off) * 1000) / 1000,
+            endSec: Math.round((s.endSec + off) * 1000) / 1000,
+            durationSec: s.durationSec
+          };
+        });
+      }
       /* RMS-таймлайн → sequence-time (как silences). Только при wantRms и успехе. */
       if (opts.wantRms && Array.isArray(res.rms)) {
         out.rmsTimeline = res.rms.map(function (p) {
@@ -535,6 +551,7 @@
     });
     var results = await promisePool(tasks, FFMPEG_CONCURRENCY);
     var allSil = [];
+    var allDense = [];
     var rmsSeries = [];
     var firstLoud = null;
     var firstThresh = null;
@@ -543,15 +560,18 @@
       var aa = results[i];
       if (!aa || aa.error) continue;
       if (Array.isArray(aa.silences)) allSil = allSil.concat(aa.silences);
+      if (Array.isArray(aa.silencesDense)) allDense = allDense.concat(aa.silencesDense);
       if (opts.wantRms && Array.isArray(aa.rmsTimeline)) rmsSeries.push(aa.rmsTimeline);
       if (!firstLoud && aa.loudness) firstLoud = aa.loudness;
       if (firstThresh == null && aa.silenceThresholdUsed != null) firstThresh = aa.silenceThresholdUsed;
       if (firstInputI == null && typeof aa.inputI === 'number') firstInputI = aa.inputI;
     }
     allSil.sort(function (a, b) { return a.startSec - b.startSec; });
+    allDense.sort(function (a, b) { return a.startSec - b.startSec; });
     if (progress) progress('Анализ аудио: ' + results.length + ' чанков готово');
     var out = {
       silences: allSil,
+      silencesDense: allDense,
       loudness: firstLoud,
       silencesError: null,
       loudnessError: null,
@@ -1296,9 +1316,36 @@
     return res;
   }
 
+  /* Верификация границ сегментов по плотной карте пауз (спека 06.08.2026).
+     Единая точка для ВСЕХ режимов — потребители (paragraphs/topics/главы/
+     резы/монтаж) наследуют исправленные времена автоматически. Ошибка
+     верификации не валит транскрибацию — сегменты остаются как есть. */
+  function verifyTranscriptTimings(res) {
+    if (!res || res.analysisOnly) return res;
+    try {
+      var dense = res.audioAnalysis && Array.isArray(res.audioAnalysis.silencesDense)
+        ? res.audioAnalysis.silencesDense : null;
+      if (!dense || !dense.length) return res;
+      if (typeof global.TranscriptStructure === 'undefined' ||
+          typeof global.TranscriptStructure.verifySegmentBoundaries !== 'function') return res;
+      var v = global.TranscriptStructure.verifySegmentBoundaries(res.segments, dense);
+      res.segments = v.segments;
+      res.timingVerification = {
+        verifiedPct: v.stats.verifiedPct,
+        startsVerified: v.stats.startsVerified,
+        endsVerified: v.stats.endsVerified,
+        total: v.stats.total,
+        adjustedCount: v.stats.adjustedCount,
+        maxDriftSec: v.stats.maxDriftSec,
+        at: Date.now()
+      };
+    } catch (eV) { /* верификация — уточнение, не обязательный шаг */ }
+    return res;
+  }
+
   async function runFromPrep(prep, opt) {
     var res = await runFromPrepInner(prep, opt);
-    return assertNonEmptyTranscript(res);
+    return verifyTranscriptTimings(assertNonEmptyTranscript(res));
   }
 
   global.TimelineTranscribe = {
@@ -1309,6 +1356,7 @@
     mergeSegmentLists: mergeSegmentLists,
     runFromPrep: runFromPrep,
     assertNonEmptyTranscript: assertNonEmptyTranscript,
+    verifyTranscriptTimings: verifyTranscriptTimings,
     runAudioOnlyAnalysis: runAudioOnlyAnalysis,
     computeAudioPreprocess: computeAudioPreprocess,
     mergeRmsTimelines: mergeRmsTimelines,

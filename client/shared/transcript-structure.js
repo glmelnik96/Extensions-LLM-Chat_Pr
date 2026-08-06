@@ -1505,7 +1505,230 @@
     }, function () { return []; });
   }
 
+  /* ═══════════════════════════════════════════════════════════════════════
+   * СНЭППИНГ К РЕЧЕВЫМ ОНСЕТАМ (05.08.2026)
+   *
+   * Проблема, найденная живым замером на 4 секвенциях: таймкоды Whisper — НЕ
+   * акустические. На невнятных участках модель квантует границы к целым
+   * секундам (8–12% границ на часовых уроках, 62% на коротком клипе). Глава
+   * садится на такую границу и попадает в середину фразы: замер «расстояние от
+   * главы до ближайшей ИЗМЕРЕННОЙ паузы» дал медиану 1.4–5.0с и хвост до 34.9с.
+   *
+   * При этом точность ±10мс у нас уже есть — audioAnalysis.silences (ffmpeg
+   * silencedetect, минимум 0.5с). Конец паузы = момент, когда речь возобновилась,
+   * то есть настоящее начало фразы. Именно туда и должен встать маркер.
+   *
+   * Так же работают «Тишины» и «Jump cuts» — они режут по измеренному RMS.
+   * Главы и виральные моменты были единственными, кто верил Whisper на слово.
+   * ═══════════════════════════════════════════════════════════════════════ */
+
+  var SNAP_MAX_BACK_SEC = 3.0;  /* назад — щедро: типичная ошибка квантования 1–3с */
+  var SNAP_MAX_FWD_SEC = 0.5;   /* вперёд — скупо: лучше начать раньше, чем срезать фразу */
+
+  function round3(v) { return Math.round(v * 1000) / 1000; }
+
+  /**
+   * snapToSpeechOnset(timeSec, silences, opts)
+   *   → {timeSec, driftSec, inGap} | null (снэпить некуда — оставить как есть)
+   *
+   * silences: [{startSec, endSec}] в координатах ТАЙМЛАЙНА (как их кладёт
+   * computeAudioPreprocess — оффсет там уже применён).
+   */
+  function snapToSpeechOnset(timeSec, silences, opts) {
+    opts = opts || {};
+    var maxBack = typeof opts.maxBackSec === 'number' ? opts.maxBackSec : SNAP_MAX_BACK_SEC;
+    var maxFwd = typeof opts.maxFwdSec === 'number' ? opts.maxFwdSec : SNAP_MAX_FWD_SEC;
+    if (typeof timeSec !== 'number') return null;
+    var t = timeSec;
+    if (!isFinite(t) || t < 0) return null;
+    if (!silences || !silences.length) return null;
+    /* Ноль не двигаем: почти любая запись начинается с комнатного тона, а
+       первая глава обязана стоять на 0:00 (требование YouTube-глав). */
+    if (t <= 0.05) return null;
+
+    var best = null;
+    for (var i = 0; i < silences.length; i++) {
+      var s = silences[i];
+      if (!s) continue;
+      var a = Number(typeof s.startSec === 'number' ? s.startSec : s.start);
+      var b = Number(typeof s.endSec === 'number' ? s.endSec : s.end);
+      if (!isFinite(a) || !isFinite(b) || b < a) continue;
+      /* Время попало ВНУТРЬ паузы — речь начинается в её конце. Это точный
+         ответ, окна допуска здесь не применяем. */
+      if (t >= a && t <= b) return { timeSec: round3(b), driftSec: round3(b - t), inGap: true };
+      var d = b - t; /* >0 — онсет впереди, <0 — позади */
+      if (d > maxFwd || -d > maxBack) continue;
+      if (!best || Math.abs(d) < Math.abs(best.d)) best = { v: b, d: d };
+    }
+    if (!best) return null;
+    return { timeSec: round3(best.v), driftSec: round3(best.d), inGap: false };
+  }
+
+  /**
+   * snapMarkersToSpeech(markers, silences, opts) → {markers, snappedCount, maxDriftSec}
+   *
+   * Не мутирует вход. Сохраняет строгий порядок: если снэп поставил бы маркер
+   * не позже предыдущего, откатываем его к исходному времени — лучше неточный
+   * маркер, чем два в одной точке или перепутанный порядок глав.
+   */
+  function snapMarkersToSpeech(markers, silences, opts) {
+    var list = Array.isArray(markers) ? markers : [];
+    if (!list.length || !silences || !silences.length) {
+      return { markers: list, snappedCount: 0, maxDriftSec: 0 };
+    }
+    var out = [];
+    var snapped = 0;
+    var maxDrift = 0;
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (!m || typeof m.timeSec !== 'number') { out.push(m); continue; }
+      var hit = snapToSpeechOnset(m.timeSec, silences, opts);
+      if (!hit) { out.push(m); continue; }
+      var prev = out.length ? out[out.length - 1] : null;
+      if (prev && typeof prev.timeSec === 'number' && hit.timeSec <= prev.timeSec) {
+        out.push(m);
+        continue;
+      }
+      var copy = {};
+      for (var k in m) { if (Object.prototype.hasOwnProperty.call(m, k)) copy[k] = m[k]; }
+      copy.timeSec = hit.timeSec;
+      copy.snappedFromSec = m.timeSec;
+      out.push(copy);
+      snapped++;
+      if (Math.abs(hit.driftSec) > maxDrift) maxDrift = Math.abs(hit.driftSec);
+    }
+    return { markers: out, snappedCount: snapped, maxDriftSec: round3(maxDrift) };
+  }
+
+  /* ═══ ВЕРИФИКАЦИЯ ГРАНИЦ СЕГМЕНТОВ В ИСТОЧНИКЕ (спека 06.08.2026) ═══
+   * Таймкоды Whisper — не акустические (квантование к целым секундам).
+   * Сверяем КАЖДУЮ границу сегмента с плотной картой пауз (silencedetect
+   * d=0.15, ±10мс) один раз при создании транскрипта — все потребители
+   * (paragraphs, topics, главы, резы, монтаж) наследуют исправленные времена.
+   *
+   * Правило асимметричное — «никогда не сжимать речь»:
+   *   начало → к онсету (конец паузы): назад щедро (1.0с), вперёд скупо (0.25с);
+   *   конец  → к оффсету (начало паузы): вперёд щедро (1.0с), назад скупо (0.25с).
+   * Граница без измеримого края речи в окне не двигается и остаётся
+   * verified=false — честно «проверить нечем» (политика «метить и защищать»). */
+
+  var VERIFY_WIDE_SEC = 1.0;    /* окно в сторону расширения речи */
+  var VERIFY_NARROW_SEC = 0.25; /* окно в сторону сжатия речи */
+  var VERIFY_MIN_SEG_SEC = 0.05;
+
+  /* Ближайший край речи для границы t.
+   * kind='onset' — речь начинается (конец паузы), kind='offset' — речь
+   * кончается (начало паузы). wide/narrow — допуски по направлениям:
+   * для onset «назад» = wide, для offset «вперёд» = wide.
+   * Возврат {timeSec, inGap} | null. */
+  function _nearestSpeechEdge(t, silences, kind, wide, narrow) {
+    var best = null;
+    for (var i = 0; i < silences.length; i++) {
+      var s = silences[i];
+      if (!s) continue;
+      var a = Number(typeof s.startSec === 'number' ? s.startSec : s.start);
+      var b = Number(typeof s.endSec === 'number' ? s.endSec : s.end);
+      if (!isFinite(a) || !isFinite(b) || b < a) continue;
+      /* Граница внутри паузы — точный ответ без окон: речь возобновляется
+         в её конце (onset) / закончилась в её начале (offset). */
+      if (t >= a && t <= b) return { timeSec: kind === 'onset' ? b : a, inGap: true };
+      var edge = kind === 'onset' ? b : a;
+      var d = edge - t; /* >0 — край впереди */
+      var limFwd = kind === 'onset' ? narrow : wide;
+      var limBack = kind === 'onset' ? wide : narrow;
+      if (d > limFwd || -d > limBack) continue;
+      if (!best || Math.abs(d) < Math.abs(best.d)) best = { v: edge, d: d };
+    }
+    return best ? { timeSec: best.v, inGap: false } : null;
+  }
+
+  /**
+   * Верифицирует границы всех сегментов по плотной карте пауз.
+   * Не мутирует вход. Инварианты (порядок, непересечение, min-длительность)
+   * охраняются: ломающий их снэп откатывается, граница остаётся unverified.
+   * @returns {{segments: Array, stats: {total, startsVerified, endsVerified,
+   *            verifiedPct, adjustedCount, maxDriftSec}}}
+   */
+  function verifySegmentBoundaries(segments, silencesDense, opts) {
+    opts = opts || {};
+    var wide = typeof opts.wideSec === 'number' ? opts.wideSec : VERIFY_WIDE_SEC;
+    var narrow = typeof opts.narrowSec === 'number' ? opts.narrowSec : VERIFY_NARROW_SEC;
+    var list = Array.isArray(segments) ? segments : [];
+    var sil = Array.isArray(silencesDense) ? silencesDense : [];
+    if (!list.length || !sil.length) {
+      return {
+        segments: list,
+        stats: { total: list.length, startsVerified: 0, endsVerified: 0, verifiedPct: 0, adjustedCount: 0, maxDriftSec: 0 }
+      };
+    }
+    var out = [];
+    var sVer = 0, eVer = 0, adjusted = 0, maxDrift = 0;
+    var prevEnd = -Infinity; /* скорректированный конец предыдущего сегмента */
+    for (var i = 0; i < list.length; i++) {
+      var seg = list[i];
+      var copy = {};
+      for (var k in seg) { if (Object.prototype.hasOwnProperty.call(seg, k)) copy[k] = seg[k]; }
+      var s0 = Number(typeof seg.startSec === 'number' ? seg.startSec : seg.start);
+      var e0 = Number(typeof seg.endSec === 'number' ? seg.endSec : seg.end);
+      if (!isFinite(s0) || !isFinite(e0) || e0 <= s0) { out.push(copy); prevEnd = isFinite(e0) ? e0 : prevEnd; continue; }
+      var nextStart = null;
+      for (var j = i + 1; j < list.length; j++) {
+        var ns = Number(typeof list[j].startSec === 'number' ? list[j].startSec : list[j].start);
+        if (isFinite(ns)) { nextStart = ns; break; }
+      }
+
+      var newS = s0, newE = e0, sOk = false, eOk = false;
+
+      /* Начало: ноль не трогаем (запись начинается с комнатного тона). */
+      if (s0 > 0.05) {
+        var hitS = _nearestSpeechEdge(s0, sil, 'onset', wide, narrow);
+        if (hitS && hitS.timeSec >= prevEnd && hitS.timeSec < e0 - VERIFY_MIN_SEG_SEC) {
+          newS = round3(hitS.timeSec);
+          sOk = true;
+        }
+      }
+
+      /* Конец: вперёд — не дальше начала следующего сегмента (lookahead —
+         иначе рез уедет в чужую речь и сломает порядок). */
+      var hitE = _nearestSpeechEdge(e0, sil, 'offset', wide, narrow);
+      if (hitE && hitE.timeSec > newS + VERIFY_MIN_SEG_SEC &&
+          (nextStart == null || hitE.timeSec <= nextStart)) {
+        newE = round3(hitE.timeSec);
+        eOk = true;
+      }
+
+      if (sOk || eOk) {
+        var dS = Math.abs(newS - s0), dE = Math.abs(newE - e0);
+        if (dS > maxDrift) maxDrift = dS;
+        if (dE > maxDrift) maxDrift = dE;
+        if (dS > 0.0005 || dE > 0.0005) adjusted++;
+      }
+      copy.startSec = newS;
+      copy.endSec = newE;
+      copy.startVerified = sOk;
+      copy.endVerified = eOk;
+      if (sOk) sVer++;
+      if (eOk) eVer++;
+      out.push(copy);
+      prevEnd = newE;
+    }
+    return {
+      segments: out,
+      stats: {
+        total: list.length,
+        startsVerified: sVer,
+        endsVerified: eVer,
+        verifiedPct: Math.round(((sVer + eVer) / (2 * list.length)) * 100),
+        adjustedCount: adjusted,
+        maxDriftSec: round3(maxDrift)
+      }
+    };
+  }
+
   global.TranscriptStructure = {
+    verifySegmentBoundaries: verifySegmentBoundaries,
+    snapToSpeechOnset: snapToSpeechOnset,
+    snapMarkersToSpeech: snapMarkersToSpeech,
     buildParagraphs: buildParagraphs,
     buildSpeakers: buildSpeakers,
     buildTopicsWithLLM: buildTopicsWithLLM,

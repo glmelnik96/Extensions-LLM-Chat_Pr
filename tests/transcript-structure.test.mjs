@@ -723,3 +723,267 @@ describe('buildMontageSystemPrompt referenceScript (C1)', () => {
     assert.ok(p.length < long.length + 2000);
   });
 });
+
+/* ─── снэппинг к речевым онсетам (05.08.2026) ───
+   Живой замер показал: таймкоды Whisper не акустические, на невнятных
+   участках квантуются к целым секундам. Маркер обязан садиться на конец
+   ИЗМЕРЕННОЙ паузы — там реально возобновляется речь. */
+describe('TranscriptStructure.snapToSpeechOnset', () => {
+  /* Реальные данные с Nested Sequence 02: Whisper отдал ровно 60.0,
+     речь же возобновилась на 57.787 — маркер стоял внутри фразы. */
+  const liveSilences = [
+    { startSec: 53.805, endSec: 55.787 },
+    { startSec: 56.528, endSec: 57.787 },
+    { startSec: 61.71, endSec: 62.728 }
+  ];
+
+  test('целая секунда от Whisper → назад на реальный онсет речи', () => {
+    const r = TS.snapToSpeechOnset(60, liveSilences);
+    assert.strictEqual(r.timeSec, 57.787);
+    assert.strictEqual(r.driftSec, -2.213);
+    assert.strictEqual(r.inGap, false);
+  });
+
+  test('время внутри паузы → конец этой паузы, окна допуска не мешают', () => {
+    /* 54.5 внутри 53.805–55.787: речь начинается в 55.787 (вперёд на 1.29с —
+       больше maxFwd, но это точный ответ, а не догадка). */
+    const r = TS.snapToSpeechOnset(54.5, liveSilences);
+    assert.strictEqual(r.timeSec, 55.787);
+    assert.strictEqual(r.inGap, true);
+  });
+
+  test('онсет чуть впереди предпочтительнее далёкого позади', () => {
+    const r = TS.snapToSpeechOnset(60, [{ startSec: 57, endSec: 57.8 }, { startSec: 59.9, endSec: 60.3 }]);
+    assert.strictEqual(r.timeSec, 60.3);
+  });
+
+  test('слишком далеко вперёд — не тянем, иначе срежем начало фразы', () => {
+    assert.strictEqual(TS.snapToSpeechOnset(60, [{ startSec: 61, endSec: 62 }]), null);
+  });
+
+  test('слишком далеко назад — не тянем', () => {
+    assert.strictEqual(TS.snapToSpeechOnset(60, [{ startSec: 55, endSec: 56.5 }]), null);
+  });
+
+  test('ноль не двигаем — первая глава обязана стоять на 0:00', () => {
+    assert.strictEqual(TS.snapToSpeechOnset(0, [{ startSec: 0, endSec: 2 }]), null);
+  });
+
+  test('нет измеренных пауз → снэпить некуда', () => {
+    assert.strictEqual(TS.snapToSpeechOnset(60, []), null);
+    assert.strictEqual(TS.snapToSpeechOnset(60, null), null);
+  });
+
+  test('мусор во времени и в паузах не роняет', () => {
+    assert.strictEqual(TS.snapToSpeechOnset(NaN, liveSilences), null);
+    assert.strictEqual(TS.snapToSpeechOnset(-5, liveSilences), null);
+    assert.strictEqual(TS.snapToSpeechOnset('60', liveSilences), null);
+    assert.strictEqual(TS.snapToSpeechOnset(60, [null, {}, { startSec: 5, endSec: 1 }]), null);
+  });
+
+  test('альтернативные имена полей (start/end) тоже читаются', () => {
+    const r = TS.snapToSpeechOnset(60, [{ start: 56.5, end: 57.9 }]);
+    assert.strictEqual(r.timeSec, 57.9);
+  });
+
+  test('окна допуска настраиваются', () => {
+    const far = [{ startSec: 50, endSec: 55 }];
+    assert.strictEqual(TS.snapToSpeechOnset(60, far), null);
+    assert.strictEqual(TS.snapToSpeechOnset(60, far, { maxBackSec: 10 }).timeSec, 55);
+  });
+});
+
+describe('TranscriptStructure.snapMarkersToSpeech', () => {
+  const sil = [{ startSec: 9, endSec: 9.8 }, { startSec: 19, endSec: 19.7 }];
+
+  test('двигает маркеры и считает статистику', () => {
+    const r = TS.snapMarkersToSpeech(
+      [{ timeSec: 10, name: 'A' }, { timeSec: 20, name: 'B' }],
+      sil
+    );
+    assert.strictEqual(r.markers[0].timeSec, 9.8);
+    assert.strictEqual(r.markers[1].timeSec, 19.7);
+    assert.strictEqual(r.snappedCount, 2);
+    assert.strictEqual(r.maxDriftSec, 0.3);
+  });
+
+  test('исходное время сохраняется для диагностики', () => {
+    const r = TS.snapMarkersToSpeech([{ timeSec: 10, name: 'A' }], sil);
+    assert.strictEqual(r.markers[0].snappedFromSec, 10);
+    assert.strictEqual(r.markers[0].name, 'A', 'остальные поля не теряются');
+  });
+
+  test('вход не мутируется', () => {
+    const src = [{ timeSec: 10, name: 'A' }];
+    TS.snapMarkersToSpeech(src, sil);
+    assert.strictEqual(src[0].timeSec, 10);
+  });
+
+  test('порядок строгий: снэп, ломающий его, откатывается', () => {
+    /* Оба маркера тянет на один онсет 9.8 — второй обязан остаться на месте. */
+    const r = TS.snapMarkersToSpeech(
+      [{ timeSec: 10, name: 'A' }, { timeSec: 10.2, name: 'B' }],
+      sil
+    );
+    assert.strictEqual(r.markers[0].timeSec, 9.8);
+    assert.strictEqual(r.markers[1].timeSec, 10.2, 'откат к исходному');
+    assert.strictEqual(r.snappedCount, 1);
+  });
+
+  test('без пауз возвращает вход как есть', () => {
+    const src = [{ timeSec: 10 }];
+    const r = TS.snapMarkersToSpeech(src, []);
+    assert.strictEqual(r.markers, src);
+    assert.strictEqual(r.snappedCount, 0);
+  });
+
+  test('маркеры без числового timeSec проходят насквозь', () => {
+    const r = TS.snapMarkersToSpeech([{ name: 'нет времени' }, null], sil);
+    assert.strictEqual(r.markers.length, 2);
+    assert.strictEqual(r.snappedCount, 0);
+  });
+});
+
+/* ═══ verifySegmentBoundaries — верификация границ в источнике (06.08.2026) ═══
+ * Плотная карта пауз (d=0.15) сверяет КАЖДУЮ границу Whisper-сегмента.
+ * Данные пауз — живой замер Nested Sequence 02. */
+describe('TranscriptStructure.verifySegmentBoundaries', () => {
+  const dense = [
+    { startSec: 53.805, endSec: 55.787 },
+    { startSec: 56.528, endSec: 57.787 },
+    { startSec: 61.71, endSec: 62.728 }
+  ];
+
+  test('начало на целой секунде уезжает назад к онсету (конец паузы)', () => {
+    const r = TS.verifySegmentBoundaries(
+      [{ startSec: 58, endSec: 61.7, text: 'x' }],
+      dense
+    );
+    assert.strictEqual(r.segments[0].startSec, 57.787);
+    assert.strictEqual(r.segments[0].startVerified, true);
+    assert.strictEqual(r.stats.startsVerified, 1);
+  });
+
+  test('конец уезжает вперёд к оффсету (начало паузы) — речь не сжимается', () => {
+    const r = TS.verifySegmentBoundaries(
+      [{ startSec: 50, endSec: 61.5, text: 'x' }],
+      dense
+    );
+    assert.strictEqual(r.segments[0].endSec, 61.71);
+    assert.strictEqual(r.segments[0].endVerified, true);
+  });
+
+  test('конец назад — только в узком окне 0.25с (не срезаем речь)', () => {
+    /* Конец 62.1 внутри паузы 61.71–62.728 → точный ответ = её начало */
+    const rIn = TS.verifySegmentBoundaries([{ startSec: 58, endSec: 62.1 }], dense);
+    assert.strictEqual(rIn.segments[0].endSec, 61.71);
+    /* Конец 63.5: пауза началась в 61.71 — назад 1.79с, вне узкого окна */
+    const rFar = TS.verifySegmentBoundaries([{ startSec: 58, endSec: 63.5 }], dense);
+    assert.strictEqual(rFar.segments[0].endSec, 63.5);
+    assert.strictEqual(rFar.segments[0].endVerified, false);
+  });
+
+  test('начало вперёд — только в узком окне 0.25с', () => {
+    /* 55.6 → онсет 55.787 впереди на 0.187 < 0.25 → тянем */
+    const r = TS.verifySegmentBoundaries([{ startSec: 55.6, endSec: 56.4 }], dense);
+    assert.strictEqual(r.segments[0].startSec, 55.787);
+    assert.strictEqual(r.segments[0].startVerified, true);
+  });
+
+  test('граница внутри паузы — точный ответ без окон', () => {
+    const r = TS.verifySegmentBoundaries([{ startSec: 54.5, endSec: 60 }], dense);
+    assert.strictEqual(r.segments[0].startSec, 55.787, 'речь возобновилась в конце паузы');
+  });
+
+  test('граница вне досягаемости пауз не двигается и честно unverified', () => {
+    const r = TS.verifySegmentBoundaries([{ startSec: 10, endSec: 20 }], dense);
+    assert.strictEqual(r.segments[0].startSec, 10);
+    assert.strictEqual(r.segments[0].endSec, 20);
+    assert.strictEqual(r.segments[0].startVerified, false);
+    assert.strictEqual(r.segments[0].endVerified, false);
+    assert.strictEqual(r.stats.verifiedPct, 0);
+  });
+
+  test('ноль не двигаем — запись начинается с комнатного тона', () => {
+    const r = TS.verifySegmentBoundaries(
+      [{ startSec: 0, endSec: 53.9 }],
+      [{ startSec: 0, endSec: 0.8 }, ...dense]
+    );
+    assert.strictEqual(r.segments[0].startSec, 0);
+    assert.strictEqual(r.segments[0].startVerified, false);
+  });
+
+  test('инвариант: конец не пересекает начало следующего сегмента (lookahead)', () => {
+    /* Конец 61.5 хочет вперёд к 61.71, но следующий сегмент начинается в 61.6 —
+       снэп сломал бы порядок → откат, unverified. */
+    const r = TS.verifySegmentBoundaries(
+      [
+        { startSec: 58, endSec: 61.5 },
+        { startSec: 61.6, endSec: 65 }
+      ],
+      dense
+    );
+    assert.strictEqual(r.segments[0].endSec, 61.5);
+    assert.strictEqual(r.segments[0].endVerified, false);
+  });
+
+  test('инвариант: начало не заезжает за скорректированный конец предыдущего', () => {
+    /* seg2 начало 58.0 → онсет 57.787 назад; prev конец скорректирован в 61.71?
+       Нет: используем пару где prev.newE > кандидат: prev [50, 57.9] конец
+       снэпится к 61.71? — нет, вне окна. Строим прямой случай: prev конец 57.85
+       (внутри паузы 56.528–57.787? нет). Прямее: prev [50,57.787] уже на онсете,
+       seg2 старт 58.0 → кандидат 57.787 == prevEnd → допустимо (>=). */
+    const r = TS.verifySegmentBoundaries(
+      [
+        { startSec: 50, endSec: 57.787 },
+        { startSec: 58, endSec: 61.7 }
+      ],
+      dense
+    );
+    assert.strictEqual(r.segments[1].startSec, 57.787, 'ровно на prevEnd — допустимо');
+  });
+
+  test('вход не мутируется', () => {
+    const src = [{ startSec: 58, endSec: 61.5, text: 'x' }];
+    TS.verifySegmentBoundaries(src, dense);
+    assert.strictEqual(src[0].startSec, 58);
+    assert.strictEqual(src[0].startVerified, undefined);
+  });
+
+  test('пустые паузы → сегменты как есть, нулевая статистика', () => {
+    const src = [{ startSec: 1, endSec: 2 }];
+    const r = TS.verifySegmentBoundaries(src, []);
+    assert.strictEqual(r.segments, src);
+    assert.strictEqual(r.stats.total, 1);
+    assert.strictEqual(r.stats.verifiedPct, 0);
+  });
+
+  test('битые сегменты проходят насквозь без флагов', () => {
+    const r = TS.verifySegmentBoundaries(
+      [{ text: 'нет времён' }, { startSec: 5, endSec: 3 }],
+      dense
+    );
+    assert.strictEqual(r.segments.length, 2);
+    assert.strictEqual(r.segments[0].startVerified, undefined);
+  });
+
+  test('статистика: adjusted и verifiedPct считаются честно', () => {
+    const r = TS.verifySegmentBoundaries(
+      [
+        { startSec: 58, endSec: 61.5 },   /* старт снэпится, конец да (61.71) */
+        { startSec: 10, endSec: 20 }      /* мимо — но порядок! начнём с 10 */
+      ].sort((a, b) => a.startSec - b.startSec),
+      dense
+    );
+    /* seg[0]=10–20 unverified; seg[1]=58–61.5: старт→57.787, конец→61.71 */
+    assert.strictEqual(r.stats.startsVerified, 1);
+    assert.strictEqual(r.stats.endsVerified, 1);
+    assert.strictEqual(r.stats.verifiedPct, 50);
+    assert.ok(r.stats.maxDriftSec >= 0.2);
+  });
+
+  test('альтернативные имена полей start/end читаются', () => {
+    const r = TS.verifySegmentBoundaries([{ start: 58, end: 61.7 }], dense);
+    assert.strictEqual(r.segments[0].startSec, 57.787);
+  });
+});

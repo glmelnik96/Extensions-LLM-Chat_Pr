@@ -1123,12 +1123,19 @@
       return { ok: false, error: 'Нет транскрипта.' };
     }
 
-    /* Ensure paragraphs exist before building topics */
-    if ((!entry.paragraphs || !entry.paragraphs.length) && typeof TranscriptStructure !== 'undefined') {
-      try {
-        var silences = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
-        entry.paragraphs = TranscriptStructure.buildParagraphs(entry.segments, silences);
-      } catch (e) { /* fallback: buildTopicsWithLLM will work with raw segments */ }
+    /* Ensure paragraphs exist before building topics.
+       Аудит 05.08.2026: раньше проверяли только «есть/нет» — устаревшие после
+       правок абзацы молча использовались, и главы вставали по старым таймкодам.
+       Теперь так же, как в остальных точках: + isParagraphsStale. */
+    if (typeof TranscriptStructure !== 'undefined') {
+      var paraStale = !entry.paragraphs || !entry.paragraphs.length ||
+        (TranscriptStructure.isParagraphsStale && TranscriptStructure.isParagraphsStale(entry));
+      if (paraStale) {
+        try {
+          var silences = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
+          entry.paragraphs = TranscriptStructure.buildParagraphs(entry.segments, silences);
+        } catch (e) { /* fallback: buildTopicsWithLLM will work with raw segments */ }
+      }
     }
 
     /* C3: кастомные указания к главам. Кэш topics строился под КОНКРЕТНЫЕ
@@ -1201,6 +1208,24 @@
       };
     });
 
+    /* Снэп к измеренным речевым онсетам (05.08.2026). Таймкоды Whisper — не
+       акустические: на невнятных участках модель квантует границы к целым
+       секундам, и глава садится в середину фразы. audioAnalysis.silences —
+       ffmpeg silencedetect, ±10мс; конец паузы = момент возобновления речи.
+       Снэпим ДО фильтра по мин. интервалу, чтобы фильтр считал финальные
+       времена. Порядок глав снэп не ломает (см. snapMarkersToSpeech). */
+    var snapNote = '';
+    var silencesForSnap = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
+    if (silencesForSnap.length && typeof TranscriptStructure !== 'undefined' &&
+        typeof TranscriptStructure.snapMarkersToSpeech === 'function') {
+      var snapRes = TranscriptStructure.snapMarkersToSpeech(markers, silencesForSnap);
+      markers = snapRes.markers;
+      if (snapRes.snappedCount) {
+        snapNote = ' Уточнено по паузам: ' + snapRes.snappedCount + ' из ' + markers.length +
+          ' (макс. сдвиг ' + snapRes.maxDriftSec.toFixed(2) + 'с).';
+      }
+    }
+
     /* US-005: адаптивный минимальный интервал между главами.
        <3min=10s, 3-10min=20s, >10min=45s (вместо жёстких 15с).
        C3: params.minChapterSec > 0 — ручной override (merge коротких глав:
@@ -1247,7 +1272,8 @@
         markers: filtered,
         summary: 'Автоматические главы (' + filtered.length + ')' + chNote + ': по темам из транскрипта.' +
           (customIx ? ' Указания учтены.' : '') +
-          (minChapterInterval ? ' Мин. интервал: ' + minChapterInterval + 'с.' : '')
+          (minChapterInterval ? ' Мин. интервал: ' + minChapterInterval + 'с.' : '') +
+          snapNote
       }
     };
   }
@@ -2694,7 +2720,14 @@
    * NaN/инверсия → отброс. Формы тишин: {startSec,endSec} и {start,end}.
    * opts.segments (опц.): при передаче снап разрешён только к МЕЖсегментным
    * зазорам, а без валидной тишины граница держится на месте (без padding).
-   * → { intervals: [...], stats: { snapped, padded, kept — счёт ГРАНИЦ (0–2 на интервал), dropped — счёт ИНТЕРВАЛОВ } }
+   * opts.silencesDense (опц., спека 2026-08-06): плотная карта пауз (d=0.15);
+   * при непустой используется ВМЕСТО silences — на том же пороге она надмножество
+   * обычной, видит паузы короче 0.5с → больше границ подтверждается.
+   * opts.strict (опц., спека 2026-08-06, «метить и защищать»): интервал, чью
+   * границу не удалось подтвердить измеренной паузой (снап или граница уже
+   * внутри паузы), исключается из плана с причиной → res.skipped[],
+   * res.stats.unconfirmed. Виден в предложении до подтверждения пользователем.
+   * → { intervals: [...], stats: { snapped, padded, kept — счёт ГРАНИЦ (0–2 на интервал), dropped, unconfirmed — счёт ИНТЕРВАЛОВ }, skipped: [...] }
    */
   function refineCutBoundaries(intervals, silences, opts) {
     var o = opts || {};
@@ -2736,13 +2769,17 @@
       }
       return false;
     }
-    var res = { intervals: [], stats: { snapped: 0, padded: 0, dropped: 0, kept: 0 } };
+    var strict = !!o.strict;
+    var res = { intervals: [], stats: { snapped: 0, padded: 0, dropped: 0, kept: 0, unconfirmed: 0 }, skipped: [] };
     if (!intervals || !intervals.length) return res;
 
     /* Центры валидных тишин (обе формы полей). При segment-aware отсеиваем
-       центры, лежащие ВНУТРИ речи сегмента (внутрифразовые паузы). */
+       центры, лежащие ВНУТРИ речи сегмента (внутрифразовые паузы).
+       Плотная карта (d=0.15) при наличии предпочтительнее редкой (d=0.5):
+       на одном пороге она надмножество — теряем ничего, видим больше. */
     var centers = [];
-    var list = silences || [];
+    var spans = []; /* [start,end] валидных тишин — для strict-подтверждения «граница уже в паузе» */
+    var list = (o.silencesDense && o.silencesDense.length) ? o.silencesDense : (silences || []);
     for (var si = 0; si < list.length; si++) {
       var s = list[si] || {};
       var ss = (typeof s.startSec === 'number') ? s.startSec : s.start;
@@ -2751,7 +2788,14 @@
           !isFinite(ss) || !isFinite(se) || se - ss < minSilenceSec) continue;
       var cen = (ss + se) / 2;
       if (segmentAware && insideSegment(cen)) continue;
+      spans.push([ss, se]);
       centers.push(cen);
+    }
+    function insideSilence(t) {
+      for (var vi = 0; vi < spans.length; vi++) {
+        if (t >= spans[vi][0] - 1e-6 && t <= spans[vi][1] + 1e-6) return true;
+      }
+      return false;
     }
 
     function refineBoundary(t, isStart) {
@@ -2783,6 +2827,23 @@
       var n0 = Math.max(0, r0.t);
       var n1 = r1.t;
       if (n1 - n0 < minIntervalSec) { res.stats.dropped++; continue; }
+      if (strict) {
+        /* «Метить и защищать»: граница подтверждена, если снэпнута к паузе
+           ЛИБО уже лежит внутри измеренной паузы (снэп не понадобился).
+           Начало выреза на t=0 — край материала, паузы там не бывает. */
+        var ok0 = r0.how === 'snapped' || t0 <= 1e-6 || insideSilence(n0);
+        var ok1 = r1.how === 'snapped' || insideSilence(n1);
+        if (!ok0 || !ok1) {
+          res.stats.unconfirmed++;
+          res.skipped.push({
+            startSec: t0,
+            endSec: t1,
+            reason: !ok0 && !ok1 ? 'обе границы вне измеренных пауз'
+              : (!ok0 ? 'начало вне измеренной паузы' : 'конец вне измеренной паузы')
+          });
+          continue;
+        }
+      }
       res.stats[r0.how]++;
       res.stats[r1.how]++;
       var copy = {};

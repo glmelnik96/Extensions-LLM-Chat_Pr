@@ -144,6 +144,29 @@
         out.audioAnalysis = aa;
       }
     }
+    /* Переверификация границ по плотной карте пауз (спека 06.08.2026): файл
+       мог быть создан до появления верификации или отредактирован руками.
+       Карта есть — честно пересчитываем времена и флаги (идемпотентно:
+       уже снэпнутые границы стоят на краях пауз и подтвердятся заново).
+       Карты нет — флаги не выдумываем, границы остаются как в файле. */
+    try {
+      var dense = out.audioAnalysis && Array.isArray(out.audioAnalysis.silencesDense)
+        ? out.audioAnalysis.silencesDense : null;
+      if (dense && dense.length && typeof global.TranscriptStructure !== 'undefined' &&
+          typeof global.TranscriptStructure.verifySegmentBoundaries === 'function') {
+        var v = global.TranscriptStructure.verifySegmentBoundaries(out.segments, dense);
+        out.segments = v.segments;
+        out.timingVerification = {
+          verifiedPct: v.stats.verifiedPct,
+          startsVerified: v.stats.startsVerified,
+          endsVerified: v.stats.endsVerified,
+          total: v.stats.total,
+          adjustedCount: v.stats.adjustedCount,
+          maxDriftSec: v.stats.maxDriftSec,
+          at: Date.now()
+        };
+      }
+    } catch (eV) { /* верификация — уточнение, не обязательный шаг импорта */ }
     return out;
   }
 

@@ -2197,13 +2197,22 @@ PanelBoot.run('ИИ: монтаж', function () {
 
     /* Точные резы (2026-07-20): статистика уточнения границ по тишине */
     var bs = _pendingProposal.boundaryStats;
-    if (bs && (bs.snapped || bs.padded || bs.dropped)) {
+    if (bs && (bs.snapped || bs.padded || bs.dropped || bs.unconfirmed)) {
       var bsEl = document.createElement('div');
       bsEl.style.cssText = 'font-size:11px;color:var(--muted);margin:-4px 0 8px;';
       bsEl.textContent = 'Границы: ' + (bs.snapped || 0) + ' по тишине, ' +
         (bs.padded || 0) + ' с отступом' +
         (bs.dropped ? ' · интервалов отброшено (<0.3с): ' + bs.dropped : '');
       card.appendChild(bsEl);
+    }
+    /* Строгий режим (спека 2026-08-06): интервалы, исключённые из плана из-за
+       неподтверждённых границ — пользователь видит ДО подтверждения. */
+    if (bs && bs.unconfirmed) {
+      var unEl = document.createElement('div');
+      unEl.style.cssText = 'color:#f59e0b;font-size:11px;margin:2px 0 8px;';
+      unEl.textContent = '⚠ Исключено из плана (границы не подтверждены паузами): ' +
+        bs.unconfirmed + ' интервал(ов).';
+      card.appendChild(unEl);
     }
 
     /* 18.06.2026: предупреждение о неполном покрытии транскрипта при сборке «на N мин». */
@@ -3264,6 +3273,7 @@ PanelBoot.run('ИИ: монтаж', function () {
        (maxOutwardSnapSec 0.3), чтобы снап не перепрыгнул через сохраняемое слово
        к дальней паузе и не съел его — корень «монтаж по смыслу режет фразы». */
     var _cutSilences = [];
+    var _cutSilencesDense = []; /* плотная карта пауз d=0.15 (спека 2026-08-06) */
     var _cutSegments = [];
     var _snapSeqKey = _cleanSeqKey((lastSnap && lastSnap.sequenceName) || '');
     /* Тот же приоритет ключей, что у snapIntervalsToSegmentBoundaries:
@@ -3278,6 +3288,10 @@ PanelBoot.run('ИИ: монтаж', function () {
         if (_silFound.entry.audioAnalysis &&
             Array.isArray(_silFound.entry.audioAnalysis.silences)) {
           _cutSilences = _silFound.entry.audioAnalysis.silences;
+        }
+        if (_silFound.entry.audioAnalysis &&
+            Array.isArray(_silFound.entry.audioAnalysis.silencesDense)) {
+          _cutSilencesDense = _silFound.entry.audioAnalysis.silencesDense;
         }
         /* Segment-aware снап (фикс «фраза обрывается»): refineCutBoundaries
            снапает только к межсегментным зазорам, не к паузам внутри фразы. */
@@ -3297,8 +3311,15 @@ PanelBoot.run('ИИ: монтаж', function () {
     if ((!_cutSilences || !_cutSilences.length) && _cutSegments && _cutSegments.length) {
       _cutSilences = DeterministicPipelines._silencesFromSegmentGaps(_cutSegments, 0.2);
     }
+    /* Верификация границ (спека 2026-08-06, «метить и защищать»): при наличии
+       ПЛОТНОЙ карты пауз (d=0.15, реальный silencedetect) включаем строгий режим —
+       интервал, чью границу не удалось подтвердить измеренной паузой, исключается
+       из плана с причиной. Без плотной карты (старый кэш / фолбэк из зазоров
+       Whisper) строгий режим бессмыслен: подтверждали бы Whisper Whisper'ом. */
+    var _strictCuts = _cutSilencesDense.length > 0;
     var _refined = DeterministicPipelines.refineCutBoundaries(
-      snapIntervalsToSegmentBoundaries(paddedIntervals), _cutSilences, { segments: _cutSegments });
+      snapIntervalsToSegmentBoundaries(paddedIntervals), _cutSilences,
+      { segments: _cutSegments, silencesDense: _cutSilencesDense, strict: _strictCuts });
     var snappedIntervals = mergeRemoveIntervals(_refined.intervals);
     /* Лид-ин зазор (2026-07-22): ПОСЛЕ snap+refine+merge тянем конец выреза чуть
        раньше СКВОЗЬ ТИШИНУ, чтобы следующий фрагмент открывался коротким «вдохом»
@@ -3341,7 +3362,10 @@ PanelBoot.run('ИИ: монтаж', function () {
       /* HIGH (6 мая 2026): сохраняем target для UI-индикации в карточке.
          Без этого пользователь не видит «попросил 40, получил 70». */
       targetDurationSec: typeof args.targetDurationSec === 'number' ? args.targetDurationSec : null,
-      warnings: _keepInvertWarning ? [_keepInvertWarning] : null
+      warnings: _keepInvertWarning ? [_keepInvertWarning] : null,
+      /* Строгий режим (спека 2026-08-06): интервалы, исключённые из плана
+         из-за неподтверждённых границ — видны в карточке до подтверждения. */
+      skippedIntervals: (_refined.skipped && _refined.skipped.length) ? _refined.skipped : null
     };
     /* Проброс контекста плана монтажа (propose_montage_plan → карточка) */
     if (_pendingPlanContext) {
@@ -3368,6 +3392,13 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* P0-C: если часть removeRefs невалидна — сообщаем модели */
     if (refResult && refResult.refErrors && refResult.refErrors.length) {
       result._refErrors = refResult.refErrors;
+    }
+    /* Строгий режим (2026-08-06): сообщаем модели об исключённых интервалах —
+       она может переформулировать план (сдвинуть границы к паузам). */
+    if (_refined.stats.unconfirmed) {
+      result._skippedUnconfirmed = _refined.skipped;
+      result.message += ' Внимание: ' + _refined.stats.unconfirmed +
+        ' интервал(ов) исключено — границы не подтверждены измеренными паузами (см. _skippedUnconfirmed).';
     }
     return Promise.resolve(result);
   }
@@ -10144,6 +10175,23 @@ PanelBoot.run('ИИ: монтаж', function () {
           resEl.textContent = 'ИИ не нашёл убедительных кандидатов (или ответ не распарсился) — попробуйте другой пресет/длину.';
           return;
         }
+        /* Снэп начала кандидата к измеренному онсету речи (05.08.2026): LLM
+           отдаёт границы абзацев, а те построены на таймкодах Whisper —
+           неакустических. Правим один раз здесь, чтобы и таймкод в карточке,
+           и кнопка In/Out, и маркеры показывали одно и то же время. */
+        try {
+          var silV = (entry.audioAnalysis && entry.audioAnalysis.silences) || [];
+          if (silV.length) {
+            /* Поштучно, а не snapMarkersToSpeech: кандидаты отсортированы по
+               оценке, а не по времени — проверка строгого порядка там сбросила
+               бы правильные снэпы. */
+            for (var si = 0; si < cands.length; si++) {
+              var hitV = TranscriptStructure.snapToSpeechOnset(cands[si].startSec, silV);
+              if (hitV && hitV.timeSec < cands[si].endSec) cands[si].startSec = hitV.timeSec;
+            }
+          }
+        } catch (eSnap) { /* снэп — уточнение, а не обязательный шаг */ }
+
         var head = document.createElement('div');
         head.style.cssText = 'font-weight:600;margin-bottom:4px;';
         head.textContent = 'Виральные кандидаты (' + cands.length + '), оценки 0–10:';
