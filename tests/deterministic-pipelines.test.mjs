@@ -3425,3 +3425,30 @@ describe('muteProfanity (C2)', () => {
     assert.equal(r.noChanges, true);
   });
 });
+
+/* ═══ 09.2026: multicamFromAudio — стиль вставок и глушение микрофонов ═══ */
+describe('DeterministicPipelines.multicamFromAudio — bridgeStyle / muteInactiveMics', () => {
+  function mkCtx() {
+    const tl = (loud) => { const out = []; for (let i = 0; i < 1200; i++) out.push({ t: i * 0.05, rms: loud(i * 0.05) }); return out; };
+    return {
+      snapshot: { ok: true, sequenceName: 'S', tracks: [
+        { type: 'video', index: 0 }, { type: 'video', index: 1 }, { type: 'video', index: 2 },
+        { type: 'audio', index: 0 }, { type: 'audio', index: 1 }
+      ], clips: [
+        { trackType: 'audio', trackIndex: 0, mediaPath: '/a.wav', startSec: 0, endSec: 60 },
+        { trackType: 'audio', trackIndex: 1, mediaPath: '/b.wav', startSec: 0, endSec: 60 }
+      ] },
+      rmsExtractor: async () => ({ timelines: [tl(t => t < 40 ? -20 : -60), tl(t => t < 40 ? -60 : -20)], mediaPaths: ['/a.wav', '/b.wav'] })
+    };
+  }
+  test('по умолчанию audio=keep, стиль mix; muteInactiveMics → audio=mute_inactive + сегменты со speaker', async () => {
+    const a = await DP.multicamFromAudio(mkCtx(), {});
+    assert.equal(a.proposal.plan.params.audio, 'keep');
+    assert.match(a.proposal.summary, /Вставки в монолог: общий план \/ собеседник/);
+    const b = await DP.multicamFromAudio(mkCtx(), { muteInactiveMics: true, bridgeStyle: 'reaction' });
+    assert.equal(b.proposal.plan.params.audio, 'mute_inactive');
+    assert.match(b.proposal.summary, /микрофоны молчащих будут заглушены/);
+    assert.match(b.proposal.summary, /камера собеседника/);
+    b.proposal.plan.segments.forEach(s => assert.equal(typeof s.speaker, 'number'));
+  });
+});

@@ -726,3 +726,100 @@ describe('splitPlanIntoBatches', () => {
     assert.deepEqual([...batches].map((b) => b.segments.length), [1, 1, 1]);
   });
 });
+
+/* ═══ 09.2026: живой ритм вставок в монолог + спикер сегмента ═══ */
+describe('MulticamPlan._enforceMaxHold — живой ритм (09.2026)', () => {
+  const wide = 0;
+  const mono = [{ tStart: 0, tEnd: 60, activeVideoTrack: 1 }];
+
+  it('вставки НЕ одинаковой длины и НЕ через равные интервалы', () => {
+    const out = MP._enforceMaxHold(mono, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 3, bridgeStyle: 'wide' }, wide);
+    const bridges = out.filter(s => s.activeVideoTrack === wide).map(s => +(s.tEnd - s.tStart).toFixed(3));
+    const holds = out.filter(s => s.activeVideoTrack !== wide).map(s => +(s.tEnd - s.tStart).toFixed(3));
+    assert.ok(bridges.length >= 4, 'мало вставок: ' + bridges.length);
+    assert.ok(new Set(bridges).size > 1, 'все вставки одной длины: ' + bridges);
+    assert.ok(new Set(holds.slice(0, -1)).size > 1, 'все интервалы одинаковые: ' + holds);
+    bridges.forEach(b => assert.ok(b >= 0.5 && b <= 3 * 1.2 + 1e-9, 'длина вставки вне [0.5, 3.6]: ' + b));
+    holds.forEach(h => assert.ok(h <= 8 + 1e-9, 'план длиннее maxHold: ' + h));
+    const total = out.reduce((a, s) => a + (s.tEnd - s.tStart), 0);
+    assert.ok(Math.abs(total - 60) < 1e-6);
+    for (let i = 1; i < out.length; i++) assert.ok(Math.abs(out[i].tStart - out[i - 1].tEnd) < 1e-9);
+  });
+
+  it('детерминированно от seed; другой seed — другой рисунок', () => {
+    const a = MP._enforceMaxHold(mono, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 5 }, wide);
+    const b = MP._enforceMaxHold(mono, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 5 }, wide);
+    const c = MP._enforceMaxHold(mono, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 6 }, wide);
+    assert.deepEqual(a, b);
+    assert.notDeepEqual(a.map(s => s.tEnd), c.map(s => s.tEnd));
+  });
+
+  it('граница вставки притягивается к кандидату реза (пауза) в окне', () => {
+    const cands = [6.3, 9.1, 13.7, 17.2, 21.9, 26.4, 30.8, 35.1, 39.6, 44.0, 48.5, 52.9, 57.2];
+    const out = MP._enforceMaxHold(mono, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 2, bridgeStyle: 'wide' }, wide, { cutCandidates: cands });
+    const starts = out.filter(s => s.activeVideoTrack === wide).map(s => s.tStart);
+    assert.ok(starts.length >= 3);
+    const onCand = starts.filter(t => cands.some(c => Math.abs(c - t) < 1e-9)).length;
+    assert.ok(onCand >= Math.ceil(starts.length * 0.6), 'мало границ на паузах: ' + onCand + '/' + starts.length);
+  });
+
+  it('стиль reaction: вставка = камера собеседника (кто говорил ДО монолога)', () => {
+    const segs = [
+      { tStart: 0, tEnd: 4, activeVideoTrack: 2 },
+      { tStart: 4, tEnd: 40, activeVideoTrack: 1 }
+    ];
+    const out = MP._enforceMaxHold(segs, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 1, bridgeStyle: 'reaction' }, wide, { speakerTracks: [1, 2, 3] });
+    const bridges = out.slice(1).filter(s => s.activeVideoTrack !== 1);
+    assert.ok(bridges.length >= 2);
+    bridges.forEach(b => assert.equal(b.activeVideoTrack, 2, 'ожидалась камера собеседника V2'));
+  });
+
+  it('стиль reaction без второго спикера → общий план', () => {
+    const out = MP._enforceMaxHold(mono, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 1, bridgeStyle: 'reaction' }, wide);
+    out.filter(s => s.activeVideoTrack !== 1).forEach(b => assert.equal(b.activeVideoTrack, wide));
+  });
+
+  it('стиль mix: есть и общий план, и камера собеседника', () => {
+    const segs = [{ tStart: 0, tEnd: 3, activeVideoTrack: 2 }, { tStart: 3, tEnd: 120, activeVideoTrack: 1 }];
+    const out = MP._enforceMaxHold(segs, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 4, bridgeStyle: 'mix' }, wide);
+    const kinds = new Set(out.slice(1).filter(s => s.activeVideoTrack !== 1).map(s => s.activeVideoTrack));
+    assert.ok(kinds.has(wide) && kinds.has(2), 'ожидались оба типа вставок: ' + [...kinds]);
+  });
+
+  it('короткие сегменты и wide не трогаются; хвост после вставки ≥ 1.5с', () => {
+    const short = [{ tStart: 0, tEnd: 10, activeVideoTrack: 1 }];
+    assert.deepEqual(MP._enforceMaxHold(short, { maxHoldSec: 8, maxAllSpeakersSec: 3 }, wide), short);
+    const out = MP._enforceMaxHold(mono, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 9 }, wide);
+    const last = out[out.length - 1];
+    assert.equal(last.activeVideoTrack, 1);
+    assert.ok(last.tEnd - last.tStart >= 1.5 - 1e-9);
+  });
+});
+
+describe('MulticamPlan._dominantMic + speaker в плане (09.2026)', () => {
+  it('доминирующий микрофон сегмента; пауза/перебивка → -1', () => {
+    const labels = [0, 0, 0, 1, 0, -1, -1, -1, -1, -2, -2, -2];
+    assert.equal(MP._dominantMic(labels, 0, 0.25, 0.05), 0);       /* кадры 0..4 */
+    assert.equal(MP._dominantMic(labels, 0.25, 0.45, 0.05), -1);   /* тишина */
+    assert.equal(MP._dominantMic(labels, 0.45, 0.6, 0.05), -1);    /* перебивка */
+    assert.equal(MP._dominantMic([], 0, 1, 0.05), -1);
+  });
+
+  it('buildSwitchPlan: у сегментов есть speaker; вставка в монолог наследует говорящего', () => {
+    /* 60с монолога спикера 0 (mic0 громкий), затем 5с спикера 1 */
+    const frames = [];
+    for (let i = 0; i < 1300; i++) {
+      const t = i * 0.05;
+      frames.push({ tStart: t, tEnd: t + 0.05, rmsByTrack: t < 60 ? [-20, -60] : [-60, -20] });
+    }
+    const mapping = { wideVideoTrack: 0, speakers: [{ audioTrack: 0, videoTrack: 1 }, { audioTrack: 1, videoTrack: 2 }] };
+    const res = MP.buildSwitchPlan(frames, mapping, { maxHoldSec: 8, maxAllSpeakersSec: 3, variationsSeed: 2, bridgeStyle: 'mix' });
+    assert.ok(res.segments.length >= 4);
+    res.segments.forEach(s => assert.equal(typeof s.speaker, 'number'));
+    const bridges = res.segments.filter(s => s.tEnd <= 60 + 1e-6 && s.activeVideoTrack !== 1);
+    assert.ok(bridges.length >= 2, 'нет вставок в монолог');
+    bridges.forEach(b => assert.equal(b.speaker, 0, 'вставка должна наследовать спикера 0'));
+    const tail = res.segments[res.segments.length - 1];
+    assert.equal(tail.speaker, 1);
+  });
+});

@@ -2433,6 +2433,10 @@
     if (typeof params.maxAllSpeakersSec === 'number') planParams.maxAllSpeakersSec = params.maxAllSpeakersSec;
     if (typeof params.variationsJitterSec === 'number') planParams.variationsJitterSec = params.variationsJitterSec;
     if (typeof params.variationsSeed === 'number') planParams.variationsSeed = params.variationsSeed;
+    /* 09.2026: стиль вставок в монолог — общий план / камера собеседника / чередовать */
+    if (params.bridgeStyle === 'wide' || params.bridgeStyle === 'reaction' || params.bridgeStyle === 'mix') {
+      planParams.bridgeStyle = params.bridgeStyle;
+    }
     if (Array.isArray(params.speechOnsets)) planParams.speechOnsets = params.speechOnsets;
     /* Tier «оживления тумблеров»: тишина/перебивка держат последнего спикера */
     if (typeof params.wideOnSilence === 'boolean') planParams.wideOnSilence = params.wideOnSilence;
@@ -2460,7 +2464,12 @@
       version: 1,
       rangeSec: [built.segments[0].tStart, built.segments[built.segments.length - 1].tEnd],
       mapping: mapping,
-      params: { mode: (params.mode === 'delete' ? 'delete' : 'disable') },
+      params: {
+        mode: (params.mode === 'delete' ? 'delete' : 'disable'),
+        /* 09.2026: глушить микрофоны молчащих спикеров (host отключает аудиоклипы
+           не-говорящих на сегменте; звук идёт за речью, не за камерой). */
+        audio: params.muteInactiveMics ? 'mute_inactive' : 'keep'
+      },
       segments: built.segments
     };
 
@@ -2483,9 +2492,12 @@
     for (var sli = 0; sli < speakers.length; sli++) {
       screenPart(speakers[sli].label || ('Гость ' + (sli + 1)), speakers[sli].videoTrack);
     }
+    var bridgeLabel = planParams.bridgeStyle === 'wide' ? 'общий план'
+      : planParams.bridgeStyle === 'reaction' ? 'камера собеседника' : 'общий план / собеседник';
     var summary = 'Авто-MultiCam (по голосу): ' + built.segments.length + ' сегментов, ' +
       built.switchCount + ' переключений. Спикеров: ' + speakerCount + '.' +
-      '\nЭкранное время: ' + screenParts.join(' · ');
+      '\nЭкранное время: ' + screenParts.join(' · ') +
+      '\nВставки в монолог: ' + bridgeLabel + (params.muteInactiveMics ? ' · микрофоны молчащих будут заглушены' : '');
     /* Длинный план применяется батчами — честно предупредим о времени.
        11.07.2026: live-замер на 6_SYNCED — 92 батча ≈ 11 мин (~7 с/батч),
        старая оценка 3 с/батч занижала в 2.4 раза. Долгие планы — в минутах. */

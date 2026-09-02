@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.16.2';
+$._EXT_PRM_.version = '2.17.0';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -4482,10 +4482,35 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
       }
     }
   }
+  /* 2.17.0 (09.2026): глушение микрофонов молчащих. plan.params.audio ===
+     'mute_inactive' → микрофонные аудиодорожки спикеров (mapping.speakers[].audioTrack)
+     режутся теми же razor-точками, и на каждом сегменте аудиоклипы всех
+     спикеров, кроме говорящего (segment.speaker — индекс в mapping.speakers),
+     отключаются. speaker < 0 (пауза/перебивка) — все микрофоны остаются.
+     Аудио только disable, никогда не delete — синхрон и откат дороже. */
+  var muteAudio = !!(plan.params && plan.params.audio === 'mute_inactive');
+  var managedAudioTracks = [];
+  var micTrackToSpeaker = {};
+  if (muteAudio && plan.mapping.speakers && plan.mapping.speakers.length) {
+    for (var spa = 0; spa < plan.mapping.speakers.length; spa++) {
+      var at = plan.mapping.speakers[spa].audioTrack;
+      if (typeof at !== 'number' || at < 0 || at >= seq.audioTracks.numTracks) continue;
+      if (micTrackToSpeaker.hasOwnProperty(String(at))) continue; /* общий микрофон двух спикеров — не глушим */
+      micTrackToSpeaker[String(at)] = spa;
+      managedAudioTracks.push(at);
+    }
+  }
 
   /* Preflight: заблокированные управляемые дорожки. Razor на locked-дорожке
      молча не сработает → план «порежется» частично и сегменты разъедутся. */
   var lockedMC = $._EXT_PRM_._findLockedTracks(seq, managedTracks);
+  if (managedAudioTracks.length) {
+    var lockedA = [];
+    for (var la = 0; la < managedAudioTracks.length; la++) {
+      try { if ($._EXT_PRM_._trackIsLocked(seq.audioTracks[managedAudioTracks[la]])) lockedA.push('A' + (managedAudioTracks[la] + 1)); } catch (eLA) {}
+    }
+    lockedMC = lockedMC.concat(lockedA);
+  }
   if (lockedMC.length) {
     if (undoOpened) try { app.endUndoGroup(); } catch (eEUL) {}
     return JSON.stringify({
@@ -4524,6 +4549,8 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
   var segmentsApplied = 0;
   var disabledCount = 0;
   var deletedCount = 0;
+  var audioDisabledCount = 0;
+  var audioEnabledCount = 0;
   /* Счётчик неудачных razor/remove — раньше ошибки глотались молча. */
   var mcStats = { applied: 0, failed: 0, reasons: [] };
   try {
@@ -4565,6 +4592,14 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
           }
         } catch (eGT) { $._EXT_PRM_._statFail(mcStats, eGT); }
       }
+      for (var mta = 0; mta < managedAudioTracks.length; mta++) {
+        try {
+          var qAT = qeSeq.getAudioTrackAt(managedAudioTracks[mta]);
+          if (qAT) {
+            try { qAT.razor(tc, true, true); $._EXT_PRM_._bump(); cutsApplied++; } catch (eRZA) { $._EXT_PRM_._statFail(mcStats, eRZA); }
+          }
+        } catch (eGTA) { $._EXT_PRM_._statFail(mcStats, eGTA); }
+      }
     }
 
     /* Шаг 2 (переписан 10.07.2026): раньше — для КАЖДОГО сегмента полный проход
@@ -4584,7 +4619,13 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     validSegs.sort(function (a, b) { return a.tStart - b.tStart; });
 
     /* Сегмент, целиком содержащий клип [cs, ce], или null (клип вне плана —
-       не трогаем: важно для батчей, где план покрывает лишь часть таймлайна). */
+       не трогаем: важно для батчей, где план покрывает лишь часть таймлайна).
+       2.17.0 (live-находка 02.09.2026): выбор сегмента — СТРОГО по середине клипа,
+       без eps. Раньше eps (0.04 = кадр при 25 fps) участвовал и в бинпоиске:
+       однокадровый обрезок на стыке (старый рез на 40.04 + новый на 40.00 →
+       клип [40.00, 40.04]) «содержался» в ОБОИХ соседних сегментах, и побеждал
+       тот, куда первым попал бинпоиск — обрезок уходил не в ту камеру (кадр-
+       вспышка чужого плана, а с глушением микрофонов — щелчок звука). */
     var findSegForClip = function (cs, ce) {
       var mid = (cs + ce) / 2;
       var lo = 0;
@@ -4592,8 +4633,8 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
       while (lo <= hi) {
         var m = (lo + hi) >> 1;
         var sg = validSegs[m];
-        if (mid < sg.tStart - eps) { hi = m - 1; }
-        else if (mid > sg.tEnd + eps) { lo = m + 1; }
+        if (mid < sg.tStart) { hi = m - 1; }
+        else if (mid >= sg.tEnd) { lo = m + 1; }
         else {
           if (cs >= sg.tStart - eps && ce <= sg.tEnd + eps) return sg;
           return null; /* клип шире сегмента (razor не прошёл?) — не трогаем */
@@ -4634,6 +4675,27 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
         } catch (eC) {}
       }
     }
+    /* Аудио: микрофон говорящего включён, остальные микрофоны сегмента — выключены. */
+    for (var mat = 0; mat < managedAudioTracks.length; mat++) {
+      var aIdx = managedAudioTracks[mat];
+      var mySpeaker = micTrackToSpeaker[String(aIdx)];
+      var aTrack = seq.audioTracks[aIdx];
+      for (var aci = aTrack.clips.numItems - 1; aci >= 0; aci--) {
+        try {
+          var aClip = aTrack.clips[aci];
+          if (!aClip) continue;
+          var aSeg = findSegForClip(aClip.start.seconds, aClip.end.seconds);
+          if (!aSeg) continue;
+          var spk = (typeof aSeg.speaker === 'number') ? aSeg.speaker : -1;
+          var wantOn = (spk < 0) || (spk === mySpeaker);
+          if (wantOn) {
+            try { if (aClip.disabled) { aClip.disabled = false; $._EXT_PRM_._bump(); audioEnabledCount++; } } catch (eAE) {}
+          } else {
+            try { if (!aClip.disabled) { aClip.disabled = true; $._EXT_PRM_._bump(); audioDisabledCount++; } } catch (eAD) { $._EXT_PRM_._statFail(mcStats, eAD); }
+          }
+        } catch (eAC) {}
+      }
+    }
     segmentsApplied = validSegs.length;
   } finally {
     /* GUARANTEED endUndoGroup даже на throw из горячего пути. */
@@ -4660,6 +4722,9 @@ $._EXT_PRM_.applyMulticamCuts = function (jsonPlan) {
     segmentsApplied: segmentsApplied,
     disabledCount: disabledCount,
     deletedCount: deletedCount,
+    audioDisabledCount: audioDisabledCount,
+    audioEnabledCount: audioEnabledCount,
+    managedAudioTracks: managedAudioTracks,
     mode: mode,
     managedTracks: managedTracks,
     fpsUsed: fps,

@@ -845,6 +845,19 @@
               </select>
               <button type="button" id="mc-preset-save" class="secondary" style="padding:2px 8px;" title="Сохранить текущие слайдеры как «Мой пресет»">💾</button>
             </div>
+            <!-- 09.2026: стиль вставок в монолог + глушение микрофонов молчащих -->
+            <div class="param-row" title="Чем перебивать долгий монолог: общим планом, камерой собеседника (реакция) или чередовать. Место вставки подбирается по паузам речи, длина и интервал слегка случайные — без «метронома».">
+              <span class="param-label">Вставки в монолог</span>
+              <select id="mc-bridge" style="flex:1;min-width:0;">
+                <option value="mix" selected>Чередовать: общий / собеседник</option>
+                <option value="wide">Только общий план</option>
+                <option value="reaction">Камера собеседника</option>
+              </select>
+            </div>
+            <div class="param-row" title="Вместе с камерами отключать и микрофоны молчащих спикеров на каждом сегменте (аудиоклипы disable, без удаления). Говорящий определяется по громкости — его микрофон остаётся; на паузах/перебивках все микрофоны включены. Внимание: транскрибация nest учитывает только включённые аудиоклипы — транскрибируйте ДО или откатите ⏪.">
+              <span class="param-label">Глушить микрофоны молчащих</span>
+              <input type="checkbox" id="mc-mute-mics" />
+            </div>
             <details class="tool-advanced" data-adv="card-multicam">
               <summary>⚙ Тонкая настройка (14)</summary>
 
@@ -870,10 +883,10 @@
                 <input type="range" id="mc-overlap" min="0" max="3" step="0.25" value="1" />
                 <span class="param-val" id="mc-overlap-val">1с</span>
               </div>
-              <div class="param-row" title="Сколько длится общий план, вставленный в длинный монолог. Меньше = короткие мелькания, больше = спокойные вставки.">
-                <span class="param-label">Длина общего плана</span>
-                <input type="range" id="mc-maxall" min="0.5" max="4" step="0.5" value="4" />
-                <span class="param-val" id="mc-maxall-val">4с</span>
+              <div class="param-row" title="Средняя длина вставки в долгий монолог (общий план / камера собеседника). Реальная длина гуляет ±30% вокруг этого, чтобы не было метронома. Меньше = короткие мелькания, больше = спокойные вставки.">
+                <span class="param-label">Длина вставки</span>
+                <input type="range" id="mc-maxall" min="0.5" max="6" step="0.5" value="3" />
+                <span class="param-val" id="mc-maxall-val">3с</span>
               </div>
               <div class="param-row" title="Пауза (никто не говорит) → общий план. Выкл = держим камеру последнего говорившего.">
                 <span class="param-label">Общий на паузах</span>
@@ -909,10 +922,10 @@
               </div>
 
               <div class="mc-section-title">Вариативность и анализ</div>
-              <div class="param-row" title="Случайный разброс длины планов, чтобы нарезка не была механически ровной. 0 = выкл.">
+              <div class="param-row" title="Дополнительный случайный сдвиг границ между планами (±N с), чтобы переключения не были механически ровными. Ритм вставок в монолог варьируется всегда — этот ползунок трогает остальные границы. 0 = выкл.">
                 <span class="param-label">Вариативность</span>
-                <input type="range" id="mc-jitter" min="0" max="0.5" step="0.05" value="0" />
-                <span class="param-val" id="mc-jitter-val">выкл</span>
+                <input type="range" id="mc-jitter" min="0" max="0.5" step="0.05" value="0.2" />
+                <span class="param-val" id="mc-jitter-val">0.2с</span>
               </div>
               <div class="param-row" title="Перетасовка рисунка разброса. Не понравился прогон → сдвинь, получишь другой. Только при «Вариативность» > 0.">
                 <span class="param-label">Дубль</span>

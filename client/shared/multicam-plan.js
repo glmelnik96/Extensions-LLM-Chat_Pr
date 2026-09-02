@@ -32,7 +32,8 @@
     overlapWideMinSec: 1.0,     /* кросс-ток: уходим в wide только если перебивка длится ≥ N сек */
     wideVideoTrack: 0,          /* индекс wide-дорожки */
     maxHoldSec: 8,
-    maxAllSpeakersSec: 4,
+    maxAllSpeakersSec: 3,       /* длина вставки в монолог (реальная, а не потолок — 09.2026) */
+    bridgeStyle: 'mix',         /* вставка в монолог: 'wide' | 'reaction' (камера собеседника) | 'mix' */
     variationsJitterSec: 0,
     variationsSeed: 1,
     frameOffsetSec: 0
@@ -376,8 +377,29 @@
     segments = enforceMinHold(segments, p.minHoldSec);
     segments = mergeAdjacentSame(segments);
 
-    /* Шаг 4b: enforce max-hold (Wraith Max Camera Duration) */
-    segments = enforceMaxHold(segments, p, mapping.wideVideoTrack);
+    /* Шаг 4b: enforce max-hold (Wraith Max Camera Duration) — вставки в монолог
+       с живым ритмом (09.2026): кандидаты реза = начала фраз + середины пауз. */
+    var cutCandidates = [];
+    if (Array.isArray(p.cutCandidates) && p.cutCandidates.length) {
+      cutCandidates = p.cutCandidates.slice();
+    } else {
+      var snapSrcMH = computeSnapSources(audioFrames, p);
+      cutCandidates = snapSrcMH.speechOnsets.slice();
+      for (var cs = 0; cs < snapSrcMH.silences.length; cs++) {
+        cutCandidates.push((snapSrcMH.silences[cs].startSec + snapSrcMH.silences[cs].endSec) / 2);
+      }
+    }
+    cutCandidates.sort(function (a, b) { return a - b; });
+    var speakerTracksMH = [];
+    if (mapping.speakers) {
+      for (var spk = 0; spk < mapping.speakers.length; spk++) {
+        if (typeof mapping.speakers[spk].videoTrack === 'number') speakerTracksMH.push(mapping.speakers[spk].videoTrack);
+      }
+    }
+    segments = enforceMaxHold(segments, p, mapping.wideVideoTrack, {
+      cutCandidates: cutCandidates,
+      speakerTracks: speakerTracksMH
+    });
 
     /* Шаг 4c: variations (анти-монотонность, seeded) */
     if (p.variationsJitterSec > 0) {
@@ -389,6 +411,14 @@
       segments = snapToSpeechOnset(segments, p.speechOnsets, p.snapWindowSec, p.frameOffsetSec || 0);
     } else if (silences && silences.length && p.snapWindowSec > 0) {
       segments = snapToSilences(segments, silences, p.snapWindowSec);
+    }
+
+    /* Спикер сегмента (09.2026, для глушения микрофонов молчащих): доминирующий
+       микрофон по кадрам сегмента. Вставка в монолог (общий план / камера
+       собеседника) наследует говорящего — звук идёт за речью, а не за камерой.
+       -1 = никто/перебивка: микрофоны не глушим. */
+    for (var si2 = 0; si2 < segments.length; si2++) {
+      segments[si2].speaker = dominantMic(micLabels, segments[si2].tStart, segments[si2].tEnd, p.frameSec);
     }
 
     /* Статистика */
@@ -408,6 +438,30 @@
         perTrackSeconds: perTrack
       }
     };
+  }
+
+  /**
+   * Доминирующий микрофон на [tStart, tEnd): индекс спикера (≥0), либо -1,
+   * если большинство кадров — тишина/перебивка. micLabels — per-frame метки
+   * decideActiveMic (после resolveShortOverlaps), frameSec — шаг кадра.
+   */
+  function dominantMic(micLabels, tStart, tEnd, frameSec) {
+    if (!micLabels || !micLabels.length || !(frameSec > 0)) return -1;
+    var i0 = Math.max(0, Math.floor(tStart / frameSec + 1e-6));
+    var i1 = Math.min(micLabels.length, Math.ceil(tEnd / frameSec - 1e-6));
+    if (i1 <= i0) { i0 = Math.min(micLabels.length - 1, i0); i1 = i0 + 1; }
+    var counts = {};
+    var best = -1, bestN = 0, speechN = 0;
+    for (var i = i0; i < i1; i++) {
+      var m = micLabels[i];
+      if (m < 0) continue;
+      speechN++;
+      counts[m] = (counts[m] || 0) + 1;
+      if (counts[m] > bestN) { bestN = counts[m]; best = m; }
+    }
+    /* речи меньше трети сегмента — считаем «никто» (пауза/перебивка) */
+    if (speechN * 3 < (i1 - i0)) return -1;
+    return best;
   }
 
   /**
@@ -466,52 +520,140 @@
   }
 
   /**
-   * Разбивает длинные сегменты одной камеры (не-wide), вставляя короткий
-   * wide-bridge между кусками — анти-монотонность Wraith «Max Camera Duration».
-   * maxHoldSec — макс длительность куска одной камеры (default 8с, 0 = выкл).
-   * maxAllSpeakersSec — верхний потолок длительности wide-bridge (default 4с).
-   * wideVideoTrack — индекс wide-дорожки (нужен для маркировки вставок).
+   * Разбивает длинные сегменты одной камеры (не-wide), вставляя короткие
+   * «вставки» — анти-монотонность Wraith «Max Camera Duration».
    *
-   * Wide-сегменты сами не делим в этой функции (обрезка длинных wide — отдельная мера).
+   * Ревью 09.2026 (жалоба: «общие планы появляются с одинаковыми интервалами и
+   * одинаковой длины»). Раньше вставки были ровно maxHold/4 длиной (слайдер
+   * «Длина общего плана» на деле был потолком) и стояли строго через равные
+   * промежутки — на таймлайне это читалось как метроном: 8с спикер / 2с общий.
+   * Теперь, детерминированно от seed (params.variationsSeed):
+   *   • интервал до вставки — случайный в [0.6, 1.0]×maxHold;
+   *   • длина вставки — случайная в [0.6, 1.2]×maxAllSpeakersSec (слайдер честный);
+   *   • граница вставки притягивается к ближайшей естественной точке реза
+   *     (opts.cutCandidates: паузы/начала фраз) в окне ±0.25×maxHold;
+   *   • стиль (params.bridgeStyle): 'wide' — общий план; 'reaction' — камера
+   *     собеседника (кто говорил перед монологом, иначе следующий, иначе любой
+   *     другой спикер из opts.speakerTracks); 'mix' — чередуются случайно.
+   *     Без второго спикера reaction деградирует в wide.
+   * Хвост после последней вставки не короче 1.5с (иначе вставка не ставится).
+   * Wide-сегменты сами не делим (обрезка длинных wide — отдельная мера).
+   * maxHoldSec 0/absent = выкл (вход возвращается slice()'ом).
    */
-  function enforceMaxHold(segments, params, wideVideoTrack) {
+  function enforceMaxHold(segments, params, wideVideoTrack, opts) {
     var p = params || {};
+    var o = opts || {};
     var maxHold = typeof p.maxHoldSec === 'number' ? p.maxHoldSec : 0;
     if (!segments || !segments.length || maxHold <= 0) return (segments || []).slice();
-    var maxAllSpk = typeof p.maxAllSpeakersSec === 'number' ? p.maxAllSpeakersSec : 4;
-    var bridgeSec = Math.min(maxHold / 4, maxAllSpk);
-    if (bridgeSec <= 0) bridgeSec = Math.min(1, maxHold / 4);
-    // Быстрый путь: ни одного сегмента не нужно делить — возвращаем slice()
-    // входа, чтобы сохранить prototype-chain (важно для vm-loaded тестов).
+    var bridgeBase = typeof p.maxAllSpeakersSec === 'number' && p.maxAllSpeakersSec > 0 ? p.maxAllSpeakersSec : 3;
+    if (bridgeBase > maxHold) bridgeBase = maxHold;
+    var style = p.bridgeStyle === 'wide' || p.bridgeStyle === 'reaction' ? p.bridgeStyle : 'mix';
+    var rand = typeof o.rng === 'function' ? o.rng : _seededRng(typeof p.variationsSeed === 'number' ? p.variationsSeed : 1);
+    var candidates = Array.isArray(o.cutCandidates) ? o.cutCandidates : [];
+    var MIN_TAIL = 1.5;
+    var MIN_CHUNK = 1.0;
+
+    /* Спикерские дорожки: из opts либо из самих сегментов. */
+    var speakerTracks = [];
+    var seenT = {};
+    var srcTracks = Array.isArray(o.speakerTracks) ? o.speakerTracks : [];
+    for (var st = 0; st < srcTracks.length; st++) {
+      if (srcTracks[st] !== wideVideoTrack && !seenT[srcTracks[st]]) { seenT[srcTracks[st]] = 1; speakerTracks.push(srcTracks[st]); }
+    }
+    for (var sg = 0; sg < segments.length; sg++) {
+      var tr = segments[sg].activeVideoTrack;
+      if (tr !== wideVideoTrack && !seenT[tr]) { seenT[tr] = 1; speakerTracks.push(tr); }
+    }
+
+    /* Ни один сегмент не нужно делить — возвращаем slice() входа (prototype-chain
+       важна для vm-loaded тестов). */
     var anyToSplit = false;
     for (var qi = 0; qi < segments.length; qi++) {
       var qs = segments[qi];
-      if (qs.activeVideoTrack !== wideVideoTrack && (qs.tEnd - qs.tStart) > maxHold + bridgeSec) {
+      if (qs.activeVideoTrack !== wideVideoTrack && (qs.tEnd - qs.tStart) > maxHold + bridgeBase) {
         anyToSplit = true; break;
       }
     }
     if (!anyToSplit) return segments.slice();
+
+    /* Естественная точка реза, ближайшая к цели t среди кандидатов в допустимом
+       диапазоне [lo, hi]; кандидатов нет — сама цель. Диапазон (а не узкое окно)
+       — потому что редактору важно попасть В ПАУЗУ, а не в конкретную секунду. */
+    function snapCut(t, lo, hi) {
+      var best = t, bestD = Infinity;
+      for (var ci = 0; ci < candidates.length; ci++) {
+        var c = candidates[ci];
+        if (c < lo || c > hi) continue;
+        var d = Math.abs(c - t);
+        if (d < bestD) { best = c; bestD = d; }
+      }
+      return best;
+    }
+    /* Камера собеседника для монолога сегмента i: предыдущий другой спикер,
+       иначе следующий, иначе любой другой. Нет → wide. */
+    function reactionTrack(i) {
+      var own = segments[i].activeVideoTrack;
+      for (var b = i - 1; b >= 0; b--) {
+        var tb = segments[b].activeVideoTrack;
+        if (tb !== wideVideoTrack && tb !== own) return tb;
+      }
+      for (var a = i + 1; a < segments.length; a++) {
+        var ta = segments[a].activeVideoTrack;
+        if (ta !== wideVideoTrack && ta !== own) return ta;
+      }
+      for (var k = 0; k < speakerTracks.length; k++) {
+        if (speakerTracks[k] !== own) return speakerTracks[k];
+      }
+      return wideVideoTrack;
+    }
+    function pickBridgeTrack(i) {
+      if (style === 'wide') return wideVideoTrack;
+      var rt = reactionTrack(i);
+      if (style === 'reaction') return rt;
+      return rand() < 0.5 ? rt : wideVideoTrack;
+    }
+
     var out = [];
     for (var i = 0; i < segments.length; i++) {
-      var s = segments[i];
-      var dur = s.tEnd - s.tStart;
-      // Wide и достаточно короткие — без изменений.
-      if (s.activeVideoTrack === wideVideoTrack || dur <= maxHold + bridgeSec) {
-        out.push({ tStart: s.tStart, tEnd: s.tEnd, activeVideoTrack: s.activeVideoTrack });
+      var seg = segments[i];
+      var dur = seg.tEnd - seg.tStart;
+      if (seg.activeVideoTrack === wideVideoTrack || dur <= maxHold + bridgeBase) {
+        out.push({ tStart: seg.tStart, tEnd: seg.tEnd, activeVideoTrack: seg.activeVideoTrack });
         continue;
       }
-      // Сколько wide-вставок? n = floor((dur - maxHold) / (maxHold + bridgeSec)) + 1
-      var n = Math.floor((dur - maxHold) / (maxHold + bridgeSec)) + 1;
-      // Расставляем равномерно: chunkLen = (dur - n*bridgeSec) / (n+1).
-      var chunkLen = (dur - n * bridgeSec) / (n + 1);
-      var t = s.tStart;
-      for (var k = 0; k < n; k++) {
-        out.push({ tStart: t, tEnd: t + chunkLen, activeVideoTrack: s.activeVideoTrack });
-        out.push({ tStart: t + chunkLen, tEnd: t + chunkLen + bridgeSec, activeVideoTrack: wideVideoTrack });
-        t = t + chunkLen + bridgeSec;
+      var t = seg.tStart;
+      var own = seg.activeVideoTrack;
+      var prevBridgeTrack = null;
+      while (true) {
+        var remaining = seg.tEnd - t;
+        if (remaining <= maxHold) break;
+        /* Верхняя граница реза: план ≤ maxHold И после вставки (≥0.5с) остаётся
+           хвост ≥ MIN_TAIL — иначе инвариант «ни один план длиннее maxHold» ломается. */
+        var hiCut = Math.min(t + maxHold, seg.tEnd - MIN_TAIL - 0.5);
+        if (hiCut - t < MIN_CHUNK) break;
+        /* интервал до вставки: цель в [0.6, 1.0]×maxHold, рез — на паузе в
+           диапазоне [0.5×maxHold, hiCut] (ближайшей к цели) */
+        var interval = maxHold * (0.6 + 0.4 * rand());
+        var cutAt = snapCut(Math.min(t + interval, hiCut), Math.max(t + MIN_CHUNK, t + maxHold * 0.5), hiCut);
+        if (cutAt > hiCut) cutAt = hiCut;
+        /* длина вставки: цель [0.6, 1.2]×base, конец — на паузе в [0.5с, 1.6×base] */
+        var bLen = bridgeBase * (0.6 + 0.6 * rand());
+        var bEnd = snapCut(cutAt + bLen, cutAt + 0.5, Math.min(cutAt + bridgeBase * 1.6, seg.tEnd - MIN_TAIL));
+        if (bEnd - cutAt < 0.5 || bEnd > seg.tEnd - MIN_TAIL) {
+          bEnd = Math.min(cutAt + bLen, seg.tEnd - MIN_TAIL);
+          if (bEnd - cutAt < 0.5) bEnd = Math.min(cutAt + 0.5, seg.tEnd - MIN_TAIL);
+          if (bEnd - cutAt < 0.5) break;
+        }
+        var bTrack = pickBridgeTrack(i);
+        /* две вставки одной камеры подряд в 'mix' — заменяем на общий план */
+        if (style === 'mix' && prevBridgeTrack !== null && bTrack === prevBridgeTrack && bTrack !== wideVideoTrack) bTrack = wideVideoTrack;
+        if (bTrack === own) bTrack = wideVideoTrack;
+        out.push({ tStart: t, tEnd: cutAt, activeVideoTrack: own });
+        out.push({ tStart: cutAt, tEnd: bEnd, activeVideoTrack: bTrack });
+        prevBridgeTrack = bTrack;
+        t = bEnd;
       }
-      // Последний кусок — оставшаяся длина.
-      out.push({ tStart: t, tEnd: s.tEnd, activeVideoTrack: s.activeVideoTrack });
+      out.push({ tStart: t, tEnd: seg.tEnd, activeVideoTrack: own });
     }
     return out;
   }
@@ -635,6 +777,7 @@
     _mergeAdjacentSame: mergeAdjacentSame,
     _snapToSilences: snapToSilences,
     _enforceMaxHold: enforceMaxHold,
+    _dominantMic: dominantMic,
     _applyVariations: applyVariations,
     _snapToSpeechOnset: snapToSpeechOnset
   };

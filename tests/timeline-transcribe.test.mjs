@@ -326,3 +326,29 @@ describe('normalizeWhisper* переносит words в сегменты', () =>
     assert.equal(r.segments[0].words, undefined);
   });
 });
+
+/* ═══ clampSegmentsToWindow (ревью 09.2026): хвост Whisper за концом окна ═══ */
+describe('TimelineTranscribe.clampSegmentsToWindow', () => {
+  const TT = loadTimelineTranscribe();
+  it('media_file: workIn/workOut — хвост клэмпится, сегмент за окном выбрасывается', () => {
+    const res = TT.clampSegmentsToWindow({ segments: [
+      { startSec: 599.5, endSec: 602, text: 'a' }, { startSec: 700, endSec: 783.9, text: 'b' }, { startSec: 790, endSec: 795, text: 'c' }
+    ] }, { workInSec: 600, workOutSec: 780 });
+    assert.equal(res.segments.length, 2);
+    assert.deepEqual([res.segments[0].startSec, res.segments[0].endSec], [600, 602]);
+    assert.deepEqual([res.segments[1].startSec, res.segments[1].endSec], [700, 780]);
+    assert.equal(res.clampedToWindow, 3);
+  });
+  it('nest/export: offset+windowDur; слова за окном отбрасываются', () => {
+    const res = TT.clampSegmentsToWindow({ segments: [
+      { startSec: 770, endSec: 785, text: 'x', words: [{ w: 'a', s: 771, e: 772 }, { w: 'b', s: 781, e: 782 }] }
+    ] }, { timelineOffsetSec: 600, windowDurSec: 180 });
+    assert.equal(res.segments[0].endSec, 780);
+    assert.equal(JSON.parse(JSON.stringify(res.segments[0].words)).length, 1);
+  });
+  it('без окна в prep — без изменений', () => {
+    const r = { segments: [{ startSec: 1, endSec: 2 }] };
+    assert.equal(TT.clampSegmentsToWindow(r, {}), r);
+    assert.equal(r.clampedToWindow, undefined);
+  });
+});

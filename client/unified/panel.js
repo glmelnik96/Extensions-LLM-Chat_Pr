@@ -1394,6 +1394,10 @@ PanelBoot.run('ИИ: монтаж', function () {
         i: globalIdx,
         startSec: p.startSec,
         endSec: p.endSec,
+        /* Ревью 09.2026: готовый человеческий таймкод — модель цитирует его,
+           а не пересчитывает секунды в m:ss сама (типичный источник «ошибок
+           в таймкодах» в ответах: 1304с → «21:04» вместо 21:44). */
+        tc: fmtSec(p.startSec) + '–' + fmtSec(p.endSec),
         durationSec: Math.round((p.endSec - p.startSec) * 100) / 100,
         pauseBeforeSec: p.pauseBeforeSec,
         pauseAfterSec: p.pauseAfterSec,
@@ -1425,7 +1429,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         'Для полного анализа длинного транскрипта используй analyze_transcript_for_cuts.';
     }
     out2._hint = 'Для вырезки используй removeRefs:[{paragraph: i}] в propose_transcript_cuts — ' +
-      'плагин сам развернёт индексы в секунды. Надёжнее ручного копирования таймкодов.';
+      'плагин сам развернёт индексы в секунды. Надёжнее ручного копирования таймкодов. ' +
+      'В ответе пользователю цитируй таймкоды из поля tc (м:сс) — не пересчитывай секунды сам.';
     if (out2.editedAfterTranscribe) {
       out2._notice = 'Структура пересчитана под текущее состояние таймлайна.';
     }
@@ -4125,6 +4130,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         return {
           startSec: Math.round(m.startSec * 100) / 100,
           endSec: Math.round(m.endSec * 100) / 100,
+          tc: fmtSec(m.startSec) + '–' + fmtSec(m.endSec),
           source: m.source,
           matchType: m.matchType,
           quote: String(m.text || '').slice(0, 240)
@@ -8695,12 +8701,12 @@ PanelBoot.run('ИИ: монтаж', function () {
       var sel = document.getElementById('mc-preset');
       var saveBtn = document.getElementById('mc-preset-save');
       if (!sel) return;
-      var MC_SLIDERS = ['mc-minhold', 'mc-maxhold', 'mc-margin', 'mc-silence', 'mc-jitter'];
+      var MC_SLIDERS = ['mc-minhold', 'mc-maxhold', 'mc-margin', 'mc-silence', 'mc-jitter', 'mc-maxall'];
       var BUILTIN = {
-        /* Спокойный: интервью/лекция — длинные планы, реже переключения */
-        calm: { 'mc-minhold': 2.5, 'mc-maxhold': 12, 'mc-margin': 6, 'mc-silence': 35, 'mc-jitter': 0 },
-        /* Динамичный: подкаст/шоу — короткие планы, лёгкая вариативность */
-        dynamic: { 'mc-minhold': 1.0, 'mc-maxhold': 6, 'mc-margin': 5, 'mc-silence': 35, 'mc-jitter': 0.2 }
+        /* Спокойный: интервью/лекция — длинные планы, реже переключения, спокойные вставки */
+        calm: { 'mc-minhold': 2.5, 'mc-maxhold': 12, 'mc-margin': 6, 'mc-silence': 35, 'mc-jitter': 0.15, 'mc-maxall': 4 },
+        /* Динамичный: подкаст/шоу — короткие планы, живые вставки */
+        dynamic: { 'mc-minhold': 1.0, 'mc-maxhold': 6, 'mc-margin': 5, 'mc-silence': 35, 'mc-jitter': 0.3, 'mc-maxall': 2 }
       };
       var LS_KEY = 'mcShowPreset';
       function applyValues(vals) {
@@ -9280,7 +9286,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         });
         var mcBatches = MulticamPlan.splitPlanIntoBatches(mcPlan);
         var mcTotalSegs = mcPlan.segments.length;
-        var mcTotals = { cutsApplied: 0, cutsFailed: 0, segmentsApplied: 0, disabledCount: 0, deletedCount: 0 };
+        var mcTotals = { cutsApplied: 0, cutsFailed: 0, segmentsApplied: 0, disabledCount: 0, deletedCount: 0, audioDisabledCount: 0 };
         var mcDoneSegs = 0;
 
         var mcFinish = function (failMsg) {
@@ -9296,7 +9302,8 @@ PanelBoot.run('ИИ: монтаж', function () {
           var msg = 'MultiCam: ' + mcTotals.cutsApplied + ' разрезов, ' +
             mcTotals.segmentsApplied + ' сегментов, ' +
             (mcTotals.deletedCount ? mcTotals.deletedCount + ' клипов удалено.' :
-              mcTotals.disabledCount + ' клипов отключено.') + ' Откат: ⏪';
+              mcTotals.disabledCount + ' клипов отключено.') +
+            (mcTotals.audioDisabledCount ? ' Микрофонов заглушено: ' + mcTotals.audioDisabledCount + ' клип(ов).' : '') + ' Откат: ⏪';
           toolsStatusUi.show(msg, false);
           toolsSetCardStatus(prop.cardId, prop.seqKey, msg, 'ok');
           try { window.toolsRefreshLed(); } catch (eL) {}
@@ -9319,6 +9326,7 @@ PanelBoot.run('ИИ: монтаж', function () {
               mcTotals.segmentsApplied += data.segmentsApplied || 0;
               mcTotals.disabledCount += data.disabledCount || 0;
               mcTotals.deletedCount += data.deletedCount || 0;
+              mcTotals.audioDisabledCount += data.audioDisabledCount || 0;
               mcDoneSegs += b.segments.length;
               mcRunBatch(bi + 1);
               return;
@@ -11308,6 +11316,11 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (mcSnapEl) params.snapWindowSec = parseFloat(mcSnapEl.value);
           var mcSnapOffEl = document.getElementById('mc-snapoff');
           if (mcSnapOffEl) params.frameOffsetSec = parseFloat(mcSnapOffEl.value);
+          /* 09.2026: стиль вставок в монолог + глушение микрофонов молчащих */
+          var mcBridgeEl = document.getElementById('mc-bridge');
+          if (mcBridgeEl && mcBridgeEl.value) params.bridgeStyle = mcBridgeEl.value;
+          var mcMuteEl = document.getElementById('mc-mute-mics');
+          if (mcMuteEl) params.muteInactiveMics = !!mcMuteEl.checked;
           /* Кастомный выбор дорожек: null = авто-схема пайплайна */
           var mcMapping = toolsMcReadMapping();
           if (mcMapping) params.mapping = mcMapping;

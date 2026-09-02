@@ -1434,9 +1434,48 @@
     return res;
   }
 
+  /**
+   * Клэмп сегментов к окну транскрибации (ревью 09.2026). Whisper регулярно
+   * тянет ПОСЛЕДНИЙ сегмент за конец аудио (live: окно 600–780 → конец 783.9):
+   * таймкод указывает туда, где речи уже нет, а резы/маркеры по нему уезжают
+   * за In/Out. Окно: workIn/workOut (media_file) либо offset+windowDur.
+   */
+  function clampSegmentsToWindow(res, prep) {
+    if (!res || !Array.isArray(res.segments) || !prep) return res;
+    var lo = null, hi = null;
+    if (typeof prep.workInSec === 'number' && typeof prep.workOutSec === 'number' && prep.workOutSec > prep.workInSec) {
+      lo = prep.workInSec; hi = prep.workOutSec;
+    } else if (typeof prep.timelineOffsetSec === 'number' && typeof prep.windowDurSec === 'number' && prep.windowDurSec > 0) {
+      lo = prep.timelineOffsetSec; hi = prep.timelineOffsetSec + prep.windowDurSec;
+    }
+    if (lo === null || hi === null) return res;
+    var out = [];
+    var clamped = 0;
+    for (var i = 0; i < res.segments.length; i++) {
+      var s = res.segments[i];
+      if (!s || typeof s.startSec !== 'number' || typeof s.endSec !== 'number') { out.push(s); continue; }
+      var ns = Math.max(lo, s.startSec), ne = Math.min(hi, s.endSec);
+      if (ne - ns < 0.05) { clamped++; continue; }
+      if (ns !== s.startSec || ne !== s.endSec) {
+        clamped++;
+        var c = {};
+        for (var k in s) { if (Object.prototype.hasOwnProperty.call(s, k)) c[k] = s[k]; }
+        c.startSec = Math.round(ns * 1000) / 1000;
+        c.endSec = Math.round(ne * 1000) / 1000;
+        if (Array.isArray(c.words)) {
+          c.words = c.words.filter(function (w) { return w && w.e > lo && w.s < hi; });
+        }
+        out.push(c);
+      } else out.push(s);
+    }
+    res.segments = out;
+    if (clamped) res.clampedToWindow = clamped;
+    return res;
+  }
+
   async function runFromPrep(prep, opt) {
     var res = await runFromPrepInner(prep, opt);
-    return verifyTranscriptTimings(assertNonEmptyTranscript(res));
+    return verifyTranscriptTimings(clampSegmentsToWindow(assertNonEmptyTranscript(res), prep));
   }
 
   global.TimelineTranscribe = {
@@ -1449,6 +1488,7 @@
     runFromPrep: runFromPrep,
     assertNonEmptyTranscript: assertNonEmptyTranscript,
     verifyTranscriptTimings: verifyTranscriptTimings,
+    clampSegmentsToWindow: clampSegmentsToWindow,
     runAudioOnlyAnalysis: runAudioOnlyAnalysis,
     computeAudioPreprocess: computeAudioPreprocess,
     mergeRmsTimelines: mergeRmsTimelines,
