@@ -3007,21 +3007,24 @@ describe('refineCutBoundaries — silencesDense + строгий режим (202
     assert.equal(r.skipped.length, 0);
   });
 
-  it('строгий режим: граница без паузы → интервал исключён с причиной', () => {
-    /* старт снапается, конец — нет (паузы рядом нет) */
+  it('строгий режим: граница без паузы → интервал ОСТАЁТСЯ с fallback-границей и помечен', () => {
+    /* старт снапается, конец — нет (паузы рядом нет): ревью 09.2026 — не
+       исключаем, а помечаем (раньше молча выбрасывалось из плана) */
     const r = DP.refineCutBoundaries(
       [{ startSec: 10.0, endSec: 20.0 }],
       [{ startSec: 9.5, endSec: 9.9 }],
       { strict: true });
-    assert.equal(r.intervals.length, 0);
+    assert.equal(r.intervals.length, 1);
     assert.equal(r.stats.unconfirmed, 1);
-    assert.equal(r.skipped.length, 1);
-    assert.equal(r.skipped[0].startSec, 10.0);
-    assert.equal(r.skipped[0].endSec, 20.0);
-    assert.match(r.skipped[0].reason, /конец/);
-    /* счётчики границ не инкрементированы для исключённого интервала */
-    assert.equal(r.stats.snapped, 0);
-    assert.equal(r.stats.padded, 0);
+    assert.equal(r.skipped.length, 0);
+    assert.equal(r.unconfirmed.length, 1);
+    assert.match(r.unconfirmed[0].reason, /конец/);
+    assert.match(r.intervals[0].unconfirmed, /конец/);
+    /* границы уточнены как в нестрогом режиме: старт снэпнут, конец с отступом */
+    assert.ok(Math.abs(r.intervals[0].startSec - 9.7) < 1e-9);
+    assert.ok(Math.abs(r.intervals[0].endSec - 19.85) < 1e-9);
+    assert.equal(r.stats.snapped, 1);
+    assert.equal(r.stats.padded, 1);
   });
 
   it('строгий режим: граница уже внутри измеренной паузы → подтверждена без снапа', () => {
@@ -3041,13 +3044,15 @@ describe('refineCutBoundaries — silencesDense + строгий режим (202
     assert.equal(r.stats.unconfirmed, 0);
   });
 
-  it('строгий режим: обе границы вне пауз → причина «обе границы»', () => {
+  it('строгий режим: обе границы вне пауз → причина «обе границы», интервал в плане', () => {
     const r = DP.refineCutBoundaries(
       [{ startSec: 10.0, endSec: 20.0 }],
       [],
       { strict: true, silencesDense: [{ startSec: 50, endSec: 51 }] });
-    assert.equal(r.intervals.length, 0);
-    assert.match(r.skipped[0].reason, /обе границы/);
+    assert.equal(r.intervals.length, 1);
+    assert.equal(r.skipped.length, 0);
+    assert.match(r.unconfirmed[0].reason, /обе границы/);
+    assert.equal(r.stats.unconfirmed, 1);
   });
 
   it('строгий режим: старт на t=0 — край материала, подтверждение не требуется', () => {
@@ -3065,6 +3070,8 @@ describe('refineCutBoundaries — silencesDense + строгий режим (202
     assert.equal(r.stats.padded, 2);
     assert.equal(r.stats.unconfirmed, 0);
     assert.equal(r.skipped.length, 0);
+    assert.equal(r.unconfirmed.length, 0);
+    assert.equal(r.intervals[0].unconfirmed, undefined);
   });
 });
 

@@ -2552,9 +2552,14 @@
    * обычной, видит паузы короче 0.5с → больше границ подтверждается.
    * opts.strict (опц., спека 2026-08-06, «метить и защищать»): интервал, чью
    * границу не удалось подтвердить измеренной паузой (снап или граница уже
-   * внутри паузы), исключается из плана с причиной → res.skipped[],
-   * res.stats.unconfirmed. Виден в предложении до подтверждения пользователем.
-   * → { intervals: [...], stats: { snapped, padded, kept — счёт ГРАНИЦ (0–2 на интервал), dropped, unconfirmed — счёт ИНТЕРВАЛОВ }, skipped: [...] }
+   * внутри паузы), ПОМЕЧАЕТСЯ: остаётся в плане с fallback-границей
+   * (padded/kept) и попадает в res.unconfirmed[] с причиной, res.stats.unconfirmed.
+   * Ревью 09.2026: раньше такой интервал ИСКЛЮЧАЛСЯ из плана — на реальном
+   * кэше (плотная карта есть у 9 из 12 записей) это молча выбрасывало часть
+   * запрошенных вырезов («нашёл 20, вырезал 9»). Пометка видна в карточке
+   * до подтверждения; skipped[] остаётся для совместимости (NaN/инверсия
+   * считаются в stats.dropped, как и раньше).
+   * → { intervals: [...], stats: { snapped, padded, kept — счёт ГРАНИЦ (0–2 на интервал), dropped, unconfirmed — счёт ИНТЕРВАЛОВ }, unconfirmed: [...], skipped: [] }
    */
   function refineCutBoundaries(intervals, silences, opts) {
     var o = opts || {};
@@ -2597,7 +2602,7 @@
       return false;
     }
     var strict = !!o.strict;
-    var res = { intervals: [], stats: { snapped: 0, padded: 0, dropped: 0, kept: 0, unconfirmed: 0 }, skipped: [] };
+    var res = { intervals: [], stats: { snapped: 0, padded: 0, dropped: 0, kept: 0, unconfirmed: 0 }, unconfirmed: [], skipped: [] };
     if (!intervals || !intervals.length) return res;
 
     /* Центры валидных тишин (обе формы полей). При segment-aware отсеиваем
@@ -2654,29 +2659,28 @@
       var n0 = Math.max(0, r0.t);
       var n1 = r1.t;
       if (n1 - n0 < minIntervalSec) { res.stats.dropped++; continue; }
-      if (strict) {
-        /* «Метить и защищать»: граница подтверждена, если снэпнута к паузе
-           ЛИБО уже лежит внутри измеренной паузы (снэп не понадобился).
-           Начало выреза на t=0 — край материала, паузы там не бывает. */
-        var ok0 = r0.how === 'snapped' || t0 <= 1e-6 || insideSilence(n0);
-        var ok1 = r1.how === 'snapped' || insideSilence(n1);
-        if (!ok0 || !ok1) {
-          res.stats.unconfirmed++;
-          res.skipped.push({
-            startSec: t0,
-            endSec: t1,
-            reason: !ok0 && !ok1 ? 'обе границы вне измеренных пауз'
-              : (!ok0 ? 'начало вне измеренной паузы' : 'конец вне измеренной паузы')
-          });
-          continue;
-        }
-      }
-      res.stats[r0.how]++;
-      res.stats[r1.how]++;
       var copy = {};
       for (var k in iv) { if (Object.prototype.hasOwnProperty.call(iv, k)) copy[k] = iv[k]; }
       copy.startSec = n0;
       copy.endSec = n1;
+      if (strict) {
+        /* «Метить и защищать»: граница подтверждена, если снэпнута к паузе
+           ЛИБО уже лежит внутри измеренной паузы (снэп не понадобился).
+           Начало выреза на t=0 — край материала, паузы там не бывает.
+           Неподтверждённый интервал НЕ исключаем (ревью 09.2026) — оставляем
+           с fallback-границей и помечаем, чтобы пользователь проверил на слух. */
+        var ok0 = r0.how === 'snapped' || t0 <= 1e-6 || insideSilence(n0);
+        var ok1 = r1.how === 'snapped' || insideSilence(n1);
+        if (!ok0 || !ok1) {
+          res.stats.unconfirmed++;
+          var whyU = !ok0 && !ok1 ? 'обе границы вне измеренных пауз'
+            : (!ok0 ? 'начало вне измеренной паузы' : 'конец вне измеренной паузы');
+          copy.unconfirmed = whyU;
+          res.unconfirmed.push({ startSec: n0, endSec: n1, reason: whyU });
+        }
+      }
+      res.stats[r0.how]++;
+      res.stats[r1.how]++;
       res.intervals.push(copy);
     }
     return res;

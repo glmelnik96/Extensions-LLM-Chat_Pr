@@ -547,12 +547,32 @@
       return head +
         '\nПлотный таймлайн: ' + all.length + ' клипов — список опущен (не влезает в контекст).' +
         '\nПо дорожкам: ' + parts.join(', ') + '.' +
-        '\nРаботай через транскрипт: get_transcript_structure / propose_montage_plan; ' +
-        'точечные клипы — get_timeline_snapshot не вызывай, проси пользователя указать таймкоды.';
+        '\nРаботай через транскрипт: get_transcript_structure / propose_montage_plan / run_tool; ' +
+        'точечные клипы — get_timeline_snapshot({fromSec, toSec}) или ({nameContains}) вернёт только нужное окно.';
     }
 
-    /* Линкованное аудио НЕ прячем (live-баг 19.06.2026: BRAW-аудио линковано
-       с видео → пропадало из снапшота → «нет аудиоклипа»). */
+    var rows = _clipLines(snap);
+    var lines = [];
+    for (i = 0; i < rows.length; i++) lines.push(rows[i].line);
+    return head + '\nclips(' + lines.length + '):\n' + lines.join('\n');
+  }
+
+  /**
+   * Строки клипов для модели — единый формат auto-snapshot и инструмента
+   * get_timeline_snapshot: nodeId|name|track|startSec-endSec[|off][|a=<аудио>@A<n>].
+   * Линкованное аудио НЕ прячем (live-баг 19.06.2026: BRAW-аудио линковано
+   * с видео → пропадало из снапшота → «нет аудиоклипа»).
+   * → [{ clip, line }] (видео по порядку, затем несвязанное аудио).
+   */
+  function _clipLines(snap) {
+    var all = snap.clips;
+    var videoClips = [];
+    var audioClipsAll = [];
+    var i;
+    for (i = 0; i < all.length; i++) {
+      if (all[i].trackType === 'video') videoClips.push(all[i]);
+      else if (all[i].trackType === 'audio') audioClipsAll.push(all[i]);
+    }
     var linkedAudioBy = {};
     var audioOnlyClips = [];
     for (i = 0; i < audioClipsAll.length; i++) {
@@ -564,19 +584,92 @@
       if (v) { if (!linkedAudioBy[v.nodeId]) linkedAudioBy[v.nodeId] = c; }
       else audioOnlyClips.push(c);
     }
-    var lines = [];
+    var out = [];
     for (i = 0; i < videoClips.length; i++) {
       var vc = videoClips[i];
       var la = linkedAudioBy[vc.nodeId];
-      lines.push(vc.nodeId + '|' + vc.name + '|' + vc.trackType[0] + vc.trackIndex + '|' + vc.startSec + '-' + vc.endSec +
-        (vc.disabled ? '|off' : '') + (la ? '|a=' + la.nodeId + '@' + la.trackType[0] + la.trackIndex : ''));
+      out.push({
+        clip: vc,
+        line: vc.nodeId + '|' + vc.name + '|' + vc.trackType[0] + vc.trackIndex + '|' + vc.startSec + '-' + vc.endSec +
+          (vc.disabled ? '|off' : '') + (la ? '|a=' + la.nodeId + '@' + la.trackType[0] + la.trackIndex : '')
+      });
     }
     for (i = 0; i < audioOnlyClips.length; i++) {
       var ac = audioOnlyClips[i];
-      lines.push(ac.nodeId + '|' + ac.name + '|' + ac.trackType[0] + ac.trackIndex + '|' + ac.startSec + '-' + ac.endSec +
-        (ac.disabled ? '|off' : ''));
+      out.push({
+        clip: ac,
+        line: ac.nodeId + '|' + ac.name + '|' + ac.trackType[0] + ac.trackIndex + '|' + ac.startSec + '-' + ac.endSec +
+          (ac.disabled ? '|off' : '')
+      });
     }
-    return head + '\nclips(' + lines.length + '):\n' + lines.join('\n');
+    return out;
+  }
+
+  /**
+   * compactSnapshotForLlmFiltered(snap, {fromSec, toSec, nameContains, maxClips})
+   * — ответ инструмента get_timeline_snapshot для МОДЕЛИ (ревью 09.2026).
+   * Раньше инструмент отдавал сырой JSON со всеми полями всех клипов: после
+   * чистки тишин (+300 клипов) это ~100 КБ на вызов, контекст забивался и
+   * точечные правки («удали клип X») деградировали. Теперь — компактные
+   * строки того же формата, что auto-snapshot, с фильтром по окну времени
+   * и/или части имени клипа и капом строк.
+   */
+  function compactSnapshotForLlmFiltered(snap, opts) {
+    if (!snap || !snap.ok || !Array.isArray(snap.clips)) return null;
+    opts = opts || {};
+    var max = (typeof opts.maxClips === 'number' && opts.maxClips > 0) ? opts.maxClips : 120;
+    var from = (typeof opts.fromSec === 'number' && isFinite(opts.fromSec)) ? opts.fromSec : null;
+    var to = (typeof opts.toSec === 'number' && isFinite(opts.toSec)) ? opts.toSec : null;
+    var name = opts.nameContains ? String(opts.nameContains).toLowerCase() : '';
+    var i;
+    var effectiveEndSec = snap.sequenceEndSec || 0;
+    for (i = 0; i < snap.clips.length; i++) {
+      if (snap.clips[i].endSec > effectiveEndSec) effectiveEndSec = snap.clips[i].endSec;
+    }
+    var perTrack = {};
+    for (i = 0; i < snap.clips.length; i++) {
+      var tk = (snap.clips[i].trackType ? snap.clips[i].trackType[0] : '?') +
+        (typeof snap.clips[i].trackIndex === 'number' ? snap.clips[i].trackIndex : '?');
+      perTrack[tk] = (perTrack[tk] || 0) + 1;
+    }
+    var parts = [];
+    for (var k in perTrack) {
+      if (Object.prototype.hasOwnProperty.call(perTrack, k)) parts.push(k + ': ' + perTrack[k]);
+    }
+    parts.sort();
+    var rows = _clipLines(snap);
+    var matched = [];
+    for (i = 0; i < rows.length; i++) {
+      var c = rows[i].clip;
+      if (from !== null && c.endSec < from) continue;
+      if (to !== null && c.startSec > to) continue;
+      if (name && String(c.name || '').toLowerCase().indexOf(name) === -1) continue;
+      matched.push(rows[i].line);
+    }
+    var truncated = matched.length > max;
+    var shown = truncated ? matched.slice(0, max) : matched;
+    var inS = (typeof snap.sequenceInSec === 'number' && isFinite(snap.sequenceInSec) && snap.sequenceInSec >= 0) ? snap.sequenceInSec : null;
+    var outS = (typeof snap.sequenceOutSec === 'number' && isFinite(snap.sequenceOutSec) && snap.sequenceOutSec >= 0) ? snap.sequenceOutSec : null;
+    return {
+      ok: true,
+      sequenceName: snap.sequenceName || null,
+      sequenceId: snap.sequenceId || null,
+      durationSec: Math.round(effectiveEndSec * 100) / 100,
+      fps: snap.fps || null,
+      playheadSec: (typeof snap.playheadSec === 'number') ? snap.playheadSec : null,
+      inSec: inS,
+      outSec: outS,
+      clipCount: snap.clips.length,
+      tracks: parts.join(', '),
+      filter: (from !== null || to !== null || name) ? { fromSec: from, toSec: to, nameContains: name || null } : null,
+      matched: matched.length,
+      format: 'nodeId|name|track|startSec-endSec[|off][|a=<аудио nodeId>@A<n>]',
+      clips: shown,
+      truncated: truncated,
+      note: truncated
+        ? ('Показаны ' + max + ' из ' + matched.length + ' строк — сузь окно fromSec/toSec или задай nameContains.')
+        : null
+    };
   }
 
   /* ─── Ожидаемая дельта длительности для набора операций ────────── */
@@ -705,6 +798,7 @@
     extractRippleIntervals: extractRippleIntervals,
     buildTimelineDiff: buildTimelineDiff,
     compactSnapshotForLlm: compactSnapshotForLlm,
+    compactSnapshotForLlmFiltered: compactSnapshotForLlmFiltered,
     buildAutoSnapshotText: buildAutoSnapshotText,
     isAutoSnapshotText: isAutoSnapshotText,
     calcExpectedDeltaSec: calcExpectedDeltaSec,

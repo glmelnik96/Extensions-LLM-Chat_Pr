@@ -62,6 +62,86 @@ PanelBoot.run('ИИ: монтаж', function () {
     if (opQueue) opQueue.end();
   }
   var _activeSystemAddon = null;
+  /* Ревью 09.2026: аддон стартера живёт несколько ходов (ответ на вопрос
+     «какая длительность?», уточнение «нет, короче»), а не только первый. */
+  var _activeSystemAddonTurns = 0;
+  var ADDON_MAX_TURNS = 3;
+  /* Свежесть транскрипта на момент отправки: причина (строка) или null. */
+  var _chatTranscriptStale = null;
+
+  /* ── Трейс ходов (ревью 09.2026, client/shared/run-trace.js) ─────────
+     Каждый ход чата → строка JSONL в ~/.extensions_llm_chat_pr/traces/<день>.jsonl;
+     кнопки 👍/👎 под ответом дописывают feedback с тем же traceId. */
+  var _trace = null;
+  function _tracesDir() {
+    var fs = require('fs');
+    var path = require('path');
+    var os = require('os');
+    var dir = path.join(os.homedir(), '.extensions_llm_chat_pr', 'traces');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+  function _traceWrite(rec) {
+    if (!rec || typeof require === 'undefined') return;
+    try {
+      var day = new Date().toISOString().slice(0, 10);
+      require('fs').appendFileSync(require('path').join(_tracesDir(), day + '.jsonl'), JSON.stringify(rec) + '\n', 'utf8');
+    } catch (e) {
+      console.warn('[trace] write failed:', e && e.message);
+    }
+  }
+  function _traceStart(panelId, text, route, extra) {
+    if (!window.RunTrace) return null;
+    var meta = { panelId: panelId, text: text, route: route };
+    if (extra) { for (var k in extra) { if (Object.prototype.hasOwnProperty.call(extra, k)) meta[k] = extra[k]; } }
+    return RunTrace.create(meta);
+  }
+  function _traceEvent(kind, data) {
+    if (_trace) _trace.event(kind, data);
+  }
+  function _traceStatus(ev) {
+    if (!_trace || !window.RunTrace) return;
+    var te = RunTrace.fromStatusEvent(ev);
+    if (te) _trace.event(te.kind, te);
+  }
+  function _traceFinish(status, extra) {
+    if (!_trace) return null;
+    var rec = _trace.finish(status, extra);
+    _trace = null;
+    _traceWrite(rec);
+    return rec.id;
+  }
+
+  /* Служебные поля сообщений (_traceId и т.п.) не уходят в API: строгие
+     бэкенды отвечают 400 на неизвестные ключи. */
+  function _toApiMessage(m) {
+    if (!m || typeof m !== 'object') return m;
+    var out = {};
+    for (var k in m) {
+      if (Object.prototype.hasOwnProperty.call(m, k) && k.charAt(0) !== '_') out[k] = m[k];
+    }
+    return out;
+  }
+
+  function _staleMsg(reason) {
+    return 'Транскрипт устарел: ' + (reason || _chatTranscriptStale || 'таймлайн менялся после транскрибации') +
+      '. Нажмите «Транскрибировать In–Out» (для тишин/джампкатов — «⚡ Анализ аудио» на вкладке «Инструменты») и повторите запрос.';
+  }
+  /* Жёлтая плашка над полем ввода: транскрипт не совпадает с таймлайном. */
+  function _renderStaleHint(reason) {
+    var hint = document.getElementById('transcript-stale-hint');
+    if (!reason) { if (hint) hint.style.display = 'none'; return; }
+    if (!hint) {
+      if (!el.input || !el.input.parentNode) return;
+      hint = document.createElement('div');
+      hint.id = 'transcript-stale-hint';
+      hint.style.cssText = 'font-size:11px;color:#f59e0b;line-height:1.4;padding:4px 6px;' +
+        'background:rgba(245,158,11,0.08);border-radius:4px;margin-bottom:4px;';
+      el.input.parentNode.insertBefore(hint, el.input);
+    }
+    hint.textContent = '⚠ ' + _staleMsg(reason);
+    hint.style.display = 'block';
+  }
   var _pendingProposal = null;
   var _pendingPlanContext = null;
   var _keepInvertWarning = null;
@@ -661,8 +741,18 @@ PanelBoot.run('ИИ: монтаж', function () {
       type: 'function',
       'function': {
         name: 'get_timeline_snapshot',
-        description: 'Снимок активной секвенции (имена клипов, nodeId, время на таймлайне).',
-        parameters: { type: 'object', properties: {} }
+        description:
+          'Компактный снимок активной секвенции: seq/dur/fps + строки клипов nodeId|name|track|startSec-endSec[|off][|a=<аудио nodeId>@A<n>]. ' +
+          'Нужен ТОЛЬКО после apply_* или если auto-snapshot опущен (плотный таймлайн) — тогда фильтруй: fromSec/toSec (окно времени) или nameContains (часть имени клипа).',
+        parameters: {
+          type: 'object',
+          properties: {
+            fromSec: { type: 'number', description: 'Начало окна (сек таймлайна) — вернуть клипы, пересекающие окно.' },
+            toSec: { type: 'number', description: 'Конец окна (сек).' },
+            nameContains: { type: 'string', description: 'Часть имени клипа (без учёта регистра).' },
+            forceRefresh: { type: 'boolean' }
+          }
+        }
       }
     },
     {
@@ -1099,6 +1189,38 @@ PanelBoot.run('ИИ: монтаж', function () {
      описывает vision-модель Cloud.ru (visionModel, дефолт MiniMax-M3).
      BRAW ffmpeg не декодирует — для таких проектов агент передаёт sourceFile
      (черновой экспорт/прокси секвенции). */
+  /* Ревью 09.2026: детерминированные пайплайны вкладки «Инструменты» доступны
+     агенту одним инструментом — раньше «убери тишины» LLM собирала вручную по
+     зазорам абзацев, а джампкаты/пробелы/кроссфейды были ей недоступны вовсе. */
+  var TOOLS_PIPELINES = [
+    {
+      type: 'function',
+      'function': {
+        name: 'run_tool',
+        description:
+          'Запустить детерминированный инструмент монтажа (тот же, что кнопки на вкладке «Инструменты»). Показывает карточку подтверждения; после вызова — ЗАВЕРШИ ход. ' +
+          'name: silences (убрать тишины/паузы по измеренной громкости), jumps (jump cuts — сжать все паузы, YouTube-ритм), fillers (слова-паразиты по транскрипту, точечно), ' +
+          'profanity (заглушить/вырезать мат), chapters (маркеры-главы по темам транскрипта), gaps (закрыть пустые пробелы таймлайна). ' +
+          'Для этих задач ВСЕГДА предпочитай run_tool вместо ручного подбора интервалов.',
+        parameters: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', enum: ['silences', 'jumps', 'fillers', 'profanity', 'chapters', 'gaps'] },
+            params: {
+              type: 'object',
+              description:
+                'Необязательные параметры. silences: {minDuration (сек, дефолт 1.0), padding, cutMode: remove|keep_spaces|mute, crossfade: boolean, limitToInOut: boolean}; ' +
+                'jumps: {maxPause (дефолт 0.5), keepBreathing, minSegmentDuration, crossfade}; fillers: {sensitivity: strict|normal}; ' +
+                'profanity: {cutMode: mute|remove, customWords: [..]}; chapters: {maxChapters, minChapterSec, customInstructions}; gaps: {minGapSec}.',
+              properties: {}
+            }
+          },
+          required: ['name']
+        }
+      }
+    }
+  ];
+
   var TOOLS_VISION = [
     {
       type: 'function',
@@ -1130,7 +1252,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   ];
 
   var TOOLS_UNIFIED = (function () {
-    var all = [].concat(TOOLS_TEXTMONTAGE, TOOLS_MARKERS, TOOLS_TIMECODE, UNIFIED_EDIT_PLAN_TOOLS, TOOLS_VISION);
+    var all = [].concat(TOOLS_TEXTMONTAGE, TOOLS_MARKERS, TOOLS_TIMECODE, UNIFIED_EDIT_PLAN_TOOLS, TOOLS_VISION, TOOLS_PIPELINES);
     var seen = {};
     var out = [];
     for (var i = 0; i < all.length; i++) {
@@ -1466,14 +1588,19 @@ PanelBoot.run('ИИ: монтаж', function () {
     if (!Array.isArray(removeIntervals) || !removeIntervals.length) return removeIntervals;
     if (!paddingSec || paddingSec <= 0) return removeIntervals;
     var MIN_DURATION = 0.05;
+    /* Ревью 09.2026: раньше интервал короче 2×padding выбрасывался ЦЕЛИКОМ —
+       при дефолтных 0.3с это молча терялись все паразиты/сегменты короче 0.65с
+       (в реальном кэше 564 таких сегмента). Теперь паддинг ограничен четвертью
+       длины интервала с каждой стороны: короткий вырез сжимается, но остаётся. */
+    var MAX_PAD_FRACTION = 0.25;
     var out = [];
     for (var i = 0; i < removeIntervals.length; i++) {
       var iv = removeIntervals[i];
       if (typeof iv.startSec !== 'number' || typeof iv.endSec !== 'number') continue;
-      var s = iv.startSec + paddingSec;
-      var e = iv.endSec - paddingSec;
-      if (e - s < MIN_DURATION) continue; /* интервал короче 2*padding — пропустить полностью */
-      out.push({ startSec: s, endSec: e, reason: iv.reason });
+      var dur = iv.endSec - iv.startSec;
+      if (dur < MIN_DURATION) continue;
+      var pad = Math.min(paddingSec, dur * MAX_PAD_FRACTION);
+      out.push({ startSec: iv.startSec + pad, endSec: iv.endSec - pad, reason: iv.reason });
     }
     return out;
   }
@@ -1914,7 +2041,8 @@ PanelBoot.run('ИИ: монтаж', function () {
       markers: '⚠ Требуется подтверждение: маркеры',
       audio_ducking: '⚠ Требуется подтверждение: ducking музыки',
       loudness: '⚠ Требуется подтверждение: LUFS-нормализация',
-      j_cuts: '⚠ Требуется подтверждение: J/L-cuts аудио'
+      j_cuts: '⚠ Требуется подтверждение: J/L-cuts аудио',
+      close_gaps: '⚠ Требуется подтверждение: убрать пробелы таймлайна'
     };
     title.textContent = titleByKind[kind] || titleByKind.transcript_cuts;
     card.appendChild(title);
@@ -2176,6 +2304,27 @@ PanelBoot.run('ИИ: монтаж', function () {
       return;
     }
 
+    /* ── kind: close_gaps (пайплайн «Убрать пробелы» из чата, ревью 09.2026) ── */
+    if (kind === 'close_gaps') {
+      var sumG = _proposalSummaryEl(_pendingProposal.summary);
+      if (sumG) card.appendChild(sumG);
+      var gList = document.createElement('div');
+      gList.style.cssText = 'font-size:11px;max-height:160px;overflow-y:auto;margin-top:6px;';
+      (_pendingProposal.gaps || []).forEach(function (g, gi) {
+        var row = document.createElement('div');
+        row.style.cssText = 'padding:2px 0;';
+        row.appendChild(document.createTextNode((gi + 1) + '. '));
+        row.appendChild(_tcJumpEl(g.startSec));
+        row.appendChild(document.createTextNode(' – ' + fmtSec(g.endSec) + ' (' + (g.endSec - g.startSec).toFixed(2) + 'с)'));
+        gList.appendChild(row);
+      });
+      card.appendChild(gList);
+      card.appendChild(_buildButtons('Закрыть пробелы'));
+      el.chat.appendChild(card);
+      el.chat.scrollTop = el.chat.scrollHeight;
+      return;
+    }
+
     /* ── kind: transcript_cuts (исходный путь) ────────────────────── */
     if (_pendingProposal.summary) {
       var sumBlock = _proposalSummaryEl(_pendingProposal.summary);
@@ -2206,11 +2355,19 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
     /* Строгий режим (спека 2026-08-06): интервалы, исключённые из плана из-за
        неподтверждённых границ — пользователь видит ДО подтверждения. */
+    /* Ревью 09.2026: неподтверждённые интервалы остаются В плане (раньше
+       молча исключались — «нашёл 20, вырезал 9»), но помечены: проверить на слух. */
     if (bs && bs.unconfirmed) {
       var unEl = document.createElement('div');
       unEl.style.cssText = 'color:#f59e0b;font-size:11px;margin:2px 0 8px;';
-      unEl.textContent = '⚠ Исключено из плана (границы не подтверждены паузами): ' +
-        bs.unconfirmed + ' интервал(ов).';
+      unEl.appendChild(document.createTextNode('⚠ Границы не подтверждены измеренными паузами у ' +
+        bs.unconfirmed + ' интервал(ов) — проверьте на слух: '));
+      var unList = _pendingProposal.unconfirmedIntervals || [];
+      for (var ui = 0; ui < unList.length && ui < 12; ui++) {
+        if (ui) unEl.appendChild(document.createTextNode(', '));
+        unEl.appendChild(_tcJumpEl(unList[ui].startSec));
+      }
+      if (unList.length > 12) unEl.appendChild(document.createTextNode(' … ещё ' + (unList.length - 12)));
       card.appendChild(unEl);
     }
 
@@ -2726,6 +2883,27 @@ PanelBoot.run('ИИ: монтаж', function () {
           }
           PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
             if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
+            /* Ревью 09.2026: ripple через карточку тоже сдвигает кэш транскрипта
+               (раньше синхронил только fast-path, карточка оставляла кэш съехавшим);
+               move/trim/remove — помечаем структуру как подозрительную. */
+            try {
+              var seqKeyT = (snapData && snapData.sequenceName) || (prop.snapshot && prop.snapshot.sequenceName) || '';
+              if (seqKeyT && Array.isArray(prop.operations)) {
+                var rippleT = [], shiftT = false;
+                prop.operations.forEach(function (o) {
+                  if (!o) return;
+                  var act = o.action || o.kind;
+                  if (act === 'ripple_delete_range' || act === 'ripple_delete_range_all_tracks') {
+                    if (typeof o.startSec === 'number' && typeof o.endSec === 'number') rippleT.push({ startSec: o.startSec, endSec: o.endSec });
+                  } else if (act === 'move_clip' || act === 'shift_timeline_ripple' || act === 'set_timeline_in' ||
+                             act === 'set_timeline_out' || act === 'set_timeline_bounds' || act === 'remove_clip') shiftT = true;
+                });
+                if (rippleT.length) ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, seqKeyT, rippleT);
+                if (shiftT) ContextStore.markTranscriptStale(TRANSCRIPT_PID, seqKeyT, 'timecode_edits apply: ' +
+                  prop.operations.map(function (o) { return o.action || o.kind; }).join(','));
+              }
+            } catch (eSyncT) {}
+            _traceWrite({ kind: 'apply', at: new Date().toISOString(), proposalKind: 'timecode_edits', ok: true, ops: (prop.operations || []).length });
             statusUi.show('Готово', false);
             setTimeout(function () { statusUi.hide(); }, 1200);
             var s = prop.simulation && prop.simulation.summary;
@@ -2858,49 +3036,149 @@ PanelBoot.run('ИИ: монтаж', function () {
       return;
     }
 
+    if (kind === 'close_gaps') {
+      statusUi.show('Закрываю пробелы…', true);
+      var cgExpectedC = (prop.snapshot && prop.snapshot.sequenceName) || '';
+      /* B2-9: checkpoint перед сдвигом клипов (Cmd+Z на пакет сдвигов ненадёжен) */
+      _makeSequenceCheckpoint('убрать пробелы', function () {
+        PremiereBridge.closeSequenceGaps({ gaps: prop.gaps || [], expectedSequenceName: cgExpectedC }, function (err, data) {
+          if (err || !data || data.ok === false) {
+            statusUi.hide();
+            showErr('Пробелы НЕ закрыты: ' + (err ? String(err.message || err) : describeHostFailure(data)));
+            _traceWrite({ kind: 'apply', at: new Date().toISOString(), proposalKind: 'close_gaps', ok: false });
+            return;
+          }
+          _snapDirty = true;
+          PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
+            if (!snapErr && snapData && snapData.ok) { lastSnap = snapData; _snapDirty = false; }
+            /* Ремап кэша транскрипта той же математикой, что ripple-удаления:
+               закрытые пробелы = вырезанные интервалы (речи в них нет). */
+            var closedIvs = [];
+            var prg = data.perResults || [];
+            for (var pi = 0; pi < prg.length; pi++) {
+              if (prg[pi].ok && prop.gaps && prop.gaps[prg[pi].i]) closedIvs.push(prop.gaps[prg[pi].i]);
+            }
+            try {
+              var seqKeyG = (snapData && snapData.sequenceName) || cgExpectedC;
+              if (seqKeyG && closedIvs.length) ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, seqKeyG, closedIvs);
+            } catch (eG) {}
+            statusUi.show('Готово', false);
+            setTimeout(function () { statusUi.hide(); }, 1200);
+            var failedCnt = (data.requested || 0) - (data.closed || 0);
+            var msgsG = ContextStore.getMessages(panelId);
+            msgsG.push({
+              role: 'assistant',
+              content: 'Закрыто пробелов: ' + (data.closed || 0) + ' из ' + (data.requested || 0) +
+                ' (−' + Number(data.closedSec || 0).toFixed(1) + 'с)' + (failedCnt > 0 ? ', ' + failedCnt + ' пропущено' : '') +
+                '. Откат: «⏪ Откатить» или Cmd+Z / Ctrl+Z.'
+            });
+            ContextStore.setMessages(panelId, msgsG);
+            renderMessages(msgsG);
+            _traceWrite({ kind: 'apply', at: new Date().toISOString(), proposalKind: 'close_gaps', ok: true, closed: data.closed || 0, requested: data.requested || 0 });
+          });
+        });
+      });
+      return;
+    }
+
     /* default: transcript_cuts (исходный путь) */
     statusUi.show('Применяю монтаж…', true);
-    /* B2-9: checkpoint — клон секвенции перед ripple-удалениями */
-    _makeSequenceCheckpoint('монтаж по тексту', function () {
-    PremiereBridge.applyTranscriptCuts(
-      /* Волна 1.5: host сверит секвенцию сам — закрывает окно между
-         assertSequenceMatch и фактическим apply. */
-      { removeIntervals: prop.removeIntervals, summary: prop.summary,
-        expectedSequenceName: (prop.snapshot && prop.snapshot.sequenceName) || '' },
-      function (err, data) {
-        if (err) {
-          statusUi.hide();
-          showErr('Ошибка применения монтажа: ' + String(err.message || err));
-          return;
-        }
-        /* Host-контракт (10 июня 2026): ok:false приходит как data, не err —
-           locked-дорожки или полный отказ razor. НЕ пишем «применено». */
-        if (data && data.ok === false) {
-          statusUi.hide();
-          showErr('Монтаж НЕ применён: ' + describeHostFailure(data));
-          return;
-        }
-        PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
-          if (!snapErr && snapData && snapData.ok) lastSnap = snapData;
-          try {
-            var seqKey = (snapData && snapData.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
-            if (seqKey) {
-              ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, seqKey, prop.removeIntervals || []);
-            }
-          } catch (eShift) {}
-          statusUi.show('Готово', false);
-          setTimeout(function () { statusUi.hide(); }, 1200);
-          var msgs = ContextStore.getMessages(panelId);
-          msgs.push({
-            role: 'assistant',
-            content: _buildApplySummary(prop, data, snapData)
-          });
-          ContextStore.setMessages(panelId, msgs);
-          renderMessages(msgs);
-        });
+    /* Ревью 09.2026: тот же контракт, что у вкладки «Инструменты» — батчи по 10
+       (120с-watchdog моста на плотных таймлайнах), режим удаления (remove /
+       keep_spaces / mute — раньше чат применял mute-план как ripple!), кроссфейды
+       на швах и ремап транскрипта ТОЛЬКО для ripple. */
+    var tcExpectedC = (prop.snapshot && prop.snapshot.sequenceName) || '';
+    var tcModeC = (prop.cutMode === 'mute' || prop.cutMode === 'keep_spaces') ? prop.cutMode : 'remove';
+    var tcAllC = prop.removeIntervals || [];
+    var tcBatchesC = DeterministicPipelines.splitCutIntervalsIntoBatches(tcAllC);
+    var tcDoneC = 0, tcRemSecC = 0, tcLastData = null, tcXfNote = '';
+    var tcSeqKeyC = prop.seqKey || tcExpectedC || (lastSnap && lastSnap.sequenceName) || '';
+    var tcFinishC = function (failMsg) {
+      if (failMsg) {
+        statusUi.hide();
+        showErr(failMsg);
+        _traceWrite({ kind: 'apply', at: new Date().toISOString(), proposalKind: 'transcript_cuts', ok: false, done: tcDoneC, total: tcAllC.length, error: String(failMsg).slice(0, 200) });
+        return;
       }
-    );
-    }); /* конец _makeSequenceCheckpoint */
+      _snapDirty = true;
+      PremiereBridge.getTimelineSnapshot(function (snapErr, snapData) {
+        if (!snapErr && snapData && snapData.ok) { lastSnap = snapData; _snapDirty = false; }
+        statusUi.show('Готово', false);
+        setTimeout(function () { statusUi.hide(); }, 1200);
+        var msgs = ContextStore.getMessages(panelId);
+        var body = tcModeC === 'remove'
+          ? _buildApplySummary(prop, tcLastData, snapData)
+          : ('✂ Применено: ' + tcDoneC + ' интервал(ов) — ' +
+            (tcModeC === 'mute' ? 'заглушено (клипы отключены)' : 'вырезано без сдвига (дыры остались)') +
+            ' (' + tcRemSecC.toFixed(1) + 'с). Таймлайн не сдвигался, транскрипт актуален.' +
+            describeHostWarnings(tcLastData) + '\n• Откат: «⏪ Откатить» или Cmd+Z / Ctrl+Z');
+        msgs.push({ role: 'assistant', content: body + tcXfNote });
+        ContextStore.setMessages(panelId, msgs);
+        renderMessages(msgs);
+        _traceWrite({ kind: 'apply', at: new Date().toISOString(), proposalKind: 'transcript_cuts', ok: true, mode: tcModeC, done: tcDoneC, removedSec: Math.round(tcRemSecC * 10) / 10 });
+      });
+    };
+    var tcRunBatchC = function (bi) {
+      if (bi >= tcBatchesC.length) {
+        /* B1: кроссфейды на швах после всех батчей (только ripple-вырезка).
+           Шов k в пост-монтажных координатах = startSec_k − вырезано левее. */
+        if (prop.crossfade && tcModeC === 'remove' && tcDoneC > 0 && PremiereBridge.addAudioCrossfades) {
+          statusUi.show('Добавляю кроссфейды на швах…', true);
+          var xfSorted = tcAllC.slice().sort(function (x, y) { return x.startSec - y.startSec; });
+          var xfTimes = [], xfCum = 0;
+          for (var xfi = 0; xfi < xfSorted.length; xfi++) {
+            var seam = xfSorted[xfi].startSec - xfCum;
+            if (seam > 0.05) xfTimes.push(Math.round(seam * 1000) / 1000);
+            xfCum += Math.max(0, xfSorted[xfi].endSec - xfSorted[xfi].startSec);
+          }
+          PremiereBridge.addAudioCrossfades({ times: xfTimes, expectedSequenceName: tcExpectedC }, function (errX, dX) {
+            var added = (dX && typeof dX.added === 'number') ? dX.added : 0;
+            var warn = errX ? String(errX.message || errX).slice(0, 80)
+              : ((dX && dX.ok === false) ? String(dX.error || 'не добавились').slice(0, 80)
+                : ((dX && dX.failed > 0) ? dX.failed + ' не добавились' : ''));
+            tcXfNote = '\n• Кроссфейды на швах: ' + added + (warn ? ' (' + warn + ')' : '');
+            tcFinishC(null);
+          });
+          return;
+        }
+        tcFinishC(null);
+        return;
+      }
+      var ivs = tcBatchesC[bi];
+      if (tcBatchesC.length > 1) {
+        statusUi.show('Монтаж: батч ' + (bi + 1) + '/' + tcBatchesC.length +
+          ' (вырезки ' + (tcDoneC + 1) + '–' + (tcDoneC + ivs.length) + ' из ' + tcAllC.length + ')…', true);
+      }
+      PremiereBridge.applyTranscriptCuts(
+        /* Волна 1.5: host сверит секвенцию сам — закрывает окно между
+           assertSequenceMatch и фактическим apply. */
+        { removeIntervals: ivs, summary: prop.summary, expectedSequenceName: tcExpectedC, cutMode: tcModeC },
+        function (err, data) {
+          /* Host-контракт (10 июня 2026): ok:false приходит как data, не err —
+             locked-дорожки или полный отказ razor. НЕ пишем «применено». */
+          if (err || (data && data.ok === false)) {
+            var reason = err ? String(err.message || err) : ('Монтаж НЕ применён: ' + describeHostFailure(data));
+            var partial = tcDoneC > 0
+              ? ' Применено ' + tcDoneC + ' из ' + tcAllC.length + ' вырезок — откатите кнопкой ⏪ и повторите.'
+              : ' Таймлайн не изменён.';
+            tcFinishC((tcBatchesC.length > 1 ? 'Ошибка (батч ' + (bi + 1) + '/' + tcBatchesC.length + '): ' : 'Ошибка: ') + reason + partial);
+            return;
+          }
+          tcLastData = data;
+          /* Ремап транскрипта СРАЗУ после батча: батчи независимы (справа-налево),
+             при сбое следующего кэш останется согласованным. Только для ripple. */
+          if (tcModeC === 'remove') {
+            try { if (tcSeqKeyC) ContextStore.applyRippleDeletionsToTranscript(TRANSCRIPT_PID, tcSeqKeyC, ivs); }
+            catch (eR) { console.warn('[chat] applyRippleDeletionsToTranscript failed:', eR && eR.message); }
+          }
+          tcDoneC += ivs.length;
+          for (var rvi = 0; rvi < ivs.length; rvi++) tcRemSecC += Math.max(0, (ivs[rvi].endSec || 0) - (ivs[rvi].startSec || 0));
+          tcRunBatchC(bi + 1);
+        }
+      );
+    };
+    /* B2-9: checkpoint — клон секвенции перед ripple-удалениями */
+    _makeSequenceCheckpoint('монтаж по тексту', function () { tcRunBatchC(0); });
   }
 
   /**
@@ -3051,6 +3329,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   }
 
   function cancelPendingProposal() {
+    _traceWrite({ kind: 'cancel', at: new Date().toISOString(), proposalKind: (_pendingProposal && _pendingProposal.kind) || null });
     _pendingProposal = null;
     var card = document.getElementById('pending-proposal-card');
     if (card && card.parentNode) card.parentNode.removeChild(card);
@@ -3139,6 +3418,8 @@ PanelBoot.run('ИИ: монтаж', function () {
 
   function execProposeTranscriptCuts(args) {
     args = args || {};
+    /* Гейт свежести (ревью 09.2026): по устаревшему транскрипту не режем. */
+    if (_chatTranscriptStale) return Promise.resolve({ validationError: _staleMsg() });
     var hasRefs = Array.isArray(args.removeRefs) && args.removeRefs.length > 0;
     var hasRemove = Array.isArray(args.removeIntervals) && args.removeIntervals.length > 0;
     var hasKeep = Array.isArray(args.keepIntervals) && args.keepIntervals.length > 0;
@@ -3367,7 +3648,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       warnings: _keepInvertWarning ? [_keepInvertWarning] : null,
       /* Строгий режим (спека 2026-08-06): интервалы, исключённые из плана
          из-за неподтверждённых границ — видны в карточке до подтверждения. */
-      skippedIntervals: (_refined.skipped && _refined.skipped.length) ? _refined.skipped : null
+      unconfirmedIntervals: (_refined.unconfirmed && _refined.unconfirmed.length) ? _refined.unconfirmed : null
     };
     /* Проброс контекста плана монтажа (propose_montage_plan → карточка) */
     if (_pendingPlanContext) {
@@ -3398,9 +3679,10 @@ PanelBoot.run('ИИ: монтаж', function () {
     /* Строгий режим (2026-08-06): сообщаем модели об исключённых интервалах —
        она может переформулировать план (сдвинуть границы к паузам). */
     if (_refined.stats.unconfirmed) {
-      result._skippedUnconfirmed = _refined.skipped;
-      result.message += ' Внимание: ' + _refined.stats.unconfirmed +
-        ' интервал(ов) исключено — границы не подтверждены измеренными паузами (см. _skippedUnconfirmed).';
+      result._unconfirmedIntervals = _refined.unconfirmed;
+      result.message += ' Внимание: у ' + _refined.stats.unconfirmed +
+        ' интервал(ов) границы не подтверждены измеренными паузами — они В плане с отступом (см. _unconfirmedIntervals); ' +
+        'если можешь, сдвинь их границы к паузам из get_transcript_structure и пришли план заново.';
     }
     return Promise.resolve(result);
   }
@@ -3418,6 +3700,7 @@ PanelBoot.run('ИИ: монтаж', function () {
    * можно продолжить принудительно через allowUnconsolidated:true.
    */
   function execProposeMontagePlan(args) {
+    if (_chatTranscriptStale) return Promise.resolve({ validationError: _staleMsg() });
     args = args || {};
     var sequenceKey = String(args.sequenceKey || '').trim();
     if (!sequenceKey) return Promise.resolve({ error: 'propose_montage_plan: нужен sequenceKey (sequenceName из снимка)' });
@@ -4506,11 +4789,109 @@ PanelBoot.run('ИИ: монтаж', function () {
     }
   }
 
+  /* ── Пайплайны «Инструментов» из чата (ревью 09.2026) ──────────────────
+     Один вход для трёх путей: slash-команда, фраза (ChatRouter.matchPipelineIntent)
+     и LLM-инструмент run_tool. → {status: proposal|nochange|stale|error, text, proposal?} */
+  var PIPELINE_TRANSCRIPT_TOOLS = { fillers: 1, profanity: 1, chapters: 1 };
+  var PIPELINE_AUDIO_TOOLS = { silences: 1, jumps: 1 };
+  function _pipelineByTool(tool) {
+    if (typeof DeterministicPipelines === 'undefined') return null;
+    var DP = DeterministicPipelines;
+    var map = {
+      silences: { fn: DP.cutSilences, label: 'Убрать тишины' },
+      jumps: { fn: DP.jumpCuts, label: 'Jump cuts' },
+      fillers: { fn: DP.cutFillers, label: 'Убрать паразиты' },
+      profanity: { fn: DP.muteProfanity, label: 'Мат' },
+      chapters: { fn: DP.chapterize, label: 'Авто-главы' },
+      gaps: { fn: DP.removeGaps, label: 'Убрать пробелы' }
+    };
+    var spec = map[String(tool || '').toLowerCase()];
+    return (spec && typeof spec.fn === 'function') ? spec : null;
+  }
+  async function runChatPipeline(pipelineFn, params, opts) {
+    opts = opts || {};
+    var snap = await execGetSnapshot(true);
+    var seqKey = (snap && snap.sequenceName) || '';
+    var found = seqKey ? ContextStore.findTranscriptEntry(TRANSCRIPT_PID, seqKey, (snap && snap.sequenceId) || '') : null;
+    var entry = found && found.entry ? found.entry : null;
+    /* Гейт свежести: ручные правки после транскрибации/анализа сдвигают тайминги.
+       Вкладка «Инструменты» даёт confirm-обход; в чате блокируем честно. */
+    var tool = opts.tool || '';
+    if (entry && snap && snap.audioFp && typeof ChatRouter !== 'undefined') {
+      if (PIPELINE_TRANSCRIPT_TOOLS[tool]) {
+        var frP = ChatRouter.transcriptFreshness(snap, entry);
+        if (frP.state === 'stale') return { status: 'stale', text: '⚠ ' + _staleMsg(frP.reason) };
+      } else if (PIPELINE_AUDIO_TOOLS[tool]) {
+        var aFp = entry.audioAnalysis && entry.audioAnalysis.analyzedFp;
+        if (aFp && String(aFp) !== String(snap.audioFp)) {
+          return { status: 'stale', text: '⚠ Аудио-анализ устарел: таймлайн менялся после «⚡ Анализ аудио». ' +
+            'Запустите анализ заново (вкладка «Инструменты») и повторите.' };
+        }
+      }
+    }
+    var res = await pipelineFn({
+      settings: opts.settings || ContextStore.getResolvedSettings(),
+      snapshot: snap,
+      transcriptEntry: entry,
+      onStatus: function (msg) { statusUi.show(msg, true); },
+      abortCheck: opts.abortCheck || function () { return false; }
+    }, params || {});
+    if (!res || !res.ok) return { status: 'error', text: (res && res.error) || 'Ошибка пайплайна.' };
+    if (res.noChanges) return { status: 'nochange', text: res.summary || 'Нечего менять.' };
+    if (!res.proposal) return { status: 'nochange', text: res.summary || 'Готово (без изменений таймлайна).' };
+    _pendingProposal = res.proposal;
+    _pendingProposal.snapshot = snap;
+    _pendingProposal.seqKey = seqKey;
+    _pendingProposal.createdAt = Date.now();
+    if (res.proposal.kind === 'transcript_cuts') {
+      _pendingProposal.verification = computeVerification(res.proposal.removeIntervals);
+    }
+    if (res.proposal.kind === 'j_cuts') _pendingProposal.kind = 'j_cuts';
+    renderPendingProposalCard();
+    var count = (res.proposal.removeIntervals || res.proposal.markers || res.proposal.gaps || []).length;
+    return { status: 'proposal', text: res.proposal.summary || res.summary || '', proposal: _pendingProposal, count: count };
+  }
+  /* LLM-инструмент run_tool: те же пайплайны по имени. */
+  function execRunTool(args) {
+    args = args || {};
+    var name = String(args.name || '').toLowerCase();
+    var spec = _pipelineByTool(name);
+    if (!spec) {
+      return Promise.resolve({ error: 'Неизвестный инструмент «' + name + '». Доступны: silences, jumps, fillers, profanity, chapters, gaps.' });
+    }
+    var params = (args.params && typeof args.params === 'object') ? args.params : {};
+    return runChatPipeline(spec.fn, params, {
+      tool: name, label: spec.label,
+      settings: ContextStore.getResolvedSettings(),
+      abortCheck: function () { return !!(runAbort && runAbort.aborted); }
+    }).then(function (pr) {
+      _traceEvent('pipeline', { tool: name, status: pr.status, count: pr.count || 0 });
+      if (pr.status === 'proposal') {
+        return {
+          ok: true, status: 'waiting_user_confirmation', tool: name, count: pr.count || 0, summary: pr.text,
+          message: 'Карточка показана пользователю — он нажмёт «Применить». НЕ вызывай apply_* — заверши ход коротким резюме.'
+        };
+      }
+      if (pr.status === 'nochange') return { ok: true, noChanges: true, tool: name, summary: pr.text };
+      return { error: pr.text, tool: name };
+    });
+  }
+  /* get_timeline_snapshot для МОДЕЛИ: компактные строки + фильтры (ревью 09.2026). */
+  function execGetSnapshotForLlm(args) {
+    args = args || {};
+    return Promise.resolve(execGetSnapshot(args)).then(function (snap) {
+      if (!snap || !snap.ok) return snap;
+      return EditPlanSimulator.compactSnapshotForLlmFiltered(snap, {
+        fromSec: args.fromSec, toSec: args.toSec, nameContains: args.nameContains, maxClips: 120
+      }) || snap;
+    });
+  }
+
   function buildExecutorsForPreset(preset) {
     var pid = preset.panelId;
     /* Единый набор: все экзекуторы доступны всегда */
     return {
-      get_timeline_snapshot: execGetSnapshot,
+      get_timeline_snapshot: execGetSnapshotForLlm,
       get_transcript_from_cache: execGetTranscriptFromCache,
       get_transcript_structure: execGetTranscriptStructure,
       /* таймкоды */
@@ -4533,7 +4914,9 @@ PanelBoot.run('ИИ: монтаж', function () {
       propose_audio_ducking: execProposeAudioDucking,
       propose_loudness_normalization: execProposeLoudness,
       /* vision */
-      describe_frames: execDescribeFrames
+      describe_frames: execDescribeFrames,
+      /* пайплайны «Инструментов» (ревью 09.2026) */
+      run_tool: execRunTool
     };
   }
 
@@ -4910,6 +5293,27 @@ PanelBoot.run('ИИ: монтаж', function () {
       role.appendChild(roleText);
     } else {
       role.textContent = m.role + (m.tool_calls ? ' · tools' : '');
+      /* Оценка ответа (ревью 09.2026): 👍/👎 пишутся в трейс хода — реальные
+         промахи агента копятся в ~/.extensions_llm_chat_pr/traces/*.jsonl */
+      if (m.role === 'assistant' && m._traceId && window.RunTrace) {
+        var fbWrap = document.createElement('span');
+        fbWrap.className = 'trace-feedback';
+        fbWrap.style.cssText = 'margin-left:8px;opacity:0.6;font-size:11px;';
+        ['👍', '👎'].forEach(function (sym) {
+          var fbBtn = document.createElement('button');
+          fbBtn.type = 'button';
+          fbBtn.textContent = sym;
+          fbBtn.title = sym === '👎' ? 'Не то — записать промах в трейс' : 'Хорошо — записать в трейс';
+          fbBtn.style.cssText = 'background:none;border:none;cursor:pointer;padding:0 3px;font-size:12px;';
+          fbBtn.onclick = function (ev) {
+            ev.stopPropagation();
+            _traceWrite(RunTrace.feedbackRecord(m._traceId, sym === '👎' ? 'bad' : 'good', String(m.content || '').slice(0, 200)));
+            fbWrap.textContent = sym === '👎' ? '👎 записано' : '👍 записано';
+          };
+          fbWrap.appendChild(fbBtn);
+        });
+        role.appendChild(fbWrap);
+      }
     }
     div.appendChild(role);
 
@@ -5095,7 +5499,7 @@ PanelBoot.run('ИИ: монтаж', function () {
   function _selectStarter(s, panelId) {
     el.input.value = s.userPrompt || '';
     el.input.focus();
-    if (s.systemPromptAddon) _activeSystemAddon = s.systemPromptAddon;
+    if (s.systemPromptAddon) { _activeSystemAddon = s.systemPromptAddon; _activeSystemAddonTurns = 0; }
   }
 
   function _selectHint(h) {
@@ -5419,6 +5823,8 @@ PanelBoot.run('ИИ: монтаж', function () {
   if (btnClrChat) {
     btnClrChat.onclick = function () {
       ContextStore.clearChat(active.panelId);
+      _activeSystemAddon = null;
+      _activeSystemAddonTurns = 0;
       renderMessages([]);
       el.moreMenu.classList.remove('open');
     };
@@ -6606,140 +7012,108 @@ PanelBoot.run('ИИ: монтаж', function () {
     ContextStore.setMessages(panelId, stored);
     renderMessages(stored);
 
-    /* Fast-path для простых команд «удали с X по Y секунду» */
-    {
-      var direct = parseTimelineIntervalDeleteSec(text);
-      if (direct && direct.endSec > direct.startSec + 0.02) {
-        el.send.disabled = true;
-        el.stop.disabled = false;
-        runAbort = createAbortPair();
-        var acFast = runAbort;
-        statusUi.show('Вырезание интервала на таймлайне…', true);
-        try {
-          if (acFast.aborted) throw new Error('Остановлено');
-          var delAction = direct.ripple ? 'ripple_delete_range' : 'lift_delete_range';
-          var plan = {
-            operations: [{ action: delAction, startSec: direct.startSec, endSec: direct.endSec }],
-            summary: 'Удалён участок ' + direct.startSec + '–' + direct.endSec + ' с (' + delAction + ')'
-          };
-          /* Чекпоинт перед деструктивным fast-path — чтобы работала «⏪ Откатить»
-             (18.06.2026: раньше fast-path применял без бэкапа, откат только Ctrl+Z). */
-          await new Promise(function (resolve) {
-            _makeSequenceCheckpoint('вырезание интервала', function () { resolve(); });
-          });
-          var fastRes = await new Promise(function (resolve, reject) {
-            PremiereBridge.applyTimecodeEdits(plan, function (err, data) {
-              if (err) reject(err);
-              else resolve(data);
-            });
-          });
-          /* Откат таймкодов средствами плагина не реализован — Cmd+Z в таймлайне Premiere вручную. */
-          if (fastRes && !fastRes.ok) throw new Error(fastRes.error || 'Ошибка применения правки');
-          /* 19.06.2026: fast-path синхронизирует кэш транскрипта так же, как
-             канонический apply_timecode_edits (panel.js:1142-1168). Раньше fast-path
-             применял ripple к таймлайну, но НЕ сдвигал кэш транскрипта → после
-             «удали с 10 по 20 сек» все сегменты после выреза оставались съехавшими
-             на длину выреза, и последующие чат-запросы видели неверные таймкоды
-             (подтверждено live: вырез 5-6с не сдвинул last-сегмент 1877.574).
-             lift_delete оставляет дыру (контент не сдвигается) — канонический путь
-             его не синхронит, fast-path тоже только для ripple. */
-          _snapDirty = true;
-          try {
-            var fastSnap = await new Promise(function (resolve) {
-              PremiereBridge.getTimelineSnapshot(function (e2, d2) { resolve((!e2 && d2 && d2.ok) ? d2 : null); });
-            });
-            if (fastSnap) { lastSnap = fastSnap; _snapDirty = false; }
-            var fastSeqKey = (fastSnap && fastSnap.sequenceName) || (lastSnap && lastSnap.sequenceName) || '';
-            if (fastSeqKey && direct.ripple) {
-              ContextStore.applyRippleDeletionsToTranscript(
-                TRANSCRIPT_PID, fastSeqKey,
-                [{ startSec: direct.startSec, endSec: direct.endSec }]
-              );
-            }
-          } catch (eFastSync) { /* sync best-effort — таймлайн уже изменён */ }
-          stored = ContextStore.getMessages(panelId);
-          stored.push({
-            role: 'assistant',
-            content:
-              'Готово: вырезан интервал с ' + direct.startSec + ' по ' + direct.endSec + ' с (' + delAction + ').'
-          });
-          ContextStore.setMessages(panelId, stored);
-          renderMessages(stored);
-          statusUi.show('Готово', false);
-          setTimeout(function () {
-            statusUi.hide();
-          }, 1200);
-        } catch (e) {
-          statusUi.hide();
-          if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1))
-            showErr('Остановлено.');
-          else showErr(String(e.message || e));
-        } finally {
-          if (runAbort === acFast) runAbort = null;
-          endOperation();
-          el.send.disabled = false;
-          el.stop.disabled = true;
+    /* ── Детерминированный роутер (ревью 09.2026, client/shared/chat-router.js) ──
+       1) «удали с 1:30 по 1:45» / «убери первые 10 секунд» / «последние 30 сек» →
+          карточка правок таймлайна с ТОЧНЫМИ секундами (без padding/snap/strict
+          транскрипт-конвейера, куда такие запросы уходили через LLM);
+       2) «убери тишины / паразитов / джампкаты / главы / пробелы / мат» → тот же
+          пайплайн, что кнопка на вкладке «Инструменты» (раньше LLM переизобретала
+          их вручную по абзацам). Стартер (аддон) — явный LLM-сценарий: фразы
+          при нём не перехватываем, только таймкоды. */
+    var CR = (typeof ChatRouter !== 'undefined') ? ChatRouter : null;
+    var routeIv = CR ? CR.parseIntervalDelete(text) : null;
+    if (!routeIv && !CR) {
+      var legacyIv = parseTimelineIntervalDeleteSec(text);
+      if (legacyIv) routeIv = { startSec: legacyIv.startSec, endSec: legacyIv.endSec, ripple: legacyIv.ripple, exact: true, form: 'range' };
+    }
+    if (routeIv) {
+      el.send.disabled = true;
+      el.stop.disabled = false;
+      runAbort = createAbortPair();
+      var acFast = runAbort;
+      _trace = _traceStart(panelId, text, 'exact-interval', { extra: routeIv });
+      statusUi.show('Готовлю правку таймлайна…', true);
+      try {
+        if (acFast.aborted) throw new Error('Остановлено');
+        var fastSnap = await execGetSnapshot(true);
+        var durFast = CR ? CR.snapshotDurationSec(fastSnap) : 0;
+        if (routeIv.needsDuration && CR) routeIv = CR.parseIntervalDelete(text, { durationSec: durFast });
+        if (!routeIv || routeIv.needsDuration || !(routeIv.endSec > routeIv.startSec + 0.02)) {
+          throw new Error('Не удалось определить интервал — уточните таймкоды (например «с 1:30 по 1:45» или «первые 10 секунд»).');
         }
-        return;
+        if (durFast > 0 && routeIv.startSec >= durFast) {
+          throw new Error('Интервал ' + fmtSec(routeIv.startSec) + '–' + fmtSec(routeIv.endSec) +
+            ' за концом таймлайна (' + fmtSec(durFast) + ').');
+        }
+        var delAction = routeIv.ripple ? 'ripple_delete_range' : 'lift_delete_range';
+        var fastPlan = {
+          operations: [{ action: delAction, startSec: routeIv.startSec, endSec: routeIv.endSec }],
+          summary: (routeIv.ripple ? 'Вырезать ' : 'Вырезать без смыкания ') + fmtSec(routeIv.startSec) + '–' + fmtSec(routeIv.endSec) +
+            ' (' + (routeIv.endSec - routeIv.startSec).toFixed(2) + 'с) — точные таймкоды из запроса'
+        };
+        var fastRes = await execProposeTimecodeEdits(fastPlan);
+        stored = ContextStore.getMessages(panelId);
+        if (fastRes && fastRes.validationError) {
+          stored.push({ role: 'assistant', content: 'Не могу подготовить правку: ' + fastRes.validationError });
+        } else {
+          stored.push({ role: 'assistant', content: fastPlan.summary + '. Проверьте карточку и нажмите «Применить».' });
+        }
+        ContextStore.setMessages(panelId, stored);
+        renderMessages(stored);
+        _traceFinish(fastRes && fastRes.validationError ? 'validation' : 'proposal',
+          { proposalKind: 'timecode_edits', validationError: (fastRes && fastRes.validationError) || null });
+        statusUi.show('Готово', false);
+        setTimeout(function () { statusUi.hide(); }, 1200);
+      } catch (e) {
+        statusUi.hide();
+        _traceFinish('error', { error: String((e && e.message) || e).slice(0, 300) });
+        if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1))
+          showErr('Остановлено.');
+        else showErr(String(e.message || e));
+      } finally {
+        if (runAbort === acFast) runAbort = null;
+        endOperation();
+        el.send.disabled = false;
+        el.stop.disabled = true;
       }
+      return;
     }
 
-    /* ── Deterministic pipelines: /cut_fillers, /cut_silences, /chapterize, /jump_cuts ── */
+    /* ── Deterministic pipelines: slash-команды и фразы («убери тишины») ── */
     if (typeof DeterministicPipelines !== 'undefined') {
       var pipeCmd = DeterministicPipelines.parsePipelineCommand(text);
-      if (pipeCmd) {
+      var pipeFn = pipeCmd ? pipeCmd.pipeline : null;
+      var pipeParams = pipeCmd ? pipeCmd.params : null;
+      var pipeLabel = pipeCmd ? pipeCmd.name : null;
+      var pipeTool = null;
+      if (!pipeCmd && CR && !_activeSystemAddon) {
+        var pm = CR.matchPipelineIntent(text);
+        var pmSpec = pm ? _pipelineByTool(pm.tool) : null;
+        if (pmSpec) { pipeTool = pm.tool; pipeFn = pmSpec.fn; pipeParams = pm.params; pipeLabel = pm.label; }
+      }
+      if (pipeFn) {
         el.send.disabled = true;
         el.stop.disabled = false;
         runAbort = createAbortPair();
         var acPipe = runAbort;
-        statusUi.show('Пайплайн ' + pipeCmd.name + '…', true);
+        _trace = _traceStart(panelId, text, pipeCmd ? 'slash' : 'pipeline-intent', { extra: { tool: pipeTool || pipeLabel, params: pipeParams } });
+        statusUi.show('Пайплайн ' + pipeLabel + '…', true);
         try {
-          /* Получаем snapshot и транскрипт */
-          var pipeSnap = await execGetSnapshot(true);
-          var pipeSeqKey = (pipeSnap && pipeSnap.sequenceName) || '';
-          var pipeFound = pipeSeqKey ? ContextStore.findTranscriptEntry(TRANSCRIPT_PID, pipeSeqKey) : null;
-          var pipeEntry = pipeFound && pipeFound.entry ? pipeFound.entry : null;
-
-          var pipeResult = await pipeCmd.pipeline({
-            settings: settings,
-            snapshot: pipeSnap,
-            transcriptEntry: pipeEntry,
-            onStatus: function (msg) { statusUi.show(msg, true); },
+          var pr = await runChatPipeline(pipeFn, pipeParams, {
+            tool: pipeTool, label: pipeLabel, settings: settings,
             abortCheck: function () { return acPipe.aborted; }
-          }, pipeCmd.params);
-
-          if (!pipeResult.ok) {
-            stored = ContextStore.getMessages(panelId);
-            stored.push({ role: 'assistant', content: pipeResult.error || 'Ошибка пайплайна.' });
-            ContextStore.setMessages(panelId, stored);
-            renderMessages(stored);
-          } else if (pipeResult.noChanges) {
-            stored = ContextStore.getMessages(panelId);
-            stored.push({ role: 'assistant', content: pipeResult.summary });
-            ContextStore.setMessages(panelId, stored);
-            renderMessages(stored);
-          } else if (pipeResult.proposal) {
-            /* Показываем карточку подтверждения */
-            _pendingProposal = pipeResult.proposal;
-            _pendingProposal.snapshot = pipeSnap;
-            if (pipeResult.proposal.kind === 'transcript_cuts') {
-              _pendingProposal.verification = computeVerification(pipeResult.proposal.removeIntervals);
-            }
-            if (pipeResult.proposal.kind === 'j_cuts') {
-              /* J-cuts не используют стандартную карточку — специальная обработка */
-              _pendingProposal.kind = 'j_cuts';
-            }
-            stored = ContextStore.getMessages(panelId);
-            stored.push({ role: 'assistant', content: pipeResult.proposal.summary || pipeResult.summary || '' });
-            ContextStore.setMessages(panelId, stored);
-            renderMessages(stored);
-            renderPendingProposalCard();
-          }
-
+          });
+          stored = ContextStore.getMessages(panelId);
+          stored.push({ role: 'assistant', content: pr.text });
+          ContextStore.setMessages(panelId, stored);
+          renderMessages(stored);
+          if (pr.proposal) renderPendingProposalCard();
+          _traceFinish(pr.status, { proposalKind: pr.proposal ? pr.proposal.kind : null, count: pr.count || 0 });
           statusUi.show('Готово', false);
           setTimeout(function () { statusUi.hide(); }, 1200);
         } catch (ePipe) {
           statusUi.hide();
+          _traceFinish('error', { error: String((ePipe && ePipe.message) || ePipe).slice(0, 300) });
           if (ePipe && (ePipe.name === 'AbortError' || String(ePipe.message || '').indexOf('Остановлен') !== -1))
             showErr('Остановлено.');
           else showErr(String(ePipe.message || ePipe));
@@ -6762,9 +7136,10 @@ PanelBoot.run('ИИ: монтаж', function () {
       : active.sysprompt();
     if (_activeSystemAddon) {
       sysContent += '\n\n' + _activeSystemAddon;
-      _activeSystemAddon = null;
+      _activeSystemAddonTurns++;
+      if (_activeSystemAddonTurns >= ADDON_MAX_TURNS) { _activeSystemAddon = null; _activeSystemAddonTurns = 0; }
     }
-    var apiMessages = [{ role: 'system', content: sysContent }].concat(stored);
+    var apiMessages = [{ role: 'system', content: sysContent }].concat(stored.map(_toApiMessage));
 
     el.send.disabled = true;
     el.stop.disabled = false;
@@ -6781,8 +7156,34 @@ PanelBoot.run('ИИ: монтаж', function () {
     try {
       var autoSnap = await execGetSnapshot(true); /* ВСЕГДА свежий snap для каждого нового сообщения */
       var autoSnapText = EditPlanSimulator.buildAutoSnapshotText(autoSnap);
+      /* Гейт свежести (ревью 09.2026): ручные правки в Premiere после
+         транскрибации сдвигают все тайминги — раньше чат резал по старым
+         секундам молча (отпечаток сверяла только вкладка «Инструменты»). */
+      _chatTranscriptStale = null;
+      try {
+        var frEntry = ContextStore.findTranscriptEntry(TRANSCRIPT_PID, autoSnap.sequenceName || '', autoSnap.sequenceId || '');
+        var fr = (typeof ChatRouter !== 'undefined') ? ChatRouter.transcriptFreshness(autoSnap, frEntry && frEntry.entry) : null;
+        if (fr && fr.state === 'stale') {
+          _chatTranscriptStale = fr.reason;
+          if (autoSnapText) {
+            autoSnapText += '\n⚠ ТРАНСКРИПТ УСТАРЕЛ: ' + fr.reason + '. Инструменты по транскрипту ' +
+              '(propose_transcript_cuts, propose_montage_plan, removeRefs) вернут ошибку — предложи пользователю ' +
+              'нажать «Транскрибировать In–Out» и НЕ пытайся резать по старым таймкодам.';
+          }
+        } else if (fr && fr.state === 'suspect' && autoSnapText) {
+          autoSnapText += '\n⚠ После правок таймлайна структура транскрипта могла сдвинуться — перечитай ' +
+            'get_transcript_structure перед резами и предупреди пользователя проверить на слух.';
+        }
+      } catch (eFr) {}
+      _renderStaleHint(_chatTranscriptStale);
       if (autoSnapText) {
-        apiMessages.push({ role: 'user', content: autoSnapText });
+        /* Ревью 09.2026: снимок — ПЕРЕД запросом пользователя, а не после:
+           последним сообщением модель должна видеть сам запрос, иначе на
+           короткие фразы она отвечала описанием таймлайна вместо действия. */
+        var snapMsg = { role: 'user', content: autoSnapText };
+        var lastApi = apiMessages[apiMessages.length - 1];
+        if (lastApi && lastApi.role === 'user') apiMessages.splice(apiMessages.length - 1, 0, snapMsg);
+        else apiMessages.push(snapMsg);
       }
     } catch (eSnap) { /* не критично — агент сам вызовет get_timeline_snapshot */ }
 
@@ -6798,6 +7199,12 @@ PanelBoot.run('ИИ: монтаж', function () {
           streamSettings.activeAgentModel = streamSettings.fastModel;
         }
       }
+      _trace = _traceStart(panelId, text, 'llm', {
+        model: streamSettings.activeAgentModel || streamSettings.chatModel || null,
+        intents: (AgentPrompts.classifyIntent ? AgentPrompts.classifyIntent(text) : null),
+        complexity: (typeof complexity !== 'undefined') ? complexity : null,
+        stale: _chatTranscriptStale
+      });
       var result = await runAgentLoop({
         settings: streamSettings,
         messages: apiMessages,
@@ -6813,6 +7220,7 @@ PanelBoot.run('ИИ: монтаж', function () {
         },
         onStatus: function (ev) {
           statusUi.show(ev.message || ev.name || '…', true);
+          _traceStatus(ev);
           /* ETA: запрос к модели ушёл — таймер «думает… Nс (обычно ~Mс)» */
           if (ev.phase === 'llm') startWaitIndicator(ev.model, ev.etaMs);
           /* UI-волна: стриминг-чанки → живой пузырь (раньше выбрасывались) */
@@ -6831,6 +7239,18 @@ PanelBoot.run('ИИ: монтаж', function () {
       setTimeout(function () {
         statusUi.hide();
       }, 1200);
+      /* Трейс хода: id на финальном ответе — для кнопок 👍/👎 в пузыре. */
+      var traceIdDone = _traceFinish(result.cycleDetected ? 'cycle' : 'done', {
+        finalText: String(result.finalText || '').slice(0, 300),
+        messages: result.messages.length,
+        proposalKind: _pendingProposal ? _pendingProposal.kind : null
+      });
+      if (traceIdDone) {
+        for (var tmi = result.messages.length - 1; tmi >= 0; tmi--) {
+          var tmsg = result.messages[tmi];
+          if (tmsg && tmsg.role === 'assistant' && !tmsg.tool_calls) { tmsg._traceId = traceIdDone; break; }
+        }
+      }
       ContextStore.setMessages(
         panelId,
         result.messages.filter(function (m) {
@@ -6847,6 +7267,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       renderMessages(ContextStore.getMessages(panelId));
     } catch (e) {
       statusUi.hide();
+      _traceFinish(e && e.name === 'AbortError' ? 'aborted' : 'error', { error: String((e && e.message) || e).slice(0, 300) });
       if (_thinkLog) _thinkLog.finish(e && e.name === 'AbortError' ? 'Остановлено' : 'Ошибка');
       if (e && (e.name === 'AbortError' || String(e.message || '').indexOf('Остановлен') !== -1)) {
         showErr('Остановлено (запрос к API FM прерван).');
@@ -6957,6 +7378,7 @@ PanelBoot.run('ИИ: монтаж', function () {
     var prep = null;
     statusUi.show('Подготовка аудио с таймлайна (In–Out)…', true);
     setTranscriptLed('busy');
+    _renderStaleHint(null);
     try {
       prep = await new Promise(function (resolve, reject) {
         PremiereBridge.prepareTranscribeFromTimeline(

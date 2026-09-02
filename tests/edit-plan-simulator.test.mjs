@@ -541,3 +541,45 @@ describe('EditPlanSimulator.isAutoSnapshotText', () => {
     assert.equal(EP.isAutoSnapshotText(42), false);
   });
 });
+
+/* ═══ compactSnapshotForLlmFiltered (ревью 09.2026): компактный get_timeline_snapshot для модели ═══ */
+describe('EditPlanSimulator.compactSnapshotForLlmFiltered', () => {
+  const sf = {
+    ok: true, sequenceName: 'S', sequenceId: 'id1', sequenceEndSec: 0, fps: 25, playheadSec: 5,
+    sequenceInSec: -400000,
+    clips: [
+      { nodeId: 'v0', name: 'Intro.mp4', trackType: 'video', trackIndex: 0, startSec: 0, endSec: 10 },
+      { nodeId: 'a0', name: 'Intro.mp4', trackType: 'audio', trackIndex: 0, startSec: 0, endSec: 10 },
+      { nodeId: 'v1', name: 'Talk.mp4', trackType: 'video', trackIndex: 0, startSec: 10, endSec: 30 },
+      { nodeId: 'm1', name: 'music.wav', trackType: 'audio', trackIndex: 1, startSec: 0, endSec: 30 }
+    ]
+  };
+  test('без фильтра: все строки, линкованное аудио маркером, мета', () => {
+    const c = EP.compactSnapshotForLlmFiltered(sf, {});
+    assert.equal(c.ok, true);
+    assert.equal(c.durationSec, 30);
+    assert.equal(c.inSec, null);
+    assert.equal(c.clipCount, 4);
+    assert.deepEqual(c.clips, ['v0|Intro.mp4|v0|0-10|a=a0@a0', 'v1|Talk.mp4|v0|10-30', 'm1|music.wav|a1|0-30']);
+    assert.equal(c.filter, null);
+    assert.equal(c.truncated, false);
+  });
+  test('окно fromSec/toSec оставляет пересекающие клипы', () => {
+    const c = EP.compactSnapshotForLlmFiltered(sf, { fromSec: 15, toSec: 20 });
+    assert.deepEqual(c.clips, ['v1|Talk.mp4|v0|10-30', 'm1|music.wav|a1|0-30']);
+    assert.equal(c.matched, 2);
+  });
+  test('nameContains без учёта регистра', () => {
+    const c = EP.compactSnapshotForLlmFiltered(sf, { nameContains: 'intro' });
+    assert.deepEqual(c.clips, ['v0|Intro.mp4|v0|0-10|a=a0@a0']);
+  });
+  test('кап строк → truncated + note', () => {
+    const c = EP.compactSnapshotForLlmFiltered(sf, { maxClips: 1 });
+    assert.equal(c.clips.length, 1);
+    assert.equal(c.truncated, true);
+    assert.match(c.note, /fromSec\/toSec/);
+  });
+  test('невалидный снимок → null', () => {
+    assert.equal(EP.compactSnapshotForLlmFiltered(null), null);
+  });
+});

@@ -381,3 +381,24 @@ describe('findTranscriptEntry: ключ по sequenceID + миграция (сп
     } finally { cleanup(); }
   });
 });
+
+describe('ContextStore.applyRippleDeletionsToTranscript — word-level тайминги (09.2026)', () => {
+  const { ContextStore, cleanup } = loadContextStoreWithTempRoot();
+  after(() => cleanup());
+  test('слова сдвигаются той же математикой, слова внутри выреза выбрасываются', () => {
+    ContextStore.setTranscriptEntry('unified', 'WSeq', {
+      segments: [
+        { startSec: 0, endSec: 10, text: 'а б в', words: [{ w: 'а', s: 1, e: 2 }, { w: 'б', s: 4, e: 5 }, { w: 'в', s: 8, e: 9 }] },
+        { startSec: 12, endSec: 14, text: 'г', words: [{ w: 'г', s: 12.5, e: 13 }] }
+      ]
+    });
+    ContextStore.applyRippleDeletionsToTranscript('unified', 'WSeq', [{ startSec: 3, endSec: 6 }]);
+    const segs = ContextStore.findTranscriptEntry('unified', 'WSeq').entry.segments;
+    /* сегмент 0: [0,10] → [0,7] (вырезано 3с); «б» внутри выреза — удалено; «в» 8–9 → 5–6 */
+    /* vm-лоадер → другой realm: сравниваем JSON-копию */
+    assert.deepEqual(JSON.parse(JSON.stringify(segs[0].words)), [{ w: 'а', s: 1, e: 2 }, { w: 'в', s: 5, e: 6 }]);
+    /* сегмент 1: сдвиг на 3с */
+    assert.equal(segs[1].startSec, 9);
+    assert.deepEqual(JSON.parse(JSON.stringify(segs[1].words)), [{ w: 'г', s: 9.5, e: 10 }]);
+  });
+});

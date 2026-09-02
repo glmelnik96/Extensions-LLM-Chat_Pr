@@ -192,3 +192,27 @@ test('cache keys: null tasks → "*", null aggressiveness → "normal"', () => {
   assert.equal(labelsCacheKey('S', null, 0), 'S|v0|*');
   assert.equal(analysisCacheKey('S', null, null, 0), 'S|v0|*|normal');
 });
+
+/* ── _padRemoveIntervals (ревью 09.2026): короткие интервалы не выбрасываются ── */
+const { _padRemoveIntervals } = loadFunctions(['_padRemoveIntervals']);
+
+test('pad: обычный интервал ужимается на padding с обеих сторон', () => {
+  /* vm-контекст → другой realm: сравниваем JSON-копию */
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(_padRemoveIntervals([{ startSec: 10, endSec: 12, reason: 'x' }], 0.3))),
+    [{ startSec: 10.3, endSec: 11.7, reason: 'x' }]
+  );
+});
+
+test('pad: короткий интервал (0.5с < 2×0.3) остаётся, паддинг ограничен четвертью длины', () => {
+  const out = _padRemoveIntervals([{ startSec: 10, endSec: 10.5 }], 0.3);
+  assert.equal(out.length, 1);
+  assert.ok(Math.abs(out[0].startSec - 10.125) < 1e-9);
+  assert.ok(Math.abs(out[0].endSec - 10.375) < 1e-9);
+});
+
+test('pad: интервалы короче 0.05с отбрасываются; padding 0 — без изменений', () => {
+  assert.equal(_padRemoveIntervals([{ startSec: 1, endSec: 1.01 }], 0.3).length, 0);
+  const same = [{ startSec: 1, endSec: 2 }];
+  assert.equal(_padRemoveIntervals(same, 0), same);
+});

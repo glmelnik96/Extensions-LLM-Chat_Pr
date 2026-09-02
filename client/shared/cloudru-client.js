@@ -560,16 +560,27 @@
         throw new Error('Проверьте fm-defaults.js (baseUrl) и fm-secrets.js (apiKey).');
       }
       var url = apiV1Root(base) + '/audio/transcriptions';
+      var tx = opts.transcribeParams || {};
+      var rf = opts.response_format || tx.response_format || 'verbose_json';
+      /* Word-level тайминги (ревью 09.2026): без них позиции слов интерполируются
+         равномерно по сегменту (±0.2–0.4с) — паразиты/мат режутся приблизительно.
+         Запрашиваем timestamp_granularities[]=word (+segment, чтобы сегменты
+         остались). Если сервер параметр не знает (400/422) — один повтор без
+         него и запоминаем на сессию, чтобы не платить лишним запросом дальше. */
+      var wantWords = tx.wordTimestamps !== false && String(rf) === 'verbose_json' &&
+        !global.__whisperWordTsUnsupported && opts._noWordTs !== true;
       var form = new FormData();
       form.append('file', opts.fileBlob, opts.fileName || 'audio.wav');
       form.append('model', model);
-      var tx = opts.transcribeParams || {};
       if (tx.language) form.append('language', String(tx.language));
       else if (opts.language) form.append('language', opts.language);
-      var rf = opts.response_format || tx.response_format || 'verbose_json';
       form.append('response_format', String(rf));
       if (tx.temperature !== undefined && tx.temperature !== null) {
         form.append('temperature', String(tx.temperature));
+      }
+      if (wantWords) {
+        form.append('timestamp_granularities[]', 'word');
+        form.append('timestamp_granularities[]', 'segment');
       }
       var trFetch = {
         method: 'POST',
@@ -590,7 +601,15 @@
       }
       var data = parseJsonResponse(text, 'Транскрипция: не JSON');
       if (!res.ok) {
-        throw new Error(data.error && data.error.message ? data.error.message : text.slice(0, 300));
+        var errMsg = data.error && data.error.message ? data.error.message : text.slice(0, 300);
+        if (wantWords && (res.status === 400 || res.status === 422) && /granularit|timestamp/i.test(String(errMsg))) {
+          global.__whisperWordTsUnsupported = true;
+          var retryOpts = {};
+          for (var rk in opts) { if (Object.prototype.hasOwnProperty.call(opts, rk)) retryOpts[rk] = opts[rk]; }
+          retryOpts._noWordTs = true;
+          return global.CloudRuClient.transcribeAudio(retryOpts);
+        }
+        throw new Error(errMsg);
       }
       if (global.UsageMeter && data && typeof data.duration === 'number') {
         UsageMeter.recordWhisper(data.duration);

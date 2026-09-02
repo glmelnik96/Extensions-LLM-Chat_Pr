@@ -129,7 +129,8 @@
 | `client/shared/transcript-structure.js` | ~1055 | paragraphs/segments structure. `buildParagraphs`, `isParagraphsStale`, `analyzeForCutsWithLLM` — critical |
 | `client/shared/cloudru-client.js` | ~430 | HTTP client + retry + SSE streaming. Unit-тесты на internals (`_cloudRuInternals`): parseSSEStream (вкл. abort), isRetryable, parseJsonResponse, normalizeBase — `tests/cloudru-client.test.mjs` |
 | `client/shared/agent-loop.js` | ~14KB | Tool orchestration + cycle detection. **НЕТ unit-тестов** — backlog |
-| `client/shared/prompts.js` | ~30KB | Tiered prompts по intent. **НЕТ unit-тестов** — backlog. Любое изменение → re-validate 23/23 LLM checks |
+| `client/shared/prompts.js` | ~30KB | Tiered prompts по intent (quality-v6, 09.2026: run_tool-маппинг, таймкоды → edit_plan). Тесты: `tests/prompts.test.mjs`. Любое изменение → re-validate 23/23 LLM checks |
+| `client/shared/chat-router.js` | ~250 | Детерминированный роутер до LLM: точные таймкоды → карточка правок, фразы → пайплайны, свежесть транскрипта по `audioFp`. Любое изменение → `tests/chat-router.test.mjs` (golden-set формулировок) |
 | `host/premiere.jsx` | ~2840 | ExtendScript (ES3!). Особенности: JSON-полифилл (гард по `typeof JSON`), `_wrap()` декоратор, `safeSeconds()` null-guards. НЕТ `.trim`/`.forEach`/`Object.keys` — см. ExtendScript quirks |
 
 **Правила hot zones:**
@@ -166,12 +167,12 @@ node tools/cep-debug.mjs evalfile tools/_live_probe.js   # выполнить JS
 ```
 
 **Pattern для добавления unit-тестов:**
-1. Pure-logic функция кладётся в `client/shared/<module>.js` как IIFE
-2. Создаётся `tests/load-<module>.mjs` (vm-loader)
+1. Pure-logic функция кладётся в `client/shared/<module>.js` как IIFE (экспорт ТОЛЬКО `global.X = api` — UMD-ветка в CEP уводит экспорт в `module.exports`)
+2. В тесте грузим через `loadIife('client/shared/<module>.js', 'GlobalName')` из `tests/helpers.mjs` (host-realm, deepEqual работает). Специализированные vm-лоадеры (context-store, cloudru-client, agent-loop, timeline-transcribe, deterministic-pipelines, usage-meter) отдают объекты другого realm — сравнивай JSON-копии.
 3. Создаётся `tests/<module>.test.mjs` (node:test + assert/strict)
-4. Запускается `npm test`
+4. Запускается `node --test "tests/*.test.mjs"`
 
-См. примеры: `tests/load-analysis-routing.mjs` + `tests/analysis-routing.test.mjs`.
+См. примеры: `tests/chat-router.test.mjs`, `tests/run-trace.test.mjs`.
 
 ---
 
@@ -287,7 +288,8 @@ node tools/cep-debug.mjs evalfile tools/_live_probe.js   # выполнить JS
 4. Добавить test case в `tests/integration/run-starters-quality.mjs` если стартер сложный
 
 ### Хочу добавить новый tool для LLM-агента
-1. Добавить schema в `panel.js` (`TOOL_SCHEMAS` массив)
+0. Если это детерминированный пайплайн вкладки «Инструменты» — НЕ новый tool: добавь его в `_pipelineByTool` (panel.js) и в enum `run_tool` (TOOLS_PIPELINES) + фразу-триггер в `ChatRouter.matchPipelineIntent` (client/shared/chat-router.js, с тестом). Роутер простых запросов до LLM (таймкоды «с 1:30 по 1:45», «убери тишины») живёт там же.
+1. Добавить schema в `panel.js` (массивы TOOLS_* → TOOLS_UNIFIED)
 2. Добавить executor (функция `execXxx`) — должен возвращать `{ok, ...}` или `{validationError}`
 3. Wire в TOOL_HANDLERS dispatch
 4. Если меняется состояние таймлайна — обязательно через `propose_*` → `apply_*` pattern

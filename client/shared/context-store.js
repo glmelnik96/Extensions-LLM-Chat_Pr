@@ -494,6 +494,22 @@
         var copy = shallowCopy(seg);
         copy.startSec = Math.round(ns * 1000) / 1000;
         copy.endSec = Math.round(ne * 1000) / 1000;
+        /* Word-level тайминги (ревью 09.2026): сдвигаем той же математикой,
+           слова внутри вырезанного — выбрасываем, края клампим к сегменту. */
+        if (Array.isArray(seg.words) && seg.words.length) {
+          var nw = [];
+          for (var wi = 0; wi < seg.words.length; wi++) {
+            var w = seg.words[wi];
+            if (!w || typeof w.s !== 'number' || typeof w.e !== 'number') continue;
+            var wMid = (w.s + w.e) / 2;
+            if (insideRemove(wMid) !== -1) continue;
+            var wS = Math.max(copy.startSec, Math.round((w.s - shiftBefore(w.s)) * 1000) / 1000);
+            var wE = Math.min(copy.endSec, Math.round((w.e - shiftBefore(w.e)) * 1000) / 1000);
+            if (wE < wS) continue;
+            nw.push({ w: w.w, s: wS, e: wE });
+          }
+          if (nw.length) copy.words = nw; else delete copy.words;
+        }
         newSegs.push(copy);
       }
       var entry = shallowCopy(found.entry);

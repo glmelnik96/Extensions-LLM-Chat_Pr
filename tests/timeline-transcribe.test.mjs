@@ -280,3 +280,49 @@ describe('TimelineTranscribe.extractAudioChunksWithFfmpeg — cleanup при с�
     assert.equal(env.files.size, 0);
   });
 });
+
+/* ═══ Word-level тайминги Whisper (ревью 09.2026) ═══ */
+/* vm-лоадер → другой realm: сравниваем через JSON-копию, иначе strict deepEqual падает на прототипе */
+const plain = (x) => JSON.parse(JSON.stringify(x));
+describe('TimelineTranscribe.attachWordsToSegments', () => {
+  const TT = loadTimelineTranscribe();
+  it('верхнеуровневые words раскладываются по сегментам по середине слова', () => {
+    const segs = [{ start: 0, end: 2, text: 'а б' }, { start: 2.5, end: 4, text: 'в' }];
+    const words = [
+      { word: 'а', start: 0.1, end: 0.5 }, { word: 'б', start: 1.0, end: 1.9 },
+      { word: 'в', start: 2.6, end: 3.2 }, { word: 'x', start: 9, end: 9.5 }
+    ];
+    const out = TT.attachWordsToSegments(segs, words);
+    assert.deepEqual(plain(out[0]), [{ w: 'а', s: 0.1, e: 0.5 }, { w: 'б', s: 1.0, e: 1.9 }]);
+    assert.deepEqual(plain(out[1]), [{ w: 'в', s: 2.6, e: 3.2 }]);
+  });
+  it('words внутри сегмента имеют приоритет над верхнеуровневыми', () => {
+    const segs = [{ start: 0, end: 2, text: 'а', words: [{ word: 'а', start: 0.2, end: 0.4 }] }];
+    const out = TT.attachWordsToSegments(segs, [{ word: 'а', start: 0.1, end: 0.5 }]);
+    assert.deepEqual(plain(out[0]), [{ w: 'а', s: 0.2, e: 0.4 }]);
+  });
+  it('без words → пустые списки', () => {
+    assert.deepEqual(plain(TT.attachWordsToSegments([{ start: 0, end: 1 }], null)), [[]]);
+  });
+});
+
+describe('normalizeWhisper* переносит words в сегменты', () => {
+  const TT = loadTimelineTranscribe();
+  it('export: слова со смещением таймлайна', () => {
+    const r = TT.normalizeWhisperExport(
+      { segments: [{ start: 0, end: 2, text: 'а б' }], words: [{ word: 'а', start: 0.1, end: 0.5 }] }, 10);
+    assert.deepEqual(plain(r.segments[0].words), [{ w: 'а', s: 10.1, e: 10.5 }]);
+  });
+  it('media_file: формула clipStart + (t − inPoint), слова вне окна отбрасываются', () => {
+    const r = TT.normalizeWhisperMediaFile(
+      { segments: [{ start: 30, end: 40, text: 'а б' }],
+        words: [{ word: 'а', start: 31, end: 32 }, { word: 'б', start: 38, end: 39 }] },
+      100, 30, 100, 105);
+    assert.equal(r.segments.length, 1);
+    assert.deepEqual(plain(r.segments[0].words), [{ w: 'а', s: 101, e: 102 }]);
+  });
+  it('без words у сегментов нет поля words', () => {
+    const r = TT.normalizeWhisperExport({ segments: [{ start: 0, end: 2, text: 'а' }] }, 0);
+    assert.equal(r.segments[0].words, undefined);
+  });
+});

@@ -121,7 +121,11 @@
      * Простые «вопросы» («что на таймлайне», «привет») роутятся на fastModel
      * через AgentPrompts.classifyComplexity (panel.js:3575-3579).
      */
-    chatModel: 'zai-org/GLM-5.1',
+    /* Ревью 09.2026: GLM-5.1 отдаёт 403 «not available for this project» на аккаунте
+       (живые пробы 04.08 и 02.09) — каждый ход начинался с провального вызова и
+       уходил фолбэком. Дефолт — GLM-4.7 (бенчмарк 18.06: 5/5 простых, 4/5 сложных,
+       быстрее GLM-5.1). Когда GLM-5.1 вернут — переключить здесь и в analysis/findMoments. */
+    chatModel: 'zai-org/GLM-4.7',
 
     /**
      * Альтернатива для агента; включается флагом useCodeModelForAgent.
@@ -141,7 +145,7 @@
      * GLM-5.1 + default thinking на 14K input → NoneType, content=null).
      * При thinking=false справляется за 3.65s, JSON schema OK.
      */
-    analysisModel: 'zai-org/GLM-5.1',
+    analysisModel: 'zai-org/GLM-4.7', /* 09.2026: GLM-5.1 = 403 на аккаунте */
 
     /**
      * Модель для построения глав (buildTopicsWithLLM).
@@ -162,7 +166,7 @@
      * Сейчас find-moments использует TF-IDF + stem-match, но при low-confidence
      * fallback подключаем LLM. Phase 2: GLM-5.1 (thinking=false, см. policy).
      */
-    findMomentsModel: 'zai-org/GLM-5.1',
+    findMomentsModel: 'zai-org/GLM-4.7', /* 09.2026: GLM-5.1 = 403 на аккаунте */
 
     /**
      * Быстрая модель для простых задач (маркеры, классификация, структура).
@@ -193,7 +197,7 @@
      */
     modelFallbacks: {
       'zai-org/GLM-5.1':        ['zai-org/GLM-4.7', 'openai/gpt-oss-120b'],
-      'zai-org/GLM-4.7':        ['openai/gpt-oss-120b'],
+      'zai-org/GLM-4.7':        ['openai/gpt-oss-120b', 'deepseek-ai/DeepSeek-V4-Pro'],
       'deepseek-ai/DeepSeek-V4-Pro': ['zai-org/GLM-5.1', 'zai-org/GLM-4.7'],
       'MiniMaxAI/MiniMax-M3':   ['Qwen/Qwen3.5-397B-A17B']
     },
@@ -206,8 +210,8 @@
      * выбранной модели. id = модель для API, label = подпись в UI.
      */
     knownModels: [
-      { id: 'zai-org/GLM-5.1', label: 'GLM-5.1 · по умолчанию, топ FC' },
-      { id: 'zai-org/GLM-4.7', label: 'GLM-4.7 · быстрая, дешёвая' },
+      { id: 'zai-org/GLM-4.7', label: 'GLM-4.7 · по умолчанию, быстрая' },
+      { id: 'zai-org/GLM-5.1', label: 'GLM-5.1 · топ FC (403 на аккаунте с 04.08)' },
       { id: 'openai/gpt-oss-120b', label: 'gpt-oss-120b · стабильная' },
       { id: 'deepseek-ai/DeepSeek-V4-Pro', label: 'DeepSeek-V4-Pro · 1M контекст' }
     ],
@@ -377,7 +381,10 @@
     transcribeParams: {
       language: 'ru',
       temperature: '0.1',
-      response_format: 'verbose_json'
+      response_format: 'verbose_json',
+      /* Ревью 09.2026: word-level тайминги (timestamp_granularities[]=word).
+         false — отключить (сервер без поддержки отключается сам после 400). */
+      wordTimestamps: true
     }
   };
 })(window);

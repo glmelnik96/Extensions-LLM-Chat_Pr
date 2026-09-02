@@ -17,7 +17,7 @@ if (typeof $._EXT_PRM_ === 'undefined') {
   $._EXT_PRM_ = {};
 }
 
-$._EXT_PRM_.version = '2.16.1';
+$._EXT_PRM_.version = '2.16.2';
 
 $._EXT_PRM_._EPS = 0.04;
 
@@ -1380,6 +1380,7 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
     /* Сводный счётчик razor/remove/trim по всем интервальным операциям плана. */
     var rangeStats = { applied: 0, failed: 0, reasons: [] };
     var results = [];
+    var linkRemoved = {}; /* nodeId, удалённые как связанные (remove_clip) */
     var i,
       op,
       found,
@@ -1445,7 +1446,19 @@ $._EXT_PRM_.applyTimecodeEdits = function (jsonPlan) {
       }
 
       if (a === 'remove_clip') {
+        /* Ревью 09.2026: связанное аудио удаляется вместе с видео (getLinkedItems).
+           Модель по старому промпту слала ОБА nodeId — второй op падал «клип не
+           найден», а на прямом apply это уводило её в бесполезные повторы.
+           Уже удалённый как связанный nodeId — успех, не ошибка. */
+        var rmId = String(op.nodeId);
+        if (linkRemoved[rmId]) {
+          results.push({ op: a, ok: true, note: 'уже удалён как связанный с предыдущим remove_clip', detail: { removed: [], count: 0 } });
+          continue;
+        }
         var rmResult = $._EXT_PRM_._removeClipAndLinked(seq, op.nodeId);
+        if (rmResult && rmResult.removed) {
+          for (var rk = 0; rk < rmResult.removed.length; rk++) linkRemoved[String(rmResult.removed[rk])] = true;
+        }
         results.push({ op: a, ok: rmResult.ok, detail: rmResult });
         continue;
       }

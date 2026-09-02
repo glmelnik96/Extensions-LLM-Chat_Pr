@@ -142,3 +142,31 @@ describe('buildPrompt — интеграция', () => {
     assert.ok(p.includes(AP._TIER0.slice(0, 40)));
   });
 });
+
+/* ═══ quality-v6 (09.2026): run_tool-маппинг, таймкоды → timeline, remove_clip один nodeId ═══ */
+describe('quality-v6 — маппинг простых запросов и честные границы', () => {
+  it('TIER0 содержит run_tool-маппинг и список «чего не умею»', () => {
+    assert.ok(AP._TIER0.includes('run_tool({name:"silences"})'));
+    assert.ok(AP._TIER0.includes('run_tool({name:"jumps"})'));
+    assert.ok(AP._TIER0.includes('run_tool({name:"gaps"})'));
+    assert.ok(AP._TIER0.includes('ЧЕГО ТЫ НЕ УМЕЕШЬ'));
+  });
+  it('TIER1_TIMELINE: явные таймкоды → propose_edit_plan; remove_clip — один nodeId', () => {
+    assert.ok(AP._TIER1_TIMELINE.includes('«вырежи с 1:30 по 1:45»'));
+    assert.ok(AP._TIER1_TIMELINE.includes('ОДИН nodeId'));
+    assert.ok(!AP._TIER1_TIMELINE.includes('ОБА клипа'));
+  });
+  it('TIER1_TRANSCRIPT: паузы и паразиты уходят в run_tool, не в ручной подбор по абзацам', () => {
+    assert.ok(AP._TIER1_TRANSCRIPT.includes('run_tool({name:"silences"})'));
+    assert.ok(AP._TIER1_TRANSCRIPT.includes('run_tool({name:"fillers"})'));
+    assert.ok(!AP._TIER1_TRANSCRIPT.includes('собери паузы между абзацами'));
+  });
+  for (const q of ['вырежи с 1:30 по 1:45', 'удали первые 10 секунд', 'убери последние 30 сек', 'отрежь 2 мин в начале']) {
+    it(JSON.stringify(q) + ' → intents содержит timeline', () => {
+      assert.ok(AP.classifyIntent(q).includes('timeline'), JSON.stringify(AP.classifyIntent(q)));
+    });
+  }
+  it('«уложи в 60 секунд» — не timeline (сборка по смыслу)', () => {
+    assert.ok(!AP.classifyIntent('уложи ролик в 60 секунд').includes('timeline'));
+  });
+});

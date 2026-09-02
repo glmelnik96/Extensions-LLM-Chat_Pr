@@ -46,6 +46,58 @@
   var CLOUD_CONCURRENCY = 20; /* Cloud.ru поддерживает до 20 параллельных запросов */
   var FFMPEG_CONCURRENCY = 4; /* Локальные ffmpeg-процессы: нарезка чанков и аудиоанализ */
 
+  /**
+   * Word-level тайминги Whisper (ревью 09.2026). OpenAI-совместимый verbose_json
+   * с timestamp_granularities[]=word отдаёт слова ТОП-УРОВНЕМ (data.words:
+   * [{word,start,end}]), а не внутри сегментов. Раскладываем по сегментам по
+   * середине слова; если сервер положил words внутрь сегмента — берём их.
+   * Возвращает массив (параллельный rawSegments) списков {w,s,e} в source-времени.
+   */
+  function attachWordsToSegments(rawSegments, rawWords) {
+    var segs = Array.isArray(rawSegments) ? rawSegments : [];
+    var out = new Array(segs.length);
+    var eps = 0.05;
+    var i, w;
+    for (i = 0; i < segs.length; i++) {
+      var inner = segs[i] && Array.isArray(segs[i].words) ? segs[i].words : null;
+      out[i] = [];
+      if (inner && inner.length) {
+        for (w = 0; w < inner.length; w++) {
+          var iw = inner[w] || {};
+          var itxt = String(iw.word !== undefined ? iw.word : (iw.w || '')).trim();
+          var is = typeof iw.start === 'number' ? iw.start : iw.s;
+          var ie = typeof iw.end === 'number' ? iw.end : iw.e;
+          if (itxt && typeof is === 'number' && typeof ie === 'number' && ie >= is) out[i].push({ w: itxt, s: is, e: ie });
+        }
+      }
+    }
+    var words = Array.isArray(rawWords) ? rawWords : [];
+    if (!words.length) return out;
+    var si = 0;
+    for (w = 0; w < words.length; w++) {
+      var rw = words[w] || {};
+      var txt = String(rw.word !== undefined ? rw.word : (rw.w || '')).trim();
+      var ws = typeof rw.start === 'number' ? rw.start : rw.s;
+      var we = typeof rw.end === 'number' ? rw.end : rw.e;
+      if (!txt || typeof ws !== 'number' || typeof we !== 'number' || we < ws) continue;
+      var mid = (ws + we) / 2;
+      /* сегменты отсортированы по времени — двигаем указатель монотонно */
+      while (si < segs.length) {
+        var se = typeof segs[si].end === 'number' ? segs[si].end : parseFloat(segs[si].end) || 0;
+        if (mid > se + eps) si++; else break;
+      }
+      if (si >= segs.length) break;
+      var ss = typeof segs[si].start === 'number' ? segs[si].start : parseFloat(segs[si].start) || 0;
+      if (mid < ss - eps) continue; /* слово в зазоре между сегментами — пропускаем */
+      if (!out[si].length || out[si]._fromTop) {
+        out[si]._fromTop = true;
+        out[si].push({ w: txt, s: ws, e: we });
+      }
+    }
+    for (i = 0; i < out.length; i++) { if (out[i]._fromTop) delete out[i]._fromTop; }
+    return out;
+  }
+
   function normalizeWhisperExport(data, timelineOffsetSec) {
     var off = typeof timelineOffsetSec === 'number' && !isNaN(timelineOffsetSec) ? timelineOffsetSec : 0;
     /* Защита от мусорных значений из ExtendScript: getInPoint() в редких случаях
@@ -53,14 +105,21 @@
     if (off < 0 || off > 360000) off = 0;
     var segments = [];
     if (data.segments && Array.isArray(data.segments)) {
-      data.segments.forEach(function (seg) {
+      var wordsByExp = attachWordsToSegments(data.segments, data.words);
+      data.segments.forEach(function (seg, idx) {
         var st = typeof seg.start === 'number' ? seg.start : parseFloat(seg.start) || 0;
         var en = typeof seg.end === 'number' ? seg.end : parseFloat(seg.end) || 0;
-        segments.push({
+        var segOut = {
           startSec: st + off,
           endSec: en + off,
           text: (seg.text || '').trim()
-        });
+        };
+        if (wordsByExp[idx] && wordsByExp[idx].length) {
+          segOut.words = wordsByExp[idx].map(function (w) {
+            return { w: w.w, s: Math.round((w.s + off) * 1000) / 1000, e: Math.round((w.e + off) * 1000) / 1000 };
+          });
+        }
+        segments.push(segOut);
       });
     } else if (data.text) {
       segments.push({ startSec: 0 + off, endSec: null, text: data.text.trim() });
@@ -76,7 +135,8 @@
     var eps = 0.06;
     var segments = [];
     if (data.segments && Array.isArray(data.segments)) {
-      data.segments.forEach(function (seg) {
+      var wordsByMf = attachWordsToSegments(data.segments, data.words);
+      data.segments.forEach(function (seg, idx) {
         var srcStart = typeof seg.start === 'number' ? seg.start : parseFloat(seg.start) || 0;
         var srcEnd = typeof seg.end === 'number' ? seg.end : parseFloat(seg.end) || 0;
         var t0 = clipStartSec + (srcStart - clipInPointSec);
@@ -84,11 +144,23 @@
         var lo = Math.max(t0, workInSec);
         var hi = Math.min(t1, workOutSec);
         if (hi - lo > eps) {
-          segments.push({
+          var segOut = {
             startSec: lo,
             endSec: hi,
             text: (seg.text || '').trim()
-          });
+          };
+          if (wordsByMf[idx] && wordsByMf[idx].length) {
+            var ws = [];
+            for (var wi = 0; wi < wordsByMf[idx].length; wi++) {
+              var w = wordsByMf[idx][wi];
+              var a = clipStartSec + (w.s - clipInPointSec);
+              var b = clipStartSec + (w.e - clipInPointSec);
+              if (b < lo || a > hi) continue; /* слово за пределами окна */
+              ws.push({ w: w.w, s: Math.round(Math.max(a, lo) * 1000) / 1000, e: Math.round(Math.min(b, hi) * 1000) / 1000 });
+            }
+            if (ws.length) segOut.words = ws;
+          }
+          segments.push(segOut);
         }
       });
     } else if (data.text) {
@@ -1373,6 +1445,7 @@
     readPathAsBlob: readPathAsBlob,
     guessMime: guessMime,
     mergeSegmentLists: mergeSegmentLists,
+    attachWordsToSegments: attachWordsToSegments,
     runFromPrep: runFromPrep,
     assertNonEmptyTranscript: assertNonEmptyTranscript,
     verifyTranscriptTimings: verifyTranscriptTimings,
