@@ -453,6 +453,91 @@
     });
   }
 
+  /**
+   * Одновременные микрофонные записи в clip_queue (ревью 09.2026). Live на
+   * подкасте с двумя микрофонами: каждый файл транскрибировался ОТДЕЛЬНО, голос
+   * пролезал в соседний микрофон, и одна фраза попадала в транскрипт дважды с
+   * разным временем (68 дублей и 190 перекрытий на 20 минут) — главный источник
+   * «ошибок в таймкодах». Если ≥2 элемента очереди пересекаются во времени
+   * таймлайна хотя бы на 30% короткого — это мультимик: сводим в один микс
+   * (как nest_reconstruct) и транскрибируем один раз.
+   * → { mix: boolean, segments: [...] } — сегменты в формате buildNestReconstructFilter.
+   */
+  function detectSimultaneousMics(items, workInSec) {
+    var list = Array.isArray(items) ? items : [];
+    if (list.length < 2) return { mix: false, segments: [] };
+    var overlapping = false;
+    for (var i = 0; i < list.length && !overlapping; i++) {
+      for (var j = i + 1; j < list.length; j++) {
+        var a = list[i], b = list[j];
+        if (!a || !b) continue;
+        var ov = Math.min(a.workOutSec, b.workOutSec) - Math.max(a.workInSec, b.workInSec);
+        var shorter = Math.min(a.workOutSec - a.workInSec, b.workOutSec - b.workInSec);
+        if (shorter > 0 && ov >= shorter * 0.3) { overlapping = true; break; }
+      }
+    }
+    if (!overlapping) return { mix: false, segments: [] };
+    var base = typeof workInSec === 'number' ? workInSec : 0;
+    var segments = [];
+    for (var k = 0; k < list.length; k++) {
+      var it = list[k];
+      if (!it || !it.path) continue;
+      var dur = it.workOutSec - it.workInSec;
+      if (!(dur > 0.05)) continue;
+      segments.push({
+        mediaPath: it.path,
+        streamIndex: 0,
+        srcStart: (it.clipInPointSec || 0) + (it.workInSec - (it.clipStartSec || 0)),
+        segDur: dur,
+        localOffset: it.workInSec - base,
+        outerStart: it.workInSec,
+        outerEnd: it.workOutSec,
+        trackIndex: k
+      });
+    }
+    return { mix: segments.length >= 2, segments: segments };
+  }
+
+  /**
+   * Швы между чанками (ревью 09.2026). Фраза, попавшая на границу 180-секундных
+   * чанков, транскрибируется дважды: хвост — в чанке N (сегмент вылезает за
+   * границу), голова — в чанке N+1 (сегмент стартует ровно на границе). Live на
+   * 20-мин миксе: все 10 оставшихся перекрытий — ровно на 180/360/540/720/900с.
+   * Для сегмента, начинающегося на границе (±0.05с), чей предшественник кончается
+   * позже границы: начало сдвигается к концу предшественника; если остаётся
+   * меньше 0.3с — сегмент выбрасывается (его текст уже есть в хвосте чанка N).
+   * boundaries — таймлайн-координаты начал чанков (кроме первого).
+   */
+  function fixChunkBoundarySegments(segments, boundaries) {
+    var segs = Array.isArray(segments) ? segments.slice() : [];
+    var bs = Array.isArray(boundaries) ? boundaries : [];
+    if (segs.length < 2 || !bs.length) return { segments: segs, fixed: 0, dropped: 0 };
+    segs.sort(function (a, b) { return a.startSec - b.startSec; });
+    var out = [];
+    var fixed = 0, dropped = 0;
+    for (var i = 0; i < segs.length; i++) {
+      var s = segs[i];
+      var onBoundary = false;
+      for (var b = 0; b < bs.length; b++) { if (Math.abs(s.startSec - bs[b]) <= 0.05) { onBoundary = true; break; } }
+      if (onBoundary && out.length) {
+        var prevEnd = -Infinity;
+        for (var k = out.length - 1; k >= 0 && k >= out.length - 3; k--) { if (out[k].endSec > prevEnd) prevEnd = out[k].endSec; }
+        if (prevEnd > s.startSec + 0.05) {
+          if (s.endSec - prevEnd < 0.3) { dropped++; continue; }
+          var c = {};
+          for (var kk in s) { if (Object.prototype.hasOwnProperty.call(s, kk)) c[kk] = s[kk]; }
+          c.startSec = Math.round(prevEnd * 1000) / 1000;
+          if (Array.isArray(c.words)) c.words = c.words.filter(function (w) { return w && w.e > c.startSec; });
+          fixed++;
+          out.push(c);
+          continue;
+        }
+      }
+      out.push(s);
+    }
+    return { segments: out, fixed: fixed, dropped: dropped };
+  }
+
   function mergeSegmentLists(lists) {
     var all = [];
     lists.forEach(function (list) {
@@ -737,6 +822,69 @@
       abortCheck: abortCheck
     };
 
+    /* Общий путь «сегменты медиа → ffmpeg-микс → чанки → Whisper» для nest и
+       мультимика (ревью 09.2026): раньше жил только в ветке nest_reconstruct. */
+    async function transcribeMixedSegments(segmentsMix, baseOff, spanSec, label) {
+      beforeAwait();
+      var rec = await reconstructNestAudio(segmentsMix, progress);
+      var wavPath = rec.path;
+      var chunksMix;
+      try {
+        var chunkSecCfgX = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
+          ? settings.transcribeExportChunkSec : 90;
+        /* Нарезаем по фактической длине реконструированного аудио, а не по всему
+           окну In–Out: после выпадения Dynamic Link-сегментов WAV может быть много
+           короче окна, и чанки за его концом выходили пустыми (хард-фейл). */
+        var effX = (typeof rec.effectiveDurSec === 'number' && rec.effectiveDurSec > 0) ? rec.effectiveDurSec : spanSec;
+        var chunkSpanX = (spanSec > 0) ? Math.min(spanSec, effX) : effX;
+        beforeAwait();
+        progress(label + ': нарезка ffmpeg…');
+        chunksMix = await extractAudioChunksWithFfmpeg(wavPath, 0, chunkSpanX, chunkSecCfgX, progress, chunkFmt);
+        var combinedX = [], textAccX = '', doneX = 0;
+        var tasksX = chunksMix.map(function (xch, xci) {
+          return function () {
+            return backendTranscribe(settings, {
+              path: xch.path,
+              fileName: 'mix_chunk_' + xci + '.' + (String(xch.path || '').replace(/^.*\./, '') || 'wav'),
+              signal: signal, onProgress: function () {}, CloudRuClient: CC, transcribeOptsBase: transcribeOptsBase
+            }).then(function (xData) {
+              doneX++; progress(label + ': ' + doneX + '/' + chunksMix.length + ' готово…');
+              return { index: xci, data: xData, offset: baseOff + xch.offsetInSpanSec };
+            });
+          };
+        });
+        var resultsX = await promisePool(tasksX, CLOUD_CONCURRENCY);
+        resultsX.sort(function (a, b) { return a.index - b.index; });
+        for (var xri = 0; xri < resultsX.length; xri++) {
+          var xNorm = normalizeWhisperExport(resultsX[xri].data, resultsX[xri].offset);
+          combinedX = combinedX.concat(xNorm.segments);
+          textAccX += (xNorm.text || '') + ' ';
+        }
+        var audioAnalysisX = null;
+        try {
+          audioAnalysisX = await analyzeChunksInParallel(
+            chunksMix.map(function (c) { return { path: c && c.path, timelineOffsetSec: baseOff + ((c && c.offsetInSpanSec) || 0) }; }),
+            progress
+          );
+        } catch (eAX) {}
+        /* швы между чанками: голова фразы из чанка N+1 не дублирует хвост из N */
+        var boundariesX = [];
+        for (var bx = 1; bx < chunksMix.length; bx++) boundariesX.push(baseOff + chunksMix[bx].offsetInSpanSec);
+        var seamX = fixChunkBoundarySegments(mergeSegmentLists([combinedX]), boundariesX);
+        return {
+          raw: { ffmpegChunks: chunksMix.length, seamFixed: seamX.fixed, seamDropped: seamX.dropped },
+          segments: seamX.segments,
+          text: textAccX.trim(),
+          timelineOffsetSec: baseOff,
+          audioAnalysis: audioAnalysisX
+        };
+      } finally {
+        /* чанки и микс удаляем и на успехе, и при abort/ошибке */
+        unlinkChunkList(chunksMix);
+        try { if (typeof require !== 'undefined') require('fs').unlinkSync(wavPath); } catch (eUW) {}
+      }
+    }
+
     if (prep.mode === 'export_chunks' && prep.chunks && prep.chunks.length) {
       var combined = [];
       var textAcc = '';
@@ -884,6 +1032,16 @@
     }
 
     if (prep.mode === 'clip_queue' && prep.items && prep.items.length) {
+      /* Мультимик → один микс (ревью 09.2026, см. detectSimultaneousMics). */
+      var simul = detectSimultaneousMics(prep.items, prep.workInSec);
+      if (simul.mix && settings.transcribeMixSimultaneousMics !== false &&
+          (typeof global.NestReconstruct !== 'undefined' || typeof window !== 'undefined' && window.NestReconstruct)) {
+        progress('Транскрибация: ' + simul.segments.length + ' одновременных дорожек → микс…');
+        var mixRes = await transcribeMixedSegments(simul.segments, prep.workInSec, prep.workOutSec - prep.workInSec, 'Транскрибация микса');
+        mixRes.mode = 'clip_queue_mix';
+        mixRes.raw = { items: prep.items.length, ffmpegChunks: mixRes.raw && mixRes.raw.ffmpegChunks };
+        return mixRes;
+      }
       var chunkSecCfgQ = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
         ? settings.transcribeExportChunkSec : 90;
       var whisperByPath = {};
@@ -1057,63 +1215,12 @@
           (prep.droppedOffline.length > 5 ? '…' : '') +
           ') — их речь не попадёт в транскрипт. Верните медиа онлайн / откройте секвенцию.');
       }
-      var nestRec = await reconstructNestAudio(prep.segments, progress);
-      var nestWavPath = nestRec.path;
-      try {
-        var chunkSecCfgN = (typeof settings.transcribeExportChunkSec === 'number' && settings.transcribeExportChunkSec >= 15)
-          ? settings.transcribeExportChunkSec : 90;
-        var baseOffN = (typeof prep.timelineOffsetSec === 'number') ? prep.timelineOffsetSec : 0;
-        var spanN = (typeof prep.windowDurSec === 'number') ? prep.windowDurSec : 0;
-        /* Нарезаем по фактической длине реконструированного аудио, а не по всему
-           окну In–Out: после выпадения Dynamic Link-сегментов WAV может быть много
-           короче окна, и чанки за его концом выходили пустыми (хард-фейл). */
-        var effN = (typeof nestRec.effectiveDurSec === 'number' && nestRec.effectiveDurSec > 0)
-          ? nestRec.effectiveDurSec : spanN;
-        var chunkSpanN = (spanN > 0) ? Math.min(spanN, effN) : effN;
-        beforeAwait();
-        progress('Транскрибация nest: нарезка ffmpeg…');
-        var nChunks = await extractAudioChunksWithFfmpeg(nestWavPath, 0, chunkSpanN, chunkSecCfgN, progress, chunkFmt);
-        var combinedN = [], textAccN = '', nDone = 0;
-        var nTasks = nChunks.map(function (nch, nci) {
-          return function () {
-            return backendTranscribe(settings, {
-              path: nch.path,
-              fileName: 'nestmix_chunk_' + nci + '.' + (String(nch.path || '').replace(/^.*\./, '') || 'wav'),
-              signal: signal, onProgress: function () {}, CloudRuClient: CC, transcribeOptsBase: transcribeOptsBase
-            }).then(function (nData) {
-              nDone++; progress('Транскрибация nest: ' + nDone + '/' + nChunks.length + ' готово…');
-              return { index: nci, data: nData, offset: baseOffN + nch.offsetInSpanSec };
-            });
-          };
-        });
-        var nResults = await promisePool(nTasks, CLOUD_CONCURRENCY);
-        nResults.sort(function (a, b) { return a.index - b.index; });
-        for (var nri = 0; nri < nResults.length; nri++) {
-          var nNorm = normalizeWhisperExport(nResults[nri].data, nResults[nri].offset);
-          combinedN = combinedN.concat(nNorm.segments);
-          textAccN += (nNorm.text || '') + ' ';
-        }
-        var audioAnalysisN = null;
-        try {
-          audioAnalysisN = await analyzeChunksInParallel(
-            nChunks.map(function (c) { return { path: c && c.path, timelineOffsetSec: baseOffN + ((c && c.offsetInSpanSec) || 0) }; }),
-            progress
-          );
-        } catch (eAN) {}
-        return {
-          raw: { nestSegments: prep.segments.length, ffmpegChunks: nChunks.length },
-          segments: mergeSegmentLists([combinedN]),
-          text: textAccN.trim(),
-          timelineOffsetSec: baseOffN,
-          mode: 'nest_reconstruct',
-          audioAnalysis: audioAnalysisN
-        };
-      } finally {
-        /* 10.07.2026 (Волна 1.4): nChunks раньше НЕ удалялись вовсе (утечка даже на успехе).
-           var-хойстинг: если нарезка упала, nChunks undefined — unlinkChunkList терпит. */
-        unlinkChunkList(nChunks);
-        try { if (typeof require !== 'undefined') require('fs').unlinkSync(nestWavPath); } catch (eUN) {}
-      }
+      var baseOffNest = (typeof prep.timelineOffsetSec === 'number') ? prep.timelineOffsetSec : 0;
+      var spanNest = (typeof prep.windowDurSec === 'number') ? prep.windowDurSec : 0;
+      var nestOut = await transcribeMixedSegments(prep.segments, baseOffNest, spanNest, 'Транскрибация nest');
+      nestOut.mode = 'nest_reconstruct';
+      nestOut.raw = { nestSegments: prep.segments.length, ffmpegChunks: nestOut.raw && nestOut.raw.ffmpegChunks };
+      return nestOut;
     }
 
     if (prep.mode === 'media_file') {
@@ -1484,6 +1591,8 @@
     readPathAsBlob: readPathAsBlob,
     guessMime: guessMime,
     mergeSegmentLists: mergeSegmentLists,
+    detectSimultaneousMics: detectSimultaneousMics,
+    fixChunkBoundarySegments: fixChunkBoundarySegments,
     attachWordsToSegments: attachWordsToSegments,
     runFromPrep: runFromPrep,
     assertNonEmptyTranscript: assertNonEmptyTranscript,

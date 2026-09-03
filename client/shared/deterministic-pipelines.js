@@ -2389,6 +2389,22 @@
         'Детект говорящего по нему ненадёжен: спикер может всегда «побеждать» или никогда не включаться.');
     }
 
+    /* Выравнивание уровней микрофонов (09.2026): сравнение «кто громче» честно
+       только при равной чувствительности; по умолчанию включено. */
+    if (params.equalizeMics !== false && typeof MulticamPlan.equalizeMicLevels === 'function') {
+      var eq = MulticamPlan.equalizeMicLevels(timelines);
+      if (eq && eq.timelines && eq.timelines.length === timelines.length) {
+        var eqNotes = [];
+        for (var eqi = 0; eqi < eq.gainsDb.length; eqi++) {
+          if (eq.gainsDb[eqi] > 0) eqNotes.push(aLabel(eqi) + ' +' + eq.gainsDb[eqi].toFixed(1) + ' дБ');
+        }
+        for (var eqs = 0; eqs < eq.skipped.length; eqs++) {
+          warnings.push('Микрофон ' + aLabel(eq.skipped[eqs]) + ' тише остальных более чем на 18 дБ — уровень не выравнивался (похоже на выключенный микрофон/шум).');
+        }
+        if (eqNotes.length) warnings.push('Уровни микрофонов выровнены: ' + eqNotes.join(', ') + '.');
+        timelines = eq.timelines;
+      }
+    }
     var frameSec = typeof params.frameSec === 'number' ? params.frameSec : 0.05;
     var frames = MulticamPlan.framesFromRmsTimelines(timelines, frameSec);
     if (!frames.length) {
@@ -2428,6 +2444,7 @@
     /* Phase 2B: опциональные параметры — отдаём только если заданы,
        иначе buildSwitchPlan возьмёт свои DEFAULTS */
     if (typeof params.maxHoldSec === 'number') planParams.maxHoldSec = params.maxHoldSec;
+    if (typeof params.silenceHoldSec === 'number') planParams.silenceHoldSec = params.silenceHoldSec;
     if (typeof params.smoothingWindow === 'number') planParams.smoothingWindow = params.smoothingWindow;
     if (typeof params.overlapWideMinSec === 'number') planParams.overlapWideMinSec = params.overlapWideMinSec;
     if (typeof params.maxAllSpeakersSec === 'number') planParams.maxAllSpeakersSec = params.maxAllSpeakersSec;

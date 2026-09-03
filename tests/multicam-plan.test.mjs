@@ -823,3 +823,70 @@ describe('MulticamPlan._dominantMic + speaker в плане (09.2026)', () => {
     assert.equal(tail.speaker, 1);
   });
 });
+
+describe('MulticamPlan.equalizeMicLevels (09.2026)', () => {
+  const mk = (level, n = 200) => Array.from({ length: n }, (_, i) => ({ t: i * 0.05, rms: level + (i % 10 === 0 ? -30 : 0) }));
+  it('тихий микрофон подтягивается к громкому по p90', () => {
+    const eq = MP.equalizeMicLevels([mk(-40), mk(-31)]);
+    assert.deepEqual(eq.gainsDb, [9, 0]);
+    assert.equal(eq.refDb, -31);
+    const p90 = (tl) => tl.map(f => f.rms).sort((a, b) => a - b)[Math.floor(tl.length * 0.9)];
+    assert.equal(p90(eq.timelines[0]), -31);
+    assert.equal(eq.timelines[1], undefined === eq.timelines[1] ? eq.timelines[1] : eq.timelines[1]);
+    assert.deepEqual(eq.skipped, []);
+  });
+  it('разница > 18 дБ (мёртвый микрофон) не выравнивается и попадает в skipped', () => {
+    const eq = MP.equalizeMicLevels([mk(-70), mk(-30)]);
+    assert.deepEqual(eq.gainsDb, [0, 0]);
+    assert.deepEqual(eq.skipped, [0]);
+  });
+  it('после выравнивания тихий спикер побеждает на своих кадрах', () => {
+    /* спикер 0 говорит на −40 (тихий микрофон), в мик 1 пролезает −52; при
+       абсолютном пороге −35 он «молчал»; после +9 дБ — −31 против −43 → лидер */
+    const eq = MP.equalizeMicLevels([mk(-40), mk(-31)]);
+    const frames = MP.framesFromRmsTimelines([eq.timelines[0].map(f => ({ t: f.t, rms: f.rms })), mk(-31).map(f => ({ t: f.t, rms: -52 }))], 0.05);
+    const lead = MP._decideActiveMic(frames[1].rmsByTrack, -35, 6);
+    assert.equal(lead, 0);
+  });
+  it('пустой вход / мало сэмплов — без изменений', () => {
+    assert.deepEqual(MP.equalizeMicLevels([]).timelines, []);
+    const eq = MP.equalizeMicLevels([mk(-40, 5), mk(-31, 5)]);
+    assert.deepEqual(eq.gainsDb, [0, 0]);
+  });
+});
+
+describe('MulticamPlan._bridgeShortWideGaps (09.2026)', () => {
+  const wide = 0;
+  it('короткая пауза между двумя сегментами одного спикера → спикер, сегменты сливаются', () => {
+    const out = MP._bridgeShortWideGaps([
+      { tStart: 0, tEnd: 3, activeVideoTrack: 1 }, { tStart: 3, tEnd: 4.2, activeVideoTrack: wide },
+      { tStart: 4.2, tEnd: 8, activeVideoTrack: 1 }, { tStart: 8, tEnd: 12, activeVideoTrack: wide }, { tStart: 12, tEnd: 15, activeVideoTrack: 2 }
+    ], wide, 2.0);
+    assert.deepEqual(JSON.parse(JSON.stringify(out)), [
+      { tStart: 0, tEnd: 8, activeVideoTrack: 1 }, { tStart: 8, tEnd: 12, activeVideoTrack: wide }, { tStart: 12, tEnd: 15, activeVideoTrack: 2 }
+    ]);
+  });
+  it('пауза между РАЗНЫМИ спикерами и длинная пауза не трогаются; 0 = выкл', () => {
+    const segs = [{ tStart: 0, tEnd: 3, activeVideoTrack: 1 }, { tStart: 3, tEnd: 4, activeVideoTrack: wide }, { tStart: 4, tEnd: 8, activeVideoTrack: 2 }];
+    assert.deepEqual(JSON.parse(JSON.stringify(MP._bridgeShortWideGaps(segs, wide, 2.0))), segs);
+    const long = [{ tStart: 0, tEnd: 3, activeVideoTrack: 1 }, { tStart: 3, tEnd: 6, activeVideoTrack: wide }, { tStart: 6, tEnd: 8, activeVideoTrack: 1 }];
+    assert.deepEqual(JSON.parse(JSON.stringify(MP._bridgeShortWideGaps(long, wide, 2.0))), long);
+    assert.deepEqual(MP._bridgeShortWideGaps(long, wide, 0), long);
+  });
+  it('buildSwitchPlan: дроблёная речь одного спикера с микропаузами не уходит в общий план', () => {
+    /* тишина 0–2.5с (первый «длинный» сегмент — общий план, как в live), затем
+       спикер 0 говорит до 40с всплесками 0.55с / паузы 0.55с; спикер 1 — 40–50 */
+    const frames = [];
+    for (let i = 0; i < 1000; i++) {
+      const t = i * 0.05;
+      const talking = t < 2.5 ? -1 : t < 40 ? (Math.floor(t / 0.55) % 2 === 0 ? 0 : -1) : 1;
+      frames.push({ tStart: t, tEnd: t + 0.05, rmsByTrack: talking === 0 ? [-20, -60] : talking === 1 ? [-60, -20] : [-60, -60] });
+    }
+    const mapping = { wideVideoTrack: 0, speakers: [{ audioTrack: 0, videoTrack: 1 }, { audioTrack: 1, videoTrack: 2 }] };
+    const res = MP.buildSwitchPlan(frames, mapping, { maxHoldSec: 0, smoothingWindow: 1, variationsJitterSec: 0 });
+    const wideSec = (res.stats.perTrackSeconds['0'] || 0);
+    assert.ok(wideSec < 4, 'общий план на дроблёной речи: ' + wideSec + 'с');
+    const noHold = MP.buildSwitchPlan(frames, mapping, { maxHoldSec: 0, smoothingWindow: 1, variationsJitterSec: 0, silenceHoldSec: 0 });
+    assert.ok((noHold.stats.perTrackSeconds['0'] || 0) > 20, 'без удержания min-hold клеит всплески в общий план: ' + noHold.stats.perTrackSeconds['0']);
+  });
+});

@@ -352,3 +352,60 @@ describe('TimelineTranscribe.clampSegmentsToWindow', () => {
     assert.equal(r.clampedToWindow, undefined);
   });
 });
+
+/* ═══ detectSimultaneousMics (ревью 09.2026): мультимик → микс ═══ */
+describe('TimelineTranscribe.detectSimultaneousMics', () => {
+  const TT = loadTimelineTranscribe();
+  it('два микрофона на одном интервале → mix с сегментами в формате nest', () => {
+    const r = TT.detectSimultaneousMics([
+      { path: '/m1.wav', clipStartSec: 0, clipInPointSec: 100, workInSec: 10, workOutSec: 70 },
+      { path: '/m2.wav', clipStartSec: 0, clipInPointSec: 50, workInSec: 10, workOutSec: 70 }
+    ], 10);
+    assert.equal(r.mix, true);
+    assert.equal(r.segments.length, 2);
+    const s = JSON.parse(JSON.stringify(r.segments[0]));
+    assert.equal(s.srcStart, 110);      /* inPoint + (workIn − clipStart) */
+    assert.equal(s.segDur, 60);
+    assert.equal(s.localOffset, 0);
+    assert.equal(s.outerStart, 10);
+  });
+  it('последовательные клипы (без пересечения) → не микс', () => {
+    const r = TT.detectSimultaneousMics([
+      { path: '/a.wav', clipStartSec: 0, clipInPointSec: 0, workInSec: 0, workOutSec: 30 },
+      { path: '/b.wav', clipStartSec: 30, clipInPointSec: 0, workInSec: 30, workOutSec: 60 }
+    ], 0);
+    assert.equal(r.mix, false);
+  });
+  it('один клип → не микс', () => {
+    assert.equal(TT.detectSimultaneousMics([{ path: '/a.wav', workInSec: 0, workOutSec: 10 }], 0).mix, false);
+  });
+});
+
+/* ═══ fixChunkBoundarySegments (ревью 09.2026): дубли на швах чанков ═══ */
+describe('TimelineTranscribe.fixChunkBoundarySegments', () => {
+  const TT = loadTimelineTranscribe();
+  const plain = (x) => JSON.parse(JSON.stringify(x));
+  it('сегмент на границе, перекрытый хвостом предыдущего чанка, подрезается; полностью покрытый — выбрасывается', () => {
+    const r = TT.fixChunkBoundarySegments([
+      { startSec: 176, endSec: 181.5, text: 'доклад чувака, как они обучают' },
+      { startSec: 180, endSec: 181.4, text: 'обучают.' },              /* целиком внутри хвоста → drop */
+      { startSec: 180, endSec: 183.4, text: 'обучают нейросеть. Нет' }, /* подрезать до 181.5 */
+      { startSec: 183.4, endSec: 185, text: 'там совершенно' }
+    ], [180, 360]);
+    const s = plain(r.segments);
+    assert.equal(r.dropped, 1);
+    assert.equal(r.fixed, 1);
+    assert.equal(s.length, 3);
+    assert.equal(s[1].startSec, 181.5);
+    assert.equal(s[1].text, 'обучают нейросеть. Нет');
+  });
+  it('граница без перекрытия — без изменений; не-граничные сегменты не трогаются', () => {
+    const r = TT.fixChunkBoundarySegments([
+      { startSec: 178, endSec: 179.5, text: 'a' }, { startSec: 180, endSec: 182, text: 'b' }, { startSec: 182, endSec: 184, text: 'c' }
+    ], [180]);
+    assert.equal(r.fixed + r.dropped, 0);
+    assert.equal(plain(r.segments).length, 3);
+    const r2 = TT.fixChunkBoundarySegments([{ startSec: 1, endSec: 5, text: 'a' }, { startSec: 4, endSec: 6, text: 'b' }], [180]);
+    assert.equal(r2.fixed + r2.dropped, 0);
+  });
+});

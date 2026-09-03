@@ -3452,3 +3452,27 @@ describe('DeterministicPipelines.multicamFromAudio — bridgeStyle / muteInactiv
     b.proposal.plan.segments.forEach(s => assert.equal(typeof s.speaker, 'number'));
   });
 });
+
+describe('DeterministicPipelines.multicamFromAudio — выравнивание уровней микрофонов (09.2026)', () => {
+  function mkCtx(levelA, levelB) {
+    const tl = (fn) => { const out = []; for (let i = 0; i < 1200; i++) out.push({ t: i * 0.05, rms: fn(i * 0.05) }); return out; };
+    return {
+      snapshot: { ok: true, sequenceName: 'S', tracks: [
+        { type: 'video', index: 0 }, { type: 'video', index: 1 }, { type: 'video', index: 2 },
+        { type: 'audio', index: 0 }, { type: 'audio', index: 1 } ], clips: [
+        { trackType: 'audio', trackIndex: 0, mediaPath: '/a.wav', startSec: 0, endSec: 60 },
+        { trackType: 'audio', trackIndex: 1, mediaPath: '/b.wav', startSec: 0, endSec: 60 } ] },
+      /* спикер A говорит 0–30 (тихий микрофон), B — 30–60; пролезание −20 дБ */
+      rmsExtractor: async () => ({ timelines: [
+        tl(t => t < 30 ? levelA : levelA - 20), tl(t => t < 30 ? levelB - 20 : levelB) ], mediaPaths: ['/a.wav', '/b.wav'] })
+    };
+  }
+  test('тихий микрофон (−42 vs −30) без выравнивания почти не получает экрана, с выравниванием — ~половину', async () => {
+    const raw = await DP.multicamFromAudio(mkCtx(-42, -30), { equalizeMics: false });
+    const eq = await DP.multicamFromAudio(mkCtx(-42, -30), {});
+    const share = (r, v) => (r.proposal.stats.perTrackSeconds[String(v)] || 0) / 60;
+    assert.ok(share(raw, 1) < 0.15, 'без выравнивания V2: ' + share(raw, 1));
+    assert.ok(share(eq, 1) > 0.35, 'с выравниванием V2: ' + share(eq, 1));
+    assert.ok(eq.proposal.warnings.some(w => /Уровни микрофонов выровнены: A1 \+12/.test(w)), JSON.stringify(eq.proposal.warnings));
+  });
+});

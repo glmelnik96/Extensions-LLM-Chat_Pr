@@ -32,6 +32,7 @@
     overlapWideMinSec: 1.0,     /* кросс-ток: уходим в wide только если перебивка длится ≥ N сек */
     wideVideoTrack: 0,          /* индекс wide-дорожки */
     maxHoldSec: 8,
+    silenceHoldSec: 2.0,        /* пауза внутри речи одного спикера короче этого не уводит в общий план (09.2026) */
     maxAllSpeakersSec: 3,       /* длина вставки в монолог (реальная, а не потолок — 09.2026) */
     bridgeStyle: 'mix',         /* вставка в монолог: 'wide' | 'reaction' (камера собеседника) | 'mix' */
     variationsJitterSec: 0,
@@ -188,6 +189,29 @@
       activeVideoTrack: curLabel
     });
     return segs;
+  }
+
+  /**
+   * Удержание на паузах (ревью 09.2026). Live на подкасте: речь тихого гостя
+   * дробилась на всплески < minHold между микропаузами; enforceMinHold клеил
+   * коротыши в ПРЕДЫДУЩИЙ сегмент, и первый же общий план (пауза ≥ minHold)
+   * «съедал» 20 секунд монолога. Здесь до min-hold: общий план (пауза) короче
+   * maxGapSec между двумя сегментами ОДНОГО спикера отдаётся этому спикеру.
+   * Пауза между разными спикерами не трогается (handover — честный общий план
+   * или hold-last по флагам). 0 = выкл.
+   */
+  function bridgeShortWideGaps(segments, wideVideoTrack, maxGapSec) {
+    if (!segments || segments.length < 3 || !(maxGapSec > 0)) return (segments || []).slice();
+    var out = segments.map(function (s) { return { tStart: s.tStart, tEnd: s.tEnd, activeVideoTrack: s.activeVideoTrack }; });
+    for (var i = 1; i < out.length - 1; i++) {
+      var g = out[i];
+      if (g.activeVideoTrack !== wideVideoTrack) continue;
+      if (g.tEnd - g.tStart > maxGapSec) continue;
+      var prev = out[i - 1], next = out[i + 1];
+      if (prev.activeVideoTrack === wideVideoTrack || prev.activeVideoTrack !== next.activeVideoTrack) continue;
+      g.activeVideoTrack = prev.activeVideoTrack;
+    }
+    return mergeAdjacentSame(out);
   }
 
   /**
@@ -373,6 +397,9 @@
     /* Шаг 3: свернуть в сегменты */
     var segments = labelsToSegments(labels, p.frameSec);
 
+    /* Шаг 3b: паузы внутри речи одного спикера — держим спикера (09.2026) */
+    segments = bridgeShortWideGaps(segments, mapping.wideVideoTrack, p.silenceHoldSec);
+
     /* Шаг 4: enforce min-hold */
     segments = enforceMinHold(segments, p.minHoldSec);
     segments = mergeAdjacentSame(segments);
@@ -438,6 +465,55 @@
         perTrackSeconds: perTrack
       }
     };
+  }
+
+  /**
+   * Выравнивание уровней микрофонов (ревью 09.2026). Live на подкасте: Mic 1
+   * на ~9 дБ горячее Mic 2 → при абсолютном пороге тишины −35 дБ речь тихого
+   * гостя (p90 −31 дБ) почти не проходила порог, а лидер с запасом 6 дБ всегда
+   * был у громкого микрофона: гость 1 получил 8% экрана, 43% ушло в «общий план»
+   * (алгоритм думал, что никто не говорит). Сдвигаем каждый микрофон так,
+   * чтобы его уровень речи (p90) совпал с самым громким микрофоном. Микрофон,
+   * которому не хватает больше maxGainDb (мёртвый/шум), не трогаем — иначе
+   * шум поднялся бы до уровня речи.
+   * → { timelines, gainsDb: [дБ по микрофонам], refDb, skipped: [индексы] }
+   */
+  function equalizeMicLevels(timelines, opts) {
+    var o = opts || {};
+    var maxGain = typeof o.maxGainDb === 'number' ? o.maxGainDb : 18;
+    var minSamples = typeof o.minSamples === 'number' ? o.minSamples : 20;
+    var out = { timelines: [], gainsDb: [], refDb: null, skipped: [] };
+    if (!Array.isArray(timelines) || !timelines.length) return out;
+    var p90s = [];
+    for (var i = 0; i < timelines.length; i++) {
+      var vals = [];
+      var tl = timelines[i] || [];
+      for (var k = 0; k < tl.length; k++) {
+        var v = tl[k] && tl[k].rms;
+        if (typeof v === 'number' && isFinite(v)) vals.push(v);
+      }
+      if (vals.length < minSamples) { p90s.push(null); continue; }
+      vals.sort(function (a, b) { return a - b; });
+      p90s.push(vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.9))]);
+    }
+    var ref = null;
+    for (var r = 0; r < p90s.length; r++) { if (p90s[r] !== null && (ref === null || p90s[r] > ref)) ref = p90s[r]; }
+    out.refDb = ref;
+    for (var m = 0; m < timelines.length; m++) {
+      var gain = (ref !== null && p90s[m] !== null) ? ref - p90s[m] : 0;
+      if (gain > maxGain) { out.skipped.push(m); gain = 0; }
+      if (gain < 0.5) gain = 0;
+      out.gainsDb.push(Math.round(gain * 10) / 10);
+      if (!gain) { out.timelines.push(timelines[m]); continue; }
+      var src = timelines[m] || [];
+      var shifted = new Array(src.length);
+      for (var s = 0; s < src.length; s++) {
+        var f = src[s];
+        shifted[s] = (f && typeof f.rms === 'number') ? { t: f.t, rms: f.rms + gain } : f;
+      }
+      out.timelines.push(shifted);
+    }
+    return out;
   }
 
   /**
@@ -766,6 +842,7 @@
     buildSwitchPlan: buildSwitchPlan,
     framesFromRmsTimelines: framesFromRmsTimelines,
     computeSnapSources: computeSnapSources,
+    equalizeMicLevels: equalizeMicLevels,
     splitPlanIntoBatches: splitPlanIntoBatches,
     /* Экспортируем internals для unit-тестов */
     _decideActiveMic: decideActiveMic,
@@ -774,6 +851,7 @@
     _smoothLabels: smoothLabels,
     _labelsToSegments: labelsToSegments,
     _enforceMinHold: enforceMinHold,
+    _bridgeShortWideGaps: bridgeShortWideGaps,
     _mergeAdjacentSame: mergeAdjacentSame,
     _snapToSilences: snapToSilences,
     _enforceMaxHold: enforceMaxHold,
