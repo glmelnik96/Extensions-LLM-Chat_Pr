@@ -898,10 +898,10 @@
               </div>
 
               <div class="mc-section-title">Чувствительность звука</div>
-              <div class="param-row" title="Тише этого микрофон считается молчащим. Вправо = порог ниже (строже, реже слышим тишину).">
-                <span class="param-label">Порог тишины</span>
-                <input type="range" id="mc-silence" min="20" max="50" step="1" value="35" />
-                <span class="param-val" id="mc-silence-val">-35 dB</span>
+              <div class="param-row" title="Микрофон считается молчащим, когда он тише уровня речи на столько дБ. Уровень речи измеряется по самому громкому микрофону после выравнивания уровней — настройка не зависит от того, как громко записан подкаст. Меньше = строже (тишиной считается только явная пауза), больше = мягче (тихая речь тоже тишина).">
+                <span class="param-label">Тише речи на</span>
+                <input type="range" id="mc-silence" min="8" max="30" step="1" value="16" />
+                <span class="param-val" id="mc-silence-val">16 dB</span>
               </div>
               <div class="param-row" title="Гасит покадровое дрожание камеры. Больше = плавнее; слишком много = проспим быстрые реплики.">
                 <span class="param-label">Сглаживание</span>
@@ -932,8 +932,8 @@
                 <input type="range" id="mc-seed" min="1" max="20" step="1" value="1" />
                 <span class="param-val" id="mc-seed-val">#1</span>
               </div>
-              <div class="param-row" title="Шаг анализа звука. Влево = точнее границы резов, но дольше. 50мс — оптимум для речи.">
-                <span class="param-label">Шаг анализа</span>
+              <div class="param-row" title="Как часто измеряется громкость микрофонов: 50 мс = 20 замеров в секунду. Рез ляжет не дальше этого от момента смены говорящего. 50 мс — оптимум, менять не нужно; крупнее — только если анализ слишком долгий на многочасовой записи.">
+                <span class="param-label">Точность резов</span>
                 <input type="range" id="mc-framesec" min="0.05" max="0.2" step="0.05" value="0.05" />
                 <span class="param-val" id="mc-framesec-val">50мс</span>
               </div>

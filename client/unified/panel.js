@@ -8503,7 +8503,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       var s = document.getElementById('mc-silence');
       var v = document.getElementById('mc-silence-val');
       if (!s || !v) return;
-      function upd() { v.textContent = '-' + s.value + ' dB'; }
+      function upd() { v.textContent = s.value + ' dB'; }
       s.addEventListener('input', upd);
       upd();
     })();
@@ -8704,9 +8704,9 @@ PanelBoot.run('ИИ: монтаж', function () {
       var MC_SLIDERS = ['mc-minhold', 'mc-maxhold', 'mc-margin', 'mc-silence', 'mc-jitter', 'mc-maxall'];
       var BUILTIN = {
         /* Спокойный: интервью/лекция — длинные планы, реже переключения, спокойные вставки */
-        calm: { 'mc-minhold': 2.5, 'mc-maxhold': 12, 'mc-margin': 6, 'mc-silence': 35, 'mc-jitter': 0.15, 'mc-maxall': 4 },
+        calm: { 'mc-minhold': 2.5, 'mc-maxhold': 12, 'mc-margin': 6, 'mc-silence': 16, 'mc-jitter': 0.15, 'mc-maxall': 4 },
         /* Динамичный: подкаст/шоу — короткие планы, живые вставки */
-        dynamic: { 'mc-minhold': 1.0, 'mc-maxhold': 6, 'mc-margin': 5, 'mc-silence': 35, 'mc-jitter': 0.3, 'mc-maxall': 2 }
+        dynamic: { 'mc-minhold': 1.0, 'mc-maxhold': 6, 'mc-margin': 5, 'mc-silence': 16, 'mc-jitter': 0.3, 'mc-maxall': 2 }
       };
       var LS_KEY = 'mcShowPreset';
       function applyValues(vals) {
@@ -11290,8 +11290,9 @@ PanelBoot.run('ИИ: монтаж', function () {
           if (mcMaxHoldEl) params.maxHoldSec = parseFloat(mcMaxHoldEl.value);
           var mcMarginEl = document.getElementById('mc-margin');
           if (mcMarginEl) params.bleedMarginDb = parseInt(mcMarginEl.value, 10);
+          /* 09.2026: порог тишины относительно речи («Тише речи на N дБ») */
           var mcSilenceEl = document.getElementById('mc-silence');
-          if (mcSilenceEl) params.silenceThresholdDb = -parseInt(mcSilenceEl.value, 10);
+          if (mcSilenceEl) params.silenceMarginDb = parseInt(mcSilenceEl.value, 10);
           var mcJitterEl = document.getElementById('mc-jitter');
           if (mcJitterEl) params.variationsJitterSec = parseFloat(mcJitterEl.value);
           /* Анти-дребезг: окно сглаживания (кадры) + порог кросс-тока (сек) */

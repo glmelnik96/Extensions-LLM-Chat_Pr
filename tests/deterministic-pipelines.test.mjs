@@ -520,22 +520,22 @@ describe('DeterministicPipelines.jumpCuts', () => {
  * ═══════════════════════════════════════════════════════════════ */
 
 describe('DeterministicPipelines.detectSilenceIntervals', () => {
-  test('source=gaps — только gaps между сегментами', () => {
+  test('source=gaps — только gaps между сегментами (09.2026: зазор подтверждается измеренной паузой)', () => {
     const entry = makeEntry(
       [
         { startSec: 0, endSec: 3, text: 'a' },
-        { startSec: 5, endSec: 8, text: 'b' } /* gap 2с */
+        { startSec: 5, endSec: 8, text: 'b' } /* gap 2с; звук тих только 3.5–4.8 */
       ],
       {
         audioAnalysis: {
-          silences: [{ startSec: 10, endSec: 12 }]
+          silences: [{ startSec: 3.5, endSec: 4.8 }, { startSec: 10, endSec: 12 }]
         }
       }
     );
     const r = DP.detectSilenceIntervals(entry, { minDuration: 1, padding: 0, source: 'gaps' });
     assert.equal(r.length, 1);
-    assert.equal(r[0].startSec, 3);
-    assert.equal(r[0].endSec, 5);
+    assert.equal(r[0].startSec, 3.5);
+    assert.equal(r[0].endSec, 4.8);
   });
 
   test('source=ffmpeg — только ffmpeg silences, gaps игнорируются', () => {
@@ -557,7 +557,7 @@ describe('DeterministicPipelines.detectSilenceIntervals', () => {
     assert.equal(r[0].endSec, 12);
   });
 
-  test('source=gaps+ffmpeg (default) — оба источника', () => {
+  test('source=gaps+ffmpeg (default) — оба источника (подтверждённый зазор + ffmpeg-тишина в другом месте)', () => {
     const entry = makeEntry(
       [
         { startSec: 0, endSec: 3, text: 'a' },
@@ -566,7 +566,7 @@ describe('DeterministicPipelines.detectSilenceIntervals', () => {
       {
         audioAnalysis: {
           silenceThresholdUsed: -30,
-          silences: [{ startSec: 10, endSec: 12 }]
+          silences: [{ startSec: 3, endSec: 5 }, { startSec: 10, endSec: 12 }]
         }
       }
     );
@@ -1795,7 +1795,7 @@ describe('DeterministicPipelines.multicamFromAudio', () => {
       'ожидали переключения V2/V3 на тихой записи, план: ' + segs.length + ' сегментов'
     );
     assert.ok(
-      res.proposal.warnings.some(w => /порог тишины/i.test(w)),
+      res.proposal.warnings.some(w => /порог(а)? тишины/i.test(w)),
       'ожидали варнинг про адаптацию порога: ' + JSON.stringify(res.proposal.warnings)
     );
   });
@@ -3474,5 +3474,88 @@ describe('DeterministicPipelines.multicamFromAudio — выравнивание 
     assert.ok(share(raw, 1) < 0.15, 'без выравнивания V2: ' + share(raw, 1));
     assert.ok(share(eq, 1) > 0.35, 'с выравниванием V2: ' + share(eq, 1));
     assert.ok(eq.proposal.warnings.some(w => /Уровни микрофонов выровнены: A1 \+12/.test(w)), JSON.stringify(eq.proposal.warnings));
+  });
+});
+
+describe('DeterministicPipelines.multicamFromAudio — порог тишины относительно речи (09.2026)', () => {
+  function mkCtx(level) {
+    const tl = (fn) => { const out = []; for (let i = 0; i < 1200; i++) out.push({ t: i * 0.05, rms: fn(i * 0.05) }); return out; };
+    return {
+      snapshot: { ok: true, sequenceName: 'S', tracks: [
+        { type: 'video', index: 0 }, { type: 'video', index: 1 }, { type: 'video', index: 2 },
+        { type: 'audio', index: 0 }, { type: 'audio', index: 1 } ], clips: [
+        { trackType: 'audio', trackIndex: 0, mediaPath: '/a.wav', startSec: 0, endSec: 60 },
+        { trackType: 'audio', trackIndex: 1, mediaPath: '/b.wav', startSec: 0, endSec: 60 } ] },
+      rmsExtractor: async () => ({ timelines: [
+        tl(t => t < 30 ? level : level - 40), tl(t => t < 30 ? level - 40 : level) ], mediaPaths: ['/a.wav', '/b.wav'] })
+    };
+  }
+  test('silenceMarginDb: тихая запись (речь −50) и громкая (−20) дают одинаковый план; сводка показывает порог', async () => {
+    const quiet = await DP.multicamFromAudio(mkCtx(-50), { silenceMarginDb: 16, variationsJitterSec: 0 });
+    const loud = await DP.multicamFromAudio(mkCtx(-20), { silenceMarginDb: 16, variationsJitterSec: 0 });
+    assert.equal(quiet.ok, true);
+    assert.equal(quiet.proposal.plan.segments.length, loud.proposal.plan.segments.length);
+    assert.match(quiet.proposal.summary, /порог тишины -66 дБ \(речь ≈ -50 дБ − 16\)/);
+    assert.ok(!quiet.proposal.warnings.some(w => /Тихая запись/.test(w)), 'адаптация абсолютного порога не должна срабатывать');
+  });
+  test('без silenceMarginDb — прежний абсолютный порог с адаптацией', async () => {
+    const r = await DP.multicamFromAudio(mkCtx(-50), { silenceThresholdDb: -35, variationsJitterSec: 0 });
+    assert.ok(r.proposal.warnings.some(w => /Тихая запись/.test(w)));
+    assert.match(r.proposal.summary, /порог тишины -\d+ дБ, лидер громче на 6 дБ/);
+  });
+});
+
+/* ═══ Ревью инструментов 09.2026: зазоры Whisper подтверждаются звуком; паразиты — по паузе ═══ */
+describe('detectSilenceIntervals — Whisper-зазор подтверждается измеренной паузой (09.2026)', () => {
+  const segs = [
+    { startSec: 0, endSec: 5, text: 'а' },
+    { startSec: 7, endSec: 10, text: 'б' },      /* зазор 5–7: реальная пауза 5.2–6.9 */
+    { startSec: 13, endSec: 16, text: 'в' },     /* зазор 10–13: Whisper пропустил слова, звук есть */
+    { startSec: 20, endSec: 22, text: 'г' }      /* зазор 16–20: пауза только 17–17.6 (<1с) */
+  ];
+  test('с плотной картой: подтверждённый зазор → интервал по паузе; неподтверждённые — отброшены и посчитаны', () => {
+    const entry = { segments: segs, audioAnalysis: { silences: [], silencesDense: [{ startSec: 5.2, endSec: 6.9 }, { startSec: 17, endSec: 17.6 }], silenceThresholdUsed: -39 } };
+    const r = DP.detectSilenceIntervals(entry, { minDuration: 1.0, padding: 0.15, source: 'gaps+ffmpeg' });
+    assert.equal(r.length, 1);
+    assert.ok(Math.abs(r[0].startSec - 5.35) < 1e-9 && Math.abs(r[0].endSec - 6.75) < 1e-9, JSON.stringify(r));
+    assert.match(r[0].reason, /подтверждена звуком/);
+    assert.equal(r.unconfirmedGaps, 2);
+  });
+  test('без аудио-анализа — прежнее поведение: все зазоры ≥ minDuration', () => {
+    const r = DP.detectSilenceIntervals({ segments: segs }, { minDuration: 1.0, padding: 0.15, source: 'gaps' });
+    assert.equal(r.length, 3);
+    assert.equal(r.unconfirmedGaps, 0);
+  });
+  test('подтверждённый зазор и ffmpeg-тишина той же паузы сливаются в один интервал', () => {
+    const entry = { segments: segs, audioAnalysis: { silences: [{ startSec: 5.2, endSec: 6.9 }], silencesDense: [{ startSec: 5.2, endSec: 6.9 }], silenceThresholdUsed: -39 } };
+    const r = DP.detectSilenceIntervals(entry, { minDuration: 1.0, padding: 0.15 });
+    assert.equal(r.length, 1);
+  });
+});
+
+describe('cutFillers — паразит внутри фразы только по измеренной паузе (09.2026)', () => {
+  const mk = (segments, dense) => ({ settings: {}, snapshot: { ok: true, sequenceName: 'S', sequenceEndSec: 60, clips: [] },
+    transcriptEntry: { segments, audioAnalysis: dense ? { silences: [], silencesDense: dense, silenceThresholdUsed: -39 } : undefined }, onStatus: () => {}, abortCheck: () => false });
+  test('«Ну, …» в начале: есть пауза после «ну» → рез до её середины; нет паузы → пропуск с пометкой', async () => {
+    const segs = [{ startSec: 10, endSec: 14, text: 'Ну, мы поехали дальше по плану' }, { startSec: 20, endSec: 24, text: 'Ну мы поехали дальше по плану' }];
+    /* 6 слов за 4с → «ну» ≈ 0.67с → 10.67; пауза 10.6–10.9 подтверждает первую, у второй паузы нет */
+    const r = await DP.cutFillers(mk(segs, [{ startSec: 10.6, endSec: 10.9 }]), { sensitivity: 'strict' });
+    assert.ok(r.proposal, JSON.stringify(r));
+    assert.equal(r.proposal.removeIntervals.length, 1);
+    assert.ok(Math.abs(r.proposal.removeIntervals[0].endSec - 10.75) < 1e-9, JSON.stringify(r.proposal.removeIntervals));
+    assert.match(r.proposal.summary, /Пропущено 1 внутри непрерывной речи/);
+  });
+  test('«… вот.» в конце: пауза перед «вот» → рез от её середины', async () => {
+    const segs = [{ startSec: 10, endSec: 14, text: 'мы поехали дальше по плану вот' }];
+    const r = await DP.cutFillers(mk(segs, [{ startSec: 13.2, endSec: 13.5 }]), { sensitivity: 'normal' });
+    assert.equal(r.proposal.removeIntervals.length, 1);
+    assert.ok(Math.abs(r.proposal.removeIntervals[0].startSec - 13.35) < 1e-9);
+    assert.equal(r.proposal.removeIntervals[0].endSec, 14);
+  });
+  test('без аудио-анализа — прежняя пропорция слов', async () => {
+    const segs = [{ startSec: 10, endSec: 14, text: 'Ну, мы поехали дальше по плану' }];
+    const r = await DP.cutFillers(mk(segs, null), { sensitivity: 'strict' });
+    assert.equal(r.proposal.removeIntervals.length, 1);
+    assert.ok(Math.abs(r.proposal.removeIntervals[0].endSec - (10 + 4 / 6)) < 1e-9);
   });
 });

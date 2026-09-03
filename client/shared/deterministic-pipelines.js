@@ -182,6 +182,16 @@
 
     var segments = entry.segments;
     var removeIntervals = [];
+    /* Ревью инструментов 09.2026: Cloud.ru Whisper не отдаёт тайминги слов —
+       позиция паразита внутри фразы считается ПРОПОРЦИЕЙ слов (±0.3с), и 32 из
+       60 вырезов на живом подкасте приходились на непрерывную речь без паузы
+       рядом → резали соседнее слово. Если есть измеренные паузы, внутренняя
+       граница выреза ОБЯЗАНА лечь на край паузы (окно ±0.35с), рез идёт до её
+       середины; без паузы паразит пропускается (лучше оставить «ну», чем
+       обрезать слово). Без аудио-анализа — как раньше. */
+    var fillerPauses = measuredPauses(entry);
+    var FILLER_SNAP_WIN = 0.35;
+    var skippedNoPause = 0;
 
     for (var i = 0; i < segments.length; i++) {
       var seg = segments[i];
@@ -229,6 +239,13 @@
           var frontDur = secPerWord * fw;
           if (frontDur > 0.08 && frontDur <= maxDur) {
             var fCutEnd = startSec + frontDur;
+            if (fillerPauses.length) {
+              /* после паразита должна быть измеримая пауза: рез до её середины */
+              var fEdge = nearestPauseEdge(fillerPauses, fCutEnd, FILLER_SNAP_WIN, 'start');
+              if (!fEdge || fEdge.pause[0] <= startSec + 0.05) { skippedNoPause++; break; }
+              fCutEnd = Math.min((fEdge.pause[0] + fEdge.pause[1]) / 2, endSec - 0.05);
+              if (fCutEnd - startSec < 0.08) { skippedNoPause++; break; }
+            }
             removeIntervals.push({
               startSec: startSec,
               endSec: fCutEnd,
@@ -246,6 +263,13 @@
           var tailDur = secPerWord * lw;
           if (tailDur > 0.08 && tailDur <= maxDur) {
             var tCutStart = endSec - tailDur;
+            if (fillerPauses.length) {
+              /* перед паразитом должна быть измеримая пауза: рез от её середины */
+              var tEdge = nearestPauseEdge(fillerPauses, tCutStart, FILLER_SNAP_WIN, 'end');
+              if (!tEdge || tEdge.pause[1] >= endSec - 0.05) { skippedNoPause++; break; }
+              tCutStart = Math.max((tEdge.pause[0] + tEdge.pause[1]) / 2, startSec + 0.05);
+              if (endSec - tCutStart < 0.08) { skippedNoPause++; break; }
+            }
             removeIntervals.push({
               startSec: tCutStart,
               endSec: endSec,
@@ -267,12 +291,15 @@
       return (iv.endSec - iv.startSec) >= MIN_CUT;
     });
 
+    var skipNote = skippedNoPause
+      ? ' Пропущено ' + skippedNoPause + ' внутри непрерывной речи (нет измеримой паузы рядом — рез пришёлся бы на соседнее слово).'
+      : '';
     if (removeIntervals.length === 0) {
       var modeLabel = expanded ? 'расширенном' : 'строгом';
       return {
         ok: true,
         summary: 'Слова-паразиты не обнаружены (в ' + modeLabel + ' режиме, ' +
-          segments.length + ' сегментов проверено).',
+          segments.length + ' сегментов проверено).' + skipNote,
         noChanges: true
       };
     }
@@ -290,7 +317,7 @@
         kind: 'transcript_cuts',
         removeIntervals: removeIntervals,
         summary: 'Найдено ' + removeIntervals.length + ' паразитов (' +
-          totalRemoveSec.toFixed(1) + 'с)' + modeNote + '.' + _sectionNote(section) + ' Вырезать?',
+          totalRemoveSec.toFixed(1) + 'с)' + modeNote + '.' + _sectionNote(section) + skipNote + ' Вырезать?',
         removeSummary: removeIntervals.map(function (iv) {
           return { startSec: iv.startSec, endSec: iv.endSec, reason: iv.reason };
         })
@@ -312,6 +339,44 @@
    *   - source (default 'gaps+ffmpeg'): 'gaps' | 'ffmpeg' | 'gaps+ffmpeg'
    * @returns {Array<{startSec, endSec, reason}>}
    */
+  /**
+   * Измеренные паузы entry в виде отсортированных [start,end] (ревью инструментов
+   * 09.2026). Плотная карта (d=0.15) предпочтительнее обычной (d=0.5) — на том же
+   * пороге она надмножество. Пусто = аудио-анализа нет.
+   */
+  function measuredPauses(entry) {
+    var audio = entry && entry.audioAnalysis;
+    if (!audio) return [];
+    var src = (Array.isArray(audio.silencesDense) && audio.silencesDense.length) ? audio.silencesDense
+      : (Array.isArray(audio.silences) ? audio.silences : []);
+    var out = [];
+    for (var i = 0; i < src.length; i++) {
+      var s = src[i] || {};
+      var a = typeof s.startSec === 'number' ? s.startSec : s.start;
+      var b = typeof s.endSec === 'number' ? s.endSec : s.end;
+      if (typeof a === 'number' && typeof b === 'number' && isFinite(a) && isFinite(b) && b > a) out.push([a, b]);
+    }
+    out.sort(function (x, y) { return x[0] - y[0]; });
+    return out;
+  }
+
+  /* Ближайший край измеренной паузы к t в окне ±winSec. edge: 'start' (конец речи
+     → начало паузы) | 'end' (конец паузы → начало речи) | 'any'. → {t, pause} | null */
+  function nearestPauseEdge(pauses, t, winSec, edge) {
+    var best = null, bestD = winSec + 1e-9;
+    for (var i = 0; i < pauses.length; i++) {
+      var p = pauses[i];
+      if (p[0] > t + winSec) break;
+      if (p[1] < t - winSec) continue;
+      var cands = edge === 'start' ? [p[0]] : edge === 'end' ? [p[1]] : [p[0], p[1]];
+      for (var c = 0; c < cands.length; c++) {
+        var d = Math.abs(cands[c] - t);
+        if (d < bestD) { bestD = d; best = { t: cands[c], pause: p }; }
+      }
+    }
+    return best;
+  }
+
   function detectSilenceIntervals(entry, opts) {
     opts = opts || {};
     var minDuration = typeof opts.minDuration === 'number' ? opts.minDuration : 1.0;
@@ -329,6 +394,14 @@
     var includeFFmpeg = (source !== 'gaps') && (effectiveThreshold >= thresholdUsed);
 
     var intervals = [];
+    /* Ревью инструментов 09.2026 (live на 20-мин подкасте): 13 из 41 «пауз» по
+       Whisper-зазорам не были тишиной по звуку — Whisper пропускает слова/смех/
+       перебивки, оставляя зазор в транскрипте, и «Убрать тишины» вырезал речь.
+       Если есть измеренные паузы (silencedetect), зазор транскрипта только
+       ПОДТВЕРЖДАЕТСЯ ими: берём пересечение зазора с измеренной тишиной; нет
+       пересечения ≥ minDuration — зазор не тишина. Без аудио-анализа — как раньше. */
+    var pauses = measuredPauses(entry);
+    var unconfirmedGaps = 0;
 
     /* Источник 1: gaps между Whisper-сегментами (Whisper знает границы речи). */
     if (source === 'gaps' || source === 'gaps+ffmpeg') {
@@ -340,6 +413,24 @@
         if (isNaN(prevEnd) || isNaN(nextStart)) continue;
         var gap = nextStart - prevEnd;
         if (gap < minDuration) continue;
+        if (pauses.length) {
+          var confirmed = false;
+          for (var pi = 0; pi < pauses.length; pi++) {
+            var p = pauses[pi];
+            if (p[0] > nextStart) break;
+            var a = Math.max(prevEnd, p[0]);
+            var b = Math.min(nextStart, p[1]);
+            if (b - a < minDuration) continue;
+            var cs = a + padding;
+            var ce = b - paddingAfter;
+            if (ce > cs + 0.02) {
+              intervals.push({ startSec: cs, endSec: ce, reason: 'пауза между фразами ' + (b - a).toFixed(2) + 'с (подтверждена звуком)' });
+              confirmed = true;
+            }
+          }
+          if (!confirmed) unconfirmedGaps++;
+          continue;
+        }
         var gs = prevEnd + padding;
         var ge = nextStart - paddingAfter;
         if (ge > gs + 0.02) {
@@ -374,7 +465,10 @@
       }
     }
 
-    return intervals;
+    /* Подтверждённые зазоры и ffmpeg-тишины описывают одни и те же паузы — сливаем. */
+    var merged = _mergeIntervals(intervals);
+    merged.unconfirmedGaps = unconfirmedGaps;
+    return merged;
   }
 
   /**
@@ -2391,6 +2485,7 @@
 
     /* Выравнивание уровней микрофонов (09.2026): сравнение «кто громче» честно
        только при равной чувствительности; по умолчанию включено. */
+    var speechRefDb = null; /* уровень речи самого громкого микрофона (после выравнивания) */
     if (params.equalizeMics !== false && typeof MulticamPlan.equalizeMicLevels === 'function') {
       var eq = MulticamPlan.equalizeMicLevels(timelines);
       if (eq && eq.timelines && eq.timelines.length === timelines.length) {
@@ -2399,10 +2494,20 @@
           if (eq.gainsDb[eqi] > 0) eqNotes.push(aLabel(eqi) + ' +' + eq.gainsDb[eqi].toFixed(1) + ' дБ');
         }
         for (var eqs = 0; eqs < eq.skipped.length; eqs++) {
-          warnings.push('Микрофон ' + aLabel(eq.skipped[eqs]) + ' тише остальных более чем на 18 дБ — уровень не выравнивался (похоже на выключенный микрофон/шум).');
+          var skLv = eq.levels && eq.levels[eq.skipped[eqs]];
+          var skWhy = (skLv && (skLv.speechDb - skLv.noiseDb) < 10)
+            ? 'пики не выше шума — речи на нём не слышно'
+            : 'после подъёма шум микрофона поднялся бы до уровня речи';
+          warnings.push('Микрофон ' + aLabel(eq.skipped[eqs]) + ' не выравнивался (' + skWhy + '). Поднимите гейн дорожки в Premiere или проверьте выбор дорожек.');
         }
         if (eqNotes.length) warnings.push('Уровни микрофонов выровнены: ' + eqNotes.join(', ') + '.');
         timelines = eq.timelines;
+        speechRefDb = eq.refDb;
+      }
+    } else if (typeof MulticamPlan.micLevels === 'function') {
+      for (var lvi = 0; lvi < timelines.length; lvi++) {
+        var lvx = MulticamPlan.micLevels(timelines[lvi], 20);
+        if (lvx && (speechRefDb === null || lvx.speechDb > speechRefDb)) speechRefDb = lvx.speechDb;
       }
     }
     var frameSec = typeof params.frameSec === 'number' ? params.frameSec : 0.05;
@@ -2416,23 +2521,35 @@
        тишина» → вырожденный план «1 сегмент, 0 переключений». Если 90-й
        перцентиль громкости НИЖЕ порога (даже речь тише порога) — опускаем порог
        к середине между шумовым полом (p10) и речью (p90) и честно предупреждаем. */
-    var silenceDb = typeof params.silenceThresholdDb === 'number' ? params.silenceThresholdDb : -35;
-    var pool = [];
-    for (var pti = 0; pti < timelines.length; pti++) {
-      var ptl = timelines[pti];
-      for (var pfi = 0; pfi < ptl.length; pfi++) pool.push(ptl[pfi].rms);
-    }
-    if (pool.length >= 20) {
-      pool.sort(function (a, b) { return a - b; });
-      var p10 = pool[Math.floor(pool.length * 0.1)];
-      var p90 = pool[Math.floor(pool.length * 0.9)];
-      if (p90 < silenceDb) {
-        var adaptedDb = (p10 + p90) / 2;
-        warnings.push('Тихая запись: даже громкие места (' + p90.toFixed(0) + ' дБ) ниже порога тишины (' +
-          silenceDb + ' дБ). Порог автоматически снижен до ' + adaptedDb.toFixed(0) +
-          ' дБ — при необходимости настройте слайдер «Порог тишины».');
-        silenceDb = adaptedDb;
+    /* 09.2026: порог тишины ОТНОСИТЕЛЬНО речи (params.silenceMarginDb, UI
+       «Тише речи на»): threshold = уровень речи громкого микрофона − N дБ.
+       Абсолютный silenceThresholdDb (LLM/старые вызовы) — как раньше, с
+       адаптацией на тихой записи. */
+    var silenceDb;
+    var silenceNote = '';
+    if (typeof params.silenceMarginDb === 'number' && params.silenceMarginDb > 0 && speechRefDb !== null) {
+      silenceDb = speechRefDb - params.silenceMarginDb;
+      silenceNote = 'порог тишины ' + silenceDb.toFixed(0) + ' дБ (речь ≈ ' + speechRefDb.toFixed(0) + ' дБ − ' + params.silenceMarginDb + ')';
+    } else {
+      silenceDb = typeof params.silenceThresholdDb === 'number' ? params.silenceThresholdDb : -35;
+      var pool = [];
+      for (var pti = 0; pti < timelines.length; pti++) {
+        var ptl = timelines[pti];
+        for (var pfi = 0; pfi < ptl.length; pfi++) pool.push(ptl[pfi].rms);
       }
+      if (pool.length >= 20) {
+        pool.sort(function (a, b) { return a - b; });
+        var p10 = pool[Math.floor(pool.length * 0.1)];
+        var p90 = pool[Math.floor(pool.length * 0.9)];
+        if (p90 < silenceDb) {
+          var adaptedDb = (p10 + p90) / 2;
+          warnings.push('Тихая запись: даже громкие места (' + p90.toFixed(0) + ' дБ) ниже порога тишины (' +
+            silenceDb + ' дБ). Порог автоматически снижен до ' + adaptedDb.toFixed(0) +
+            ' дБ — при необходимости настройте слайдер «Тише речи на».');
+          silenceDb = adaptedDb;
+        }
+      }
+      silenceNote = 'порог тишины ' + silenceDb.toFixed(0) + ' дБ';
     }
 
     var planParams = {
@@ -2514,7 +2631,8 @@
     var summary = 'Авто-MultiCam (по голосу): ' + built.segments.length + ' сегментов, ' +
       built.switchCount + ' переключений. Спикеров: ' + speakerCount + '.' +
       '\nЭкранное время: ' + screenParts.join(' · ') +
-      '\nВставки в монолог: ' + bridgeLabel + (params.muteInactiveMics ? ' · микрофоны молчащих будут заглушены' : '');
+      '\nВставки в монолог: ' + bridgeLabel + (params.muteInactiveMics ? ' · микрофоны молчащих будут заглушены' : '') +
+      '\nЗвук: ' + silenceNote + ', лидер громче на ' + planParams.bleedMarginDb + ' дБ';
     /* Длинный план применяется батчами — честно предупредим о времени.
        11.07.2026: live-замер на 6_SYNCED — 92 батча ≈ 11 мин (~7 с/батч),
        старая оценка 3 с/батч занижала в 2.4 раза. Долгие планы — в минутах. */
@@ -2902,6 +3020,8 @@
     planFrameSources: planFrameSources,
     _normalizeMulticamMapping: _normalizeMulticamMapping,
     detectSilenceIntervals: detectSilenceIntervals,
+    measuredPauses: measuredPauses,
+    nearestPauseEdge: nearestPauseEdge,
     silenceIntervalsFromRms: silenceIntervalsFromRms,
     rmsThresholdInfo: rmsThresholdInfo,
     rmsThresholdSegments: rmsThresholdSegments,

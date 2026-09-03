@@ -1466,6 +1466,41 @@
       }
     }
 
+    /* nest_reconstruct (ревью инструментов 09.2026): вложенная секвенция —
+       «⚡ Анализ аудио» падал «prep.path обязателен» (первый же инструмент на
+       тест-секвенции пользователя). Реконструируем слышимое аудио nest тем же
+       ffmpeg-миксом, что транскрибация, режем на чанки и анализируем как clip_queue. */
+    if (prep.mode === 'nest_reconstruct' && prep.segments && prep.segments.length) {
+      var nestRecA = await reconstructNestAudio(prep.segments, progress);
+      var nestWavA = nestRecA.path;
+      var nestChunksA = [];
+      try {
+        var baseOffA = (typeof prep.timelineOffsetSec === 'number') ? prep.timelineOffsetSec : 0;
+        var spanA = (typeof prep.windowDurSec === 'number') ? prep.windowDurSec : 0;
+        var effA = (typeof nestRecA.effectiveDurSec === 'number' && nestRecA.effectiveDurSec > 0) ? nestRecA.effectiveDurSec : spanA;
+        var chunkSpanA = (spanA > 0) ? Math.min(spanA, effA) : effA;
+        progress('Анализ аудио nest: нарезка ffmpeg…');
+        nestChunksA = await extractAudioChunksWithFfmpeg(nestWavA, 0, chunkSpanA, 90, progress, 'wav');
+        var aaN = await analyzeChunksInParallel(
+          nestChunksA.map(function (c) { return { path: c && c.path, timelineOffsetSec: baseOffA + ((c && c.offsetInSpanSec) || 0) }; }),
+          progress, { wantRms: true, rmsWindowSec: 0.025 });
+        return {
+          segments: [],
+          paragraphs: [],
+          text: '',
+          audioAnalysis: aaN,
+          timelineOffsetSec: baseOffA,
+          durationSec: spanA > 0 ? spanA : null,
+          mode: 'audio-only',
+          analysisOnly: true,
+          builtAt: Date.now()
+        };
+      } finally {
+        unlinkChunkList(nestChunksA);
+        try { if (typeof require !== 'undefined') require('fs').unlinkSync(nestWavA); } catch (eUNA) {}
+      }
+    }
+
     /* Берём путь к аудио для анализа: либо prep.path (один файл), либо первый chunk. */
     var pathForAnalysis = prep.path || (prep.chunks && prep.chunks[0] && prep.chunks[0].path);
     if (!pathForAnalysis) throw new Error('prep.path или prep.chunks[0].path обязателен');

@@ -478,30 +478,49 @@
    * шум поднялся бы до уровня речи.
    * → { timelines, gainsDb: [дБ по микрофонам], refDb, skipped: [индексы] }
    */
+  /**
+   * Уровень речи микрофона = медиана самых громких 2% кадров (не p90 всей
+   * записи: у гостя, который говорит 10% времени, p90 попадает в пролезание
+   * собеседника, и его микрофон недооценивается). Плюс шумовой пол (p10).
+   * → { speechDb, noiseDb } либо null, если кадров мало.
+   */
+  function micLevels(timeline, minSamples) {
+    var vals = [];
+    var tl = timeline || [];
+    for (var k = 0; k < tl.length; k++) {
+      var v = tl[k] && tl[k].rms;
+      if (typeof v === 'number' && isFinite(v)) vals.push(v);
+    }
+    if (vals.length < minSamples) return null;
+    vals.sort(function (a, b) { return a - b; });
+    var topN = Math.max(5, Math.floor(vals.length * 0.02));
+    var top = vals.slice(vals.length - topN);
+    return {
+      speechDb: top[Math.floor(top.length / 2)],
+      noiseDb: vals[Math.floor(vals.length * 0.1)]
+    };
+  }
+
   function equalizeMicLevels(timelines, opts) {
     var o = opts || {};
-    var maxGain = typeof o.maxGainDb === 'number' ? o.maxGainDb : 18;
+    var maxGain = typeof o.maxGainDb === 'number' ? o.maxGainDb : 30;
+    /* после подъёма шум микрофона обязан остаться минимум на snrDb ниже речи —
+       иначе шум пересечёт порог тишины и микрофон начнёт «говорить» сам */
+    var snrDb = typeof o.minSnrDb === 'number' ? o.minSnrDb : 15;
     var minSamples = typeof o.minSamples === 'number' ? o.minSamples : 20;
-    var out = { timelines: [], gainsDb: [], refDb: null, skipped: [] };
+    var out = { timelines: [], gainsDb: [], refDb: null, skipped: [], levels: [] };
     if (!Array.isArray(timelines) || !timelines.length) return out;
-    var p90s = [];
-    for (var i = 0; i < timelines.length; i++) {
-      var vals = [];
-      var tl = timelines[i] || [];
-      for (var k = 0; k < tl.length; k++) {
-        var v = tl[k] && tl[k].rms;
-        if (typeof v === 'number' && isFinite(v)) vals.push(v);
-      }
-      if (vals.length < minSamples) { p90s.push(null); continue; }
-      vals.sort(function (a, b) { return a - b; });
-      p90s.push(vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.9))]);
-    }
+    var lv = [];
+    for (var i = 0; i < timelines.length; i++) lv.push(micLevels(timelines[i], minSamples));
+    out.levels = lv;
     var ref = null;
-    for (var r = 0; r < p90s.length; r++) { if (p90s[r] !== null && (ref === null || p90s[r] > ref)) ref = p90s[r]; }
+    for (var r = 0; r < lv.length; r++) { if (lv[r] && (ref === null || lv[r].speechDb > ref)) ref = lv[r].speechDb; }
     out.refDb = ref;
     for (var m = 0; m < timelines.length; m++) {
-      var gain = (ref !== null && p90s[m] !== null) ? ref - p90s[m] : 0;
-      if (gain > maxGain) { out.skipped.push(m); gain = 0; }
+      var gain = (ref !== null && lv[m]) ? ref - lv[m].speechDb : 0;
+      /* плоский микрофон (пики не выше шума на 10 дБ) — речи нет, не трогаем */
+      var flat = lv[m] && (lv[m].speechDb - lv[m].noiseDb) < 10;
+      if (gain > 0.5 && (gain > maxGain || flat || (lv[m].noiseDb + gain) > ref - snrDb)) { out.skipped.push(m); gain = 0; }
       if (gain < 0.5) gain = 0;
       out.gainsDb.push(Math.round(gain * 10) / 10);
       if (!gain) { out.timelines.push(timelines[m]); continue; }
@@ -843,6 +862,7 @@
     framesFromRmsTimelines: framesFromRmsTimelines,
     computeSnapSources: computeSnapSources,
     equalizeMicLevels: equalizeMicLevels,
+    micLevels: micLevels,
     splitPlanIntoBatches: splitPlanIntoBatches,
     /* Экспортируем internals для unit-тестов */
     _decideActiveMic: decideActiveMic,

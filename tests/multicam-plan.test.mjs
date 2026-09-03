@@ -825,20 +825,37 @@ describe('MulticamPlan._dominantMic + speaker в плане (09.2026)', () => {
 });
 
 describe('MulticamPlan.equalizeMicLevels (09.2026)', () => {
-  const mk = (level, n = 200) => Array.from({ length: n }, (_, i) => ({ t: i * 0.05, rms: level + (i % 10 === 0 ? -30 : 0) }));
-  it('тихий микрофон подтягивается к громкому по p90', () => {
+  /* 80% кадров — речь на level, 20% — тишина на −30 ниже: пики = level, шум (p10) = level−30 */
+  const mk = (level, n = 200) => Array.from({ length: n }, (_, i) => ({ t: i * 0.05, rms: level + (i % 5 === 0 ? -30 : 0) }));
+  it('тихий микрофон подтягивается к громкому по уровню речи (пики)', () => {
     const eq = MP.equalizeMicLevels([mk(-40), mk(-31)]);
     assert.deepEqual(eq.gainsDb, [9, 0]);
     assert.equal(eq.refDb, -31);
     const p90 = (tl) => tl.map(f => f.rms).sort((a, b) => a - b)[Math.floor(tl.length * 0.9)];
     assert.equal(p90(eq.timelines[0]), -31);
-    assert.equal(eq.timelines[1], undefined === eq.timelines[1] ? eq.timelines[1] : eq.timelines[1]);
     assert.deepEqual(eq.skipped, []);
   });
-  it('разница > 18 дБ (мёртвый микрофон) не выравнивается и попадает в skipped', () => {
+  it('разница > 30 дБ не выравнивается и попадает в skipped', () => {
     const eq = MP.equalizeMicLevels([mk(-70), mk(-30)]);
     assert.deepEqual(eq.gainsDb, [0, 0]);
     assert.deepEqual(eq.skipped, [0]);
+  });
+  it('уровень речи по пикам: гость, говорящий 10% времени, выравнивается по СВОЕЙ речи, а не по пролезанию', () => {
+    /* тихий микрофон: 10% кадров своя речь −45, 60% пролезание собеседника −60, 30% шум −75 */
+    const quiet = Array.from({ length: 1000 }, (_, i) => ({ t: i * 0.05, rms: i % 10 === 0 ? -45 : (i % 10 < 7 ? -60 : -75) }));
+    const loud = Array.from({ length: 1000 }, (_, i) => ({ t: i * 0.05, rms: i % 10 < 6 ? -25 : -65 }));
+    const eq = MP.equalizeMicLevels([quiet, loud]);
+    assert.equal(eq.refDb, -25);
+    assert.equal(eq.gainsDb[0], 20, 'ожидался подъём на 20 дБ (−45 → −25), а не по p90');
+  });
+  it('шум после подъёма пересёк бы речь (SNR < 15 дБ) → skipped; плоский микрофон → skipped', () => {
+    const noisy = Array.from({ length: 400 }, (_, i) => ({ t: i * 0.05, rms: i % 20 === 0 ? -45 : -52 })); /* речь −45, шум −52 */
+    const loud = mk(-25);
+    const eq = MP.equalizeMicLevels([noisy, loud]);
+    assert.deepEqual(eq.skipped, [0]);
+    assert.equal(eq.gainsDb[0], 0);
+    const flat = Array.from({ length: 400 }, (_, i) => ({ t: i * 0.05, rms: -50 + (i % 3) }));
+    assert.deepEqual(MP.equalizeMicLevels([flat, mk(-25)]).skipped, [0]);
   });
   it('после выравнивания тихий спикер побеждает на своих кадрах', () => {
     /* спикер 0 говорит на −40 (тихий микрофон), в мик 1 пролезает −52; при
