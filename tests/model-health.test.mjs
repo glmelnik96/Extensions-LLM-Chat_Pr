@@ -46,6 +46,20 @@ describe('ModelHealth.classifyError', () => {
     assert.match(c.reason, /403/);
   });
 
+  test('403 «модель не включена в проект» → недоступна, причина понятная', () => {
+    const e = httpErr(403);
+    e.modelNotInProject = true;
+    const c = MH.classifyError(e);
+    assert.equal(c.state, MH.UNAVAILABLE);
+    assert.match(c.reason, /не включена в проект Cloud\.ru/);
+  });
+
+  test('тот же 403 без флага — по тексту сервера', () => {
+    const e = new Error('Requested model is not available for this project');
+    e.httpStatus = 403;
+    assert.match(MH.classifyError(e).reason, /не включена в проект/);
+  });
+
   test('404 → снята', () => {
     assert.equal(MH.classifyError(httpErr(404)).state, MH.UNAVAILABLE);
   });

@@ -3,7 +3,36 @@
  * Панели Premiere не содержат полей настроек API/моделей.
  *
  * ═══════════════════════════════════════════════════════════════════════
- * КАТАЛОГ МОДЕЛЕЙ Cloud.ru Foundation Models (июнь 2026 — Phase 2)
+ * ДОСТУПНО ПРОЕКТУ КЛЮЧА (живая проба 18.10.2026, /v1/models = 90 моделей)
+ * ═══════════════════════════════════════════════════════════════════════
+ * На проекте включён список разрешённых моделей. Чат отвечает только:
+ *   zai-org/GLM-4.7                          202K  549.00 / 793.00 ₽/M  FC ✓ SO ✓
+ *   MiniMaxAI/MiniMax-M2.5                   196K  353.80 / 475.80 ₽/M  FC ✓ SO ✓ (рассуждает всегда)
+ *   ai-sage/GigaChat3.5-432B-A28B-Reasoning  262K   96.22 / 288.60 ₽/M  FC ✓ (рассуждает всегда,
+ *     enable_thinking игнорирует; рассуждения в поле `reasoning`)
+ * (+ ai-sage/Giga-Embeddings-instruct-3B и -480M — эмбеддинги.)
+ * Остальные, в т.ч. openai/whisper-large-v3, MiniMax-M3, Qwen3.5-397B (vision),
+ * gpt-oss-120b, DeepSeek-V4-Pro, GLM-5.1, Kimi-K2.6, отвечают 403 PLAIN TEXT
+ * «Requested model is not available for this project». Включить модель проекту
+ * может только администратор организации в консоли Cloud.ru. Пока Whisper и
+ * vision вне проекта, транскрибация и описание кадров не работают — панель
+ * говорит об этом прямо (cloudru-client: modelNotInProject).
+ * НЕ назначай на роли и в modelFallbacks модели вне этого списка.
+ *
+ * БЕНЧМАРК 18.10.2026 (tests/integration/benchmark-models.mjs, транскрипт
+ * «Нарезка Copy 01» 20.8 мин, 10 сценариев; «различающие» — без H1/H5, где
+ * падают все: H1 бенч не валидирует target при removeIntervals, H5 — find_moments
+ * отдаёт мимо темы):
+ *   GLM-4.7      thinking=true (как в чате): 8/10, 29.0 с/сценарий (до 115 с), 40.8 ₽
+ *                thinking=false:              7/10,  8.5 с,                      40.2 ₽
+ *                различающие 15/16 — единственная стабильно режет по темам (H2 2/2)
+ *   MiniMax-M2.5 7/10 и 7/10, 8.8–14.8 с, 25.5–31.0 ₽; различающие 14/16, H2 0/2
+ *   GigaChat3.5  6/10, 28.4 с, 24.7 ₽ (втрое больше токенов на ходы)
+ * Корректура (json_object, max_tokens 4096): GLM-4.7 и MiniMax 2/2 валидный JSON
+ * за ~15 с; GigaChat 0/2 — бюджет уходит на рассуждения, content пустой (94 с).
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * КАТАЛОГ МОДЕЛЕЙ Cloud.ru Foundation Models (июнь 2026 — Phase 2, история)
  * ═══════════════════════════════════════════════════════════════════════
  *
  * ┌─────────────────────────────────────────┬────────┬──────────┬──────────┬────┬────┐
@@ -103,6 +132,9 @@
         'zai-org/GLM-4.7':             { inPerM: 549.00, outPerM: 793.00, ctxTokens: 202000 },
         'openai/gpt-oss-120b':         { inPerM: 15.86,  outPerM: 61.00,  ctxTokens: 131000 },
         'moonshotai/Kimi-K2.6':        { inPerM: 175.68, outPerM: 725.90, ctxTokens: 262000 },
+        /* Доступны проекту ключа с 18.10.2026 (цены из /v1/models metadata) */
+        'ai-sage/GigaChat3.5-432B-A28B-Reasoning': { inPerM: 96.22, outPerM: 288.60, ctxTokens: 262144 },
+        'MiniMaxAI/MiniMax-M2.5':      { inPerM: 353.80, outPerM: 475.80, ctxTokens: 196608 },
         /* Vision-модели (цены из /v1/models metadata, 2026-07-11) */
         'MiniMaxAI/MiniMax-M3':        { inPerM: 240.22, outPerM: 1008.85, ctxTokens: 524000 },
         'Qwen/Qwen3.5-397B-A17B':      { inPerM: 915.00, outPerM: 1085.80, ctxTokens: 262000 }
@@ -124,15 +156,20 @@
     /* Ревью 09.2026: GLM-5.1 отдаёт 403 «not available for this project» на аккаунте
        (живые пробы 04.08 и 02.09) — каждый ход начинался с провального вызова и
        уходил фолбэком. Дефолт — GLM-4.7 (бенчмарк 18.06: 5/5 простых, 4/5 сложных,
-       быстрее GLM-5.1). Когда GLM-5.1 вернут — переключить здесь и в analysis/findMoments. */
+       быстрее GLM-5.1). Когда GLM-5.1 вернут — переключить здесь и в analysis/findMoments.
+       18.10.2026: остаётся GLM-4.7 — точнее доступных альтернатив (см. бенчмарк в
+       шапке); цена — ожидание с thinkingPolicy.chat=true (~29 с на запрос). */
     chatModel: 'zai-org/GLM-4.7',
 
     /**
      * Альтернатива для агента; включается флагом useCodeModelForAgent.
      * Phase 2: Qwen3-Coder-Next → DeepSeek-V4-Pro (1M контекст под кодовые
      * ризонинги, native tool-calling, без проблем с большим input).
+     * 18.10.2026: DeepSeek-V4-Pro вне проекта ключа (403) → MiniMax-M2.5:
+     * в каталоге task_type «code», 196K, tools и json_object работают
+     * (бенчмарк 18.10: 7/10 в обоих прогонах, 8.8 с на сценарий в режиме чата).
      */
-    codeModel: 'deepseek-ai/DeepSeek-V4-Pro',
+    codeModel: 'MiniMaxAI/MiniMax-M2.5',
     /** true — агент использует codeModel, false — chatModel */
     useCodeModelForAgent: false,
 
@@ -190,16 +227,21 @@
      * ответ — сокет висел до 300с × 5 ретраев (~25 мин на «шаг 2 из 24»), пока
      * GLM-4.7 тем же пингом отвечала 200/300мс. Без фолбэка чат замирал.
      *
-     * Цели фолбэка — стабильные модели: GLM-4.7 (быстрая, дешёвая), затем
-     * gpt-oss-120b (самая стабильная, но проверяй факты — врёт длительность).
-     * Vision: MiniMax-M3 → Qwen3.5 (единственная альтернатива, что понимает
-     * картинки, см. visionModel). Порядок = приоритет живой замены.
+     * 18.10.2026: прежние цели (gpt-oss-120b, DeepSeek-V4-Pro, GLM-5.1, vision
+     * Qwen3.5) вне проекта ключа — 403 «not available for this project», то есть
+     * при сбое GLM-4.7 чат молча уходил в цепочку 403. Теперь цепочки только из
+     * доступных (инвариант — tests/fm-defaults.test.mjs). Порядок по бенчмарку
+     * 18.10: MiniMax-M2.5 первой (tools ✓, json_object ✓, самая быстрая в
+     * режиме чата), GigaChat3.5 последней — самая дешёвая за токен, но
+     * рассуждает всегда (enable_thinking игнорирует), втрое медленнее, а в
+     * корректуре (json_object, max_tokens 4096) сжигает бюджет на рассуждения
+     * и отдаёт пустой content. Цепочки — общие для чата и корректуры.
+     * Vision-цепочки нет: доступных vision-моделей у проекта нет вовсе.
      */
     modelFallbacks: {
-      'zai-org/GLM-5.1':        ['zai-org/GLM-4.7', 'openai/gpt-oss-120b'],
-      'zai-org/GLM-4.7':        ['openai/gpt-oss-120b', 'deepseek-ai/DeepSeek-V4-Pro'],
-      'deepseek-ai/DeepSeek-V4-Pro': ['zai-org/GLM-5.1', 'zai-org/GLM-4.7'],
-      'MiniMaxAI/MiniMax-M3':   ['Qwen/Qwen3.5-397B-A17B']
+      'zai-org/GLM-4.7':        ['MiniMaxAI/MiniMax-M2.5', 'ai-sage/GigaChat3.5-432B-A28B-Reasoning'],
+      'MiniMaxAI/MiniMax-M2.5': ['zai-org/GLM-4.7', 'ai-sage/GigaChat3.5-432B-A28B-Reasoning'],
+      'ai-sage/GigaChat3.5-432B-A28B-Reasoning': ['zai-org/GLM-4.7', 'MiniMaxAI/MiniMax-M2.5']
     },
 
     /**
@@ -208,12 +250,13 @@
      * переопределяет chatModel НА СЕССИЮ (не персистится, сбрасывается при
      * перезапуске панели); автоматический modelFallbacks остаётся поверх
      * выбранной модели. id = модель для API, label = подпись в UI.
+     * Только модели, доступные проекту ключа: на этот список опираются роли
+     * и modelFallbacks (tests/fm-defaults.test.mjs).
      */
     knownModels: [
       { id: 'zai-org/GLM-4.7', label: 'GLM-4.7 · по умолчанию, быстрая' },
-      { id: 'zai-org/GLM-5.1', label: 'GLM-5.1 · топ FC (403 на аккаунте с 04.08)' },
-      { id: 'openai/gpt-oss-120b', label: 'gpt-oss-120b · стабильная' },
-      { id: 'deepseek-ai/DeepSeek-V4-Pro', label: 'DeepSeek-V4-Pro · 1M контекст' }
+      { id: 'MiniMaxAI/MiniMax-M2.5', label: 'MiniMax-M2.5 · быстрее и дешевле, слабее в нарезке по темам' },
+      { id: 'ai-sage/GigaChat3.5-432B-A28B-Reasoning', label: 'GigaChat3.5 · самая дешёвая, медленная' }
     ],
 
     /**
@@ -223,12 +266,21 @@
      * мусор; внешние vision — 403 RBAC). MiniMax-M3: вход в ~4 раза дешевле
      * Qwen3.5 (240 vs 915 ₽/M), thinking отключаем (reasoning_optional=true).
      * ⚠ при 404 верни 'Qwen/Qwen3.5-397B-A17B'.
+     * 18.10.2026: MiniMax-M3 и Qwen3.5 вне проекта ключа (403), а доступные
+     * модели картинок не принимают («is not a multimodal model»). Модель
+     * оставлена — её и нужно включить в консоли Cloud.ru; до тех пор
+     * describe_frames и vision-кадрирование рилсов сообщают «… не включена в
+     * проект Cloud.ru» (рилсы кадрируют по центру).
      */
     visionModel: 'MiniMaxAI/MiniMax-M3',
 
     /**
      * Whisper для облачной транскрибации (Cloud.ru Foundation Models).
      * Лимит ~20 МБ на файл; длинные диапазоны автоматически режутся через ffmpeg.
+     * 18.10.2026: вне проекта ключа (403; 03.09 тот же ключ получал 200).
+     * Замены нет (решение пользователя — остаёмся на Cloud.ru Whisper):
+     * транскрибация сообщает «Транскрибация недоступна: модель … не включена
+     * в проект Cloud.ru», пока администратор не включит модель.
      */
     whisperModel: 'openai/whisper-large-v3',
 

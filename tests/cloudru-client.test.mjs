@@ -543,4 +543,155 @@ describe('cloudru-client.chatCompletions fallback', () => {
     assert.equal(calls[0], 'A');
     assert.ok(calls.filter((m) => m === 'B').length >= 2, 'B ретраилась как последняя модель');
   });
+
+  /* 18.10.2026: проект ключа пускает только модели из своего списка, остальные
+     отвечают 403 plain text «Requested model is not available for this project». */
+  const notInProject = { status: 403, body: 'Requested model is not available for this project' };
+  const boom = { status: 500, body: { error: { message: 'boom' } } };
+  const instantTimers = (fn) => setTimeout(() => fn(), 0);
+
+  test('403 «not available for this project» (plain text) → понятная ошибка с флагами', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: notInProject });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    await assert.rejects(
+      () => CR2.chatCompletions({ ...base, model: 'A' }),
+      (err) => err.httpStatus === 403 && err.modelNotInProject === true && err.model === 'A' &&
+        /^Модель A не включена в проект Cloud\.ru/.test(err.message)
+    );
+    assert.deepEqual(calls, ['A'], '403 не ретраится');
+  });
+
+  test('unavailableLead: что именно не работает — в начале сообщения', async () => {
+    const { fetchImpl } = chatFetch({ V: notInProject });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    await assert.rejects(
+      () => CR2.chatCompletions({ ...base, model: 'V', unavailableLead: 'Описание кадров недоступно' }),
+      (err) => /^Описание кадров недоступно: модель V не включена в проект Cloud\.ru/.test(err.message)
+    );
+  });
+
+  test('основная не в проекте → фолбэк на доступную, причина понятная', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: notInProject, B: ok('B') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    const fb = [];
+    const data = await CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'], onModelFallback: (i) => fb.push(i) });
+    assert.equal(data.choices[0].message.content, 'ok-B');
+    assert.deepEqual(calls, ['A', 'B']);
+    assert.match(fb[0].reason, /не включена в проект/);
+  });
+
+  test('все запасные не в проекте → ошибка основной модели, а не запасной', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: boom, B: notInProject });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl, setTimeout: instantTimers });
+    await assert.rejects(
+      () => CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'] }),
+      (err) => err.httpStatus === 500 && /boom/.test(err.message) &&
+        /Запасные модели не включены в проект Cloud\.ru: B/.test(err.message)
+    );
+    assert.deepEqual(calls, ['A', 'B']);
+  });
+
+  test('запасную, уже ответившую «не в проекте», больше не дёргаем', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: boom, B: notInProject, C: ok('C') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    await assert.rejects(() => CR2.chatCompletions({ ...base, model: 'B' }), (e) => e.modelNotInProject === true);
+    const fb = [];
+    const data = await CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B', 'C'], onModelFallback: (i) => fb.push(i) });
+    assert.equal(data.choices[0].message.content, 'ok-C');
+    assert.deepEqual(calls, ['B', 'A', 'C'], 'B второй раз не вызывается');
+    assert.equal(fb[0].from, 'A');
+    assert.equal(fb[0].to, 'C');
+  });
+
+  test('все запасные известно не в проекте → основная одна, с полным бюджетом ретраев', async () => {
+    const { fetchImpl, calls } = chatFetch({ A: boom, B: notInProject });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl, setTimeout: instantTimers });
+    await assert.rejects(() => CR2.chatCompletions({ ...base, model: 'B' }));
+    await assert.rejects(
+      () => CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B'] }),
+      (err) => /boom/.test(err.message) && /не включены в проект Cloud\.ru: B/.test(err.message)
+    );
+    assert.equal(calls.filter((m) => m === 'B').length, 1, 'B — только в первом вызове');
+    assert.ok(calls.filter((m) => m === 'A').length >= 2, 'A ретраилась как единственная модель');
+  });
+
+  test('пометка «не в проекте» живёт 30 мин, потом модель пробуем снова', async () => {
+    let now = 1e12;
+    class FakeDate extends Date { static now() { return now; } }
+    const { fetchImpl, calls } = chatFetch({ A: boom, B: notInProject, C: ok('C') });
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl, Date: FakeDate });
+    await assert.rejects(() => CR2.chatCompletions({ ...base, model: 'B' }));
+    now += 31 * 60 * 1000;
+    await CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B', 'C'] });
+    assert.deepEqual(calls, ['B', 'A', 'B', 'C']);
+  });
+
+  test('успешный ответ снимает пометку (администратор включил модель)', async () => {
+    const behavior = { A: boom, B: notInProject, C: ok('C') };
+    const { fetchImpl } = chatFetch(behavior);
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl });
+    await assert.rejects(() => CR2.chatCompletions({ ...base, model: 'B' }));
+    behavior.B = ok('B');
+    /* основную пробуем всегда, даже помеченную */
+    await CR2.chatCompletions({ ...base, model: 'B' });
+    const data = await CR2.chatCompletions({ ...base, model: 'A', fallbackModels: ['B', 'C'] });
+    assert.equal(data.choices[0].message.content, 'ok-B');
+  });
+});
+
+describe('cloudru-client.isModelNotInProject', () => {
+  const N = CR.isModelNotInProject;
+  const TEXT = 'Requested model is not available for this project';
+  test('403 + plain text «not available for this project» → true', () => {
+    assert.equal(N(403, TEXT), true);
+  });
+  test('тот же текст в JSON-обёртке → true', () => {
+    assert.equal(N(403, JSON.stringify({ error: { message: TEXT } })), true);
+  });
+  test('старый 403 RBAC, другие статусы, пустое тело → false', () => {
+    assert.equal(N(403, '403 RBAC: Access Denied'), false);
+    assert.equal(N(404, TEXT), false);
+    assert.equal(N(200, TEXT), false);
+    assert.equal(N(403, ''), false);
+    assert.equal(N(403, null), false);
+  });
+});
+
+describe('cloudru-client.transcribeAudio — ошибки API', () => {
+  function trFetch(status, body) {
+    const calls = [];
+    const fetchImpl = async (url) => {
+      calls.push(url);
+      return { status, ok: status >= 200 && status < 300, headers: { get: () => null }, text: async () => body };
+    };
+    return { fetchImpl, calls };
+  }
+  const trBase = { baseUrl: 'http://x', apiKey: 'k', model: 'openai/whisper-large-v3', fileBlob: new Blob(['x']), fileName: 'a.mp3' };
+
+  test('403 plain text → «Транскрибация недоступна: модель … не включена в проект», а не «не JSON»', async () => {
+    const { fetchImpl, calls } = trFetch(403, 'Requested model is not available for this project');
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl, FormData, Blob });
+    await assert.rejects(
+      () => CR2.transcribeAudio(trBase),
+      (err) => err.httpStatus === 403 && err.modelNotInProject === true && err.model === 'openai/whisper-large-v3' &&
+        /^Транскрибация недоступна: модель openai\/whisper-large-v3 не включена в проект Cloud\.ru/.test(err.message)
+    );
+    assert.equal(calls.length, 1, '403 не ретраится');
+  });
+
+  test('502 с HTML-телом → ошибка со статусом, а не «не JSON»', async () => {
+    const { fetchImpl } = trFetch(502, '<html><body>upstream error</body></html>');
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl, FormData, Blob, setTimeout: (fn) => setTimeout(() => fn(), 0) });
+    await assert.rejects(
+      () => CR2.transcribeAudio(trBase),
+      (err) => err.httpStatus === 502 && /^HTTP 502/.test(err.message) && !/не JSON/.test(err.message)
+    );
+  });
+
+  test('успешный ответ разбирается как раньше', async () => {
+    const { fetchImpl } = trFetch(200, JSON.stringify({ text: 'привет', segments: [] }));
+    const CR2 = loadCloudRuClient({ fetch: fetchImpl, FormData, Blob });
+    const data = await CR2.transcribeAudio(trBase);
+    assert.equal(data.text, 'привет');
+  });
 });

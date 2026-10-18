@@ -30,6 +30,11 @@
     if (!err) return { state: OK, reason: '' };
     if (err.name === 'AbortError') return { state: UNKNOWN, reason: 'проверка прервана' };
     var s = (typeof err.httpStatus === 'number') ? err.httpStatus : 0;
+    /* 18.10.2026: модель вне списка разрешённых моделей проекта ключа
+       (cloudru-client ставит modelNotInProject; без флага — по тексту сервера). */
+    if (err.modelNotInProject || (s === 403 && /not available for this project/i.test(String(err.message || '')))) {
+      return { state: UNAVAILABLE, reason: 'не включена в проект Cloud.ru (403)' };
+    }
     if (s === 403) return { state: UNAVAILABLE, reason: 'нет доступа (403 RBAC)' };
     if (s === 404) return { state: UNAVAILABLE, reason: 'модель снята (404)' };
     if (s >= 500) return { state: UNAVAILABLE, reason: 'сервер не отвечает (' + s + ')' };

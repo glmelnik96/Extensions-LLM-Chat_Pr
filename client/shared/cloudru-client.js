@@ -47,6 +47,61 @@
     return status >= 500 || status === 429;
   }
 
+  /* 18.10.2026: на проекте ключа включён список разрешённых моделей. Остальные
+     отвечают 403 PLAIN TEXT (не JSON) «Requested model is not available for this
+     project» — и чат, и Whisper. Чинится только в консоли Cloud.ru (администратор
+     организации включает модель проекту) — повтор запроса не поможет. */
+  var NOT_IN_PROJECT_RE = /not available for this project/i;
+  function isModelNotInProject(status, text) {
+    return status === 403 && NOT_IN_PROJECT_RE.test(String(text || '').slice(0, 600));
+  }
+
+  /* lead — что именно не работает («Транскрибация недоступна»): сообщение сразу
+     годится для показа пользователю, без перевода сырого ответа сервера. */
+  function modelNotInProjectError(model, lead) {
+    var tail = model + ' не включена в проект Cloud.ru (HTTP 403: Requested model is not available for this project).';
+    var err = new Error(lead ? lead + ': модель ' + tail : 'Модель ' + tail);
+    err.httpStatus = 403;
+    err.modelNotInProject = true;
+    err.model = model;
+    return err;
+  }
+
+  /* Ошибочный ответ API → Error с httpStatus. Тело бывает JSON ({error:{message}}),
+     plain text или HTML прокси — разбираем лениво, только ради текста ошибки. */
+  function httpError(status, text, model, lead) {
+    if (isModelNotInProject(status, text)) return modelNotInProjectError(model, lead);
+    var msg = '';
+    var isJson = false;
+    try {
+      var data = JSON.parse(text);
+      isJson = true;
+      msg = (data && data.error && data.error.message) ? String(data.error.message) : '';
+    } catch (_parseErr) {}
+    var body = String(text || '').slice(0, 300);
+    if (!msg && body) msg = isJson ? body : 'HTTP ' + status + ': ' + body;
+    if (!msg) msg = 'HTTP ' + status;
+    var err = new Error(msg);
+    err.httpStatus = status;
+    return err;
+  }
+
+  /* Модели, ответившие «не в проекте», — с TTL как у ModelHealth: фолбэк на них
+     не уходит (иначе сбой основной модели превращался в цепочку 403 и в чужую
+     ошибку вместо своей). Протухшая пометка вреднее лишнего запроса: модель
+     может включить администратор. */
+  var NOT_IN_PROJECT_TTL_MS = 30 * 60 * 1000;
+  var notInProjectAt = {};
+  function knownNotInProject(model) {
+    var at = notInProjectAt[model];
+    if (typeof at !== 'number') return false;
+    if (Date.now() - at > NOT_IN_PROJECT_TTL_MS) {
+      delete notInProjectAt[model];
+      return false;
+    }
+    return true;
+  }
+
   /* Пассивная телеметрия доступности моделей (04.08.2026): единственная точка,
      через которую панель узнаёт, какие модели реально отвечают. Наблюдатель
      необязателен — клиент остаётся самодостаточным. */
@@ -489,19 +544,12 @@
           throw e413;
         }
         /* Классифицируем ПО СТАТУСУ до JSON-парса: недоступная модель часто
-           отдаёт 404/502 с ПУСТЫМ или HTML-телом (живой тест 21.07: 404 «»).
-           Если парсить сначала — падаем в «Ответ не JSON» без httpStatus и
-           фолбэк не срабатывает. Тело парсим лениво только ради текста ошибки. */
+           отдаёт 404/502 с ПУСТЫМ или HTML-телом (живой тест 21.07: 404 «»),
+           а 403 «не в проекте» — plain text. Если парсить сначала — падаем в
+           «Ответ не JSON» без httpStatus и фолбэк не срабатывает. */
         if (!res.ok) {
-          var errMsg = '';
-          try {
-            var errData = JSON.parse(text);
-            errMsg = (errData && errData.error && errData.error.message) ? errData.error.message : '';
-          } catch (_parseErr) {}
-          if (!errMsg) errMsg = String(text || '').slice(0, 300) || ('HTTP ' + res.status);
-          var eHttp = new Error(errMsg);
-          eHttp.httpStatus = res.status; /* 404/5xx → модель недоступна, isModelUnavailable решит */
-          throw eHttp;
+          /* 404/5xx/403 → модель недоступна, isModelUnavailable решит */
+          throw httpError(res.status, text, modelName, opts.unavailableLead);
         }
         var data = parseJsonResponse(text, 'Ответ не JSON');
         if (global.UsageMeter && data && data.usage) {
@@ -510,11 +558,15 @@
         return data;
       }
 
-      /* Список моделей: основная + запасные (дедуп, без пустых). */
+      /* Список моделей: основная + запасные (дедуп, без пустых). Запасные, недавно
+         ответившие «не в проекте», пропускаем; основную пробуем всегда. */
       var modelList = [model];
+      var notInProjectFallbacks = [];
       var fbs = opts.fallbackModels || [];
       for (var fi = 0; fi < fbs.length; fi++) {
-        if (fbs[fi] && modelList.indexOf(fbs[fi]) < 0) modelList.push(fbs[fi]);
+        if (!fbs[fi] || modelList.indexOf(fbs[fi]) >= 0 || notInProjectFallbacks.indexOf(fbs[fi]) >= 0) continue;
+        if (knownNotInProject(fbs[fi])) notInProjectFallbacks.push(fbs[fi]);
+        else modelList.push(fbs[fi]);
       }
       /* На НЕпоследней модели урезаем ретраи (по умолчанию 1), чтобы не ждать
          5×timeout на мёртвой модели перед переключением. Последняя модель
@@ -524,17 +576,35 @@
         : 1;
 
       var lastErr = null;
+      var primaryErr = null;
       for (var mi = 0; mi < modelList.length; mi++) {
         var isLast = mi === modelList.length - 1;
         try {
           var okRes = await attemptModel(modelList[mi], isLast ? undefined : retriesBeforeFallback);
+          delete notInProjectAt[modelList[mi]];
           notifyModelHealth({ model: modelList[mi], ok: true });
           return okRes;
         } catch (err) {
           lastErr = err;
+          if (mi === 0) primaryErr = err;
+          if (err && err.modelNotInProject) {
+            notInProjectAt[modelList[mi]] = Date.now();
+            if (mi > 0) notInProjectFallbacks.push(modelList[mi]);
+          }
           notifyModelHealth({ model: modelList[mi], error: err });
           if (err && err.name === 'AbortError') throw err;
-          if (isLast || !isModelUnavailable(err)) throw err;
+          if (isLast || !isModelUnavailable(err)) {
+            /* Тупик цепочки из-за запасных «не в проекте» — показываем ошибку
+               ОСНОВНОЙ модели: причина сбоя в ней, а «not available» запасной
+               только путала (18.10.2026). */
+            var deadEnd = notInProjectFallbacks.length > 0 &&
+              (mi === 0 ? isModelUnavailable(err) : !!(err && err.modelNotInProject));
+            if (deadEnd) {
+              primaryErr.message += ' Запасные модели не включены в проект Cloud.ru: ' + notInProjectFallbacks.join(', ') + '.';
+              throw primaryErr;
+            }
+            throw err;
+          }
           if (typeof opts.onModelFallback === 'function') {
             try {
               opts.onModelFallback({
@@ -599,18 +669,20 @@
           '413 Payload Too Large — аудио слишком большое для API. Установите ffmpeg (brew install ffmpeg / apt install ffmpeg) — плагин автоматически нарежет диапазон на чанки. Альтернатива: создайте .epr пресет и пропишите exportAudioPresetPath в fm-defaults.js (см. host/presets/README.txt).'
         );
       }
-      var data = parseJsonResponse(text, 'Транскрипция: не JSON');
+      /* Статус — ДО JSON-парса: 403 «не в проекте» приходит plain text, и
+         раньше пользователь видел «Транскрипция: не JSON: Requested model…». */
       if (!res.ok) {
-        var errMsg = data.error && data.error.message ? data.error.message : text.slice(0, 300);
-        if (wantWords && (res.status === 400 || res.status === 422) && /granularit|timestamp/i.test(String(errMsg))) {
+        var trErr = httpError(res.status, text, model, 'Транскрибация недоступна');
+        if (wantWords && (res.status === 400 || res.status === 422) && /granularit|timestamp/i.test(trErr.message)) {
           global.__whisperWordTsUnsupported = true;
           var retryOpts = {};
           for (var rk in opts) { if (Object.prototype.hasOwnProperty.call(opts, rk)) retryOpts[rk] = opts[rk]; }
           retryOpts._noWordTs = true;
           return global.CloudRuClient.transcribeAudio(retryOpts);
         }
-        throw new Error(errMsg);
+        throw trErr;
       }
+      var data = parseJsonResponse(text, 'Транскрипция: не JSON');
       if (global.UsageMeter && data && typeof data.duration === 'number') {
         UsageMeter.recordWhisper(data.duration);
       }
@@ -626,9 +698,11 @@
     isPayloadTooLarge: isPayloadTooLarge,
     isRetryable: isRetryable,
     isModelUnavailable: isModelUnavailable,
+    isModelNotInProject: isModelNotInProject,
     parseRetryAfterMs: parseRetryAfterMs,
     fetchWithRetry: fetchWithRetry,
     parseSSEStream: parseSSEStream,
-    chatCompletions: global.CloudRuClient.chatCompletions
+    chatCompletions: global.CloudRuClient.chatCompletions,
+    transcribeAudio: global.CloudRuClient.transcribeAudio
   };
 })(window);

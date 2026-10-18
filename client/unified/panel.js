@@ -4778,6 +4778,8 @@ PanelBoot.run('ИИ: монтаж', function () {
         temperature: 0.2,
         chatParams: { max_tokens: 2048 },
         enableThinking: false, /* MiniMax-M3: reasoning_optional — выключаем, описания не требуют CoT */
+        /* 18.10.2026: vision-модели нет в проекте ключа — текст ошибки для агента/пользователя */
+        unavailableLead: 'Описание кадров (vision) недоступно',
         messages: [{ role: 'user', content: content }]
       });
       var text = '';
@@ -7554,7 +7556,9 @@ PanelBoot.run('ИИ: монтаж', function () {
         if (cls.kind === 'network' || cls.kind === 'server' || cls.kind === 'other') {
           opts.retry = function () { onTranscribeTimeline(); };
         }
-        showErr('Транскрибация: ' + String(e.message || e), opts);
+        /* «Транскрибация недоступна: модель … не включена в проект» уже с префиксом */
+        var trMsg = String(e.message || e);
+        showErr(/^Транскрибац/.test(trMsg) ? trMsg : 'Транскрибация: ' + trMsg, opts);
       }
     } finally {
       if (TimelineTranscribe && TimelineTranscribe.unlinkWorkFiles) TimelineTranscribe.unlinkWorkFiles(prep);
@@ -9842,6 +9846,7 @@ PanelBoot.run('ИИ: монтаж', function () {
                  * возвращает ПУСТОЙ content (finish=stop), A/B-проверено live
                  * 17.07.2026. Без него модель отвечает честным JSON. */
                 chatParams: { max_tokens: 2048 }, /* 512 не хватает: MiniMax-M3 жжёт бюджет на скрытое рассуждение до ответа — на 4 кадрах finish=length с пустым content (live 20.07.2026) */
+                unavailableLead: 'Vision-кадрирование недоступно',
                 messages: [{ role: 'user', content: vContent }]
               });
               var vText = (vResp && vResp.choices && vResp.choices[0] && vResp.choices[0].message)
@@ -9849,6 +9854,12 @@ PanelBoot.run('ИИ: монтаж', function () {
               var cxBatch = ReelsPipeline.parseVisionBatchAnswer(vText, idxs.length);
               for (var pb = 0; pb < idxs.length; pb++) cxAll[idxs[pb]] = cxBatch[pb];
             } catch (eB) {
+              /* Модели нет в проекте — остальные батчи упадут так же: одна внятная
+                 пометка вместо N одинаковых 403 (18.10.2026). */
+              if (eB && eB.modelNotInProject) {
+                notes.push(String(eB.message) + ' Кадрирование по центру; ручной «Фокус камер» работает.');
+                break;
+              }
               notes.push('vision-запрос ' + (bi + 1) + ' не сработал (' + String((eB && eB.message) || eB) + ') — центр для его кадров');
             }
           }

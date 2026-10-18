@@ -14,6 +14,9 @@ describe('ErrorHumanizer.classify — каталог', () => {
     ['HTTP 401 Unauthorized', 'auth', 'fm-secrets'],
     ['invalid api key provided', 'auth', 'ключ'],
     ['HTTP 403 Forbidden', 'auth', 'прав'],
+    /* 18.10.2026: модель вне списка проекта — ключ ни при чём, повтор не поможет */
+    ['Requested model is not available for this project', 'model', 'администратор'],
+    ['Транскрибация недоступна: модель openai/whisper-large-v3 не включена в проект Cloud.ru (HTTP 403: Requested model is not available for this project).', 'model', 'администратор'],
     ['HTTP 404: model glm-5 not found', 'model', 'fm-defaults'],
     ['HTTP 413 Payload Too Large', 'payload', '25MB'],
     ['HTTP 429 Too Many Requests: rate limit', 'quota', 'Retry-After'],
