@@ -11,6 +11,11 @@ import vm from 'node:vm';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export function loadCloudRuClient(sandboxExtras) {
+  return loadCloudRuClientRoot(sandboxExtras)._cloudRuInternals;
+}
+
+/** Весь root: CloudRuClient (публичные методы) + _cloudRuInternals. */
+export function loadCloudRuClientRoot(sandboxExtras) {
   const filePath = path.join(__dirname, '..', 'client', 'shared', 'cloudru-client.js');
   let src = fs.readFileSync(filePath, 'utf8');
   const marker = '})(window);';
@@ -46,7 +51,7 @@ export function loadCloudRuClient(sandboxExtras) {
   if (!root._cloudRuInternals) {
     throw new Error('_cloudRuInternals not attached to root');
   }
-  return root._cloudRuInternals;
+  return root;
 }
 
 /**

@@ -9,6 +9,8 @@
  *                               Adds tokens; ₽ = in/1e6*inPerM + out/1e6*outPerM.
  *                               Unknown model → 0 ₽ (tokens still accumulate).
  *                               Broken/missing usage → no-op.
+ *   recordEmbedding(model, promptTokens) — эмбеддинги: tokens → inTokens,
+ *                               ₽ += tokens/1e6*inPerM; окно контекста не меняет.
  *   recordWhisper(seconds)    — adds seconds; ₽ += seconds * whisperPerSec.
  *   getSummary()              — { inTokens, outTokens, totalTokens, whisperSec, rubles,
  *                                 lastModel, lastPromptTokens, lastCompletionTokens }.
@@ -124,6 +126,20 @@
     fireChange();
   }
 
+  /* Эмбеддинги find_moments (18.10.2026): только вход, ₽ по inPerM. Окно
+     контекста не трогаем — индикатор показывает последний ЧАТ-запрос. */
+  function recordEmbedding(model, promptTokens) {
+    if (!isFiniteNumber(promptTokens) || promptTokens <= 0) return;
+    var inPerM = 0;
+    var pricing = getPricing();
+    if (pricing && pricing.models && pricing.models[model]) {
+      inPerM = Number(pricing.models[model].inPerM) || 0;
+    }
+    inTokens += promptTokens;
+    rubles += (promptTokens / 1e6) * inPerM;
+    fireChange();
+  }
+
   function recordWhisper(seconds) {
     var sec = Number(seconds);
     if (!isFiniteNumber(sec) || sec <= 0) return;
@@ -160,6 +176,7 @@
 
   global.UsageMeter = {
     recordChat: recordChat,
+    recordEmbedding: recordEmbedding,
     recordWhisper: recordWhisper,
     getSummary: getSummary,
     getContextInfo: getContextInfo,

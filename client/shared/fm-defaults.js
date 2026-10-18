@@ -127,6 +127,9 @@
     pricing: {
       currency: '₽',
       models: {
+        /* Эмбеддинги find_moments (/v1/models metadata 18.10.2026): только вход */
+        'ai-sage/Giga-Embeddings-instruct-3B':   { inPerM: 32.22, outPerM: 0, ctxTokens: 8192 },
+        'ai-sage/Giga-Embeddings-instruct-480M': { inPerM: 3.32,  outPerM: 0, ctxTokens: 8192 },
         'zai-org/GLM-5.1':             { inPerM: 198.86, outPerM: 829.60, ctxTokens: 202000 },
         'deepseek-ai/DeepSeek-V4-Pro': { inPerM: 183.00, outPerM: 732.00, ctxTokens: 1048000 },
         'zai-org/GLM-4.7':             { inPerM: 549.00, outPerM: 793.00, ctxTokens: 202000 },
@@ -204,6 +207,17 @@
      * fallback подключаем LLM. Phase 2: GLM-5.1 (thinking=false, см. policy).
      */
     findMomentsModel: 'zai-org/GLM-4.7', /* 09.2026: GLM-5.1 = 403 на аккаунте */
+
+    /**
+     * Эмбеддинги для find_moments (18.10.2026, client/shared/moment-embeddings.js):
+     * векторы абзацев + запрос → гибрид с лексикой (FindMoments.rankHybrid).
+     * Замер на 4 транскриптах кэша, 248 запросов к главам: лексика top-1 37% /
+     * top-3 50% → 3B 67% / 81%; 480M (в 10 раз дешевле) 58% / 77%.
+     * Цена 3B: ~0.14 ₽ на векторы 20-мин ролика (один раз, кэш в entry),
+     * ~0.001 ₽ на запрос. '' — выключить (только лексика). Если модель вне
+     * проекта ключа (403) — тихий фолбэк на лексику с паузой 30 мин.
+     */
+    embeddingModel: 'ai-sage/Giga-Embeddings-instruct-3B',
 
     /**
      * Быстрая модель для простых задач (маркеры, классификация, структура).

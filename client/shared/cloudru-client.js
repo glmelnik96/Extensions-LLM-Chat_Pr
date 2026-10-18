@@ -451,7 +451,79 @@
     };
   }
 
+  /* Вектор эмбеддинга: base64 little-endian float32 (encoding_format=base64)
+     или массив чисел — некоторые серверы игнорируют encoding_format. */
+  function decodeEmbedding(e) {
+    if (typeof e !== 'string') return new Float32Array(e || []);
+    var bin = atob(e);
+    var dv = new DataView(new ArrayBuffer(bin.length));
+    for (var i = 0; i < bin.length; i++) dv.setUint8(i, bin.charCodeAt(i));
+    var out = new Float32Array(Math.floor(bin.length / 4));
+    for (var j = 0; j < out.length; j++) out[j] = dv.getFloat32(j * 4, true);
+    return out;
+  }
+
   global.CloudRuClient = {
+    /**
+     * POST /v1/embeddings (18.10.2026: find_moments через MomentEmbeddings).
+     * opts: { baseUrl, apiKey, model, input: string[], signal?, abortCheck?,
+     *         timeoutMs?:20000, maxRetries?:2 } → { vectors: Float32Array[], usage, model }.
+     * base64 вместо JSON-чисел — ответ в 4 раза меньше (живая проба: 11 КБ vs 44 КБ
+     * на вектор 2048). Ошибка HTTP несёт httpStatus — фолбэк решает вызывающий.
+     */
+    embeddings: async function (opts) {
+      var base = normalizeBase(opts.baseUrl);
+      var apiKey = opts.apiKey;
+      var model = opts.model;
+      var input = opts.input || [];
+      if (!base || !apiKey || !model) {
+        throw new Error('Проверьте fm-defaults.js (baseUrl, embeddingModel) и fm-secrets.js (apiKey).');
+      }
+      var fetchOpts = {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + apiKey,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ model: model, input: input, encoding_format: 'base64' })
+      };
+      if (opts.signal) fetchOpts.signal = opts.signal;
+      throwIfAbortCheck(opts.abortCheck);
+      var res = await fetchWithRetry(apiV1Root(base) + '/embeddings', fetchOpts, opts.abortCheck, {
+        timeoutMs: typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 20000,
+        maxRetries: typeof opts.maxRetries === 'number' ? opts.maxRetries : 2
+      });
+      throwIfAbortCheck(opts.abortCheck);
+      var text = await res.text();
+      if (!res.ok) {
+        var errMsg = '';
+        try {
+          var errData = JSON.parse(text);
+          errMsg = (errData && errData.error && errData.error.message) ? errData.error.message : '';
+        } catch (_parseErr) {}
+        if (!errMsg) errMsg = String(text || '').slice(0, 300) || ('HTTP ' + res.status);
+        var eHttp = new Error('Эмбеддинги ' + model + ': ' + errMsg);
+        eHttp.httpStatus = res.status;
+        throw eHttp;
+      }
+      var data = parseJsonResponse(text, 'Эмбеддинги: ответ не JSON');
+      var items = (data && data.data) || [];
+      var vectors = new Array(input.length);
+      for (var i = 0; i < items.length; i++) {
+        var idx = typeof items[i].index === 'number' ? items[i].index : i;
+        if (idx >= 0 && idx < input.length) vectors[idx] = decodeEmbedding(items[i].embedding);
+      }
+      var got = 0;
+      for (var g = 0; g < vectors.length; g++) if (vectors[g]) got++;
+      if (got !== input.length) {
+        throw new Error('Эмбеддинги: векторов ' + got + ' на ' + input.length + ' текстов');
+      }
+      if (global.UsageMeter && typeof global.UsageMeter.recordEmbedding === 'function' && data.usage) {
+        global.UsageMeter.recordEmbedding(data.model || model, Number(data.usage.prompt_tokens) || 0);
+      }
+      return { vectors: vectors, usage: data.usage || null, model: data.model || model };
+    },
+
     /**
      * POST /v1/chat/completions
      * opts.stream — if true, uses SSE streaming

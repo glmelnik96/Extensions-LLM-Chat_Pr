@@ -292,6 +292,16 @@ describe('ContextStore — ручной переключатель модели 
     absent.cleanup();
   });
 
+  test('embeddingModel пробрасывается из дефолтов; поля нет → "" (find_moments на лексике)', () => {
+    const on = loadContextStoreWithTempRoot({ fmDefaults: { ...FM, embeddingModel: ' ai-sage/Giga-Embeddings-instruct-3B ' } });
+    assert.equal(on.ContextStore.getResolvedSettings().embeddingModel, 'ai-sage/Giga-Embeddings-instruct-3B');
+    on.cleanup();
+
+    const absent = freshCS();
+    assert.equal(absent.ContextStore.getResolvedSettings().embeddingModel, '');
+    absent.cleanup();
+  });
+
   test('setSessionChatModel валидной id → override применён везде (chat+agent)', () => {
     const { ContextStore: CS, cleanup } = freshCS();
     const applied = CS.setSessionChatModel('openai/gpt-oss-120b');

@@ -1002,13 +1002,13 @@ PanelBoot.run('ИИ: монтаж', function () {
       'function': {
         name: 'find_moments',
         description:
-          'Семантический поиск моментов в транскрипте по запросу. Возвращает топ-K параграфов или сегментов с интервалами времени и оценкой совпадения. Используй вместо чтения всего транскрипта, если ищешь конкретное место.',
+          'Поиск моментов в транскрипте по смыслу: эмбеддинги абзацев + словоформы запроса. Возвращает абзацы с интервалами времени по убыванию релевантности (score 0..1). searchMode="lexical" — эмбеддинги недоступны, работал поиск по словам. weakMatch=true — темы в ролике, скорее всего, нет. Используй вместо чтения всего транскрипта, если ищешь конкретное место.',
         parameters: {
           type: 'object',
           properties: {
             sequenceKey: { type: 'string', description: 'Имя секвенции (ключ кэша).' },
-            query: { type: 'string', description: 'Запрос на естественном языке. Сначала literal-поиск по словоформам (стратегия → стратегии/стратегиям), потом TF-IDF fallback.' },
-            k: { type: 'number', description: 'Сколько результатов вернуть (по умолчанию 20). Возвращаются ВСЕ literal-совпадения до этого лимита.' }
+            query: { type: 'string', description: 'Тема или фраза на естественном языке («где про комиссию Steam»). Пересказ и синонимы находятся по смыслу, не только дословно.' },
+            k: { type: 'number', description: 'Максимум результатов (по умолчанию 20). По смыслу возвращаются только близкие к лучшему — обычно 3–8 абзацев.' }
           },
           required: ['sequenceKey', 'query']
         }
@@ -1165,7 +1165,7 @@ PanelBoot.run('ИИ: монтаж', function () {
       'function': {
         name: 'find_moments',
         description:
-          'Семантический поиск моментов в транскрипте по запросу. Возвращает топ-K параграфов с временными интервалами. Удобно для расстановки маркеров на конкретные темы.',
+          'Поиск моментов в транскрипте по смыслу (эмбеддинги + словоформы). Возвращает абзацы с временными интервалами по убыванию релевантности. Удобно для расстановки маркеров на конкретные темы.',
         parameters: {
           type: 'object',
           properties: {
@@ -4119,23 +4119,58 @@ PanelBoot.run('ИИ: монтаж', function () {
         } catch (eR) {}
       }
     }
-    var moments = FindMoments.find(e, q, { k: k });
-    return Promise.resolve({
-      ok: true,
-      query: q,
-      sequenceKey: found.matchedKey,
-      count: moments.length,
-      matchType: moments.length ? moments[0].matchType : null,
-      moments: moments.map(function (m) {
-        return {
-          startSec: Math.round(m.startSec * 100) / 100,
-          endSec: Math.round(m.endSec * 100) / 100,
-          tc: fmtSec(m.startSec) + '–' + fmtSec(m.endSec),
-          source: m.source,
-          matchType: m.matchType,
-          quote: String(m.text || '').slice(0, 240)
-        };
-      })
+    /* 18.10.2026: поиск по смыслу — эмбеддинги абзацев Cloud.ru + словоформы
+       (MomentEmbeddings → FindMoments.rankHybrid); векторы кэшируются в entry.
+       Без модели/ключа/сети — лексический FindMoments.find, как раньше. */
+    var settings = ContextStore.getResolvedSettings ? ContextStore.getResolvedSettings() : {};
+    var embedTexts = null;
+    if (typeof CloudRuClient !== 'undefined' && CloudRuClient.embeddings && settings.embeddingModel && settings.apiKey) {
+      embedTexts = function (texts) {
+        return CloudRuClient.embeddings({
+          baseUrl: settings.baseUrl,
+          apiKey: settings.apiKey,
+          model: settings.embeddingModel,
+          input: texts,
+          signal: runAbort ? runAbort.signal : null,
+          abortCheck: runAbort ? function () { return runAbort.aborted; } : null
+        }).then(function (r) { return r.vectors; });
+      };
+    }
+    var searchP = typeof MomentEmbeddings !== 'undefined'
+      ? MomentEmbeddings.search(e, q, { k: k, model: settings.embeddingModel, embedTexts: embedTexts })
+      : Promise.resolve({ moments: FindMoments.find(e, q, { k: k }), mode: 'lexical' });
+    return searchP.then(function (r) {
+      if (r.persist) {
+        try { ContextStore.setTranscriptEntry(TRANSCRIPT_PID, found.matchedKey, e); } catch (eP) {}
+      }
+      var moments = r.moments || [];
+      var semantic = r.mode === 'semantic';
+      var res = {
+        ok: true,
+        query: q,
+        sequenceKey: found.matchedKey,
+        count: moments.length,
+        searchMode: r.mode,
+        matchType: moments.length ? moments[0].matchType : null,
+        moments: moments.map(function (m) {
+          var o = {
+            startSec: Math.round(m.startSec * 100) / 100,
+            endSec: Math.round(m.endSec * 100) / 100,
+            tc: fmtSec(m.startSec) + '–' + fmtSec(m.endSec),
+            source: m.source,
+            matchType: m.matchType,
+            quote: String(m.text || '').slice(0, 240)
+          };
+          if (semantic) o.score = m.score;
+          return o;
+        })
+      };
+      if (r.weak) {
+        res.weakMatch = true;
+        res.note = 'Совпадения слабые: похоже, этой темы в ролике нет. Скажи об этом пользователю, не ставь маркеры наугад.';
+      }
+      if (r.fallbackReason && settings.embeddingModel) res.fallbackReason = r.fallbackReason;
+      return res;
     });
   }
 

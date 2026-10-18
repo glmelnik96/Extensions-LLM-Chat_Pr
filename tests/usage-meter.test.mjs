@@ -188,3 +188,46 @@ test('reset(): getContextInfo снова null, baseline очищен', () => {
   m.recordChat('zai-org/GLM-5.1', { prompt_tokens: 30_000, completion_tokens: 10 });
   assert.equal(m.getContextInfo().baseTokens, 30_000);
 });
+
+/* ── recordEmbedding — эмбеддинги find_moments (18.10.2026) ─────────── */
+
+const embPricing = {
+  pricing: {
+    currency: '₽',
+    models: { 'ai-sage/Giga-Embeddings-instruct-3B': { inPerM: 32.22, outPerM: 0, ctxTokens: 8192 } },
+    whisperPerSec: 0.01
+  }
+};
+
+test('recordEmbedding: токены во вход, ₽ по inPerM', () => {
+  const m = loadUsageMeter(embPricing);
+  m.recordEmbedding('ai-sage/Giga-Embeddings-instruct-3B', 1_000_000);
+  const s = m.getSummary();
+  assert.equal(s.inTokens, 1_000_000);
+  assert.equal(s.outTokens, 0);
+  assert.ok(Math.abs(s.rubles - 32.22) < EPS, `rubles=${s.rubles}`);
+});
+
+test('recordEmbedding не трогает окно контекста чата', () => {
+  const m = loadUsageMeter(embPricing);
+  m.recordEmbedding('ai-sage/Giga-Embeddings-instruct-3B', 5000);
+  assert.equal(m.getContextInfo(), null, 'до чата индикатора нет');
+  m.recordChat('zai-org/GLM-4.7', { prompt_tokens: 9000, completion_tokens: 10 });
+  m.recordEmbedding('ai-sage/Giga-Embeddings-instruct-3B', 5000);
+  const c = m.getContextInfo();
+  assert.equal(c.model, 'zai-org/GLM-4.7');
+  assert.equal(c.promptTokens, 9000);
+});
+
+test('recordEmbedding: мусор → no-op, onChange не зовётся', () => {
+  const m = loadUsageMeter(embPricing);
+  let fired = 0;
+  m.onChange(() => { fired++; });
+  m.recordEmbedding('ai-sage/Giga-Embeddings-instruct-3B', NaN);
+  m.recordEmbedding('ai-sage/Giga-Embeddings-instruct-3B', -5);
+  m.recordEmbedding('ai-sage/Giga-Embeddings-instruct-3B', undefined);
+  assert.equal(m.getSummary().inTokens, 0);
+  assert.equal(fired, 0);
+  m.recordEmbedding('ai-sage/Giga-Embeddings-instruct-3B', 10);
+  assert.equal(fired, 1);
+});

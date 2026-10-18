@@ -1,8 +1,10 @@
 /**
- * find_moments: семантический (token-IDF) поиск по транскрипту.
+ * find_moments: поиск по транскрипту.
  *
- * MVP без эмбеддингов: токенизация по словам, нормализация (lowercase + удаление пунктуации),
- * стоп-слова (RU/EN), TF×IDF + бонус за совпадение фразы целиком.
+ * find — лексика без сети: literal по стемам → TF×IDF (стоп-слова RU/EN, бонус за фразу целиком).
+ * rankHybrid — гибрид с эмбеддингами (18.10.2026): косинусы абзацев считает
+ * moment-embeddings.js, здесь только ранжирование. Если эмбеддинги недоступны,
+ * панель остаётся на find.
  *
  * Используется как client-side executor: получает paragraphs или segments из кэша
  * (TranscriptStructure.buildStructure / get_transcript_from_cache) и возвращает топ-K совпадений.
@@ -272,8 +274,85 @@
     return merged.slice(0, k);
   }
 
+  /**
+   * Доля стемов запроса (0..1), найденных в начале слов каждого текста —
+   * лексический сигнал гибрида. Тот же префиксный матч, что у literal-поиска.
+   */
+  function stemCoverage(texts, query) {
+    var stems = queryStems(query);
+    var out = [];
+    for (var i = 0; i < texts.length; i++) {
+      out.push(stems.length ? stemMatchCount(texts[i], stems) / stems.length : 0);
+    }
+    return out;
+  }
+
+  /* Гибрид (замер 18.10.2026, tests/integration/benchmark-find-moments.mjs):
+     0.9 × косинус (min-max по ролику) + 0.1 × stemCoverage: top-1 63% → 67%.
+     Вес лексики 0.05–0.2 — плато (±1 попадание из 124 запросов title/summary);
+     TF-IDF вместо стемов и RRF — хуже чистого косинуса. cutoff 0.15 от лучшего
+     балла оставляет в среднем ~5.5 абзаца, minKeep — запас для агента
+     (top-3 точнее top-1: 81% против 67%). */
+  var HYBRID = { k: 20, lexWeight: 0.1, cutoff: 0.15, minKeep: 3 };
+
+  /**
+   * @param {object} entry    кэш транскрипта с paragraphs
+   * @param {string} query
+   * @param {number[]} cosines косинус запроса к каждому абзацу (по индексу paragraphs)
+   * @param {object} opt      { k?:20, lexWeight?:0.1, cutoff?:0.15, minKeep?:3 }
+   * @returns {Array<{startSec, endSec, score, text, source, idx, matchType}>} по убыванию score
+   */
+  function rankHybrid(entry, query, cosines, opt) {
+    opt = opt || {};
+    var paras = (entry && entry.paragraphs) || [];
+    var cos = cosines || [];
+    if (cos.length !== paras.length) {
+      throw new Error('rankHybrid: косинусов ' + cos.length + ', абзацев ' + paras.length);
+    }
+    if (!paras.length) return [];
+    var k = opt.k || HYBRID.k;
+    var w = typeof opt.lexWeight === 'number' ? opt.lexWeight : HYBRID.lexWeight;
+    var cutoff = typeof opt.cutoff === 'number' ? opt.cutoff : HYBRID.cutoff;
+    var minKeep = typeof opt.minKeep === 'number' ? opt.minKeep : HYBRID.minKeep;
+
+    var lo = Infinity;
+    var hi = -Infinity;
+    for (var i = 0; i < cos.length; i++) {
+      if (cos[i] < lo) lo = cos[i];
+      if (cos[i] > hi) hi = cos[i];
+    }
+    var span = hi - lo;
+    var cov = stemCoverage(paras.map(function (p) { return p.text || ''; }), query);
+    var scored = paras.map(function (p, j) {
+      var c = (span > 0 && isFinite(cos[j])) ? (cos[j] - lo) / span : 0;
+      return { j: j, s: (1 - w) * c + w * cov[j] };
+    });
+    scored.sort(function (a, b) { return (b.s - a.s) || (a.j - b.j); });
+
+    var top = scored[0].s;
+    var keep = [];
+    for (var m = 0; m < scored.length && keep.length < k; m++) {
+      if (scored[m].s < top - cutoff && keep.length >= minKeep) break;
+      keep.push(scored[m]);
+    }
+    return keep.map(function (o) {
+      var p = paras[o.j];
+      return {
+        startSec: p.startSec,
+        endSec: p.endSec,
+        score: Math.round(o.s * 1000) / 1000,
+        text: p.text || '',
+        source: 'paragraphs',
+        idx: o.j,
+        matchType: 'semantic'
+      };
+    });
+  }
+
   global.FindMoments = {
     find: findMoments,
+    rankHybrid: rankHybrid,
+    stemCoverage: stemCoverage,
     _tokenize: tokenize,
     _buildIdf: buildIdf
   };

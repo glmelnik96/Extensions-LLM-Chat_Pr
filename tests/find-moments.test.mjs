@@ -107,3 +107,71 @@ describe('FindMoments.find', () => {
     });
   });
 });
+
+describe('FindMoments.stemCoverage', () => {
+  test('доля стемов запроса, найденных в начале слов текста', () => {
+    const cov = FM.stemCoverage(
+      ['Китайский автопром вырос.', 'Темпы роста рекордные.', 'Нет, просто вопрос.'],
+      'китай рост'
+    );
+    assert.deepEqual(cov, [0.5, 0.5, 0]);
+  });
+
+  test('запрос без значимых слов → нули', () => {
+    assert.deepEqual(FM.stemCoverage(['что-то', 'ещё'], 'и в на'), [0, 0]);
+  });
+});
+
+/* 18.10.2026: гибрид для эмбеддингов — косинусы абзацев приходят снаружи
+   (MomentEmbeddings), здесь только чистое ранжирование. */
+describe('FindMoments.rankHybrid', () => {
+  const hEntry = {
+    paragraphs: [
+      { startSec: 0, endSec: 10, text: 'Сначала про погоду и новости.' },
+      { startSec: 10, endSec: 20, text: 'Площадка забирает тридцать процентов с продаж.' },
+      { startSec: 20, endSec: 30, text: 'Комиссия Steam высокая, но там аудитория.' },
+      { startSec: 30, endSec: 40, text: 'Потом поговорили про движок.' },
+      { startSec: 40, endSec: 50, text: 'И немного про тесты.' }
+    ]
+  };
+
+  test('ранжирует по смыслу: лучший косинус первым, даже без общих слов с запросом', () => {
+    const r = FM.rankHybrid(hEntry, 'сколько берёт магазин', [0.1, 0.6, 0.5, 0.2, 0.1]);
+    assert.equal(r[0].idx, 1);
+    assert.equal(r[0].startSec, 10);
+    assert.equal(r[0].endSec, 20);
+    assert.equal(r[0].matchType, 'semantic');
+    assert.equal(r[0].source, 'paragraphs');
+    assert.ok(r[0].text.includes('тридцать процентов'));
+  });
+
+  test('при равном косинусе выше абзац со словами запроса', () => {
+    const r = FM.rankHybrid(hEntry, 'комиссия Steam', [0.1, 0.5, 0.5, 0.2, 0.1]);
+    assert.equal(r[0].idx, 2);
+    assert.equal(r[1].idx, 1);
+  });
+
+  test('отсекает хвост ниже лучшего балла − cutoff, но оставляет минимум 3', () => {
+    const cos = [0.9, 0.1, 0.1, 0.1, 0.1];
+    const r = FM.rankHybrid(hEntry, 'погода', cos, { minKeep: 3 });
+    assert.equal(r.length, 3);
+    assert.equal(r[0].idx, 0);
+    const near = FM.rankHybrid(hEntry, 'погода', [0.9, 0.88, 0.87, 0.1, 0.1], { minKeep: 1, cutoff: 0.15 });
+    assert.deepEqual(near.map((m) => m.idx), [0, 1, 2]);
+  });
+
+  test('k ограничивает выдачу', () => {
+    const r = FM.rankHybrid(hEntry, 'x', [0.5, 0.5, 0.5, 0.5, 0.5], { k: 2 });
+    assert.equal(r.length, 2);
+  });
+
+  test('score — гибридный балл 0..1, у лучшего максимальный', () => {
+    const r = FM.rankHybrid(hEntry, 'комиссия Steam', [0.1, 0.5, 0.6, 0.2, 0.1]);
+    assert.ok(r[0].score <= 1 && r[0].score > 0.9, `score=${r[0].score}`);
+    for (let i = 1; i < r.length; i++) assert.ok(r[i].score <= r[i - 1].score);
+  });
+
+  test('косинусов не столько, сколько абзацев → ошибка (вызывающий уйдёт в лексику)', () => {
+    assert.throws(() => FM.rankHybrid(hEntry, 'x', [0.5, 0.5]), /косинусов 2, абзацев 5/);
+  });
+});
